@@ -16,6 +16,12 @@ public sealed record ArmorRegistryDataMappingResult(
 	string? Message = null)
 {
 	public static readonly ArmorRegistryDataMappingResult Nothing = new(0, 0, false, null);
+
+	/// <summary>被写成 <c>0</c>（隐藏）的格子数。来源没覆盖到的部位都算在这里。</summary>
+	public int Hidden { get; init; }
+
+	/// <summary>换成本源 unit 的格子数。</summary>
+	public int Replaced { get; init; }
 }
 
 public sealed record RuntimeArmorRegistryModel(
@@ -41,7 +47,18 @@ public sealed record RuntimeArmorRegistryModelPiece(
 	bool Enabled = true,
 	bool IsDefaultBase = false,
 	bool IsReserved = false,
-	uint? OriginalBody = null);
+	uint? OriginalBody = null)
+{
+	/// <summary>
+	/// 这一件是**被挪过来的**时，写下它原来的格子（形如 <c>slot0/layer0</c>）；空 = 原生件。
+	/// <para>
+	/// 只给"头身合并"用：素体的头原本是「头盔槽 / 层 0」，合并后被挪到胸部的某个空层。
+	/// 没有这个字段，事后没人能证明"某个胸甲层的那件就是头盔层 0 挪过去的"——看到的只是
+	/// 两条互不相干的记录，也没法据此还原。
+	/// </para>
+	/// </summary>
+	public string? MovedFrom { get; init; }
+}
 
 public sealed record RuntimeArmorRegistryPieceOverride(
 	uint OwnerItemId,

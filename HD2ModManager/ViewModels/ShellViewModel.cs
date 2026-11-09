@@ -1184,6 +1184,25 @@ namespace HD2ModManager.ViewModels
                             LogService.Warn($"导入没有产生 Mod：来源={item.Path}；{detail}");
                             _notificationService.Show($"没有导入任何 Mod。{detail}", NotificationLevel.Warning, TimeSpan.FromSeconds(12));
                         }
+
+                        // **导入到此结束**：来源已经在条目里了。
+                        // 接下来自动跑一次重构建 —— 只针对**这次导入**的条目，
+                        // 直接跑，不开底栏、不等用户再点一下。
+                        if (import.LastVpkImportTargets.Count != 0)
+                        {
+                            var rebuildTargets = import.LastVpkImportTargets
+                                .Select(guid => Guid.TryParse(guid, out var id)
+                                    && _libraryService.Snapshot.Nodes.TryGetValue(new ModNodeId(id), out var node)
+                                    ? new VpkBulkRebuildTarget(
+                                        node.Id,
+                                        node.Metadata.Name,
+                                        System.IO.Path.Combine(_libraryService.ModsRootDirectory, node.RelativePath))
+                                    : null)
+                                .Where(target => target is not null)
+                                .Select(target => target!)
+                                .ToArray();
+                            _ = RunImportRebuildAsync(rebuildTargets);
+                        }
                         foreach (var nodeId in import.LastAffectedNodeIds)
                             affectedNodeIds.Add(nodeId);
                         libraryChanged = true;
@@ -2388,6 +2407,16 @@ namespace HD2ModManager.ViewModels
                 _selection,
                 _armorDisplayFactsGate.Task);
 
+        // 选择栏"设置分类"用：当前选择属于哪个页面，就用哪个页面的分类筛选；返回选中的 Mod Guid。
+        internal (ModCategoryFilter Filter, IReadOnlyList<string> Guids)? GetCategorySelectionTarget()
+        {
+            var filter = _bottomBar.IsLibrarySelection ? _libraryWorkspacePage?.Category
+                : _bottomBar.IsProfileSelection ? _profileWorkspacePage?.Category
+                : null;
+            if (filter is null || !filter.IsEnabled) return null;
+            return (filter, _bottomBar.SelectedIds);
+        }
+
         private LibraryPageViewModel CreateLibraryPage()
         {
             var hideSelectedProfileMembers = LeftPageType == WorkspacePageType.Profile || RightPageType == WorkspacePageType.Profile;
@@ -2462,6 +2491,23 @@ namespace HD2ModManager.ViewModels
                 return;
             }
 
+            StartBulkVpkRebuild(targets, "一键重构");
+        }
+
+        /// <summary>
+        /// 按给定目标起一次批量重构建（底栏 + 并发 5）。**导入完成后也走这条**：
+        /// 导入只负责把来源摆进条目，转换与编译是另一件事。
+        /// </summary>
+        private void StartBulkVpkRebuild(IReadOnlyList<VpkBulkRebuildTarget> targets, string origin)
+        {
+            if (targets.Count == 0) return;
+            if (_bulkVpkRebuildOperation is { IsRunning: true })
+            {
+                _notificationService.Show("上一批重构还在跑：这次的条目等它结束后在「一键重构」里再跑一次。",
+                    NotificationLevel.Warning, TimeSpan.FromSeconds(8));
+                return;
+            }
+
             DismissToolBottomBars();
             _bulkVpkRebuildTargets = targets;
             _bulkVpkRebuildOperation = new VpkBulkRebuildBottomBarViewModel(
@@ -2471,7 +2517,86 @@ namespace HD2ModManager.ViewModels
             RegisterBulkVpkRebuildRow("bulk-vpk-rebuild-options", VpkBulkRebuildBottomBarRowKind.Options, insertAtRow: 1);
             RegisterBulkVpkRebuildRow("bulk-vpk-rebuild-progress", VpkBulkRebuildBottomBarRowKind.Progress);
             OnPropertyChanged(nameof(HasBulkVpkRebuildBottomBar));
-            LogService.Info($"一键重构：目标 {targets.Count} 个 VPK 类模组，默认并发 {VpkBulkRebuildService.DefaultConcurrency}。");
+            LogService.Info($"{origin}：目标 {targets.Count} 个，并发 {VpkBulkRebuildService.DefaultConcurrency}。");
+        }
+
+        /// <summary>
+        /// 导入完成后的自动重构建：**只针对这次导入的条目**。
+        /// <para>
+        /// 不开底栏、不等用户点：导入是把来源摆进条目，转换与编译是紧接着的自动一步。
+        /// 用户在底栏上再点一次"重构"不该是必经之路。
+        /// </para>
+        /// </summary>
+        private async Task RunImportRebuildAsync(IReadOnlyList<VpkBulkRebuildTarget> targets)
+        {
+            if (targets.Count == 0) return;
+
+            var concurrency = VpkBulkRebuildService.DefaultConcurrency;
+            var startedUtc = DateTime.UtcNow;
+            var task = _backgroundTasks.Enqueue(
+                BackgroundTaskKind.RebuildVpk,
+                "转换并编译新导入的 Mod",
+                $"{targets.Count} 个条目，并发 {concurrency}",
+                origin: "导入",
+                userVisibleReason: "刚导入的条目里只有来源 VPK，需要转换出 sectional 并编译出生效层。",
+                suggestedAction: "完成后重启游戏生效。",
+                retry: () => RunImportRebuildAsync(targets),
+                presentation: BackgroundTaskPresentation.Foreground);
+
+            task.MarkRunning("正在转换并编译");
+            try
+            {
+                var result = await VpkBulkRebuildService.RunAsync(
+                    targets,
+                    concurrency,
+                    (entry, done, total) => RefreshOnUiThread(() =>
+                    {
+                        task.UpdateStage($"{done}/{total}：{entry.Target.Name}（{(entry.Ok ? "完成" : "失败")}）");
+                        task.UpdateProgress(total == 0 ? null : (double)done / total);
+                    }),
+                    stage => RefreshOnUiThread(() => task.UpdateStage(stage)),
+                    task.CancellationToken).ConfigureAwait(true);
+
+                var succeeded = result.SucceededNodeIds;
+                if (succeeded.Count != 0)
+                {
+                    foreach (var nodeId in succeeded)
+                        await _libraryService.InvalidateContentNodeAsync(nodeId, CancellationToken.None).ConfigureAwait(true);
+                    await _libraryService.RefreshCommittedContentAsync(
+                        succeeded,
+                        ModContentChangeKind.Changed,
+                        alreadyInvalidated: true,
+                        cancellationToken: CancellationToken.None).ConfigureAwait(true);
+                }
+
+                var reportPath = VpkBulkRebuildService.WriteReport(
+                    result, concurrency, DateTime.UtcNow - startedUtc);
+                task.SetOutputArtifacts(_libraryService.ModsRootDirectory, reportPath);
+
+                var failures = result.Entries
+                    .Where(entry => !entry.Ok && entry.Outcome is not null)
+                    .Select(entry => $"{entry.Target.Name}：{entry.Error}")
+                    .ToArray();
+                var summary = result.Summary + "。" + (result.SucceededCount != 0 ? "重启游戏后生效。" : string.Empty);
+                if (result.SucceededCount == 0 && failures.Length != 0) task.MarkFailed(summary + " " + failures[0]);
+                else task.MarkCompleted();
+
+                RefreshOnUiThread(() => _notificationService.Show(
+                    "导入完成并已生成产物：" + summary,
+                    failures.Length == 0 ? NotificationLevel.Info : NotificationLevel.Warning,
+                    TimeSpan.FromSeconds(failures.Length == 0 ? 10 : 20)));
+            }
+            catch (OperationCanceledException)
+            {
+                task.MarkCanceled();
+            }
+            catch (Exception exception) when (exception is IOException or InvalidOperationException
+                or InvalidDataException or UnauthorizedAccessException)
+            {
+                task.MarkFailed(exception.Message);
+                RefreshOnUiThread(() => _notificationService.Show(
+                    "导入后自动转换失败：" + exception.Message, NotificationLevel.Error, TimeSpan.FromSeconds(20)));
+            }
         }
 
         private void RegisterBulkVpkRebuildRow(string sourceId, VpkBulkRebuildBottomBarRowKind kind, int? insertAtRow = null)

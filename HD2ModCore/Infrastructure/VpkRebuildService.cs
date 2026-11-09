@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.IO;
 using System.Text.Json;
 using HD2ModCore.Infrastructure;
@@ -24,6 +25,16 @@ public sealed record VpkRebuildOutcome(
 
 	/// <summary>这次换到了哪件护甲（显示名）；<c>null</c> = 没做换甲。</summary>
 	public string? TargetName { get; init; }
+
+	/// <summary>
+	/// 该做却没做成的那一步的原因（目前只有"生效层没重建"）。
+	/// <para>
+	/// <b>为什么要有它。</b>来源产物已经换好了，所以整次重构建不能算失败；但生效层还停在旧状态，
+	/// 于是"用户以为修好了、游戏里还是旧样子"。只写在 Notes 里会被折叠进细节——实测有用户
+	/// 重构建了全部 vpk2patch Mod、每次其实都失败在换甲那一步，界面却只说"重构建完成"。
+	/// </para>
+	/// </summary>
+	public string? IncompleteReason { get; init; }
 }
 
 /// <summary>
@@ -72,6 +83,22 @@ public static class VpkRebuildService
 	/// </para>
 	/// </summary>
 	private static readonly VpkConversionSettings CurrentImportDefaults = new("merge", "metal", null, null, null);
+
+	/// <summary>
+	/// 全局几何参数：角色头部的等比缩放比例。<c>null</c> = 不给，转换器用自己的默认值
+	/// <c>8/7 ≈ 1.142857</c>（见 <c>RetargetOptions.HeadScale</c>）。
+	/// <para>
+	/// <b>为什么放在这里而不是 <see cref="VpkConversionSettings"/> 里。</b>那个 record 是
+	/// "重跑出逐字节一致产物"所需的那组参数，只收**会改变材质内容或 id** 的开关。
+	/// 头部缩放是纯几何：改它不会让任何材质包失配，但它也不该被冻在某个 Mod 的产物里 ——
+	/// 用户改设置、点重构建，就该看到新值。用 UpperScale / MeshShift 那几项的同一套口径。
+	/// </para>
+	/// <para>
+	/// 由管理器在启动与设置变更时写入（<c>SettingsService.ApplyToVpkBuild</c>）；
+	/// CLI 直接跑重构建时保持 <c>null</c>，行为与以前一致。
+	/// </para>
+	/// </summary>
+	public static double? HeadScale { get; set; }
 
 	/// <param name="modSelector">库里的 Mod 标识（GUID 或前缀）。换甲要用它定位工作区里的节点。</param>
 	/// <param name="targetArchiveIds">
@@ -198,6 +225,15 @@ public static class VpkRebuildService
 			else if (report?.IdNamespace is { Length: > 0 } token)
 				arguments.AddRange(["--id-namespace-token", token]);
 			arguments.AddRange(settings.ToArguments());
+			// 头部缩放：**不进产物记录，按当前设置即时生效。**
+			//
+			// 为什么不记进 vpk2patch.json：它是纯几何参数，和 UpperScale / MeshShift / 手臂姿态
+			// 同一类 —— 那几项从来没记过，一直是"转换器常量"。记它会让每个已存在的 Mod 在
+			// 第一次重构建时把当时的值冻住，用户之后改设置就会发现"改了没用"。
+			// 代价是重构建不保证与上次逐字节一致（改了设置就会变），这一点是明确的、
+			// 用户自己按的按钮。
+			if (HeadScale is { } headScale)
+				arguments.AddRange(["--head-scale", headScale.ToString("R", CultureInfo.InvariantCulture)]);
 			if (reuseModel is not null)
 				arguments.AddRange(["--reuse-model", reuseModel]);
 			arguments.Add("--json");
@@ -207,15 +243,28 @@ public static class VpkRebuildService
 			var conversion = await Hd2ModProcess.RunAsync(
 				executable, arguments, cancellationToken,
 				onProgress: (_, _, _, text) => onStage?.Invoke(text)).ConfigureAwait(false);
-			var produced = FindProducedPatchDirectory(convertRoot);
-			if (produced is null)
+
+			// ⚠️ **一次转换的产出是「每个输入 VPK 一个子目录」**（模型一个、每个材质包各一个）。
+			// 而存储约定要求 `sectional/` 里全部 patch 组平铺按序号，所以这里必须先收成
+			// 一份平铺载荷：模型 → `patch_0`，材质 → `patch_1..patch_N`。
+			//
+			// 以前这一步是"找第一个含 patch 的子目录"，于是**模型 patch 进来了、材质全丢** ——
+			// 表现是"重构完成、游戏里材质没了"，重转多少次都一样（2026-11-07 用户实测）。
+			var fresh = VpkConversionReport.TryParse(conversion.Output);
+			var collectedPayload = Path.Combine(stagingRoot, "payload");
+			var collected = VpkPayloadCollector.Collect(
+				convertRoot, collectedPayload, fresh, rawReportJson: conversion.Output, sourceVpkPaths: sources);
+			if (!collected.Succeeded)
 			{
-				// 失败时留下的临时产物不删：那是唯一能看"CLI 到底写了什么"的东西。
 				preserveStaging = true;
 				return VpkRebuildOutcome.Failed(
-					ExplainConversionFailure(conversion) + $"（临时产物保留在：{stagingRoot}）", notes);
+					(conversion.ExitCode == 0 ? string.Empty : ExplainConversionFailure(conversion))
+					+ "收集转换产物失败：" + collected.Error
+					+ $"（临时产物保留在：{stagingRoot}）", notes);
 			}
 
+			notes.AddRange(collected.Notes);
+			var produced = collectedPayload;
 			if (isUnitMod && !File.Exists(Path.Combine(produced, WardrobeSectionMapFile.FileName)))
 			{
 				preserveStaging = true;
@@ -224,7 +273,6 @@ public static class VpkRebuildService
 					+ $"继续替换只会得到一个关不掉任何东西的 Mod。临时产物保留在：{stagingRoot}", notes);
 			}
 
-			var fresh = VpkConversionReport.TryParse(conversion.Output);
 			var units = fresh?.UnitCount ?? 0;
 			var previousMaterials = await CountDistinctMaterialsAsync(payloadDirectory, cancellationToken).ConfigureAwait(false);
 			var freshMaterials = await CountDistinctMaterialsAsync(produced, cancellationToken).ConfigureAwait(false);
@@ -270,6 +318,11 @@ public static class VpkRebuildService
 					+ $"（本次临时产物：{stagingRoot}）", notes);
 			}
 
+			// **换载荷之前**把旧的 `patches.json` 读下来：里面除了派生信息，还装着用户输入的
+			// 选项名/备注/配图/顺序。换载荷会把它删掉，事后再读就什么都没有了。
+			var previousManifest = SectionalPatchManifestFile
+				.TryReadAsync(payloadDirectory).AsTask().GetAwaiter().GetResult();
+
 			// ⑤ 换进 vpk2patch/：先把旧载荷备份到临时目录，再整批替换。
 			// 规则与"同一来源再次导入"共用一份（见 VpkPayloadSwap），否则两条路会各自漂移。
 			onStage?.Invoke("正在替换 vpk2patch/…");
@@ -299,7 +352,9 @@ public static class VpkRebuildService
 				var restoreReportReadOnly = VpkPayloadSwap.ClearReadOnlyForWrite(reportPath);
 				try
 				{
-					await File.WriteAllTextAsync(reportPath, conversion.Output, cancellationToken)
+					// 写**改写过 patch 文件名**的那份：平铺之后编号变了，
+					// 报告不跟着改的话 `patches.json` 里材质选项就没有名字。
+					await File.WriteAllTextAsync(reportPath, collected.ReportJson ?? conversion.Output, cancellationToken)
 						.ConfigureAwait(false);
 				}
 				catch (UnauthorizedAccessException exception)
@@ -319,59 +374,62 @@ public static class VpkRebuildService
 					+ "界面上的材质/贴图计数与警告可能已经过时。");
 			}
 
+			// ⑤c **结构文件跟着新报告重写**。
+			//
+			// 不重写会怎样：`patches.json` 里"哪个 patch 是谁"还是上一批产物的说法。
+			// 归拢/合并之后基底多了几个材质 patch，旧清单里根本没有它们——于是材质选项
+			// 一行名字都没有，界面显示成「材质 1 / 2 / 3」（2026-11-08 用户报的就是这个）。
+			if (SectionalPatchManifestFile.Rebuild(modDirectory, DateTimeOffset.UtcNow, previousManifest) is null)
+				notes.Add("没能重写 `patches.json`：材质选项的名字/顺序可能显示不出来。");
+
 			// ⑥ 物理参数容器：转换阶段刻意不嵌（会让受管步骤记账错位），这里才是它该来的地方。
 			onStage?.Invoke("正在写入物理参数…");
 			notes.Add(await VpkPhysBoneEmbedder.RunAsync(executable, modDirectory, cancellationToken).ConfigureAwait(false));
 
-			// ⑦ **按当前配置**重新生成 Overwrite/。
+			// ⑥b 生效层**不在这里动**。
 			//
-			// "当前配置"= 调用方给的目标与勾选（界面上正显示着的那份），没给才退回
-			// wardrobe.json 记着的。这条是刻意的：用户可能刚改了下拉里的目标、刚勾掉几个
-			// section，都还没点「切换」/「应用」。重构建一并把它们做掉，
-			// 否则"点完重构建，界面上的配置还没生效"会再困惑一次。
+			// 以前（2026-11-08 上午）这里会先物化一遍"基底 unit + 启用材质"，然后才做 ⑦ 换甲。
+			// 后果分两种，都很糟：
+			//   · ⑦ 成功：白做一次，还把用户现有的换甲产物临时换成基底 unit；
+			//   · ⑦ 失败/被跳过：那份**基底 unit 留在原地** —— 用户看到的是"重构之后这个 Mod
+			//     不再替换任何护甲，变成了它自己的素体"，而他什么都没改过。
+			// 正确的做法是：只有"确定不会重做换甲"时，才在最后补一份生效层（见 ⑦b）。
+
+			// ⑦ **编译**：把 `sectional/` 的标准产物按当前条件（目标护甲 / section 开关 / 材质开关）
+			// 重新算成 `Overwrite/`。
+			//
+			// 重构建不再自己写生效层：那是编译基座（`ModCompileService`）的唯一职责。
+			// 于是"重建"就是干净的两段——**转换**（来源 → sectional）、**编译**（sectional → Overwrite）。
 			var rekeyed = false;
 			string? targetName = null;
-			var wardrobe = await VpkModWardrobeService.ReadAsync(modDirectory, cancellationToken).ConfigureAwait(false);
-			var targets = targetArchiveIds is { Count: > 0 }
-				? targetArchiveIds
-				: ResolveRekeyTargets(modDirectory, wardrobe);
-			var disabled = disabledSections ?? wardrobe.State.Disabled;
+			string? incompleteReason = null;
 			if (!isUnitMod)
 			{
-				// 材质包没有 Unit，也没有 "换甲 / 组件开关" 这些概念：只更新转换产物就结束。
-				notes.Add("这是材质包（没有 Unit）：只更新了转换产物（vpk2patch/），没有换甲这一步。");
-			}
-			else if (targets is null)
-			{
-				notes.Add("这个 Mod 还没有选过目标护甲：本次只更新了来源产物（vpk2patch/），"
-					+ "没有生成 Overwrite。到详情页选一件目标护甲再点「切换」即可。");
+				// 材质包没有 Unit，也没有"换甲 / 组件开关"这些概念：只更新转换产物就结束。
+				notes.Add("这是材质包（没有 Unit）：只更新了转换产物，没有编译这一步。");
 			}
 			else
 			{
-				onStage?.Invoke("正在按当前配置重新生成换甲产物…");
-				var rekey = await VpkRekeyService.RunAsync(
-					modSelector, modDirectory, context, targets, disabled,
-					stage => onStage?.Invoke(stage), cancellationToken,
-					// 头身合并也照 Mod 自己的设置来：重构建不该把用户关掉的开关又打开。
-					headMergeIntoBody: wardrobe.HeadMergeIntoBody).ConfigureAwait(false);
-				if (!rekey.Ok)
+				onStage?.Invoke("正在按当前条件编译生效层…");
+				var compile = await ModCompileService.CompileAsync(
+					modSelector, modDirectory, context, targetArchiveIds, disabledSections,
+					stage => onStage?.Invoke(stage), cancellationToken).ConfigureAwait(false);
+				foreach (var warning in compile.Notes) notes.Add(warning);
+				if (!compile.Ok)
 				{
-					// 来源产物已经换好了，换甲失败不该把这件事说成"什么都没做"。
-					notes.Add("来源产物已更新，但重新生成 Overwrite 失败：" + (rekey.Error ?? "原因未知")
+					// 来源产物已经换好了，编译失败不该被说成"什么都没做"；
+					// 但也不能报成"做完了"——生效层还停在旧状态，用户会以为已经修好。
+					incompleteReason = compile.Error ?? "原因未知";
+					notes.Add("来源产物已更新，但编译生效层失败：" + incompleteReason
 						+ "。可以在详情页点「应用」重试。");
 				}
 				else
 				{
-					rekeyed = true;
-					targetName = rekey.TargetNames.FirstOrDefault()
-						?? rekey.TargetArchiveIds.FirstOrDefault();
-					var target = targetName ?? string.Empty;
-					notes.Add(rekey.RestoredFromSource
-						? "换甲产物已按自定义素体模式重新生成。"
-						: $"换甲产物已重新生成（目标 {target}）：替换 {rekey.ReplacedUnits} 个 Unit、隐藏 {rekey.HiddenMeshes} 个网格。");
-					var offCount = disabled.Values.Sum(sections => sections.Count);
-					if (offCount != 0) notes.Add($"已把 {offCount} 个 section 烘成关闭状态。");
-					foreach (var warning in rekey.Warnings) notes.Add("注意：" + warning);
+					rekeyed = compile.Rekeyed;
+					targetName = compile.TargetName;
+					notes.Add(rekeyed
+						? $"换甲产物已重新生成（目标 {targetName ?? "未知"}）。"
+						: $"生效层已按自定义素体形态编译（{targetName ?? "自身素体"}）。");
 				}
 			}
 
@@ -384,6 +442,7 @@ public static class VpkRebuildService
 				rekeyed, backupDirectory, notes)
 			{
 				TargetName = targetName,
+				IncompleteReason = incompleteReason,
 			};
 		}
 		catch (OperationCanceledException)
@@ -451,29 +510,6 @@ public static class VpkRebuildService
 		}
 
 		return result;
-	}
-
-	/// <summary>重跑换甲的目标：记过的游戏护甲优先，其次这个 Mod 自己登记的素体。都没有就返回 <c>null</c>。</summary>
-	private static IReadOnlyList<string>? ResolveRekeyTargets(string modDirectory, VpkWardrobeFile wardrobe)
-	{
-		if (!string.IsNullOrWhiteSpace(wardrobe.TargetArmorArchiveId))
-			return [wardrobe.TargetArmorArchiveId];
-
-		var ownKey = VpkModWardrobeService.TryReadOwnCustomModelKey(modDirectory);
-		return ownKey is null ? null : [RuntimeArmorRegistryService.CustomModelArchiveId(ownKey)];
-	}
-
-	/// <summary>转换目录下那个"唯一含 patch 文件的子目录"（<c>vpk2patch</c> 按包名建目录，名字会被清洗过）。</summary>
-	private static string? FindProducedPatchDirectory(string root)
-	{
-		if (!Directory.Exists(root)) return null;
-		foreach (var directory in Directory.EnumerateDirectories(root))
-		{
-			if (Directory.EnumerateFiles(directory, "*.patch_*", SearchOption.TopDirectoryOnly).Any())
-				return directory;
-		}
-
-		return null;
 	}
 
 	private static string ExplainConversionFailure(Hd2ModProcess.Result result)

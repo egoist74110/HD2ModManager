@@ -87,10 +87,15 @@
                         <TextBlock Grid.Column="0" Text="section 组件开关"
                                    Foreground="{StaticResource TextPrimary}"
                                    VerticalAlignment="Center" TextWrapping="Wrap"/>
+                        <!--
+                            ⚠ **不要用 Visibility 绑这里**：那会让这一行整行消失/出现，
+                            卡面高度跟着变——用户看到的就是"每点一次按钮，卡片抖一下"。
+                            置灰（IsEnabled）不改变布局，静态卡才真的是静态。
+                        -->
                         <Button Grid.Column="1" Style="{StaticResource AppSecondaryButton}" Content="编辑 section 组"
                                 Command="{Binding OpenSectionalEditorCommand}" Margin="12,0,0,0" Padding="14,6"
                                 VerticalAlignment="Center"
-                                Visibility="{Binding CanOpenSectionalEditor, Converter={StaticResource BoolToVis}}"/>
+                                IsEnabled="{Binding CanOpenSectionalEditor}"/>
                     </Grid>
                     <!--
                         头身合并：头并进护甲套件的胸部槽位，于是游戏里那件头盔 item 不再有模型
@@ -102,30 +107,19 @@
                             <ColumnDefinition Width="*"/>
                             <ColumnDefinition Width="Auto"/>
                         </Grid.ColumnDefinitions>
-                        <StackPanel Grid.Column="0" VerticalAlignment="Center">
-                            <TextBlock Text="头身合并到身体（头盔 item 不再有模型）"
-                                       Foreground="{StaticResource TextPrimary}" TextWrapping="Wrap"/>
-                            <TextBlock Text="关掉则头回到头盔套件，需要把配套头盔也穿上才有头"
-                                       Foreground="{StaticResource TextSecondary}" FontSize="11"
-                                       TextWrapping="Wrap"/>
-                        </StackPanel>
+                        <TextBlock Grid.Column="0" Text="将头盔合并到身体"
+                                   Foreground="{StaticResource TextPrimary}"
+                                   VerticalAlignment="Center" TextWrapping="Wrap"/>
                         <CheckBox Grid.Column="1" Style="{StaticResource AppToggleSwitch}"
                                   IsChecked="{Binding HeadMergeIntoBody, Mode=TwoWay}"
                                   VerticalAlignment="Center" Margin="12,0,0,0"
                                   AutomationProperties.Name="头身合并到身体"/>
                     </Grid>
-                    <!-- 当前目标下这一项不生效时当场说明（例如目标是自定义素体：头本来就在主体里）。 -->
-                    <TextBlock Text="{Binding HeadMergeHint}"
-                               Foreground="{StaticResource StatusWarning}"
-                               FontSize="11" TextWrapping="Wrap" Margin="0,4,0,0"
-                               Visibility="{Binding HasHeadMergeHint, Converter={StaticResource BoolToVis}}"/>
                     <!--
-                        重构建已经移到汉堡菜单（它和并发/范围一起在底栏里定），
-                        这里不再重复放一个按钮 —— 同一个动作两个入口只会让人猜哪个是"真"的。
+                        这张卡保持**静态**：只在上面三行给出入口与开关，不在这里显示任何过程/
+                        结果文字。翻转开关或点「切换」产生的话一律走消息中心（后台任务或通知），
+                        否则卡面会随每次操作冒出一行，且内容与消息中心重复。
                     -->
-                    <TextBlock Text="{Binding VpkComponentStatus}" Foreground="{StaticResource TextSecondary}"
-                               TextWrapping="Wrap" Margin="0,8,0,0"
-                               Visibility="{Binding HasVpkComponentStatus, Converter={StaticResource BoolToVis}}"/>
                 </StackPanel>
             </DataTemplate>
 

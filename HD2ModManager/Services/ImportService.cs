@@ -26,6 +26,9 @@ namespace HD2ModManager.Services
         public IReadOnlyList<ModNodeId> LastAffectedNodeIds { get; private set; } = Array.Empty<ModNodeId>();
 		public bool LastImportHasOptionPathConflicts { get; private set; }
 
+		/// <summary>这次导入新建/更新的 VPK 类节点（guid）。调用方据此自己起一次标准重构建。</summary>
+		public IReadOnlyList<string> LastVpkImportTargets { get; private set; } = Array.Empty<string>();
+
         /// <summary>
         /// 这次导入如果是 VPK 来源，这里就是转换报告（每个 VPK 转了/跳过了/为什么）。
         /// <c>null</c> 表示这次导入与 VPK 无关。
@@ -249,77 +252,84 @@ namespace HD2ModManager.Services
                     return new List<string>();
                 }
 
-                // 每个 VPK 一个文件夹，逐个走常规导入。派生数据在整批之后再算一次，
-                // 否则每个 VPK 都要重算一遍全库内容事实。
+                // **导入只做两件事**：把每组来源放进一个条目，然后对每个条目跑一次标准重构建。
+                //
+                // 转换与编译都在重构建里（来源 → sectional → Overwrite），导入阶段不碰它们：
+                // 重构建会用默认编译参数（没有目标护甲 → 自定义素体形态；材质按设置文件）编出生效层，
+                // 所以这条链不需要额外代码。
                 var guids = new List<string>();
-                // guid → 它属于哪个主体组、是主体还是材质包（挂选项关系时要用）。
-                var groupOf = new Dictionary<string, VpkProducedPackage>(StringComparer.OrdinalIgnoreCase);
                 var affected = new List<ModNodeId>();
-                var conflicts = false;
+                var rebuildTargets = new List<string>();
+
+                // 更新已有条目：把新来源换进去（不动节点身份），随后重构建。
+                async Task<bool> ReplaceSourcesAsync(string targetDirectory, string packageDirectory)
+                {
+                    var relative = Path.GetRelativePath(_paths.ModsDirectory, targetDirectory);
+                    var node = _library.Snapshot.Nodes.Values.FirstOrDefault(candidate =>
+                        string.Equals(candidate.RelativePath.TrimEnd(Path.DirectorySeparatorChar),
+                            relative.TrimEnd(Path.DirectorySeparatorChar),
+                            StringComparison.OrdinalIgnoreCase));
+                    if (node is null)
+                    {
+                        _onError?.Invoke($"库里找不到目录 {relative} 对应的 Mod：改为新建一个条目。");
+                        return false;
+                    }
+
+                    foreach (var source in Directory.EnumerateFiles(packageDirectory, "*.vpk", SearchOption.TopDirectoryOnly))
+                    {
+                        var destination = Path.Combine(targetDirectory, Path.GetFileName(source));
+                        VpkPayloadSwap.ClearReadOnly(destination);
+                        File.Copy(source, destination, overwrite: true);
+                    }
+
+                    var guid = node.Id.Value.ToString("N");
+                    guids.Add(guid);
+                    affected.Add(node.Id);
+                    rebuildTargets.Add(guid);
+                    return true;
+                }
+
                 foreach (var package in produced)
                 {
                     ct.ThrowIfCancellationRequested();
 
-                    // **同一来源再来一次 = 更新那个 Mod。** 不新建节点、不换名字、不动顺序与启停，
-                    // 素体 key 与 unit id 由 `--reuse-model` 逐位沿用（见 VpkImportService）。
                     if (package.IsUpdate && package.UpdateTargetDirectory is { } updateTarget)
                     {
-                        var updated = await SwapIntoExistingModAsync(package, updateTarget, ct).ConfigureAwait(false);
-                        if (updated is { } updatedGuid)
-                        {
-                            guids.Add(updatedGuid);
-                            groupOf[updatedGuid] = package;
-                            if (_library.Get(updatedGuid) is { } node) affected.Add(new ModNodeId(Guid.Parse(node.Guid)));
-                            continue;
-                        }
-
-                        // 换不进去就退回"新建一个"：产物是好的，用户至少能用上。
-                        _onInfo?.Invoke($"{package.UpdateTargetName}：没能更新原有 Mod（原因见上一条），改为新建一个。");
+                        if (await ReplaceSourcesAsync(updateTarget, package.Directory).ConfigureAwait(false)) continue;
                     }
 
-                    var imported = await ImportPathAsync(
-                        package.Directory,
-                        ct,
-                        notifyLibraryChanged: false,
-                        refreshDerivedData: false,
-                        // 这是转换产出，不是待转换的来源：见 ImportPathAsync 里的说明。
-                        allowVpkConversion: false).ConfigureAwait(false);
-                    guids.AddRange(imported);
-                    foreach (var guid in imported) groupOf[guid] = package;
-                    affected.AddRange(LastAffectedNodeIds);
-                    conflicts |= LastImportHasOptionPathConflicts;
-
-                    // **不自动换甲。** 转换产物是"新 Unit id 的自定义素体"，它本来就该以
-                    // 自定义素体模式存在：用户在护甲映射页把它挂到某件护甲上（或者到详情页
-                    // 主动选一个目标）才算"要用它替换谁"。
-                    //
-                    // 以前这里会立刻换到 CLI 的缺省目标（RE-2310），后果是：用户装完一个 VPK
-                    // 模组，发现自己的荣誉卫队被顶掉了，而他从没做过这个决定；想换回自定义素体
-                    // 又会在换甲链路里撞上"把 Unit 搬到它自己身上"。默认不动，是更安全的语义。
-                    foreach (var guid in imported)
-                        LogVpkCustomModelImported(guid);
+                    try
+                    {
+                        var imported = await ImportPathAsync(
+                            package.Directory,
+                            ct,
+                            notifyLibraryChanged: false,
+                            refreshDerivedData: false,
+                            allowVpkConversion: false).ConfigureAwait(false);
+                        guids.AddRange(imported);
+                        affected.AddRange(LastAffectedNodeIds);
+                        foreach (var guid in imported) rebuildTargets.Add(guid);
+                    }
+                    catch (Exception exception) when (exception is IOException
+                        or InvalidDataException
+                        or InvalidOperationException
+                        or UnauthorizedAccessException)
+                    {
+                        // 一组失败不拖垮整批（八人包里各主体互不相干）。
+                        _onError?.Invoke($"{package.GroupName ?? Path.GetFileName(package.Directory)}：入库失败：{exception.Message}");
+                    }
                 }
 
                 LastAffectedNodeIds = affected.Distinct().ToArray();
-                LastImportHasOptionPathConflicts = conflicts;
+                LastImportHasOptionPathConflicts = false;
 
-                // 同批的"模型 + 它的材质包"自动接成 主体 → 选项：用户现在要导入完之后在库里
-                // 把材质包一个个拖到模型下面，而同一批转换出来的东西本来就知道谁是谁的。
-                // **物理结构不变**（还是平铺的一个个文件夹），改的只是 option.json 的父子关系。
-                var attach = await AttachVpkBatchOptionsAsync(guids, groupOf, ct).ConfigureAwait(false);
-                if (attach.Relationships > 0)
-                {
-                    var message = attach.Hosts == 1
-                        ? $"已把 {attach.Materials} 个材质包设为同批模型的选项。"
-                        : $"已把 {attach.Materials} 个材质包挂到 {attach.Hosts} 个模型主体的选项下。";
-                    _onInfo?.Invoke(message);
-                    LogService.Info(message);
-                }
-
-                if (attach.Failures > 0)
-                {
-                    LogService.Warn($"有 {attach.Failures} 个模型主体没能建立选项关系（产物本身没问题，可在库里手动拖）。");
-                }
+                // **导入到这里就结束了。**
+                //
+                // 转换与编译是**另一件事**：调用方拿到 `LastVpkImportTargets` 之后自己起一次
+                // 标准重构建（复用「一键重构」那套底栏 + 并发 5）。
+                // 在导入里 await 它，会让"入库"和"重建"变成同一个动作：
+                // 列表要等几分钟才刷新，而且一个包失败还会把整次导入算成失败。
+                LastVpkImportTargets = rebuildTargets;
 
                 if (refreshDerivedData && LastAffectedNodeIds.Count != 0)
                 {
@@ -338,180 +348,37 @@ namespace HD2ModManager.Services
                 source.Dispose();
             }
         }
-
-        /// <summary>一次"把同批材质包挂成选项"的结果。<c>Relationships</c> = 实际新建的关系条数。</summary>
-        private readonly record struct VpkOptionAttachResult(int Hosts, int Materials, int Relationships, int Failures);
-
-        /// <summary>
-        /// 把新产物换进**库里已有的**那个 Mod，返回它的 guid（换不进去返回 <c>null</c>）。
-        /// <para>
-        /// <b>为什么要走这条路而不是"删了重建"。</b>删了重建会换掉节点 id、名字、在配置里的位置、
-        /// 启停状态与它的选项关系；素体还会多出一具（unit id 变了，旧映射全部指向不存在的 unit）。
-        /// 而用户重新导入同一个包时想要的只是"产物换成新的"。
-        /// </para>
-        /// <para>
-        /// <b>只换产物，不碰用户的改动</b>：<c>Overwrite/</c>、<c>wardrobe.json</c>、
-        /// <c>custom-model.json</c>、<c>components.json</c> 全部原样保留
-        /// （见 <see cref="VpkPayloadSwap.PreservedFileNames"/>）。
-        /// </para>
-        /// </summary>
-        private async Task<string?> SwapIntoExistingModAsync(
-            VpkProducedPackage package,
-            string modDirectory,
-            CancellationToken cancellationToken)
-        {
-            try
-            {
-                // 写进**已存在的**基底目录：老库里它叫 vpk2patch/，直接写新名会在旁边多出一个
-                // sectional/，于是同一个 Mod 有两层基底——枚举时新名赢，但旧名里被删掉的 patch
-                // 会以"只在旧层存在"的身份复活。迁移由 P2 的一次性改名统一处理。
-                var payload = ModNodePayloadLayout.TryGetExistingVpkPatchDirectory(modDirectory)
-                    ?? ModNodePayloadLayout.GetVpkPatchDirectory(modDirectory);
-                var backupRoot = Path.Combine(
-                    _paths.ModsDirectory,
-                    ".hd2modmanager-swap-backups",
-                    Path.GetFileName(modDirectory) + "-" + DateTime.UtcNow.ToString("yyyyMMdd-HHmmss", System.Globalization.CultureInfo.InvariantCulture));
-                var swap = VpkPayloadSwap.Swap(payload, package.Directory, backupRoot);
-                if (!swap.Succeeded)
-                {
-                    _onError?.Invoke(swap.Error ?? "替换 vpk2patch/ 失败。");
-                    return null;
-                }
-
-                // 报告必须一起换：管理器显示的材质/贴图/警告全来自它，只换载荷会让界面停在旧数字。
-                if (!string.IsNullOrWhiteSpace(package.ReportJson))
-                {
-                    var reportPath = VpkConversionReport.GetPath(modDirectory);
-                    var restoreReadOnly = VpkPayloadSwap.ClearReadOnlyForWrite(reportPath);
-                    try
-                    {
-                        await File.WriteAllTextAsync(reportPath, package.ReportJson, cancellationToken).ConfigureAwait(false);
-                    }
-                    catch (UnauthorizedAccessException exception)
-                    {
-                        // 报告写不进去不算更新失败：产物是新的，只是界面上的计数与警告会旧一层。
-                        _onError?.Invoke($"`vpk2patch.json` 写不进去（{exception.Message}）：产物已换成新的，"
-                            + "但界面上的材质/贴图计数与警告仍是上一次的。");
-                    }
-                    finally
-                    {
-                        if (restoreReadOnly) VpkPayloadSwap.MarkReadOnly(reportPath);
-                    }
-                }
-
-                // 物理参数：**必须在换完之后、在真正的 Mod 目录上做**。
-                //
-                // `physbone embed-mod` 要靠目录里那份来源 .vpk 才找得到 jiggle 骨；
-                // 在暂存目录上跑只会得到"没有物理参数"，然后把用户原来那套参数覆盖成空。
-                //
-                // ⚠️ 顺序：**先嵌参数，再把只读补回去**。反过来的话这一步要写
-                // `.gpu_resources`，而那些文件刚被标成只读 —— 得到的是一句
-                // "Access to the path … is denied"，一个字都没提只读。
-                var physBone = await VpkPhysBoneEmbedder.TryRunAsync(modDirectory, cancellationToken).ConfigureAwait(false);
-                if (physBone is not null) _onInfo?.Invoke($"{package.UpdateTargetName}：{physBone}");
-
-                // 这条路径后面没有写入步骤了，把库的只读保护补回去。
-                if (swap.RestoreReadOnly) VpkPayloadSwap.SetPayloadReadOnly(payload);
-
-                var relative = Path.GetRelativePath(_paths.ModsDirectory, modDirectory);
-                var node = _library.Snapshot.Nodes.Values.FirstOrDefault(candidate =>
-                    string.Equals(
-                        candidate.RelativePath.TrimEnd(Path.DirectorySeparatorChar),
-                        relative.TrimEnd(Path.DirectorySeparatorChar),
-                        StringComparison.OrdinalIgnoreCase));
-                if (node is null)
-                {
-                    _onError?.Invoke($"在库里找不到目录 {relative} 对应的 Mod：产物已换成新的，"
-                        + "但界面上的材质/贴图计数可能仍是旧的。下次刷新库时会重新读。");
-                    return null;
-                }
-
-                if (swap.BackupDirectory is not null)
-                    _onInfo?.Invoke($"{package.UpdateTargetName}：旧产物已备份到 {swap.BackupDirectory}。");
-
-                // 内容事实必须失效重读，否则界面还显示上一批的 Unit / 材质 / 贴图。
-                await _library.InvalidateContentNodeAsync(node.Id, cancellationToken).ConfigureAwait(false);
-                return node.Id.Value.ToString("N");
-            }
-            catch (Exception exception) when (exception is IOException or UnauthorizedAccessException
-                or InvalidDataException or InvalidOperationException)
-            {
-                _onError?.Invoke($"更新原有 Mod 失败：{exception.Message}");
-                return null;
-            }
-        }
-        /// <summary>
-        /// 把这一批里的**材质包**挂到同一批的**模型主体**下面当选项。
-        /// <para>
-        /// <b>按主体分组挂。</b>整合包里几套角色的材质裸名相同（<c>tights_socks.vmt</c> 谁都有），
-        /// 把 plum 的材质挂到 chiffon 下面会得到一堆"看起来对、点开什么都不变"的选项。
-        /// 所以只把**同一个主体组**里的材质挂给这个主体。
-        /// </para>
-        /// <para>
-        /// <b>判据：</b>转换阶段已经算好了——含 <c>vpk2patch/sections.json</c> 的是模型主体，
-        /// 其余是它的材质包（见 <c>VpkImportService.BuildConversionWorkload</c>）。
-        /// 没有分组信息的（只导材质包）退回老做法：全部材质挂到唯一的主体下。
-        /// </para>
-        /// <para>
-        /// <b>失败只记日志。</b>这一步是便利，不是导入正确性的一部分：关系写失败时产物照样是好的，
-        /// 手动拖一下就能补。
-        /// </para>
-        /// </summary>
-        private async Task<VpkOptionAttachResult> AttachVpkBatchOptionsAsync(
-            List<string> guids,
-            IReadOnlyDictionary<string, VpkProducedPackage> groupOf,
-            CancellationToken cancellationToken)
-        {
-            var distinct = guids.Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
-            if (distinct.Length < 2) return default;
-
-            // 分组：主体 → 它自己的材质包。分组信息缺失时整批算一组（老行为）。
-            var groups = distinct
-                .GroupBy(guid => groupOf.TryGetValue(guid, out var package) && package.GroupName is { Length: > 0 }
-                    ? package.GroupName
-                    : "（整批）", StringComparer.OrdinalIgnoreCase)
-                .Select(group => new
-                {
-                    Hosts = group.Where(guid => !groupOf.TryGetValue(guid, out var package) || package.IsModel).ToArray(),
-                    Materials = group.Where(guid => groupOf.TryGetValue(guid, out var package) && !package.IsModel).ToArray(),
-                })
-                .Where(group => group.Hosts.Length != 0 && group.Materials.Length != 0)
-                .ToArray();
-
-            if (groups.Length == 0) return default;
-
-            var relationships = 0;
-            var failures = 0;
-            var materials = groups.Sum(group => group.Materials.Length);
-            var hosts = groups.Sum(group => group.Hosts.Length);
-            foreach (var group in groups)
-            {
-                foreach (var host in group.Hosts)
-                {
-                    try
-                    {
-                        var result = await _library.AddOptionsToHostAsync(host, group.Materials, cancellationToken)
-                            .ConfigureAwait(false);
-                        relationships += result.ChangedNodeIds.Count;
-                    }
-                    catch (Exception exception) when (exception is ModRelationshipMutationException
-                        or InvalidOperationException or IOException or UnauthorizedAccessException)
-                    {
-                        failures++;
-                        LogService.Warn($"没能把同批材质包设为主体「{_library.Get(host)?.Name ?? host}」的选项：{exception.Message}");
-                    }
-                }
-            }
-
-            return new VpkOptionAttachResult(hosts, materials, relationships, failures);
-        }
-
-        /// <summary>从 Mod 的 GUID 拿到它的目录；拿不到就 <c>null</c>。</summary>
         private string? TryGetModDirectory(string guid)
         {
             if (!Guid.TryParse(guid, out var id)) return null;
             if (!_library.Snapshot.Nodes.TryGetValue(new ModNodeId(id), out var node)) return null;
             return Path.Combine(_paths.ModsDirectory, node.RelativePath);
+        }
+
+        /// <summary>
+        /// 把 <c>Overwrite/</c>（唯一生效层）建起来：unit 层 + 启用的材质层。
+        /// <para>
+        /// 只在"这是 VPK 转换产物"时调用——判据是根上有 <c>vpk2patch.json</c>。手写或手工拼的
+        /// sectional Mod 没有转换报告，物化器无从判断"哪些材质算模型自带"，贸然物化会把它
+        /// 自己的 patch 藏进变体里（表现是"导入成功、游戏里没东西"）。
+        /// </para>
+        /// </summary>
+        private void MaterializeEffectiveLayer(string modDirectory)
+        {
+            if (VpkConversionReport.TryRead(modDirectory) is null) return;
+
+            var result = OverwriteMaterializer.Materialize(modDirectory, OverwriteSelection.Default);
+            if (!result.Succeeded)
+            {
+                // 物化失败**不算导入失败**：Mod 仍然可以部署，只是退回"基底全上"的老行为。
+                // 但必须说出来——否则用户看到的是"颜色不对"，而没人会想到是这一步没过。
+                _onError?.Invoke($"「{Path.GetFileName(modDirectory)}」的生效层没能建起来（{result.Error}）："
+                    + "这个 Mod 仍然可用，但材质会按基底目录里的全部变体一起上。");
+                return;
+            }
+
+            foreach (var warning in result.Warnings)
+                LogService.Warn(warning);
         }
 
         /// <summary>

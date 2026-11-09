@@ -59,7 +59,35 @@ public static class SectionalPatchManifestFile
 	}
 
 	/// <summary>
-	/// 按"目录里实际有哪些 patch + 转换报告怎么说"生成一份清单。
+	/// 按**当前的**转换报告重写一份 <c>patches.json</c>；目录不存在/没有转换报告时返回 <c>null</c>。
+	/// <para>
+	/// <b>必须在"新报告已经写进 Mod 根"之后调用。</b>报告是"哪个 patch 是谁"的唯一来源；
+	/// 拿上一份报告写出来的清单会把材质选项的名字全丢掉（界面上退化成「材质 1 / 2 / 3」），
+	/// 而且顺序、角色也会跟着错。2026-11-08 的实测就是这条：载荷换了、报告还没换，
+	/// 于是清单里那几个新材质没有名字。
+	/// </para>
+	/// </summary>
+	public static SectionalPatchManifestDocument? Rebuild(
+		string modDirectory,
+		DateTimeOffset generatedUtc,
+		SectionalPatchManifestDocument? previous = null)
+	{
+		ArgumentException.ThrowIfNullOrWhiteSpace(modDirectory);
+		var payload = ModNodePayloadLayout.TryGetExistingVpkPatchDirectory(modDirectory);
+		if (payload is null) return null;
+		var archive = ReadArchiveHex16(payload);
+		if (string.IsNullOrEmpty(archive)) return null;
+
+		// 上一版里的**用户输入**（选项名/备注/配图/顺序）必须跨重建保留。
+		// 调用方应该在"换载荷之前"读好传进来：换载荷会把旧文件删掉。
+		previous ??= TryReadAsync(payload).AsTask().GetAwaiter().GetResult();
+		var document = Build(payload, archive, VpkConversionReport.TryRead(modDirectory), generatedUtc, null, previous);
+		if (document.Patches.Count == 0) return null;
+		_ = TryWrite(payload, document);
+		return document;
+	}
+
+	/// <summary>按"目录里实际有哪些 patch + 转换报告怎么说"生成一份清单。
 	/// <para>
 	/// 报告里 <c>patches[]</c> 的 <c>unitPatch</c> / <c>materialPatch</c> 给出"来源 VPK → patch 文件名"
 	/// 的对应关系；据此可以把每个 patch 文件名翻译成"来自哪个来源、是 unit 还是材质、带多少资源"。
@@ -99,18 +127,36 @@ public static class SectionalPatchManifestFile
 				{ MatchedUnit: true } => SectionalPatchRole.Unit,
 				_ => patchIndex == 0 ? SectionalPatchRole.Unit : SectionalPatchRole.Material,
 			};
-			var carried = previous?.Patches.FirstOrDefault(entry => entry.PatchIndex == patchIndex);
+			// **按来源 VPK 认领上一版的用户字段**，序号只作兜底。
+			//
+			// 用户改的是"某个材质包叫什么、排在哪儿"。重转之后序号可能变（报告顺序变了、
+			// 少了一个包……），按序号认领会把名字/顺序接到**另一个**包上 —— 那既污染了名字，
+			// 也污染了部署顺序，而用户看不出是重建干的。
+			//
+			// ⚠️ **一个 VPK 可以产出多个 patch**（模型自带材质时 unit + 材质同源）。这时只按名字
+			// 找会永远命中第一条（unit，没有名字），于是材质那一行又退回默认名 ——
+			// 2026-11-08 实测的"名字不显示"就是这个：同源两条，按名字认领必须再带上序号/角色。
+			var sourceVpkName = matched?.Patch.Name;
+			var sameSource = previous is null || string.IsNullOrWhiteSpace(sourceVpkName)
+				? Array.Empty<SectionalPatchGroupEntry>()
+				: previous.Patches
+					.Where(entry => string.Equals(entry.SourceVpkName, sourceVpkName, StringComparison.OrdinalIgnoreCase))
+					.ToArray();
+			var carried = sameSource.FirstOrDefault(entry => entry.PatchIndex == patchIndex)
+				?? (sameSource.Length == 1 ? sameSource[0] : null)
+				?? sameSource.FirstOrDefault(entry => entry.Role == role)
+				?? previous?.Patches.FirstOrDefault(entry => entry.PatchIndex == patchIndex);
 			entries.Add(new SectionalPatchGroupEntry(
 				patchIndex,
 				archiveHex16,
 				role,
-				matched?.Patch.Name,
+				sourceVpkName,
 				// 模型自带的那份材质也是选项之一，名字固定为「模型内置材质」：
 				// 它和折并进来的材质包是同一类东西（一个 patch、可勾选），
 				// 单独给它一个名字是为了让用户在选项表里一眼认出"这是自带的，不是后来加的包"。
 				OptionName: optionNameByPatchFileName?.GetValueOrDefault(name)
 					?? carried?.OptionName
-					?? (matched is { MatchedMaterial: true } ? SectionalPatchManifest.BuiltInMaterialOptionName : null),
+					?? DefaultOptionName(matched),
 				UnitCount: matched?.Patch.UnitCount,
 				MaterialCount: matched?.Patch.MaterialCount,
 				TextureCount: matched?.Patch.TextureCount,
@@ -208,6 +254,29 @@ public static class SectionalPatchManifestFile
 	/// <param name="MatchedUnit">命中报告的 <c>unitPatch</c> 字段。</param>
 	/// <param name="MatchedMaterial">命中报告的 <c>materialPatch</c> 字段。</param>
 	private sealed record MatchResult(VpkConversionPatchSummary Patch, bool MatchedUnit, bool MatchedMaterial);
+
+	/// <summary>
+	/// 材质选项的默认名字：**模型自己那次转换**产出的材质叫「模型内置材质」，
+	/// 别人的材质包产出的就叫那个 VPK 的名字。
+	/// <para>
+	/// <b>为什么必须区分。</b>一整组（模型 + N 个材质包）转进同一个 Mod 之后，材质选项表里有 N+1 行。
+	/// 全都叫「模型内置材质」的话，用户在界面上根本分不出哪一行是哪个包——而以前每个材质包是
+	/// 独立 Mod，靠 Mod 名区分；合并成一个条目之后，只剩这个字段能区分了。
+	/// </para>
+	/// </summary>
+	private static string? DefaultOptionName(MatchResult? matched)
+	{
+		if (matched is not { MatchedMaterial: true }) return null;
+		var kind = matched.Patch.Kind;
+		if (string.IsNullOrWhiteSpace(kind)
+			|| string.Equals(kind, "model", StringComparison.OrdinalIgnoreCase))
+			return SectionalPatchManifest.BuiltInMaterialOptionName;
+
+		var name = matched.Patch.Name;
+		return string.IsNullOrWhiteSpace(name)
+			? SectionalPatchManifest.BuiltInMaterialOptionName
+			: Path.GetFileNameWithoutExtension(name);
+	}
 
 	private static MatchResult? Match(VpkConversionReport? report, string patchFileName)
 	{

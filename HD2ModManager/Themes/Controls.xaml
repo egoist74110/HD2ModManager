@@ -229,6 +229,33 @@
         </Setter>
     </Style>
 
+    <Style x:Key="AppCategoryToggleButton" TargetType="Button" BasedOn="{StaticResource AppQuietButton}">
+        <Setter Property="Width" Value="32"/>
+        <Setter Property="Height" Value="32"/>
+        <Setter Property="Padding" Value="0"/>
+        <Setter Property="Template">
+            <Setter.Value>
+                <ControlTemplate TargetType="Button">
+                    <Border x:Name="Border"
+                            Background="{TemplateBinding Background}"
+                            BorderBrush="{TemplateBinding BorderBrush}"
+                            BorderThickness="{TemplateBinding BorderThickness}"
+                            CornerRadius="16">
+                        <!-- 图标由 Content 提供（每个"标题卡状态"用自己的图标）：
+                             以前这里把三条横线写死在模板里，于是谁设了 Content 都看不到自己的图标。 -->
+                        <ContentPresenter HorizontalAlignment="Center"
+                                          VerticalAlignment="Center"/>
+                    </Border>
+                    <ControlTemplate.Triggers>
+                        <Trigger Property="IsMouseOver" Value="True"><Setter TargetName="Border" Property="Background" Value="{StaticResource SurfaceInteractiveHover}"/><Setter Property="Foreground" Value="{StaticResource Accent}"/></Trigger>
+                        <Trigger Property="IsPressed" Value="True"><Setter TargetName="Border" Property="Background" Value="{StaticResource SurfaceSelected}"/></Trigger>
+                        <Trigger Property="IsEnabled" Value="False"><Setter Property="Opacity" Value="0.55"/></Trigger>
+                    </ControlTemplate.Triggers>
+                </ControlTemplate>
+            </Setter.Value>
+        </Setter>
+    </Style>
+
     <Style x:Key="AppHeaderTextButton" TargetType="Button">
         <Setter Property="MinHeight" Value="22"/>
         <Setter Property="Padding" Value="5,1"/>
@@ -453,6 +480,7 @@
     <Geometry x:Key="RowIcon.ToggleDecoration">M8,1.5 L8,8 M4,3.5 A6,6 0 1 0 12,3.5</Geometry>
     <!-- 与 ToggleDecoration 同一枚电源图形：语义独立（本体的一部分 vs 装饰包的选项），视觉一致。 -->
     <Geometry x:Key="RowIcon.ToggleEnabled">M8,1.5 L8,8 M4,3.5 A6,6 0 1 0 12,3.5</Geometry>
+    <Geometry x:Key="RowIcon.Category">M2.4,3.3 L8.9,3.3 L14.4,8.8 L8.9,14.3 L3.4,8.8 Z M5.6,6.3 L5.6,6.5</Geometry>
     <Geometry x:Key="RowIcon.ExportMod">M8,12.5 L8,3.5 M4.5,7 L8,3.5 L11.5,7 M2.5,11.5 L2.5,13.5 L13.5,13.5 L13.5,11.5</Geometry>
     <Geometry x:Key="RowIcon.OpenFolder">M1.5,5 L6.5,5 L8,3 L14.5,3 L14.5,13 L1.5,13 Z</Geometry>
     <Geometry x:Key="RowIcon.MoveUp">M8,13 L8,3 M3.5,7.5 L8,3 L12.5,7.5</Geometry>
