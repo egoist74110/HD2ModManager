@@ -31,6 +31,29 @@
 
 local M = {}
 
+-- 2.0.4：快照**探针**。按骨名采回来 13 个全"缺"，而同一套 API 在求解器里是好的 ——
+--        光看一个"缺 13"分不清是 has_node 假、node 假还是读位置假。请求加 `probe = 1`：
+--        前 4 个 id 逐步把 类型/返回值 打进日志（`[快照][探针]`）；另外数字 id 没命中时
+--        退回字符串名字再试一次（id32 只是名字的哈希，未必等价）。
+--
+-- 2.0.3：快照的**取证能力**补强（实机第一次按 F9 就把游戏读崩了，而日志里没有现场）。
+--        · `[快照]` 归入"永远落盘"的那几类，预算用尽也留得下
+--        · 每帧**先**打一行"开始第 k/M 帧、N 个节点"再采 —— 崩了就知道崩在第几帧
+--        · 每帧单独落盘（snapshot-<seq>-s<k>.json），崩了前面的数据还在
+--        · 新增请求项 `limit=N`：只采前 N 个节点，先探路再放量
+--        一次按键读 685 个节点 ≈ 2700 次引擎调用，这个量本身就是风险。
+--
+-- 2.0.2：**姿态快照**。按一下热键，把当前玩家那具骨架的世界变换写到
+--        `%LOCALAPPDATA%\hd2physbone-snap\snapshot-*.json`（外部工具写请求文件触发，
+--        因为游戏的输入走 Raw Input，Lua 侧读不到键）。为什么需要：穿模只在动起来时
+--        看得见，而离线只有 bind 姿态；实测绑定时链根离髋部表面 +4.6~+9.9 cm（全在外面），
+--        真正插进去的是皮面，所以必须拿到"那一帧的骨变换"，在 PC 侧蒙皮还原网格再判。
+--
+-- 2.0.1：**日志瘦身**（只动日志，不动求解）。心跳 120 帧 → 600 帧；打开时旧文件超
+--        512 KiB 就轮转成 `.1`；一次启动最多写 128 KiB，用满之后只留错误/失败/警告/驱动失效
+--        四类。目的一句话：日志是事后唯一的证据，但它不该成为磁盘上的负担，也不该因为
+--        "玩家这局玩了多久"而决定自己有多大。
+--
 -- 2.0.0：**多人局**。以前整条调度只认"一个玩家 avatar"，多出来的候选一律当成尸体；
 --        于是队友一出现就被判成"玩家换人了"，会话全丢、重新挂到队友身上，自己身上反而没物理。
 --        现在按玩家分组：每个活动玩家各自持有自己的会话，谁死了只收谁。
@@ -40,7 +63,7 @@ local M = {}
 --
 -- 1.9.1：容器扫描窗口改成"按实际部署的最大 patch 序号 + 5"（以前写死 0..63，
 --        装一堆 mod 时排在 63 之后的物理 mod 会被漏掉，日志还误报成"没做 embed"）。
-M.VERSION = "2.0.0"
+M.VERSION = "2.1.17"
 
 --- 安装标记用的全局键。只写这一个全局，且值就是模块本身（便于外部检查是否已装）。
 local INSTALL_KEY = "__hd2physbone_runtime"
@@ -64,6 +87,19 @@ local function defaultLogPath(options)
 	return nil
 end
 
+--- 一次启动最多往盘上写多少字节（默认 128 KiB）；用满之后只留"出事了"的行。
+local DEFAULT_LOG_MAX_BYTES = 128 * 1024
+
+--- 打开日志时如果已有文件超过这个大小就轮转成 `.1`（默认 512 KiB）。
+local DEFAULT_LOG_ROTATE_BYTES = 512 * 1024
+
+--- 预算用尽之后**仍然**要落盘的标记。
+--- <para>
+--- 只留这几类，是因为它们本身就是"出事了"的证据；心跳、等待、预算、逐链明细
+--- 这类常规行才是吃字节的大头，也是最没必要的长期留存。
+--- </para>
+local ALWAYS_LOG_TAGS = { "[错误]", "[失败]", "[警告]", "[驱动失效]", "[快照]", "[裙摆]" }
+
 --- 造一个 logger。返回 `log, context`。
 --- <para>
 --- 两个刻意的选择：
@@ -73,18 +109,82 @@ end
 --- 帧号由 `drive` 每帧写进 `context.frame`：compat 会直接调 `session.logger`，
 --- 只能靠这个共享表把上下文带进去。
 --- </para>
+--- <para>
+--- 光"追加"会有两个副作用，所以这里还加了两道闸：
+---   * **跨会话轮转**：打开时文件已经超过 <c>logRotateBytes</c> 就改名成 `.1`。
+---     否则这个文件会随每次启动单调长大，几百 MB 之后连打开都费劲。
+---   * **单次启动预算**：写满 <c>logMaxBytes</c> 就停常规行，并落一行说明。
+---     心跳这类周期行的总量因此有了硬上限，不再取决于玩家玩了多久。
+--- 刻意**没有**加"开局 N 秒后停止录制"的时间窗：玩到第 40 分钟才出现的毛病
+--- 恰好会落在窗外，而这正是最需要日志的时候。要省字节，砍周期行比砍时间窗安全。
+--- </para>
 local function makeLogger(options)
 	local handle = nil
 	local path = defaultLogPath(options)
+	local maxBytes = (options and options.logMaxBytes) or DEFAULT_LOG_MAX_BYTES
+	-- **开发模式**：把预算整个关掉，全量落盘。
+	-- 为什么需要：预算用尽后只留错误类，于是"我加的那行诊断"被静默丢掉——
+	-- 2026-11-09 就因为这个白测了一轮（以为没效果，其实是没有观测数据）。
+	-- 开关走调参文件（`devLog = 1`）或环境变量 `HD2_PHYSBONE_DEV=1`：两者都在启动时读一次，
+	-- 不影响运行期性能。产品环境不设它 ⇒ 行为与之前完全一致。
+	if (options and options.devLog == true) or os.getenv("HD2_PHYSBONE_DEV") == "1" then
+		maxBytes = math.huge
+	else
+		local tunePath = (options and options.tunePath) or ((os.getenv("LOCALAPPDATA") or "") .. "\\hd2pbx_tune.txt")
+		local ok, handle = pcall(io.open, tunePath, "r")
+		if ok and handle ~= nil then
+			local okRead, text = pcall(handle.read, handle, "*a")
+			pcall(handle.close, handle)
+			if okRead and type(text) == "string" and text:find("devLog%s*=%s*1") ~= nil then
+				maxBytes = math.huge
+			end
+		end
+	end
+	local rotateBytes = (options and options.logRotateBytes) or DEFAULT_LOG_ROTATE_BYTES
 	if path then
+		-- 轮转：先量旧文件，超阈值就挪到 `.1`（覆盖上一次的 `.1`）。
+		pcall(function()
+			local probe = io.open(path, "r")
+			if probe == nil then return end
+			local size = probe:seek("end") or 0
+			probe:close()
+			if size <= rotateBytes then return end
+			os.remove(path .. ".1")
+			os.rename(path, path .. ".1")
+		end)
 		local ok, h = pcall(io.open, path, "a")
 		if ok then handle = h end
 	end
 	local debugEnabled = options ~= nil and options.debug == true
 	local context = { frame = 0 }
+	local used, lines, exhausted = 0, 0, false
+	local function writeLine(text)
+		local ok = pcall(function() handle:write(text, "\n") handle:flush() end)
+		if ok then lines = lines + 1 end
+		return ok
+	end
+	local function alwaysKept(text)
+		for index = 1, #ALWAYS_LOG_TAGS do
+			if string.find(text, ALWAYS_LOG_TAGS[index], 1, true) ~= nil then return true end
+		end
+		return false
+	end
 	local function emit(text)
 		if handle ~= nil then
-			pcall(function() handle:write(text, "\n") handle:flush() end)
+			local size = #text + 1
+			if exhausted then
+				-- 预算用尽：常规行丢掉，出事的行照写。
+				if alwaysKept(text) then used = used + size; writeLine(text) end
+			elseif used + size > maxBytes then
+				exhausted = true
+				used = used + size
+				writeLine(string.format(
+					"[physbone] 日志已达上限 %d KiB（此前 %d 行）⇒ 本次启动后续只保留错误/失败/警告类",
+					math.floor(maxBytes / 1024), lines))
+			else
+				used = used + size
+				writeLine(text)
+			end
 		end
 		if debugEnabled then
 			local real = rawget(_G, "print")
@@ -822,7 +922,7 @@ end
 local function tune_values(runtime)
 	local frame = runtime.frame or 0
 	local cached = runtime.tune
-	local refresh = (runtime.options and runtime.options.tuneRefreshFrames) or 120
+	local refresh = (runtime.options and runtime.options.tuneRefreshFrames) or 30
 	if cached ~= nil and (frame - cached.frame) < refresh then return cached.values end
 
 	local values = { text = {} }
@@ -1134,6 +1234,1425 @@ local function apply_lift(runtime, S_)
 		(cameraZ ~= nil and headZ ~= nil) and string.format("%+.3f", cameraZ - headZ) or "?")
 end
 
+-- ---------------------------------------------------------------------------
+-- 调度器：谁算"自己"、以及什么时候重新判定
+-- ---------------------------------------------------------------------------
+--
+-- 语义只有一条：**相机附近的那个人拿最高物理权**。
+-- 这条语义同时覆盖了三种情况，所以不需要分别处理：
+--   ① 第一/第三人称正常游玩 —— 相机在自己身上，"自己"永远排第一；
+--   ② 观战/过场把相机拉到队友身上 —— 被观看的人自动变成热点，
+--      用户在任何视角下都不会看到"我在看的那个人物理像 PPT"；
+--   ③ 身份判错（相机读不到时退化成按节点数排）—— 队友跑远 1 秒后自动纠正。
+--
+-- 关键约束：重置**只重排、不重挂**。改 owner/ownerOrder 不释放会话、不重新 attach，
+-- 所以不会闪、不会掉物理、也不需要重新读容器（那一步是几千次引擎调用）。
+
+--- 调度器参数（走调参文件，可运行时改）
+local function sched_settings(runtime)
+	local values = tune_values(runtime) or {}
+	return {
+		fallback = (values.schedFallback or 1) ~= 0,
+		metres = values.schedFallbackMetres or 6,
+		seconds = values.schedFallbackSeconds or 1,
+		minInterval = values.schedMinIntervalSeconds or 1,
+		pollFrames = math.max(1, math.floor(values.schedPollFrames or 30)),
+		-- 手动重设通道（见 sched_tune_poll / sched_key_poll）
+		resetToken = values.schedReset,
+		hotkey = (values.schedHotkey or 1) ~= 0,
+		hotkeyName = (values.text and values.text.schedHotkeyName) or "f8",
+		-- 第一人称探针的键（默认 f11；写 none 可关掉）
+		fpProbeKey = (values.text and values.text.fpProbeKey) or "f11",
+		-- 第一人称锁定：水平距离阈值（米）与确认帧数
+		fpLock = (values.fpLock or 1) ~= 0,
+		fpLockMetres = values.fpLockMetres or 0.35,
+		fpLockFrames = math.max(1, math.floor(values.fpLockFrames or 3)),
+	}
+end
+
+--- 把一个会话重新归属到"离它最近的 avatar"。
+--- 会话是护甲件，玩家那套护甲挂在 avatar 骨架上、位置几乎重合，所以这是一个可靠判据。
+local function nearest_avatar(S_, avatars, session)
+	local sx, sy, sz = readVector(S_, try(S_.Unit.world_position, session.unit, 1))
+	if sx == nil then return nil end
+	local best, bestDistance = nil, math.huge
+	for index = 1, #avatars do
+		local avatar = avatars[index]
+		if avatar.x ~= nil then
+			local dx, dy, dz = sx - avatar.x, sy - avatar.y, sz - avatar.z
+			local distance = dx * dx + dy * dy + dz * dz
+			if distance < bestDistance then best, bestDistance = avatar, distance end
+		end
+	end
+	return best
+end
+
+--- 按相机距离重排玩家顺序，并把每个会话重新归属。
+---@param forcePrimary any|nil 强制排第一的 avatar unit（第一人称锁定用）
+---@return number changed 归属真正发生变化的会话数
+local function redistribute(S_, runtime, why, forcePrimary)
+	local avatars = runtime.avatars
+	if avatars == nil or #avatars == 0 then return 0 end
+	local camX, camY, camZ = cameraPosition(S_, runtime.world, runtime.cache or {})
+	local haveCamera = camX ~= nil
+	for index = 1, #avatars do
+		local avatar = avatars[index]
+		local ax, ay, az = readVector(S_, try(S_.Unit.world_position, avatar.unit, 1))
+		avatar.x, avatar.y, avatar.z = ax, ay, az
+		if haveCamera and ax ~= nil then
+			local dx, dy, dz = ax - camX, ay - camY, az - camZ
+			avatar.cameraDistance = dx * dx + dy * dy + dz * dz
+		else
+			avatar.cameraDistance = nil
+		end
+	end
+	table.sort(avatars, function(a, b)
+		local da, db = a.cameraDistance, b.cameraDistance
+		if da ~= nil and db ~= nil then return da < db end
+		if da ~= nil then return true end
+		if db ~= nil then return false end
+		return (a.nodes or 0) > (b.nodes or 0)
+	end)
+	-- 强制置顶：第一人称锁定的证据（水平距离≈0）比"总距离最近"强得多——
+	-- 队友完全可以比你离相机更近，但他的水平分量不可能≈0。
+	if forcePrimary ~= nil then
+		for index = 1, #avatars do
+			if avatars[index].unit == forcePrimary and index > 1 then
+				local forced = table.remove(avatars, index)
+				table.insert(avatars, 1, forced)
+				break
+			end
+		end
+	end
+	for index = 1, #avatars do avatars[index].order = index end
+
+	local changed, moved = 0, {}
+	for _, session in ipairs(runtime.sessions or {}) do
+		local best = nearest_avatar(S_, avatars, session)
+		if best ~= nil then
+			if session.owner ~= best.unit then
+				changed = changed + 1
+				moved[#moved + 1] = string.format("%s→%s", tostring(session.unitTag or "?"),
+					tostring(best.tag or "?"))
+				session.owner = best.unit
+				session.ownerTag = best.tag or unit_tag(S_, best.unit)
+			end
+			session.ownerOrder = best.order
+		end
+	end
+	-- 会话顺序也按新归属排：drive 里"第一位玩家不参与分帧"，靠的就是这个顺序
+	table.sort(runtime.sessions or {}, function(a, b)
+		return (a.ownerOrder or 99) < (b.ownerOrder or 99)
+	end)
+
+	runtime.avatars = avatars
+	runtime.schedResets = (runtime.schedResets or 0) + 1
+	runtime.schedLastResetFrame = runtime.frame
+	-- 只在**真变了**的时候打日志：自由相机那种"附近谁都没有"的状态下，
+	-- 这条规则会每秒触发一次，每次打一行就会把日志刷满，而且那些行没有任何信息量。
+	if changed > 0 then
+		runtime.logger("[physbone][调度] 重新分配（%s）：%d 个会话换了主人 %s%s",
+			why, changed, table.concat(moved, " "),
+			haveCamera and "" or "（相机不可读 ⇒ 只按节点数排，判据退化）")
+	else
+		runtime.schedNoop = (runtime.schedNoop or 0) + 1
+	end
+	return changed
+end
+
+--- 第一人称锁定：相机在自己根节点的**正上方** ⇒ **水平距离 ≈ 0**。
+--- <para>
+--- 实测（2026-11-11）：第一人称下"相机到自己根节点"的总距离稳定在 1.717~1.727 m
+--- （±5 mm），第三人称是 4.50~4.52 m。但**总距离不能当判据**：
+--- 队友站在你面前 1.7 m 处，总距离也是 1.7 m（相机在眼高、他的根在地面）。
+--- 真正伪造不了的是水平分量——别人的身体不可能站在你相机的那个点上（会碰撞）。
+--- 垂直分量对所有站在同层地面的人都约等于眼高，因此没有区分能力。
+--- </para>
+--- 语义：水平 < fpLockMetres 且连续 fpLockFrames 帧 ⇒ 锁定为"自己"；
+--- 若它当前不是最高权目标，立刻重排（不等 1 秒兜底）。
+local function fp_lock_watch(S_, runtime)
+	local settings = sched_settings(runtime)
+	if not settings.fpLock then return end
+	local avatars = runtime.avatars
+	if avatars == nil or #avatars == 0 then return end
+	local camX, camY = cameraPosition(S_, runtime.world, runtime.cache or {})
+	if camX == nil then return end
+	local lockAvatar, lockH = nil, nil
+	for index = 1, #avatars do
+		local avatar = avatars[index]
+		if avatar.x ~= nil then
+			local dx, dy = avatar.x - camX, avatar.y - camY
+			local h = math.sqrt(dx * dx + dy * dy)
+			if h < settings.fpLockMetres and (lockH == nil or h < lockH) then
+				lockAvatar, lockH = avatar, h
+			end
+		end
+	end
+	if lockAvatar == nil then
+		runtime.fpLockFrames = 0
+		runtime.fpLockUnit = nil
+		return
+	end
+	if runtime.fpLockUnit ~= lockAvatar.unit then
+		runtime.fpLockUnit = lockAvatar.unit
+		runtime.fpLockFrames = 1
+		runtime.fpLockH = lockH
+		return
+	end
+	runtime.fpLockFrames = (runtime.fpLockFrames or 0) + 1
+	runtime.fpLockH = lockH
+	-- 只在"恰好达到帧数"时动作一次；动作后清零，这样万一又被判错还能再纠正。
+	if runtime.fpLockFrames ~= settings.fpLockFrames then return end
+	if (lockAvatar.order or 99) == 1 then return end
+	runtime.logger("[physbone][调度] 第一人称锁定（水平 %.3f m，%s）⇒ 立即重排",
+		lockH, tostring(lockAvatar.tag or "?"))
+	redistribute(S_, runtime, "第一人称锁定", lockAvatar.unit)
+	runtime.fpLockFrames = 0
+end
+
+--- 兜底：**最高物理权单位**离开相机超过 `metres` 连续 `seconds` 秒 ⇒ 立刻重排。
+--- <para>
+--- 为什么用"它离相机远"而不是"别人离相机近"：前者只需要一次距离读取，
+--- 而且它把"观战即热点"这件事变成同一条规则的自然结果（相机换目标 ⇒ 1 秒后热点换人）。
+--- </para>
+--- 限流：最短间隔 `minInterval` 秒。**不做**"连续触发就停用"——持续触发恰恰说明
+--- 附近确实没有玩家（自由相机），此时每秒重排一次的代价（约 50 次引擎调用）
+--- 远小于它带来的正确性。连续没有变化时会自动退避，见下。
+local function scheduler_watch(S_, runtime, dt)
+	local settings = sched_settings(runtime)
+	if not settings.fallback then return end
+	local avatars = runtime.avatars
+	if avatars == nil or #avatars == 0 then return end
+	local primary = avatars[1]
+	if primary == nil or primary.unit == nil then return end
+	local camX, camY, camZ = cameraPosition(S_, runtime.world, runtime.cache or {})
+	if camX == nil then return end
+	local ax, ay, az = readVector(S_, try(S_.Unit.world_position, primary.unit, 1))
+	if ax == nil then return end
+	local dx, dy, dz = ax - camX, ay - camY, az - camZ
+	local distance = math.sqrt(dx * dx + dy * dy + dz * dz)
+
+	if distance <= settings.metres then
+		if (runtime.schedFar or 0) > 0 then runtime.schedFar = 0 end
+		return
+	end
+	runtime.schedFar = (runtime.schedFar or 0) + (dt or (1 / 60))
+	-- 退避期：判据仍然有效，但降到 1/10 的频率（附近确实没人时别每秒重排）。
+	local need = settings.seconds
+	if runtime.schedBackoffUntil ~= nil and runtime.frame < runtime.schedBackoffUntil then
+		need = need * 10
+	end
+	if runtime.schedFar < need then return end
+
+	-- 到点了。限流：上一次重置太近就再等等（保留累积值，下一帧会再试）。
+	local last = runtime.schedLastResetFrame
+	local since = last ~= nil and (runtime.frame - last) * (dt or (1 / 60)) or math.huge
+	if since < settings.minInterval then return end
+
+	runtime.schedFar = 0
+	local changed = redistribute(S_, runtime, string.format("最高权单位距相机 %.1f m > %.0f m 持续 %.1f s",
+		distance, settings.metres, settings.seconds))
+	if changed == 0 then
+		-- 连续多次重排都没有任何变化 ⇒ 附近确实没人（自由相机/空镜头）。
+		-- 退避到 10 倍间隔，既保住正确性又不做无意义的每秒重排；有变化时立刻恢复。
+		if (runtime.schedNoop or 0) >= 3 then
+			runtime.schedBackoffUntil = runtime.frame
+				+ math.floor(settings.minInterval * 10 * 120)
+		end
+	else
+		runtime.schedNoop = 0
+	end
+end
+
+--- 每帧只刷新"每个玩家到相机的距离"，**不重排、不重新归属**。
+--- 为什么要单独这一步：分档要看新鲜距离（一秒钟前的距离可能差出十几米），
+--- 但重排是"事件级"的事（见 scheduler_watch）。这里只有 ≤4 次引擎调用。
+local function refresh_avatar_distances(S_, runtime)
+	local avatars = runtime.avatars
+	if avatars == nil or #avatars == 0 then return end
+	local camX, camY, camZ = cameraPosition(S_, runtime.world, runtime.cache or {})
+	if camX == nil then return end
+	for index = 1, #avatars do
+		local avatar = avatars[index]
+		local ax, ay, az = readVector(S_, try(S_.Unit.world_position, avatar.unit, 1))
+		if ax ~= nil then
+			avatar.x, avatar.y, avatar.z = ax, ay, az
+			local dx, dy, dz = ax - camX, ay - camY, az - camZ
+			avatar.cameraDistance = dx * dx + dy * dy + dz * dz
+		end
+	end
+end
+
+--- 会话所属玩家到相机的距离平方。只查上面刷新的缓存，**不**调引擎。
+local function owner_distance_sq(runtime, session)
+	local owner = session.owner
+	if owner == nil then return math.huge end
+	local avatars = runtime.avatars
+	if avatars == nil then return math.huge end
+	for index = 1, #avatars do
+		if avatars[index].unit == owner then return avatars[index].cameraDistance or math.huge end
+	end
+	return math.huge
+end
+
+--- 预算 → 两档步长（纯函数，可离线单测）。
+--- <para>
+--- 语义：**自己永远每帧**（不参与节流，这一条不可协商）；
+--- 6 m 内先保证 2 帧一次，链数真的很多时才退到 3 帧一次；
+--- 6 m 外从 4 帧起，吃紧时最多 8 帧一次。
+--- 估算方式按"链数/步长"分摊到每帧，和实测的"约 3.5 次引擎调用/链"线性对应。
+--- </para>
+---@return number nearStride, number farStride
+local function schedule_budget(primaryChains, nearChains, farChains, budget)
+	if primaryChains + nearChains + farChains <= budget then return 1, 1 end
+	local nearStride, farStride = 2, 4
+	local function cost()
+		return primaryChains + nearChains / nearStride + farChains / farStride
+	end
+	while cost() > budget do
+		if farStride < 8 then
+			farStride = math.min(8, farStride * 2)
+		elseif nearStride < 3 then
+			nearStride = 3
+		else
+			break
+		end
+	end
+	-- 近处本来就没几条链时不必节流：让 6 m 内的队友完全每帧（那是他们最被看见的时候）
+	if nearChains <= budget * 0.25 then nearStride = 1 end
+	return nearStride, farStride
+end
+
+
+--- 手动重设的两条通道。**产品路径不得依赖外部脚本**（这套物理要随管理器分发给大量玩家），
+--- 所以按"零依赖优先"排列：
+---
+---   ① 调参文件里的 `schedReset`：写成**任意一个新的数字**就等于按了一次重置。
+---      零依赖、纯 Lua（读调参文件本来就有），玩家改一个数字即可，不需要任何额外程序。
+---   ② Stingray 自带的 `Keyboard` API（如果这个版本暴露了）——真正的一键热键。
+---      是否可用只能**实机探测**，探测结果打一行日志（见 probe_input）。
+--- 外部脚本写文件那条通道**已经删除**：玩家机器上不会有我们开发用的监听器。
+
+--- ① 调参文件通道：值变化即触发（首次读到只记录，不触发——启动时刚排好序，没必要）。
+local function sched_tune_poll(S_, runtime)
+	local settings = sched_settings(runtime)
+	if settings.resetToken == nil then return end
+	local seen = runtime.schedResetSeen
+	runtime.schedResetSeen = settings.resetToken
+	if seen == nil or seen == settings.resetToken then return end
+	redistribute(S_, runtime, string.format("手动重设（调参 schedReset=%s）",
+		tostring(settings.resetToken)))
+	runtime.schedNoop = 0
+	runtime.schedBackoffUntil = nil
+end
+
+--- 读一个键，返回"这一帧刚按下"（上升沿）。绑定/失败都只记一次日志。
+--- <para>
+--- ⚠️ 实机实测（2026-11-11）：`Keyboard.button` 返回的是 **`0` / `1`，不是布尔**。
+--- Lua 里 `0` 是**真值**，所以写成 `if value then` 会变成"永远按住"——每帧都会触发。
+--- 这里必须同时接受 `true` 和"数字非 0"两种语义。
+--- </para>
+local function key_edge(S_, runtime, name)
+	if type(name) ~= "string" or #name == 0 then return false end
+	local kb = S_.Keyboard
+	if type(kb) ~= "table" or type(kb.button) ~= "function" then return false end
+	local slots = runtime.keySlots
+	if slots == nil then slots = {}; runtime.keySlots = slots end
+	local slot = slots[name]
+	if slot == nil then
+		slot = { mode = nil }
+		slots[name] = slot
+		-- 键名拼写各版本不一致（"f8" / "F8"），调用约定也不一致（code / 名字），两种都试。
+		local candidates = { name, string.lower(name), string.upper(name) }
+		for _, spelling in ipairs(candidates) do
+			if slot.mode == nil and type(kb.button_index) == "function" then
+				local okIndex, code = pcall(kb.button_index, spelling)
+				if okIndex and code ~= nil and pcall(kb.button, code) then
+					slot.mode, slot.code, slot.spelling = "code", code, spelling
+				end
+			end
+			if slot.mode == nil and pcall(kb.button, spelling) then
+				slot.mode, slot.spelling = "name", spelling
+			end
+		end
+		if slot.mode == nil then
+			slot.broken = true
+			runtime.logger("[physbone][热键] 试过 %s 仍读不到（Keyboard 存在但调用不通）⇒ 停用",
+				table.concat(candidates, "/"))
+			return false
+		end
+		runtime.logger("[physbone][热键] 已绑定 %s（拼写=%s，调用约定=%s，code=%s）",
+			name, tostring(slot.spelling), slot.mode, tostring(slot.code))
+	end
+	if slot.broken then return false end
+	local ok, value
+	if slot.mode == "code" then
+		ok, value = pcall(kb.button, slot.code)
+	else
+		ok, value = pcall(kb.button, slot.spelling)
+	end
+	if not ok then
+		slot.broken = true
+		runtime.logger("[physbone][热键] 读取 %s 时抛错 ⇒ 停用", name)
+		return false
+	end
+	local isDown = (value == true) or (type(value) == "number" and value ~= 0)
+	local wasDown = slot.down == true
+	slot.down = isDown
+	if isDown == wasDown then return false end
+	if not isDown then
+		runtime.logger("[physbone][热键] %s 松开", name)
+		return false
+	end
+	runtime.keyEvents = (runtime.keyEvents or 0) + 1
+	return true
+end
+
+--- ② 手动重设热键（默认 F8）：按下沿触发一次重排。
+local function sched_key_poll(S_, runtime)
+	local settings = sched_settings(runtime)
+	if not settings.hotkey then return end
+	if not key_edge(S_, runtime, settings.hotkeyName) then return end
+	runtime.logger("[physbone][热键] %s 按下 ⇒ 重排（玩家 %d 个，会话 %d 个）",
+		settings.hotkeyName, #(runtime.avatars or {}), #(runtime.sessions or {}))
+	redistribute(S_, runtime, "手动重设（热键 " .. settings.hotkeyName .. "）")
+	runtime.schedNoop = 0
+	runtime.schedBackoffUntil = nil
+end
+
+--- 第一人称探针（默认 F11）：按一次打**一行**——相机位置 + 每个玩家到相机的距离。
+--- <para>
+--- 要回答的问题：第一人称下"自己与相机的距离"是不是固定且接近 0？
+--- 如果是（且第三人称是 2~4 m），那它就比"离相机最近的那个"可靠得多，
+--- 可以用来做**精确身份判据**（锁定 ⇒ 3 帧内立即重排，不等 1 秒兜底）。
+--- 采用按键触发而不是定时打日志：只要切换前后的两个瞬时值，不需要刷屏。
+--- </para>
+local function fp_probe_poll(S_, runtime)
+	local settings = sched_settings(runtime)
+	if not settings.fpProbeKey then return end
+	if not key_edge(S_, runtime, settings.fpProbeKey) then return end
+	local avatars = runtime.avatars or {}
+	local camX, camY, camZ = cameraPosition(S_, runtime.world, runtime.cache or {})
+	local parts = {}
+	for index = 1, #avatars do
+		local avatar = avatars[index]
+		local ax, ay, az = readVector(S_, try(S_.Unit.world_position, avatar.unit, 1))
+		local text = "?"
+		if camX ~= nil and ax ~= nil then
+			local dx, dy, dz = ax - camX, ay - camY, az - camZ
+			local horizontal = math.sqrt(dx * dx + dy * dy)
+			text = string.format("%.4fm(h=%.4f,v=%+.4f)",
+				math.sqrt(dx * dx + dy * dy + dz * dz), horizontal, dz)
+		end
+		parts[#parts + 1] = string.format("%s=%s%s", tostring(avatar.tag or "?"), text,
+			(avatar.order or 99) == 1 and "(主)" or "")
+	end
+	local chains = 0
+	for _, session in ipairs(runtime.sessions or {}) do
+		chains = chains + #(session.sessions or {})
+	end
+	runtime.logger(
+		"[physbone][FP探针] 相机=(%.3f,%.3f,%.3f) 玩家=%d 会话=%d 链=%d 距离: %s",
+		camX or 0, camY or 0, camZ or 0, #avatars, #(runtime.sessions or {}), chains,
+		#parts > 0 and table.concat(parts, " ") or "（没有玩家）")
+end
+
+--- ③ 已删除：外部脚本写文件的通道。
+--- 这套物理要随管理器分发给大量玩家，产品路径不能依赖任何外部程序
+--- （玩家机器上不会有我们开发用的 Python 监听器）。上面两条已经够用：
+--- 原生键盘能用就一键，不能用就改调参文件里的一个数字。
+
+--- 输入 API 一次性探测：只**读类型**（不调有副作用的函数），把结果打进日志。
+--- 为什么要它：能不能绑原生热键完全取决于这个版本暴露了什么，
+--- 而"猜一个 API 名字然后静默失败"是这一整层最贵的错误类型。
+local function probe_input(S_, runtime)
+	if runtime.inputProbed == true then return end
+	runtime.inputProbed = true
+	local kb = S_.Keyboard
+	local parts = { "Keyboard=" .. type(kb) }
+	if type(kb) == "table" then
+		for _, name in ipairs({ "button", "button_index", "keystroke", "any_button" }) do
+			parts[#parts + 1] = name .. "=" .. type(kb[name])
+		end
+	end
+	parts[#parts + 1] = "InputManager=" .. type(S_.InputManager)
+	parts[#parts + 1] = "Window=" .. type(S_.Window)
+	runtime.logger("[physbone][探测] 输入 API：%s", table.concat(parts, " "))
+	if type(kb) == "table" and type(kb.button_index) == "function" and type(kb.button) == "function" then
+		local okCode, code = pcall(kb.button_index, "f8")
+		local down = nil
+		if okCode and code ~= nil then
+			local okDown, value = pcall(kb.button, code)
+			if okDown then down = value end
+		end
+		runtime.logger("[physbone][探测] F8 试读：code=%s down=%s", tostring(code), tostring(down))
+	end
+end
+
+
+--- 每帧统一入口。成本：一次调参比对 + 两个键各读一次（`Keyboard.button` 是纯查询）。
+local function sched_poll(S_, runtime)
+	probe_input(S_, runtime)
+	sched_tune_poll(S_, runtime)
+	sched_key_poll(S_, runtime)
+	fp_probe_poll(S_, runtime)
+end
+
+
+
+
+-- ---------------------------------------------------------------------------
+-- 姿态快照：按一下键，把当前玩家这一具骨架的世界变换写到盘上
+--
+-- 为什么需要它：穿模这件事**只在动起来时看得见**，而离线只有 bind 姿态。
+-- 2026-11-09 的实测把这一点钉死了：绑定时 7 个挂在 hips 上的链根离髋部表面
+-- +4.6~+9.9 cm（全在外面），真正插进身体的是**皮面**（裙子上沿，最深 −1.5 cm）。
+-- 也就是说"看骨点有没有越界"这个判据永远不成立，必须拿到那一帧的骨变换，
+-- 在 PC 侧把网格蒙皮还原出来再判。
+--
+-- 为什么是"外部写请求、Lua 轮询"而不是在 Lua 里读键盘：
+-- 这个游戏的输入走 Raw Input（见 tools/game-input.py 的注释），Lua 侧没有可信的按键 API；
+-- 而"请求文件 → 轮询 → 应答文件"这条路在本仓已经有成熟先例
+-- （HD2RuntimeArmorOverride/src/armor_refresh_hotkey.lua 就是这套）。
+--
+-- 请求文件是**按行的纯文本**，不是 JSON：解析器只需要认得 `key=value`，
+-- 少一层转义就少一类静默失败。节点用 32 位哈希给（引擎的 IdString32），
+-- 因为转换产物里没有 Bone 资源、节点名根本不存在，只有哈希。
+-- ---------------------------------------------------------------------------
+local SNAPSHOT_MAX_NODES = 1024
+local SNAPSHOT_MAX_FRAMES = 32
+local SNAPSHOT_POLL_FRAMES = 30
+
+--- 快照目录。默认 `%LOCALAPPDATA%\hd2physbone-snap`，`options.snapshotDir` 可覆盖，
+--- `options.snapshot == false` 可彻底关掉。
+local function snapshot_dir(options)
+	local dir = options and options.snapshotDir
+	if type(dir) == "string" and #dir > 0 then return dir end
+	if options and options.snapshot == false then return nil end
+	local base = os.getenv("LOCALAPPDATA")
+	if type(base) == "string" and #base > 0 then return base .. "\\hd2physbone-snap" end
+	return nil
+end
+
+--- 解析请求文本。任何一行看不懂就跳过，不因此整份作废——
+--- 拿到半份数据也比"按一下什么都没发生"强。
+local function parse_snapshot_request(text)
+	if type(text) ~= "string" or #text == 0 then return nil end
+	local request = { frames = 8, stride = 2, limit = 0, nodes = {}, names = {}, seq = nil }
+	for line in text:gmatch("[^\r\n]+") do
+		line = line:gsub("^%s+", ""):gsub("%s+$", "")
+		if #line > 0 and line:sub(1, 1) ~= "#" then
+			local key, value = line:match("^([%w_]+)%s*=%s*(.-)$")
+			if key ~= nil then
+				key = key:lower()
+				if key == "frames" then
+					local count = tonumber(value)
+					if count ~= nil then
+						request.frames = math.max(1, math.min(SNAPSHOT_MAX_FRAMES, math.floor(count)))
+					end
+				elseif key == "stride" then
+					local stride = tonumber(value)
+					if stride ~= nil then
+						request.stride = math.max(1, math.min(30, math.floor(stride)))
+					end
+				elseif key == "auto" then
+					-- 自动清单：用运行时自己正在驱动的链骨名 + 固定关节名。换护甲也不用改请求。
+					request.auto = (value == "1" or value == "true")
+				elseif key == "probe" then
+					-- 探针模式：把前几个 id 的每一步结果（类型 + 返回值）打出来。
+					-- 为什么需要：按骨名采回来 13 个全"缺"，而同一套 API 在求解器里是好的，
+					-- 光看"缺 13"根本分不清是 has_node 假、node 假还是读位置假。
+					request.probe = (value == "1" or value == "true")
+				elseif key == "limit" then
+					-- 只采前 N 个节点。为什么需要：一次按键里读 685 个节点 ≈ 2700 次引擎调用，
+					-- 2026-11-09 实测直接把游戏读崩了。先用小的探路，再放量。
+					local count = tonumber(value)
+					if count ~= nil then request.limit = math.max(0, math.min(SNAPSHOT_MAX_NODES, math.floor(count))) end
+				elseif key == "seq" then
+					request.seq = value
+				elseif key == "node" then
+					local hash = tonumber((value:gsub("^0[xX]", "")), 16)
+					if hash ~= nil and #request.nodes < SNAPSHOT_MAX_NODES then
+						request.nodes[#request.nodes + 1] = hash
+					end
+				elseif key == "name" then
+					if #value > 0 and #request.names < 128 then
+						request.names[#request.names + 1] = value
+					end
+				end
+			end
+		end
+	end
+	if #request.nodes == 0 and #request.names == 0 and request.auto ~= true then return nil end
+	return request
+end
+
+--- 把请求里的"哈希 + 名字"并成一张 id 表（名字按引擎的 IdString32 现算）。
+local function snapshot_ids(S_, request)
+	local ids, seen = {}, {}
+	local limit = request.limit or 0
+	local function push(id, label, name)
+		if id == nil and name == nil then return end
+		local key = id or ("name:" .. name)
+		if seen[key] then return end
+		if limit > 0 and #ids >= limit then return end
+		seen[key] = true
+		ids[#ids + 1] = { id = id, label = label, name = name }
+	end
+	for _, hash in ipairs(request.nodes or {}) do push(hash, string.format("0x%08x", hash)) end
+	-- 名字同时留着原文：万一某些引擎版本 has_node 只认字符串，还能退回去再试一次。
+	for _, name in ipairs(request.names or {}) do push(id32(S_, name), name, name) end
+	return ids
+end
+
+	-- 自动清单要用的固定关节名。这些就是 compat 的 anchor 表里那些 HD2 原生骨名。
+local SNAPSHOT_JOINTS =
+{
+	"hips", "spine", "spine1", "spine2", "chest", "neck", "head",
+	"l_thigh", "r_thigh", "l_knee", "r_knee", "l_foot", "r_foot", "l_toe", "r_toe",
+	"l_shoulder", "r_shoulder", "l_elbow", "r_elbow", "l_hand", "r_hand",
+}
+
+--- 自动清单：**运行时自己知道它在驱动哪些骨**，不需要外部把名字喂进来。
+--- 2026-11-09 实测：请求里的名字是"上一局那件护甲"的，换一件就全落空；
+--- 而链骨名字每帧都在 `session.sessions[i].chain` 里，直接抄下来最可靠。
+local function snapshot_auto_ids(runtime)
+	local ids, seen = {}, {}
+	local function pushName(name)
+		if type(name) ~= "string" or #name == 0 or seen[name] then return end
+		if #ids >= SNAPSHOT_MAX_NODES then return end
+		seen[name] = true
+		ids[#ids + 1] = { name = name, label = name }
+	end
+	for _, name in ipairs(SNAPSHOT_JOINTS) do pushName(name) end
+	for _, session in ipairs(runtime.sessions or {}) do
+		for _, item in ipairs(session.sessions or {}) do
+			for _, bone in ipairs(item.chain or {}) do pushName(bone.name) end
+		end
+	end
+	return ids
+end
+
+--- 拍一帧：逐节点读世界位置 + 世界旋转，顺带把每条链的弹簧状态抄下来。
+--- 所有引擎调用都包 pcall：一根骨读不出来不能让整次快照作废。
+---
+--- `units` 是**一串**候选 unit（不是单个）：一具护甲被拆成头盔/胸/髋/腿…好几个 unit，
+--- 同一个骨名只在其中某一个上存在。只试第一个 unit 就会全军覆没——
+--- 2026-11-09 实测：`hips` 和求解器正在驱动的链骨都报"缺"，就因为只试了头盔那一个。
+local function snapshot_frame(S_, runtime, units, ids, frame)
+	local nodeRows, missing = {}, 0
+	local probe = runtime.snapshotState ~= nil and runtime.snapshotState.request ~= nil
+		and runtime.snapshotState.request.probe == true
+	for index = 1, #ids do
+		local entry = ids[index]
+		local detail, row, hitUnit = nil, nil, nil
+		if probe then detail = "id=" .. tostring(entry.id) .. "(" .. type(entry.id) .. ") " end
+		for unitIndex = 1, #units do
+			local unit = units[unitIndex].unit
+			-- ⚠️ 一律**先用名字字符串**：实测 `Application.string_to_id32` 返回的是
+			-- `IdString32` userdata，而且它是**会失效的**（探针日志里直接印出 `[Stale IdString32]`）。
+			-- 把它存起来跨帧用，`has_node` 一律返回 false —— 这正是"按哈希采回来 0 个"的原因。
+			-- 名字字符串没有这个问题，`has_node(unit, "hips")` 稳定为 true。
+			local key = entry.name
+			local okHas, has = false, false
+			if key ~= nil then
+				okHas, has = pcall(S_.Unit.has_node, unit, key)
+			end
+			if not (okHas and has == true) and entry.id ~= nil then
+				-- 只有哈希、没有名字的条目：现算一次 id32 再用（不跨帧缓存）。
+				okHas, has = pcall(S_.Unit.has_node, unit, entry.id)
+				if okHas and has == true then key = entry.id end
+			end
+			if probe then detail = detail .. string.format("u%d=%s ", unitIndex, tostring(has)) end
+			if okHas and has == true then
+				local okNode, node = pcall(function() return S_.Unit.node(unit, key) end)
+				if probe then detail = detail .. "node=" .. tostring(node) .. "(" .. type(node) .. ") " end
+				if okNode and node ~= nil then
+					local okPos, px, py, pz = pcall(function()
+						return S_.Vector3.to_elements(S_.Unit.world_position(unit, node))
+					end)
+					-- 四元数必须与 world_rotation 在同一次调用内取完（引擎句柄寿命问题，见 compat 的 read_quat4）
+					local okRot, qx, qy, qz, qw = pcall(function()
+						return S_.Quaternion.to_elements(S_.Unit.world_rotation(unit, node))
+					end)
+					if probe then
+						detail = detail .. string.format("pos=%s/%s rot=%s/%s ", tostring(okPos),
+							type(px) == "number" and string.format("%.3f", px) or tostring(px),
+							tostring(okRot), type(qx) == "number" and string.format("%.3f", qx) or tostring(qx))
+					end
+					if okPos and type(px) == "number" and okRot and type(qx) == "number" then
+						row = {
+							id = entry.label,
+							unit = unitIndex,
+							x = px, y = py, z = pz,
+							qx = qx, qy = qy, qz = qz, qw = qw,
+						}
+						hitUnit = unitIndex
+						break
+					end
+				end
+			end
+		end
+		if row ~= nil then
+			nodeRows[#nodeRows + 1] = row
+		else
+			missing = missing + 1
+		end
+		if probe and index <= 6 then
+			runtime.logger("[physbone][快照][探针] #%d %s⇒ %s", index, tostring(entry.name or entry.label),
+				tostring(detail) .. (hitUnit ~= nil and ("命中 u" .. hitUnit) or "全未命中"))
+		end
+	end
+
+	local chains = {}
+	for _, session in ipairs(runtime.sessions or {}) do
+		for _, item in ipairs(session.sessions or {}) do
+			local bones = {}
+			local springs = item.springs or {}
+			local chain = item.chain or {}
+			for i = 1, #chain do
+				local spring = springs[i]
+				-- 弹簧角度在求解器里是**弧度**；写出去换成度，省得读的人再做一次换算
+				-- （已经因为"限位打印 0°"这种事白查过一轮）。
+				bones[#bones + 1] = {
+					name = tostring(chain[i] and chain[i].name or "?"),
+					yawDeg = spring ~= nil and (spring.yaw or 0) * 180 / math.pi or 0,
+					pitchDeg = spring ~= nil and (spring.pitch or 0) * 180 / math.pi or 0,
+				}
+			end
+			chains[#chains + 1] = {
+				root = tostring(chain[1] and chain[1].name or "?"),
+				anchor = tostring(item.anchorNode ~= nil and "resolved" or "?"),
+				bones = bones,
+			}
+		end
+	end
+
+	return { frame = frame, nodes = nodeRows, missing = missing, chains = chains }
+end
+
+local function json_number(value)
+	if type(value) ~= "number" or value ~= value or value == math.huge or value == -math.huge then
+		return "null"
+	end
+	return string.format("%.6f", value)
+end
+
+local function json_string(value)
+	local text = tostring(value):gsub('[%z\1-\31\\"]', function(character)
+		return string.format("\\u%04x", character:byte())
+	end)
+	return '"' .. text .. '"'
+end
+
+--- 把几帧拼成一份自描述的 JSON。字段名写清楚，是为了**半年后**还能读懂。
+local function snapshot_json(runtime, request, unitTag, frames, capturedUtc)
+	local parts = {}
+	parts[#parts + 1] = string.format(
+		'{"schema":"hd2physbone.snap/1","runtime":"%s","seq":%s,"captured":"%s","unit":%s,'
+			.. '"framesRequested":%d,"stride":%d,"frames":[',
+		tostring(M.VERSION), request.seq ~= nil and json_string(request.seq) or "null",
+		capturedUtc, json_string(unitTag), request.frames, request.stride)
+	for frameIndex, frame in ipairs(frames) do
+		if frameIndex > 1 then parts[#parts + 1] = "," end
+		parts[#parts + 1] = string.format('{"frame":%d,"missingNodes":%d,"nodes":[', frame.frame, frame.missing)
+		for nodeIndex, node in ipairs(frame.nodes) do
+			if nodeIndex > 1 then parts[#parts + 1] = "," end
+			parts[#parts + 1] = string.format('{"id":"%s","x":%s,"y":%s,"z":%s,"qx":%s,"qy":%s,"qz":%s,"qw":%s}',
+				node.id:gsub('"', ""), json_number(node.x), json_number(node.y), json_number(node.z),
+				json_number(node.qx), json_number(node.qy), json_number(node.qz), json_number(node.qw))
+		end
+		parts[#parts + 1] = '],"chains":['
+		for chainIndex, chain in ipairs(frame.chains) do
+			if chainIndex > 1 then parts[#parts + 1] = "," end
+			parts[#parts + 1] = string.format('{"root":%s,"bones":[', json_string(chain.root))
+			for boneIndex, bone in ipairs(chain.bones) do
+				if boneIndex > 1 then parts[#parts + 1] = "," end
+				parts[#parts + 1] = string.format('{"name":%s,"yawDeg":%s,"pitchDeg":%s}',
+					json_string(bone.name), json_number(bone.yawDeg), json_number(bone.pitchDeg))
+			end
+			parts[#parts + 1] = "]}"
+		end
+		parts[#parts + 1] = "]}"
+	end
+	parts[#parts + 1] = string.format('],"driveFrames":%d,"dt":%s}', runtime.driveFrames or 0, json_number(runtime.dt))
+	return table.concat(parts)
+end
+
+--- 轮询一次请求。只有目录存在、请求内容变了才动手；平时每 30 帧一次 io.open，成本可忽略。
+local function snapshot_poll(S_, runtime, options)
+	local dir = snapshot_dir(options)
+	if dir == nil then return end
+	local state = runtime.snapshotState
+	if state == nil then
+		state = { seq = 0, signature = nil, framesLeft = 0, skip = 0, frames = {}, ids = nil, reported = false }
+		runtime.snapshotState = state
+	end
+
+	-- ① 采集中：按 stride 每帧记一张，够数就落盘
+	if state.framesLeft > 0 then
+		if state.skip > 0 then
+			state.skip = state.skip - 1
+			return
+		end
+		-- 一具护甲是**一堆 unit**（头盔/胸/髋/腿…），同一个骨名只在其中一个上存在。
+		-- 所以这里把所有会话的 unit 都收集起来，逐个试，第一个命中就用它。
+		local units, tags = {}, {}
+		for _, session in ipairs(runtime.sessions or {}) do
+			if session.unit ~= nil then
+				units[#units + 1] = { unit = session.unit, tag = tostring(session.unitTag or "?") }
+				tags[#tags + 1] = tostring(session.unitTag or "?")
+			end
+		end
+		if #units == 0 then
+			-- 还没有挂上任何会话（读图/换甲的空窗期）：**不许消耗帧数**，
+			-- 否则会写出一份 0 帧的残文件，看起来像"采到了"，实际什么都没有。
+			state.waitFrames = (state.waitFrames or 0) + 1
+			if state.waitFrames > (options.snapshotWaitFrames or 600) then
+				runtime.logger("[physbone][快照] 等了 %d 帧仍然没有可采的会话，放弃这次请求", state.waitFrames)
+				state.framesLeft = 0
+				state.frames = {}
+				state.waitFrames = 0
+			end
+			return
+		end
+		state.waitFrames = 0
+		state.skip = (state.request and state.request.stride or 2) - 1
+		local sampleIndex = (state.request.frames - state.framesLeft) + 1
+		local unitTag = #tags > 0 and string.format("%s 等 %d 个", tags[1], #tags) or "?"
+		-- 自动模式下**每帧现算**清单：护甲可能刚换过，链骨名跟着变。
+		local ids = state.ids
+		if state.request ~= nil and state.request.auto == true then ids = snapshot_auto_ids(runtime) end
+		-- 每帧**先**打一行再采：万一这一帧把游戏读崩了，日志里最后一行就是崩在哪一帧、
+		-- 采了多少个节点。没有这一行，"闪退"在现场只能靠猜（2026-11-09 就猜了一轮）。
+		runtime.logger("[physbone][快照] 开始第 %d/%d 帧：%d 个节点、%d 个候选 unit",
+			sampleIndex, state.request.frames, #(ids or {}), #units)
+		local sample = snapshot_frame(S_, runtime, units, ids or {}, runtime.frame or 0)
+		state.lastTag = unitTag
+		state.framesLeft = state.framesLeft - 1
+		-- 每帧单独落盘：游戏要是在后面的帧上崩了，前面采到的还在；
+		-- "最后写出的那个文件"也直接告诉我们崩在第几帧。
+		local name = string.format("snapshot-%04d-s%02d.json", state.seq, sampleIndex)
+		local path = dir .. "\\" .. name
+		local text = snapshot_json(runtime, state.request, unitTag, { sample }, os.date("%Y-%m-%dT%H:%M:%S"))
+		local ok, handle = pcall(io.open, path, "wb")
+		if ok and handle ~= nil then
+			handle:write(text)
+			handle:close()
+			runtime.logger("[physbone][快照] 已写出 %s（%d 个节点，缺 %d）", name, #sample.nodes, sample.missing)
+		else
+			runtime.logger("[physbone][快照] 写不出 %s（目录是否存在？）", path)
+		end
+		if state.framesLeft > 0 then return end
+		state.frames = {}
+		local okDone, done = pcall(io.open, dir .. "\\done.txt", "wb")
+		if okDone and done ~= nil then
+			done:write(string.format("seq=%d frames=%d\n", state.seq, state.request.frames))
+			done:close()
+		end
+		return
+	end
+
+	-- ② 空闲：每 N 帧看一次请求文件
+	if ((runtime.driveFrames or 0) % (options.snapshotPollFrames or SNAPSHOT_POLL_FRAMES)) ~= 0 then return end
+	local okOpen, handle = pcall(io.open, dir .. "\\request.txt", "rb")
+	if not okOpen or handle == nil then return end
+	local text = handle:read("*a") or ""
+	handle:close()
+	if #text == 0 or text == state.signature then return end
+
+	local request = parse_snapshot_request(text)
+	if request == nil then
+		state.signature = text
+		if not state.reported then
+			state.reported = true
+			runtime.logger("[physbone][快照] 请求里没有 node/name 行，忽略")
+		end
+		return
+	end
+	state.signature = text
+	state.request = request
+	state.ids = snapshot_ids(S_, request)
+	state.seq = state.seq + 1
+	state.frames = {}
+	state.framesLeft = request.frames
+	state.skip = 0
+	runtime.logger("[physbone][快照] 收到请求 seq=%s：%d 帧 × 每 %d 帧一张、%d 个节点",
+		tostring(request.seq or "?"), request.frames, request.stride, #state.ids)
+end
+
+-- ---------------------------------------------------------------------------
+-- 裙摆外推（keep-out）
+--
+-- 依据（2026-11-09 实机 96 帧采样）：静止时后裙骨点离髋部身体表面 +0.8～+5 cm，
+-- 跑动时最深 **−8.2 cm**（几乎总是右后那条 `source_extra_120`）。摆幅约 13 cm。
+--
+-- 做法：标定时记下"静止时的半径"，之后低于它就把链根往外转一点转回来。
+-- 只动**挂在 hips 上的链的链根**——整片布靠链根朝向摆，逐节动会把布扯变形。
+-- 参数全走调参文件（`%LOCALAPPDATA%\hd2pbx_tune.txt`，2 秒重读一次），所以
+-- 在游戏里改数字就生效，不用重启、不用重新部署。
+--
+--   skirt        = 1     0=关，1=开
+--   skirtcal     = 1     置 1 且**站着**，运行时就地记下当前半径当基准；之后置回 0
+--   skirtGain    = 0.35  每帧纠正亏损量的比例（1 = 一步到位，容易抖）
+--   skirtMaxDeg  = 12    单帧最多转多少度（保底，防止瞬间甩飞）
+--   skirtMargin  = 0.005 额外留白（米）
+--   skirtArm     = 0.30  力臂（米）：布大概从骨点往外延伸多远，用来把"距离"换成"角度"
+-- ---------------------------------------------------------------------------
+local SKIRT_DEFAULTS = {
+	gain = 0.35, maxDeg = 12, margin = 0.005, arm = 0.30,
+	-- 两处平滑的时间常数（秒）。它们存在的唯一目的是**去掉帧间抖动**：
+	-- 权重和"正后方"轴如果每帧按当前姿态重算，就会跟着步频一起摆。
+	-- weight 的语义其实是**静态**的（这根骨在裙子的哪一侧），所以宁慢不抖：1.2 秒。
+	weightSeconds = 1.2, backSeconds = 0.5,
+	-- 自适应上限（临时值，按布料相对自己基线的垂度反馈）：
+	--   · tilt（骨方向与世界水平的夹角，取绝对值）比该链观察到的**峰值**低 capDropDelta 以上
+	--     ⇒ 判定被推高/被甩高，每帧把上限降 capDropStep 度；
+	--   · tilt 回到峰值 capRiseDelta 以内 ⇒ 每 capRiseFrames 帧恢复 capRiseStep 度；
+	--   · 两者之间是**死区**，不动（没有死区就会在阈值上来回跳 = 慢速脉动）。
+	-- 为什么用"相对峰值"而不是绝对角度：实测自然下垂的链只有 41~61°，
+	-- 写死 45/65 会把大量自然下垂的链也判成被推高（2.1.11 就这么整片失效的）。
+	-- tiltDecay：峰值每秒回落多少度，让裙子换了/姿态变了之后能重新学习。
+	-- tiltBase 只在**没在推**的时候学（见 skirt_chain）。基线用来防误伤：
+	-- 自然就只有 41~61° 的链不该被当成"被推高"。
+	capDropDeg = 45, capRiseDeg = 65, capDropDelta = 5, capRiseDelta = 3,
+	capDropStep = 1, capRiseStep = 1, capRiseFrames = 3,
+	capFloor = 0, capSmoothSeconds = 0.15,
+	-- 上限的硬性下限（相对手调值的比例）：保证"永远不会被压到 0"。
+	capFloorRatio = 0.35,
+}
+
+--- 预设枚举：把"旋转加在哪个坐标系、正负号"这 8 种可能一次列全，让实机去分辨。
+--- <para>
+--- 为什么用枚举而不是推理：`write_pose` 把 (轴, 角) 解释成什么（父空间增量？局部增量？
+--- 绝对旋转？）读代码看不出来，猜错的代价是"画面毫无变化"，而那时根本分不清是
+--- 轴错了、帧错了、还是没写进去。8 个预设、每个都恒定 60°，一眼就能分出对错。
+--- </para>
+--- <para>
+--- 预设**不看** keep-out、不做亏损判断：站着不动时也要一眼看得出效果，
+--- 否则"没反应"会被误读成预设失效。这是诊断模式，不是最终行为。
+--- </para>
+local PRESET_DEGREES = 60
+local PRESETS =
+{
+	-- { 模式, 符号 }  模式 1/2 = 前乘（轴：1=父空间、2=世界）；3/4 = 后乘（同理）
+	{ 1, 1 }, { 1, -1 }, { 2, 1 }, { 2, -1 },
+	{ 3, 1 }, { 3, -1 }, { 4, 1 }, { 4, -1 },
+}
+
+local function preset_label(index)
+	local preset = PRESETS[index]
+	if preset == nil then return "无" end
+	local frame = (preset[1] == 1 or preset[1] == 3) and "父空间轴" or "世界轴"
+	local order = (preset[1] <= 2) and "前乘" or "后乘"
+	return string.format("%d/%d：%s %s %s%.0f°", index, #PRESETS, frame, order,
+		preset[2] > 0 and "+" or "−", PRESET_DEGREES)
+end
+
+local function skirt_settings(runtime)
+	local values = tune_values(runtime) or {}
+	return {
+		enabled = (values.skirt or 0) ~= 0,
+		calibrate = (values.skirtcal or 0) ~= 0,
+		gain = values.skirtGain or SKIRT_DEFAULTS.gain,
+		maxDeg = values.skirtMaxDeg or SKIRT_DEFAULTS.maxDeg,
+		margin = values.skirtMargin or SKIRT_DEFAULTS.margin,
+		arm = values.skirtArm or SKIRT_DEFAULTS.arm,
+		-- 手调角度（度）：>0 时**只要这条链有亏损**就用这个角度，不再按"亏损/力臂"推。
+		-- 为什么需要它：力臂是估的，实测偏小会让算出来的角度只有 3~4°（肉眼等于没动）。
+		-- 手调扫一遍，用眼睛定一个"多数裙子都好看又不穿"的值，比按力矩推可靠得多。
+		manualDeg = values.skirtDeg or 0,
+		-- 没手调时按"每 1 cm 亏损转多少度"换算（缺省 6°/cm）。
+		degPerCm = values.skirtDegPerCm or 6,
+		-- 运动斜坡：静止 0°、跑起来满额。实测"静止 0 度就够用，只有奔跑才需要角度"。
+		idleSpeed = values.skirtIdleSpeed or 0.5,     -- m/s，以下视为静止
+		runSpeed = values.skirtRunSpeed or 2.0,       -- m/s，以上视为满额
+		rampSeconds = values.skirtRampSeconds or 0.25,
+		-- "方向权重"收敛的多快。调小 = 更跟手但更抖；调大 = 更稳。
+		weightSeconds = values.skirtWeightSeconds or SKIRT_DEFAULTS.weightSeconds,
+		-- "正后方"轴收敛的多快。跑步时两条大腿前后交替，(l_thigh − r_thigh)
+		-- 每一步都在转，不快不行；但又不能太快，否则权重跟着摆。
+		backSeconds = values.skirtBackSeconds or SKIRT_DEFAULTS.backSeconds,
+		-- 自适应上限：绝对阈值（capDropDeg/capRiseDeg）为主，
+		-- 再加"相对自己历史峰值"的保险（capDropDelta/capRiseDelta），避免自然就趴着的链被误伤。
+		capDropDeg = values.skirtCapDropDeg or SKIRT_DEFAULTS.capDropDeg,
+		capRiseDeg = values.skirtCapRiseDeg or SKIRT_DEFAULTS.capRiseDeg,
+		capDropDelta = values.skirtCapDropDelta or SKIRT_DEFAULTS.capDropDelta,
+		capRiseDelta = values.skirtCapRiseDelta or SKIRT_DEFAULTS.capRiseDelta,
+		capDropStep = values.skirtCapDropStep or SKIRT_DEFAULTS.capDropStep,
+		capRiseStep = values.skirtCapRiseStep or SKIRT_DEFAULTS.capRiseStep,
+		capRiseFrames = math.max(1, math.floor(values.skirtCapRiseFrames or SKIRT_DEFAULTS.capRiseFrames)),
+		capFloor = values.skirtCapFloor or SKIRT_DEFAULTS.capFloor,
+		capFloorRatio = values.skirtCapFloorRatio or SKIRT_DEFAULTS.capFloorRatio,
+		capSmoothSeconds = values.skirtCapSmoothSeconds or SKIRT_DEFAULTS.capSmoothSeconds,
+		-- 方向加权的手性开关：叉乘出来的"后"可能是前，翻号即可。
+		backSign = (values.skirtBackSign or 1) < 0 and -1 or 1,
+		-- sign 只为"方向验证"存在：置 -1 就把纠正方向反过来，不必改代码重新部署。
+		sign = (values.skirtSign or 1) < 0 and -1 or 1,
+		-- 预设枚举（诊断）：>0 时完全接管，恒定角度、不看 keep-out。
+		preset = math.floor(values.preset or 0),
+		all = (values.skirtAll or 0) ~= 0,
+	}
+end
+
+--- 会话级的两个参照点：hips（圆心）与 chest（上方向）。解析不到就放弃这一帧。
+local function skirt_refs(S_, session)
+	local refs = session.skirtRefs
+	if refs ~= nil then return refs end
+	if S_.Unit == nil or session.unit == nil then return nil end
+	local okCount, count = pcall(function() return S_.Unit.num_scene_graph_items(session.unit) end)
+	if not okCount or type(count) ~= "number" then return nil end
+	local function nodeOf(name)
+		local okHas, has = pcall(S_.Unit.has_node, session.unit, name)
+		if not okHas or has ~= true then return nil end
+		local okNode, node = pcall(function() return S_.Unit.node(session.unit, name) end)
+		if okNode and type(node) == "number" and node >= 1 and node <= count then return node end
+		return nil
+	end
+	local hipsNode, chestNode = nodeOf("hips"), nodeOf("chest")
+	if hipsNode == nil then return nil end
+	refs = { hips = hipsNode, chest = chestNode, lThigh = nodeOf("l_thigh"), rThigh = nodeOf("r_thigh") }
+	session.skirtRefs = refs
+	return refs
+end
+
+local function worldPos(S_, unit, node)
+	local ok, x, y, z = pcall(function()
+		return S_.Vector3.to_elements(S_.Unit.world_position(unit, node))
+	end)
+	if ok and type(x) == "number" then return x, y, z end
+	return nil
+end
+
+--- 哪些链算"裙摆/连衣裙布料"。
+---
+--- 原来只认父骨名含 `hips`，于是**挂在胸口背后的连衣裙骨被整条漏掉**
+--- （实机反馈：有些裙子是连衣裙做法，骨在胸口那一层）。
+--- 现在两条判据，命中任一即可；结果**缓存**在 `item.skirtEligible`（躯干带相对身体是不变的，
+--- 只有名字认不出时才需要一次世界坐标查询）。
+---
+--- 安全边界不在"选中"，而在权重：正前/侧面的 cos(夹角) ≤ 0 ⇒ 一根都不会动。
+--- 所以放宽选中范围不会让乳房/小腹的骨被推动。
+local SKIRT_PARENT_HINTS = { "hips", "pelvis", "spine", "chest", "torso", "waist" }
+
+---@return boolean|nil true/false = 已确定；nil = 这一帧还没法判断（等下次）
+local function skirt_eligible(S_, session, item, body)
+	if item.skirtEligible ~= nil then return item.skirtEligible end
+	local parent = item.chain and item.chain[1] and item.chain[1].parentName
+	local lower = type(parent) == "string" and parent:lower() or ""
+	for _, hint in ipairs(SKIRT_PARENT_HINTS) do
+		if lower:find(hint, 1, true) ~= nil then
+			item.skirtEligible = true
+			item.skirtEligibleWhy = "name:" .. hint
+			return true
+		end
+	end
+	-- 名字认不出（`source_extra_*` 这类）：用高度带兜底。
+	-- 带 = [hips 下方 10 cm, chest 上方 15 cm]：兜住挂在胸口/腰上的布料，
+	-- 同时把头/头发（在 chest 上方更远）和腿（在 hips 下方）排除。
+	if body ~= nil and body.hz ~= nil and body.cz ~= nil and item.nodes ~= nil and item.nodes[1] ~= nil then
+		local _, _, rz = worldPos(S_, session.unit, item.nodes[1])
+		if rz ~= nil then
+			local inside = rz >= (body.hz - 0.10) and rz <= (body.cz + 0.15)
+			item.skirtEligible = inside
+			item.skirtEligibleWhy = inside and "height" or "outside"
+			return inside
+		end
+	end
+	return nil
+end
+
+--- 对一条链做"标定"或"纠正"。返回是否改动了 pushOut。
+local function skirt_chain(S_, runtime, session, item, settings, calibrating, logger)
+	local refs = skirt_refs(S_, session)
+	if refs == nil then return false end
+	local nodes = item.nodes
+	if nodes == nil or #nodes == 0 then return false end
+	local deep = nodes[#nodes]
+	local dx, dy, dz = worldPos(S_, session.unit, deep)
+	if dx == nil then return false end
+	local hx, hy, hz = worldPos(S_, session.unit, refs.hips)
+	if hx == nil then return false end
+	-- 上方向：優先 chest−hips，拿不到就用世界 +Z（HD2 是 Z 向上）
+	local ux, uy, uz = 0, 0, 1
+	if refs.chest ~= nil then
+		local cx, cy, cz = worldPos(S_, session.unit, refs.chest)
+		if cx ~= nil then
+			local vx, vy, vz = cx - hx, cy - hy, cz - hz
+			local len = math.sqrt(vx * vx + vy * vy + vz * vz)
+			if len > 0.05 then ux, uy, uz = vx / len, vy / len, vz / len end
+		end
+	end
+	-- 相对 hips 的位移，去掉沿上方向的分量 ⇒ 水平径向
+	local px, py, pz = dx - hx, dy - hy, dz - hz
+	local along = px * ux + py * uy + pz * uz
+	local rx, ry, rz = px - along * ux, py - along * uy, pz - along * uz
+	local radius = math.sqrt(rx * rx + ry * ry + rz * rz)
+	if radius < 1e-4 then return false end
+	local rnx, rny, rnz = rx / radius, ry / radius, rz / radius
+
+	-- "这块布有多垂" = **这根骨自己的方向**（链根 → 链尾）与世界水平面的夹角，取绝对值。
+	--
+	-- 两个坑（都是实测踩的，别再踩）：
+	--   ① 不能用 hips → 链尾：链尾在世界 z 上可能比 hips 还高，算出来恒为负，
+	--      于是每一帧都被判成"太横"，上限几帧内归零 ⇒ 整个功能等于关掉。
+	--   ② 不能依赖符号：z 轴朝上还是朝下、链的节点顺序从腰到摆还是从摆到腰，
+	--      从运行时代码里看不出来。取绝对值后这些都不影响。
+	--
+	-- 角度本身也不适合写死阈值：实测"垂着"的链只有 41~61°，不是直觉上的 60~90°，
+	-- 所以绝对阈值 45/65 会把大量自然下垂的链也判成"被推高"。改成相对各自基线（见下）。
+	local tilt = 0
+	do
+		local r0x, r0y, r0z = worldPos(S_, session.unit, nodes[1])
+		if r0x ~= nil then
+			local vx, vy, vz = dx - r0x, dy - r0y, dz - r0z
+			local horiz = math.sqrt(vx * vx + vy * vy)
+			tilt = math.abs(math.atan2(vz, horiz)) * 180 / math.pi
+		end
+	end
+	do
+		local sk = (runtime.dt or (1 / 60)) / math.max(settings.capSmoothSeconds, 0.02)
+		if sk > 1 then sk = 1 end
+		if item.skirtSag == nil then item.skirtSag = tilt
+		else item.skirtSag = item.skirtSag + (tilt - item.skirtSag) * sk end
+	end
+	item.skirtSagRaw = tilt
+
+	if calibrating then
+		if item.keepOut == nil then
+			item.keepOut = radius
+			logger("[physbone][裙摆][标定] %s r=%.3f m", tostring(item.chain[1] and item.chain[1].name), radius)
+		end
+		return false
+	end
+	-- 没标定过就用当前半径当基准：亏损算出来是 0，只影响下面的"按亏换算角度"那一档，
+	-- 不影响手调角度。
+	local keepOut = item.keepOut or radius
+	local deficit = keepOut + settings.margin - radius
+	-- **这里原本是致命的一处开关**（2.1.8 及更早）：deficit <= 0 就 pushOut=nil 并 return，
+	-- 于是后面那句"无条件加"永远走不到。实机证据（同局日志）：180 条 hips 链只有 26~51
+	-- 条被推，且每几帧在 26/34/35/43/51 之间跳；跑动时角度确实到 29~30° ⇒ 不是算小了，
+	-- 是多数帧**根本没加**。用户看到的就是"大多被拉回，少数保持角度"。
+	-- 现在亏损只用于报数和"按亏损换算角度"那一档，不再当开关。
+	if settings.preset > 0 then
+		-- 诊断模式：不看 keep-out、不算亏损，恒定 60° 往外摆（或往里，看符号）。
+		local preset = PRESETS[settings.preset]
+		if preset == nil then return false end
+		local ax, ay, az = rny * uz - rnz * uy, rnz * ux - rnx * uz, rnx * uy - rny * ux
+		local alen = math.sqrt(ax * ax + ay * ay + az * az)
+		if alen < 1e-6 then return false end
+		item.pushOut = { ax / alen, ay / alen, az / alen,
+			PRESET_DEGREES * math.pi / 180 * preset[2], preset[1] }
+		item.pushOutAll = settings.all
+		return true
+	end
+		-- 把"要补的距离"换成"要转的角度"：θ ≈ 亏损 / 力臂
+	-- 角度：手调优先（度），否则按"每厘米亏损多少度"换算。
+	-- 上一次的教训：`gain × 亏损 / 力臂` 在 deficit≈2 cm、arm=0.3 m 时只有 3.8°，
+	-- 而日志打的是**上限** 60°，于是我自己得出"推满了也没用"的错误结论。
+	-- ① 方向权重：只给"朝后"的那部分。夹角按**角度线性**拆（45° 给一半 15°），
+	--    这是用户明确要的语义：侧面/正前一点都不分。
+	local back = session.skirtBack
+	local liveWeight = 1.0
+	if back ~= nil then
+		local dot = rnx * back[1] + rny * back[2] + rnz * back[3]
+		if dot < -1 then dot = -1 elseif dot > 1 then dot = 1 end
+		local deviation = math.acos(dot) * 180 / math.pi      -- 与"正后方"的夹角
+		-- **权重 = cos(夹角)**（= dot 本身），偏前一律 0。
+		--
+		-- 为什么不用线性 `1 − θ/90`：
+		--   d/dθ[1 − θ/90] = 常数 ⇒ 侧面附近仍然按同样速度给角度，
+		--   于是"差一点没到侧面"的骨头也拿得到可观的角度，前方布料一被物理甩到后面
+		--   就会被我们顺势推进小腹（实机反馈）。
+		--   d/dθ[cos θ] = −sin θ ⇒ 正后方导数为 0（平坦、稳），越靠侧面掉得越快，
+		--   90° 处正好掉到 0。用户给的形状描述就是"半个椭圆"。
+		-- 附带好处：cos 不需要再算 acos，dot 直接就是权重。
+		liveWeight = dot > 0 and dot or 0
+		item.skirtDeviation = deviation
+	end
+	-- 权重按时间常数平滑（不是每帧直接用瞬时值）。
+	-- 为什么：瞬时权重 = f(当前姿态)，而姿态又被我们自己的偏移改变 ⇒ 反馈回路，
+	-- 表现为同一块布的角度每帧变（实测整片在 13°↔30° 之间集体摆）。
+	-- 平滑之后每条骨拿到的角度基本恒定 = 用户要的"恒定偏移"。
+	local weight = item.skirtWeight
+	if weight == nil then
+		weight = liveWeight
+	else
+		local wdt = runtime.dt or (1 / 60)
+		local k = wdt / math.max(settings.weightSeconds, 0.02)
+		if k > 1 then k = 1 end
+		weight = weight + (liveWeight - weight) * k
+	end
+	item.skirtWeight = weight
+
+	-- ② 迟滞的"需不需要保护"：避免在边界上每帧翻转（翻转就是抖动）。
+	local margin = settings.margin
+	if deficit > margin then
+		item.skirtNeed = 1
+	elseif deficit < -margin then
+		item.skirtNeed = nil
+	end
+
+	-- ③ 平滑追值：目标 = 方向权重 × 运动斜坡。
+	--    **不再乘"需要标记"**：那个标记跟着链骨半径过门槛翻转，翻转就是闪烁。
+	--    叠加关系，不是竞争关系：物理怎么摆，我们都在它的结果上多给一个恒定偏移。
+	local target = weight * (session.skirtMotion or 0)
+	local level = item.skirtLevel or 0
+	local dt = runtime.dt or (1 / 60)
+	local step = dt / math.max(settings.rampSeconds, 0.02)
+	if level < target then
+		level = math.min(target, level + step)
+	elseif level > target then
+		level = math.max(target, level - step)
+	end
+	item.skirtLevel = level
+	item.skirtDebug = { weight = weight, level = level, deviation = back ~= nil and weight or nil }
+
+	-- 按亏损换算的那一档必须夹住：deficit 现在可能为负（半径比标定值大），
+	-- 直接乘会得到一个负角度 ⇒ 往里推 ⇒ 正好推进屁股里。
+	local cm = deficit > 0 and deficit * 100 or 0
+	local degrees = settings.manualDeg > 0 and settings.manualDeg or settings.degPerCm * cm
+	local magnitude = degrees * level
+
+	-- ③ 自适应上限（临时值）：按这块布**有多垂**反馈。
+	--    基线 tiltBase 只在**没在推的时候**学（level < 0.05 ⇒ 这块布此刻的角度就是它自然的角度）。
+	--    为什么不能在推的时候学：推本身就在压低 tilt，学出来的"基线"会跟着上限一起往下跑，
+	--    系统会收敛到接近 0（离线模拟验证过，这是第一版相对阈值的致命缺陷）。
+	--    判定：绝对阈值为主（用户给的规则），基线只用来**防误伤**——
+	--    自然就只有 41~61° 的链不该被当成"被推高"，它要求比自己自然状态再低 capDropDelta 才算。
+	local ceiling = settings.manualDeg > 0 and settings.manualDeg or settings.maxDeg
+	local cap = item.skirtCap
+	if cap == nil then cap = ceiling end
+	local tiltSmooth = item.skirtSag or tilt
+	if level < 0.05 then
+		-- 自然状态：可能是站着、也可能是刚松开跑动。按 0.3 秒平滑学一次。
+		local bk = dt / 0.3
+		if bk > 1 then bk = 1 end
+		if item.skirtTiltBase == nil then item.skirtTiltBase = tiltSmooth
+		else item.skirtTiltBase = item.skirtTiltBase + (tiltSmooth - item.skirtTiltBase) * bk end
+	end
+	local base = item.skirtTiltBase
+	local tooHigh = tiltSmooth < settings.capDropDeg
+		and (base == nil or tiltSmooth < base - settings.capDropDelta)
+	local recovered = tiltSmooth > settings.capRiseDeg
+		or (base ~= nil and tiltSmooth > base - settings.capRiseDelta)
+	if tooHigh then
+		item.skirtCapRise = 0
+		if magnitude > 0.5 then cap = cap - settings.capDropStep end
+	elseif recovered then
+		item.skirtCapRise = (item.skirtCapRise or 0) + 1
+		if item.skirtCapRise >= settings.capRiseFrames then
+			item.skirtCapRise = 0
+			cap = cap + settings.capRiseStep
+		end
+	else
+		item.skirtCapRise = 0
+	end
+	if cap > ceiling then cap = ceiling
+	elseif cap < settings.capFloor then cap = settings.capFloor end
+	-- 兜底：上限永远不低于 ceiling 的 capFloorRatio 倍。
+	-- 为什么需要它：2.1.11 上限被压到 0，整个功能等于关掉（实机反馈"变成主线的物理一样"）。
+	-- 有了这条，无论如何都还留着一部分推力，最坏情况是"推得不够"，不会是"完全没推"。
+	local ratioFloor = ceiling * settings.capFloorRatio
+	if cap < ratioFloor then cap = ratioFloor end
+	item.skirtCap = cap
+	item.skirtCapActive = magnitude > 0.5
+	if magnitude > cap then magnitude = cap end
+
+	local angle = settings.sign * magnitude * math.pi / 180
+	local maxAngle = settings.maxDeg * math.pi / 180
+	if angle > maxAngle then angle = maxAngle elseif angle < -maxAngle then angle = -maxAngle end
+	if math.abs(angle) < 1e-5 then
+		item.pushOut = nil
+		return false
+	end
+	-- 轴 = r̂ × up：这样绕它转时，向下垂的布会朝 +r̂ 方向摆出去
+	local ax, ay, az = rny * uz - rnz * uy, rnz * ux - rnx * uz, rnx * uy - rny * ux
+	local alen = math.sqrt(ax * ax + ay * ay + az * az)
+	if alen < 1e-6 then return false end
+	item.pushOut = { ax / alen, ay / alen, az / alen, angle }
+	item.pushOutAll = settings.all
+	return true
+end
+
+--- 每帧调一次：遍历所有会话里"挂在 hips 上"的链。
+local function skirt_apply(S_, runtime)
+	local settings = skirt_settings(runtime)
+	if not settings.enabled and not settings.calibrate and settings.preset == 0 then return end
+	local allNodes = (tune_values(runtime).skirtAll or 0) ~= 0
+	local pushed, total, weighted = 0, 0, 0
+	local motionNow = 0
+	for _, session in ipairs(runtime.sessions or {}) do
+		if session.unit ~= nil then
+			-- 会话级准备：① 骨盆速度 → 运动斜坡；② "正后方"轴（世界坐标）。
+			local refs = skirt_refs(S_, session)
+			if refs ~= nil then
+				local hx, hy, hz = worldPos(S_, session.unit, refs.hips)
+				if hx ~= nil then
+					local dt = runtime.dt or (1 / 60)
+					local last = session.skirtPelvis
+					local speed = 0
+					if last ~= nil and dt > 1e-4 then
+						local dx, dy, dz = hx - last[1], hy - last[2], hz - last[3]
+						speed = math.sqrt(dx * dx + dy * dy + dz * dz) / dt
+					end
+					session.skirtPelvis = { hx, hy, hz }
+					-- 目标 0~1：静止 0、跑起来 1；再按时间常数追值，避免跳变。
+					local raw = (speed - settings.idleSpeed) / math.max(settings.runSpeed - settings.idleSpeed, 0.1)
+					if raw < 0 then raw = 0 elseif raw > 1 then raw = 1 end
+					local motion = session.skirtMotion or 0
+					local step = dt / math.max(settings.rampSeconds, 0.02)
+					if motion < raw then motion = math.min(raw, motion + step)
+					elseif motion > raw then motion = math.max(raw, motion - step) end
+					session.skirtMotion = motion
+
+					-- 正后方 = up × lateral（手性可能反，用 skirtBackSign 翻）
+					if refs.lThigh ~= nil and refs.rThigh ~= nil and refs.chest ~= nil then
+						local lx, ly, lz = worldPos(S_, session.unit, refs.lThigh)
+						local rx2, ry2, rz2 = worldPos(S_, session.unit, refs.rThigh)
+						local cx, cy, cz = worldPos(S_, session.unit, refs.chest)
+						if lx ~= nil and rx2 ~= nil and cx ~= nil then
+							-- 躯干高度带：给"名字认不出的连衣裙骨"兜底用（见 skirt_eligible）
+							session.skirtBody = { hz = hz, cz = cz }
+							-- lateral(points left) = l − r；up = chest − hips
+							local ax, ay, az = lx - rx2, ly - ry2, lz - rz2
+							local ux, uy, uz = cx - hx, cy - hy, cz - hz
+							local bx, by, bz = uy * az - uz * ay, uz * ax - ux * az, ux * ay - uy * ax
+							local blen = math.sqrt(bx * bx + by * by + bz * bz)
+							if blen > 1e-6 then
+								local nx, ny, nz = bx / blen * settings.backSign, by / blen * settings.backSign,
+									bz / blen * settings.backSign
+								-- 平滑追值：跑步时 l_thigh/r_thigh 前后交替，"l−r" 每一步都在转，
+								-- 直接用瞬时值会让所有链的权重跟着步频摆（实测 13°↔30°）。
+								local prev = session.skirtBack
+								if prev == nil then
+									session.skirtBack = { nx, ny, nz }
+								else
+									local k = dt / math.max(settings.backSeconds, 0.02)
+									if k > 1 then k = 1 end
+									local mx = prev[1] + (nx - prev[1]) * k
+									local my = prev[2] + (ny - prev[2]) * k
+									local mz = prev[3] + (nz - prev[3]) * k
+									local mlen = math.sqrt(mx * mx + my * my + mz * mz)
+									if mlen > 1e-6 then
+										session.skirtBack = { mx / mlen, my / mlen, mz / mlen }
+									end
+								end
+							end
+						end
+					end
+				end
+			end
+			-- 会话级一次性诊断：把所有链的**父骨名字**统计出来。
+			-- 为什么要它：连衣裙的骨挂在胸口那一层，名字是 `source_extra_*`，
+			-- 只有看到真实的父骨名，才知道该把哪些名字加进 SKIRT_PARENT_HINTS。
+			if session.skirtCensusDone ~= true then
+				session.skirtCensusDone = true
+				local counts, order = {}, {}
+				for _, item in ipairs(session.sessions or {}) do
+					local parent = item.chain and item.chain[1] and item.chain[1].parentName
+					local key = type(parent) == "string" and parent or "?"
+					if counts[key] == nil then
+						counts[key] = 0
+						order[#order + 1] = key
+					end
+					counts[key] = counts[key] + 1
+				end
+				local parts = {}
+				for _, key in ipairs(order) do
+					parts[#parts + 1] = string.format("%s×%d", key, counts[key])
+				end
+				runtime.logger("[physbone][裙摆][父骨] unit=%s 共 %d 条链：%s",
+					tostring(session.unitTag or "?"), #order, table.concat(parts, " "))
+			end
+			for _, item in ipairs(session.sessions or {}) do
+				-- 选中判据见 skirt_eligible：名字 hinted 命中，或链根落在躯干高度带里。
+				local eligible = skirt_eligible(S_, session, item, session.skirtBody)
+				if eligible == true then
+					total = total + 1
+					-- 标定只在**第一次**做：同一个会话里不重复覆盖（否则跑着跑着又标一次）
+					local calibrating = settings.calibrate and not session.skirtCalibrated
+					if skirt_chain(S_, runtime, session, item, settings, calibrating, runtime.logger) then
+						pushed = pushed + 1
+					end
+					-- 诊断：有多少条链"有方向权重"（= 该加的那部分）。
+					-- 推的条数应当≈这个数（跑动时）；差得多就说明还有别的门在挡。
+					if (item.skirtWeight or 0) > 0.01 then weighted = weighted + 1 end
+				end
+			end
+			motionNow = session.skirtMotion or motionNow
+			if settings.calibrate then session.skirtCalibrated = true end
+		end
+	end
+	local state = runtime.skirtState
+	if state == nil then state = { reported = nil, preset = nil }; runtime.skirtState = state end
+	if settings.preset > 0 and state.preset ~= settings.preset then
+		state.preset = settings.preset
+		runtime.logger("[physbone][裙摆][预设] %s（推了 %d 条 hips 链）",
+			preset_label(settings.preset), pushed)
+	end
+	local message = string.format("%d/%d", pushed, total)
+	-- 每秒报一次**实际用到的角度**（不是上限）。上限骗过一次人，不能再犯。
+	local frameNow = runtime.driveFrames or 0
+	if state.reported ~= message or frameNow % 120 == 0 then
+		if state.reported ~= message or (state.lastLogFrame == nil or frameNow - state.lastLogFrame >= 120) then
+			state.reported = message
+			state.lastLogFrame = frameNow
+			local maxDeg = 0
+			local degSum, degN = 0, 0
+			local bestWeight = 0
+			local capMin, capLimited, capN = nil, 0, 0
+			local sagSum, sagN = 0, 0
+			local peakSum = 0
+			local buckets = { 0, 0, 0, 0, 0, 0 }
+			local ceilingNow = settings.manualDeg > 0 and settings.manualDeg or settings.maxDeg
+			for _, session in ipairs(runtime.sessions or {}) do
+				for _, item in ipairs(session.sessions or {}) do
+					local push = item.pushOut
+					if push ~= nil then
+						local deg = math.abs(push[4]) * 180 / math.pi
+						if deg > maxDeg then maxDeg = deg end
+						degSum = degSum + deg
+						degN = degN + 1
+						-- 自适应上限：看它压到多少、有多少条被压过。
+						local cap = item.skirtCap
+						if cap ~= nil then
+							capN = capN + 1
+							if capMin == nil or cap < capMin then capMin = cap end
+							if cap < ceilingNow - 0.5 then capLimited = capLimited + 1 end
+						end
+					end
+					-- tilt 与基线：**不看是否在推**，否则站着（没有 pushOut）就永远是 0、看不到数据。
+					local tiltNow = item.skirtSag
+					if tiltNow ~= nil then
+						sagSum = sagSum + tiltNow
+						peakSum = peakSum + (item.skirtTiltBase or tiltNow)
+						sagN = sagN + 1
+					end
+					-- 方向分布：只统计"会被我们考虑的"链（权重已算过），按偏离正后方每 30° 一格。
+					-- 用途：判断"正后方"轴是否偏。环形裙子应当左右对称且最靠后那根接近 0°；
+					-- 若最近的一根也在 30~60°，说明轴偏了或裙子本身没有正中骨。
+					local dev = item.skirtDeviation
+					if dev ~= nil and (item.skirtWeight or 0) > 0 then
+						local index = math.floor(dev / 30) + 1
+						if index < 1 then index = 1 elseif index > 6 then index = 6 end
+						buckets[index] = buckets[index] + 1
+						if (item.skirtWeight or 0) > bestWeight then bestWeight = item.skirtWeight end
+					end
+				end
+			end
+			-- 均值比最大值有用：最大值只能证明"有一条推满了"，均值才说明"整片有没有动"。
+			runtime.logger(
+				"[physbone][裙摆] 推 %d/%d 条（权重>0 %d）· 角度 均值 %.1f° / 最大 %.1f° · 斜坡 %.2f（手调 %.0f°）· 权重最大 %.2f · 上限 最小 %.0f°（被压 %d/%d）· tilt 均值 %.0f° / 基线 %.0f° · 分布 %d/%d/%d/%d/%d/%d",
+				pushed, total, weighted, degN > 0 and degSum / degN or 0, maxDeg, motionNow,
+				settings.manualDeg, bestWeight,
+				capMin or ceilingNow, capLimited, capN,
+				sagN > 0 and sagSum / sagN or 0, sagN > 0 and peakSum / sagN or 0,
+				buckets[1], buckets[2], buckets[3], buckets[4], buckets[5], buckets[6])
+		end
+	end
+end
+
 local function drive(runtime)
 	local frame = runtime.frame
 	local options = runtime.options
@@ -1249,52 +2768,59 @@ local function drive(runtime)
 		runtime.waitSince = nil
 	end
 
+	-- ---------- 调度（谁拿最高物理权） ----------
+	-- 放在驱动之前：这一帧的驱动顺序就用新排好的结果。
+	-- 顺序有依赖：先把"每个玩家到相机的距离"刷新（≤4 次调用），
+	-- 热键探针、第一人称锁定、预算分档都用这一份新鲜值。
+	refresh_avatar_distances(S, runtime)
+	sched_poll(S, runtime)
+	fp_lock_watch(S, runtime)
+	scheduler_watch(S, runtime, runtime.dt)
+
 	-- ---------- 驱动 ----------
 	-- 计时不可靠（`Application.time_since_launch` 每帧只更新一次、`os.clock()` 被引擎其它
 	-- 线程污染），所以性能只报**引擎调用次数**——唯一不会被环境噪声污染的口径。
 	--
-	-- 多人局的**预算**：一帧的驱动成本几乎正比于链数（实测单人 52 链 ≈ 180 次引擎调用/帧，
-	-- 约 3.5 次/链）。四个玩家同屏就是 4 倍。真到那个量级还没问题，但"每人身上好几套 mod"
-	-- 会让链数继续翻，所以这里给一条闸：**第一位玩家（离相机最近的那个，也就是自己）每帧都算；
-	-- 其余玩家按 stride 分帧**，被动到的那一帧用**累积的 dt** 积分（compat 内部还会再拆子步），
-	-- 所以物理速度不变，只是采样率降到 1/2。观感差别极小，成本直接对半。
-	local chainTotal = 0
-	for index = 1, #runtime.sessions do
-		chainTotal = chainTotal + #(runtime.sessions[index].sessions or {})
-	end
-	local budget = options.maxChainsPerFrame or 160
-	-- 首位玩家（自己）身上的链数：这部分**不参与分帧**，始终每帧算。
-	local primaryChains = 0
-	if runtime.sessions[1] ~= nil then
-		primaryChains = #(runtime.sessions[1].sessions or {})
-	end
-	-- ── 自适应分帧（2026-11-03 实机：四人局红色折线约是绿色两倍、掉到 40 fps）──
-	-- 旧实现是**固定 stride=2**，于是四人局的实际工作量是
-	--     自己 418 链/帧 + 队友 3×418/2 ≈ 1045 链/帧
-	-- 完全没有被 budget 约束住 —— 每帧预算形同虚设，玩家越多越线性变慢。
+	-- 预算分配的目标不是"省"，而是**把清晰度按距离给出去**：
+	--   · 自己（相机旁的那位）永远每帧，不参与任何节流；
+	--   · 6 m 内的队友：每 2 帧一次（≈35~60 Hz 采样，肉眼基本看不出来）；
+	--   · 6 m 外的队友：每 4 帧起，链数吃紧时最多退到每 8 帧一次。
+	-- 老实现是"所有队友共用一个步长"，于是 6 m 内的队友和 60 m 外的一样稀疏，
+	-- 而且 4 人局步长一律顶到上限 16（≈6 Hz）——这就是"队友物理像 PPT"的量化来源。
 	--
-	-- 现在按"队友链数 / 队友预算"反推步长：队友那边每帧最多驱动 budget/2 条链。
-	-- 于是总工作量被压到 (自己 + budget/2) 附近，不再随玩家人数线性增长。
-	-- dt 仍然累积补偿（compat 内部会再拆子步），所以**物理速度不变，只是队友的采样率下降**。
-	-- 观感上：队友通常在画面里很小/很远，降采样几乎看不出来；自己永远是全速率。
-	local otherChains = chainTotal - primaryChains
-	local stride = 1
-	local otherBudget = math.max(math.floor(budget / 2), 24)
-	-- 只有**真的超预算**才分帧：队友链数在预算内时仍按每帧驱动（别为了省而省）。
-	if otherChains > otherBudget then
-		stride = math.max(2, math.ceil(otherChains / otherBudget))
-		local cap = options.maxOtherPlayerStride or 16
-		if stride > cap then stride = cap end
-	end
-	if stride ~= runtime.driveStride then
-		runtime.driveStride = stride
-		if stride > 1 then
-			logger("[physbone][预算] 自己 %d 链/帧 + 队友 %d 链 ⇒ 队友每 %d 帧驱动一次（每帧预算 %d；dt 累积补偿，速度不变）",
-				primaryChains, otherChains, stride, budget)
+	-- 被跳过的帧都把 dt **累积**到下一次（compat 内部再拆子步），
+	-- 所以物理速度不变，变的只是采样率。
+
+	-- 距离已经在这一帧开头刷新过了（见调度块），这里不再重复读。
+
+	local budget = options.maxChainsPerFrame or 160
+	-- 分档边界与兜底阈值共用同一个数（用户要的就是"6 m 这个清晰边界"）：
+	-- 近 = 会被看清的那个范围，远 = 只有轮廓的范围。
+	local nearMetres = sched_settings(runtime).metres
+	local nearLimit2 = nearMetres * nearMetres
+	local primaryChains, nearChains, farChains = 0, 0, 0
+	for index = 1, #runtime.sessions do
+		local session = runtime.sessions[index]
+		local chains = #(session.sessions or {})
+		if (session.ownerOrder or 99) <= 1 then
+			primaryChains = primaryChains + chains
+		elseif owner_distance_sq(runtime, session) <= nearLimit2 then
+			nearChains = nearChains + chains
 		else
-			logger("[physbone][预算] 链数 %d 在每帧预算 %d 以内 ⇒ 所有玩家恢复每帧驱动",
-				chainTotal, budget)
+			farChains = farChains + chains
 		end
+	end
+	local nearStride, farStride = schedule_budget(primaryChains, nearChains, farChains, budget)
+	if nearStride ~= runtime.nearStride or farStride ~= runtime.farStride then
+		runtime.nearStride, runtime.farStride = nearStride, farStride
+		logger("[physbone][预算] 自己 %d 链/帧 · %.0f m 内队友 %d 链（每 %d 帧）· 远处 %d 链（每 %d 帧）· 每帧预算 %d",
+			primaryChains, nearMetres, nearChains, nearStride, farChains, farStride, budget)
+	end
+	if primaryChains > budget and runtime.budgetOverLogged ~= true then
+		runtime.budgetOverLogged = true
+		logger("[physbone][预算] 自己身上 %d 链已超过每帧预算 %d：**不会**降低自己的采样率，"
+			.. "队友会被压到最大节流（这是设计选择：自己的观感优先）",
+			primaryChains, budget)
 	end
 
 	local written, skippedSame, engineCalls, staticChains = 0, 0, 0, 0
@@ -1308,8 +2834,14 @@ local function drive(runtime)
 		-- 时间**永远**先累积：没被驱动的这一帧不是"时间不存在"，攒到下一次一起积。
 		-- 丢了它，物理会比真实时间慢 —— 表现是"队友的头发像在水里"。
 		local pending = (session.pendingDt or 0) + dt
-		local order = session.ownerOrder or 1
-		local due = stride <= 1 or order <= 1 or (frame % stride) == ((order - 1) % stride)
+		local order = session.ownerOrder or 99
+		local due = true
+		if order > 1 then
+			local stride = owner_distance_sq(runtime, session) <= nearLimit2 and nearStride or farStride
+			-- 用**会话下标**错峰，而不是玩家序号：同一个玩家的若干护甲件如果同帧，
+			-- 每 stride 帧就会出现一次成本尖峰（帧时间抖动比平均成本更影响手感）。
+			if stride > 1 and ((frame + index) % stride) ~= 0 then due = false end
+		end
 		if not due then
 			session.pendingDt = pending
 		else
@@ -1339,7 +2871,7 @@ local function drive(runtime)
 
 	runtime.callsAccum = (runtime.callsAccum or 0) + engineCalls
 	runtime.staticChains = staticChains
-	runtime.lastChainTotal = chainTotal
+	runtime.lastChainTotal = primaryChains + nearChains + farChains
 	runtime.lastAttempted = attempted
 	-- 这一帧一条都没驱动（stride 分帧的正常现象）时不能让"零帧看门狗"累加，
 	-- 否则分帧本身会被误判成"驱动失效"→ 重挂 → 分帧 → 再判失效，无限循环。
@@ -1378,12 +2910,13 @@ local function drive(runtime)
 	-- 阶段心跳：每 N 帧一行，证明驱动块确实被进入过，并给出当帧的关键事实。
 	-- 上一轮出现过"phase 明明是 live 但 update 从不执行"，没有这条就无法区分
 	-- "没进块"和"进了块但走了别的分支"。
-	local heartbeat = options.heartbeatFrames or 120
+	-- 600 帧（60 fps 下 10 秒）足够回答这个问题；120 帧是每秒 2 行，一场长局光心跳就上百 KB。
+	local heartbeat = options.heartbeatFrames or 600
 	if (runtime.driveFrames % heartbeat) == 0 then
 		local chains = 0
 		for _, session in ipairs(runtime.sessions) do chains = chains + #session.sessions end
-		logger("[physbone] 驱动心跳 unit=%d 链=%d 玩家=%d 分帧=%d 本帧驱动=%d dt=%.4f 本帧 写入=%d 跳过=%d 引擎调用=%d 累计/帧=%.0f 静止链=%d 偏离绑定峰值=%.1f°(史上%.1f°) 最离谱=%s(限%.0f°) 同拍重复=%d",
-			#runtime.sessions, chains, #(runtime.avatars or {}), runtime.driveStride or 1, attempted,
+		logger("[physbone] 驱动心跳 unit=%d 链=%d 玩家=%d 分帧=%d/%d 本帧驱动=%d dt=%.4f 本帧 写入=%d 跳过=%d 引擎调用=%d 累计/帧=%.0f 静止链=%d 偏离绑定峰值=%.1f°(史上%.1f°) 最离谱=%s(限%.0f°) 同拍重复=%d",
+			#runtime.sessions, chains, #(runtime.avatars or {}), runtime.nearStride or 1, runtime.farStride or 1, attempted,
 			runtime.dt or 0, written, skippedSame, engineCalls,
 			runtime.callsAccum / runtime.driveFrames, staticChains, framePeakDeg,
 			runtime.peakAngle or 0,
@@ -1442,6 +2975,14 @@ local function drive(runtime)
 		local delay = math.min(options.maxReArmFrames or 600, (options.reArmFrames or 60) * runtime.reArm)
 		runtime.rearmAt = frame + delay
 	end
+
+	-- 姿态快照：外部按下热键 ⇒ 写请求文件 ⇒ 这里把骨架采下来。
+	-- 放在**物理写完、渲染之前**：采到的就是这一帧画到屏幕上的姿态。
+	snapshot_poll(S, runtime, options)
+
+	-- 裙摆外推：用这一帧的姿态算**下一帧**要叠的旋转（1 帧延迟，肉眼不可见）。
+	-- 放在 update 之后是因为要用到这一帧写完之后的世界位置。
+	skirt_apply(S, runtime)
 end
 
 --- 安装运行时。可重复调用：第二次直接返回同一个实例。
@@ -1474,7 +3015,8 @@ function M.install(stingray, options)
 		-- 名单变化只影响"补挂/收尾"，不会推翻别人的会话。
 		avatars = nil,
 		reconcile = nil,     -- 名单变化后待执行的补挂帧号；nil = 没有待办
-		driveStride = 1,     -- 当前的分帧步长（链数超预算时 >1）
+		nearStride = 1,      -- 6 m 内队友的分帧步长（1 = 每帧）
+		farStride = 1,       -- 6 m 外队友的分帧步长
 		frame = 0,
 		dt = options.dt or (1 / 60),
 		reArm = 0,
@@ -1545,5 +3087,29 @@ M.tune_values_ = tune_values
 M.lift_unit_ = lift_unit
 M.lift_bone_ = lift_bone
 M.apply_lift_ = apply_lift
+
+-- 测试钩子：日志闸门（轮转 + 单次启动预算 + 用尽后只留错误类）。
+-- 这三条判据都只能看**落盘结果**，所以必须能直接造一个 logger 往临时文件里写，
+-- 而不是靠进游戏观察。
+M.make_logger_ = makeLogger
+
+-- 测试钩子：姿态快照。解析、拼 JSON、轮询三段都能离线钉住——
+-- 否则"按了键但什么都没写出来"这种问题只能靠用户再进一次游戏才发现。
+M.snapshot_parse_ = parse_snapshot_request
+M.snapshot_ids_ = snapshot_ids
+M.snapshot_json_ = snapshot_json
+M.snapshot_poll_ = snapshot_poll
+M.snapshot_dir_ = snapshot_dir
+
+-- 测试钩子：调度器。重排与兜底都是纯逻辑（给定相机和一堆位置就能算），
+-- 所以可以离线钉住"位置互换后归属必须跟着换""限流必须挡住连续触发"。
+M.redistribute_ = redistribute
+M.scheduler_watch_ = scheduler_watch
+M.sched_poll_ = sched_poll
+M.sched_settings_ = sched_settings
+M.schedule_budget_ = schedule_budget
+M.key_edge_ = key_edge
+M.fp_probe_poll_ = fp_probe_poll
+M.fp_lock_watch_ = fp_lock_watch
 
 return M

@@ -2590,6 +2590,38 @@ function M.release(session)
 	return restored
 end
 
+--- 给一个"摆动轴角"再叠一个额外旋转（用于裙摆外推）。
+--- <para>
+--- `rotation` 是 `local_rotations` 产出的 (ax, ay, az, angle)，轴在**父空间**。
+--- 额外旋转也按父空间给，结果转回轴角形式，交给 `write_pose` 走原来那条路。
+--- 为什么要单独一个函数：热路径每根骨每帧都在跑，这里必须是纯数字运算、零分配
+--- （返回的是表，但只给当帧用，和 `local_rotations` 的契约一致）。
+--- </para>
+function M.push_out_rotation(rotation, axisX, axisY, axisZ, angle, postMultiply)
+	if angle == nil or angle == 0 then return rotation end
+	local rx, ry, rz, rw = q_axis_angle(rotation[1], rotation[2], rotation[3], rotation[4])
+	local ex, ey, ez, ew = q_axis_angle(axisX, axisY, axisZ, angle)
+	-- 前乘 = 在父坐标系里转，后乘 = 在骨自己的局部坐标系里转。
+	-- 到底是哪一种由 `write_pose` 的语义决定，而那个语义没法从代码一眼看出来——
+	-- 所以两种都留着，让实机去分辨（预设枚举）。
+	local nx, ny, nz, nw
+	if postMultiply == true then
+		nx, ny, nz, nw = qmul(rx, ry, rz, rw, ex, ey, ez, ew)
+	else
+		nx, ny, nz, nw = qmul(ex, ey, ez, ew, rx, ry, rz, rw)
+	end
+	local len = math.sqrt(nx * nx + ny * ny + nz * nz + nw * nw)
+	if len < 1e-9 then return rotation end
+	nx, ny, nz, nw = nx / len, ny / len, nz / len, nw / len
+	if nw < 0 then nx, ny, nz, nw = -nx, -ny, -nz, -nw end
+	local w = nw > 1 and 1 or nw
+	local s = math.sqrt(1 - w * w)
+	if s < 1e-6 then
+		return { rotation[1], rotation[2], rotation[3], 0 }
+	end
+	return { nx / s, ny / s, nz / s, 2 * math.acos(w) }
+end
+
 -- ---------------------------------------------------------------------------
 -- P2 驱动：尖端点簧核的引擎侧
 --
@@ -2937,6 +2969,27 @@ function M.update_tip(session, dt, maxWrite)
 					if maxWrite and written >= maxWrite then break end
 					local base = basePoses[index]
 					local rotation = rotations[index]
+					-- 裙摆外推：只对**链根**叠一个额外旋转（世界轴 → 锚点父空间）。
+					-- 为什么只动链根：整片布是靠链根朝向摆出去的，逐节动会把布扯变形。
+					-- `item.pushOut` 由运行时算好（世界坐标下的轴 + 角度），默认是 nil ⇒ 零影响。
+					-- `item.pushOutAll` 是**诊断开关**：把同样的旋转叠到每一节上。
+					-- 为什么需要它：如果只转链根而画面毫无变化，分不清是"方向不对"还是
+					-- "这片布根本不跟这些骨"；逐节叠上去时，跟骨的部分一定会明显动，
+					-- 不动就说明那片布蒙皮在别的骨上（那就只能改几何，运行时无解）。
+					if rotation ~= nil and item.pushOut ~= nil and (index == 1 or item.pushOutAll == true) then
+						local po = item.pushOut
+						local pax, pay, paz = po[1], po[2], po[3]
+						local mode = po[5] or 1
+						-- 模式 1/3 = 轴换算到锚点父空间；2/4 = 直接用世界轴（不换算）。
+						-- 哪个对，取决于 `write_pose` 把 rotation 解释成"父空间增量"还是别的，
+						-- 这一点从代码读不出来 ⇒ 交给实机枚举（预设 1..8）。
+						if mode == 1 or mode == 3 then
+							local cxq, cyq, czq, cwq = qconj(qx, qy, qz, qw)
+							pax, pay, paz = qrot(cxq, cyq, czq, cwq, pax, pay, paz)
+						end
+						rotation = M.push_out_rotation(rotation, pax, pay, paz, po[4],
+							mode == 3 or mode == 4)
+					end
 					if base ~= nil and rotation ~= nil then
 						if rotation[4] > maxAngle then maxAngle = rotation[4] end
 						if rotation_sane(rotation, base) then

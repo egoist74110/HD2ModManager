@@ -15,11 +15,14 @@ local runtimeModule = dofile(here .. "../src/physbone_runtime.lua")
 local failures, checks = 0, 0
 local function check(condition, message, detail)
 	checks = checks + 1
+	-- 输出统一成别的 harness 那套 `PASS` / `FAIL` 行：跑套件时要能被
+	-- tools/physbone-harness/run_physbone_regressions.py 数到，否则汇总里这一整
+	-- 文件看起来是 0 项检查。
 	if not condition then
 		failures = failures + 1
-		io.stderr:write("  ✗ " .. message .. (detail ~= nil and ("  [" .. tostring(detail) .. "]") or "") .. "\n")
+		print(string.format("  %-4s %s%s", "FAIL", message, detail ~= nil and ("  [" .. tostring(detail) .. "]") or ""))
 	else
-		io.stdout:write("  ✓ " .. message .. "\n")
+		print(string.format("  %-4s %s", "PASS", message))
 	end
 end
 
@@ -164,7 +167,7 @@ local function freshRuntime(fake, compat, options)
 		compat = compat,
 		log = false,
 		carriers = { { rig = { bones = { { name = "hair" } } }, path = "fake" } },
-		settleFrames = 1,
+		settleFrames = 1, snapshot = false, tunePath = "nonexistent-hd2pbx-tune.txt",
 		pollFrames = 1,
 		validateFrames = 3,
 		heartbeatFrames = 1000000,
@@ -287,11 +290,14 @@ do
 	for index = 1, 4 do fake:playerAt("p" .. index, (index - 1) * 10, 60) end
 	local runtime = freshRuntime(fake, compat, { maxChainsPerFrame = 160, otherPlayerStride = 2 })
 	fake:advance(80)
-	-- 2026-11-03：分帧步长从"固定 2"改成**按总量自适应**（四人局固定 2 会把预算打穿）。
-	-- 本场景：自己 60 链 + 队友 180 链；队友预算 = 160/2 = 80
-	-- ⇒ stride = ceil(180/80) = 3
-	check(runtime.driveStride == 3, "超预算后按总量自适应分帧（队友 180 链 / 预算 80 ⇒ stride=3）",
-		runtime.driveStride)
+	-- 2026-11-11：分帧从"所有队友共用一个步长"改成**按距离分档**（6 m 内 / 6 m 外）。
+	-- 本场景：自己 60 链（相机旁）；队友分别在 10/20/30 m ⇒ 全在"远处"。
+	-- 预算 160，远处 180 链 ⇒ 远处步长 4；近处没有队友 ⇒ 近处步长 1。
+	check(runtime.nearStride ~= nil and runtime.farStride ~= nil,
+		"预算分档已生效", string.format("near=%s far=%s",
+			tostring(runtime.nearStride), tostring(runtime.farStride)))
+	check(runtime.nearStride == 1, "近处没有队友 ⇒ 近处不额外节流", runtime.nearStride)
+	check(runtime.farStride >= 2, "远处队友被分帧", runtime.farStride)
 
 	compat.dtByUnit = {}
 	fake:advance(20, 0.01)
@@ -300,13 +306,13 @@ do
 	for _, entry in ipairs(compat.dtByUnit) do byUnit[entry.unit] = (byUnit[entry.unit] or 0) + entry.dt end
 	-- 20 帧 × 0.01 = 0.2 秒的时间，每个会话拿到的 dt 总和都必须≈0.2。
 	-- 容差 = **一个 stride 周期**的时间：分帧的语义是"攒够再算"，所以窗口末尾
-	-- 必然有不足一个周期的 dt 还挂在账上（stride=3 时最多 2 帧 = 0.02 秒）。
+	-- 必然有不足一个周期的 dt 还挂在账上。
 	local worst, worstName = 0, nil
 	for unit, total in pairs(byUnit) do
 		local error = math.abs(total - frames * 0.01)
 		if error > worst then worst, worstName = error, unit end
 	end
-	check(worst <= (runtime.driveStride - 1) * 0.01 + 0.001, "每个被分帧的会话都拿到了完整的时间（dt 累积补偿）",
+	check(worst <= (runtime.farStride - 1) * 0.01 + 0.001, "每个被分帧的会话都拿到了完整的时间（dt 累积补偿）",
 		string.format("最差 %s 误差 %.4f 秒", tostring(worstName), worst))
 
 	-- 第一位（自己）每帧都要算，不能被分帧。
@@ -346,7 +352,7 @@ do
 	runtimeModule.install(stingray, {
 		compat = compat, log = false,
 		carriers = { { rig = { bones = { { name = "hair" } } }, path = "fake" } },
-		settleFrames = 1, pollFrames = 1, validateFrames = 3, heartbeatFrames = 1000000, minNodes = 90,
+		settleFrames = 1, snapshot = false, tunePath = "nonexistent-hd2pbx-tune.txt", pollFrames = 1, validateFrames = 3, heartbeatFrames = 1000000, minNodes = 90,
 	})
 	runtime = rawget(_G, "__hd2physbone_runtime")
 	fake:advance(60)
@@ -364,10 +370,100 @@ do
 	local runtime = freshRuntime(fake, compat)
 	fake:advance(60)
 	check(#runtime.sessions == 2, "两件护甲都挂上", #runtime.sessions)
-	check(runtime.driveStride == 1, "链数在预算内 ⇒ 不分帧", runtime.driveStride)
+	check(runtime.nearStride == 1 and runtime.farStride == 1, "链数在预算内 ⇒ 不分帧",
+		string.format("near=%s far=%s", tostring(runtime.nearStride), tostring(runtime.farStride)))
 	local owners = {}
 	for _, session in ipairs(runtime.sessions) do owners[session.ownerOrder] = true end
 	check(owners[1] == true and next(owners, 2) == nil, "两件都属于同一位玩家")
+end
+
+-- ================================================================ 场景 8：日志闸门在真实驱动路径上生效
+-- 单测（log-budget-test）验的是 logger 本身；这一条走 install + render 的真实链路，
+-- 验的是"装进去的默认值对不对"和"预算在驱动路径上也拦得住"。默认心跳如果哪天被改回
+-- 120 帧，这里会立刻红：1201 帧出十行，而不是一两行。
+io.stdout:write("\n[场景 8] 日志闸门：默认心跳 600 帧、预算在真实驱动路径上生效\n")
+do
+	local TEMP = os.getenv("TEMP") or os.getenv("TMP") or "."
+	local stamp = tostring(os.time())
+
+	local function tempLog(tag)
+		local path = string.format("%s\\physbone-mp-log-%s-%s.log", TEMP, stamp, tag)
+		os.remove(path)
+		os.remove(path .. ".1")
+		return path
+	end
+
+	local function readLog(path)
+		local handle = io.open(path, "rb")
+		if handle == nil then return "" end
+		local text = handle:read("*a") or ""
+		handle:close()
+		return text
+	end
+
+	local function countIn(text, needle)
+		local count, from = 0, 1
+		while true do
+			local found = string.find(text, needle, from, true)
+			if found == nil then return count end
+			count = count + 1
+			from = found + #needle
+		end
+	end
+
+	-- 刻意不传 heartbeatFrames：这条测的就是默认值。
+	local function installWithLog(fake, compat, path, extra)
+		rawset(_G, "__hd2physbone_runtime", nil)
+		rawset(_G, "render", function() end)
+		local opts = {
+			compat = compat,
+			logPath = path,
+			carriers = { { rig = { bones = { { name = "hair" } } }, path = "fake" } },
+			settleFrames = 1, snapshot = false, tunePath = "nonexistent-hd2pbx-tune.txt",
+			pollFrames = 1,
+			validateFrames = 3,
+			minNodes = 90,
+		}
+		for key, value in pairs(extra or {}) do opts[key] = value end
+		runtimeModule.install(fake:stingray(), opts)
+		return rawget(_G, "__hd2physbone_runtime")
+	end
+
+	local path = tempLog("default")
+	local fake = newFake()
+	local compat = newCompat()
+	fake:playerAt("p1", 0)
+	installWithLog(fake, compat, path)
+	fake:advance(601)
+	local first = countIn(readLog(path), "驱动心跳")
+	fake:advance(600)
+	local text = readLog(path)
+	local second = countIn(text, "驱动心跳")
+	check(second >= 1, "心跳确实落盘（证明驱动块进去了）", second .. " 条")
+	check(second <= 4, "1201 帧只有一两行心跳（默认 600 帧，不是 120）", second .. " 条")
+	check(second - first <= 2, "每 600 帧才多一行", (second - first) .. " 条")
+	check(string.find(text, "累计/帧", 1, true) ~= nil, "心跳行仍带关键事实（累计/帧）")
+	check(#text < 128 * 1024, "空跑 1201 帧远没到预算", #text .. " 字节")
+
+	-- 预算：把心跳拉到每帧一行，900 字节预算必须把它截住。
+	local budgetPath = tempLog("budget")
+	local fake2 = newFake()
+	local compat2 = newCompat()
+	fake2:playerAt("p1", 0)
+	installWithLog(fake2, compat2, budgetPath, { heartbeatFrames = 1, logMaxBytes = 900 })
+	fake2:advance(400)
+	local budgetText = readLog(budgetPath)
+	local beats = countIn(budgetText, "驱动心跳")
+	check(beats > 0, "预算之内仍写了心跳", beats .. " 条")
+	check(beats < 40, "预算把心跳截住了（无预算时该是 400）", beats .. " 条")
+	check(string.find(budgetText, "日志已达上限", 1, true) ~= nil, "落了一行「已达上限」")
+	check(#budgetText < 900 + 600, "总字节仍在上限附近", #budgetText .. " 字节")
+
+	os.remove(path)
+	os.remove(path .. ".1")
+	os.remove(budgetPath)
+	os.remove(budgetPath .. ".1")
+	pcall(runtimeModule.uninstall)
 end
 
 io.stdout:write(string.format("\n%s：%d 项检查，%d 项失败\n", failures == 0 and "全部通过" or "有失败", checks, failures))
