@@ -63,11 +63,12 @@ local M = {}
 --
 -- 1.9.1：容器扫描窗口改成"按实际部署的最大 patch 序号 + 5"（以前写死 0..63，
 --        装一堆 mod 时排在 63 之后的物理 mod 会被漏掉，日志还误报成"没做 embed"）。
-M.VERSION = "2.1.17"
+M.VERSION = "2.1.23"
 
 --- 安装标记用的全局键。只写这一个全局，且值就是模块本身（便于外部检查是否已装）。
 local INSTALL_KEY = "__hd2physbone_runtime"
 
+local tune_values     -- 调参文件读数（定义在后面，tryAttach 也要用 ⇒ 必须先声明）
 local Compat          -- physbone_compat 模块（require 或注入）
 local S               -- stingray 命名空间
 local state = nil     -- 运行状态；nil = 未安装
@@ -582,6 +583,20 @@ local function tryAttach(runtime)
 	end
 	local armor = armorList[1]
 
+	-- 诊断开关（`discoverOnly = 1`）：只做发现，**不挂载、不持有任何 unit 句柄**。
+	-- 用途（2026-11-11）：已确认"写骨"不是触发点（writeOff=1 仍崩）。
+	-- 于是要把"扫描 unit"与"挂载并持有句柄"分开：
+	--   不崩 ⇒ 触发点是挂载/持有句柄；
+	--   还崩 ⇒ 连扫描都不能做（那就是更底层的事）。
+	if (tune_values(runtime).discoverOnly or 0) ~= 0 then
+		if not runtime.discoverOnlyLogged then
+			runtime.discoverOnlyLogged = true
+			runtime.logger("[physbone][诊断] discoverOnly=1 ⇒ 只扫描不挂载（找到 %d 个 avatar、%d 个护甲候选）",
+				#avatars, #armorList)
+		end
+		return false
+	end
+
 	local nodeCount = try(S.Unit.num_scene_graph_items, armor.unit)
 	if type(nodeCount) ~= "number" or nodeCount < 10 then
 		note_wait(runtime, "主件节点数异常", tostring(nodeCount))
@@ -809,11 +824,22 @@ local function pruneSessions(runtime)
 		end
 	end
 	runtime.sessions = kept
-	if dead > 0 or rebuilt > 0 then
+	local dropped = dead + rebuilt
+	if dropped > 0 then
 		runtime.logger("[physbone] 丢弃 %d 个已销毁 / %d 个已重建，剩 %d 个会话",
 			dead, rebuilt, #kept)
+		-- **死亡之后先停写一小段，等场景拆解落定。**
+		-- 场景拆解是**连续**发生的：一批 unit 死掉之后，同一场景里其余 unit 往往在接下来几帧
+		-- 继续被引擎释放。此时若继续驱动"刚才还活着"的会话，就会把骨写到已释放的对象上——
+		-- 表现为访问违例、崩在引擎内部，而 Lua 层 pcall 抓不到（2026-11-11 实机：
+		-- 多人局换场景必崩、单人必不崩；因为单人的护甲件是一起死的，直接走
+		-- "场景已变"那条分支停手，根本不会有"剩几个继续跑"）。
+		-- 时间照常累积到 pendingDt，所以物理速度不变，只是这几帧不写骨。
+		local grace = runtime.options and runtime.options.deathGraceFrames or 20
+		local holdUntil = runtime.frame + grace
+		if (runtime.driveHoldUntil or 0) < holdUntil then runtime.driveHoldUntil = holdUntil end
 	end
-	return dead + rebuilt
+	return dropped
 end
 
 --- 便宜的"场上有哪些玩家"扫描，供驱动中定期比对。
@@ -919,7 +945,7 @@ end
 
 --- 读调参文件（缓存，默认 2 秒重读一次）。
 --- 数字进表本身（`lift` 等），字符串原文进 `values.text`（`lift_bone` 这类骨名）。
-local function tune_values(runtime)
+tune_values = function(runtime)
 	local frame = runtime.frame or 0
 	local cached = runtime.tune
 	local refresh = (runtime.options and runtime.options.tuneRefreshFrames) or 30
@@ -1315,16 +1341,35 @@ local function redistribute(S_, runtime, why, forcePrimary)
 	end)
 	-- 强制置顶：第一人称锁定的证据（水平距离≈0）比"总距离最近"强得多——
 	-- 队友完全可以比你离相机更近，但他的水平分量不可能≈0。
-	if forcePrimary ~= nil then
+	--
+	-- **学到过"哪个是自己"就一直沿用。** 第三人称的相机在你身后约 4.5 m，
+	-- 队友只要站得比相机离你更近，就会把你顶到 order>1，你的护甲被按 4~8 帧节流，
+	-- 看起来就是"队友有物理、我没有"。而 F8 只是重跑同一个判据，所以按了没效果
+	-- （2026-11-11 实机）。身份一旦被第一人称锁定学到，就让 F8 / 兜底重排都用它，
+	-- 这两条路径才真正能把你恢复成最高权。
+	local forced = forcePrimary
+	if forced == nil and runtime.selfUnit ~= nil then forced = runtime.selfUnit end
+	if forced ~= nil then
 		for index = 1, #avatars do
-			if avatars[index].unit == forcePrimary and index > 1 then
-				local forced = table.remove(avatars, index)
-				table.insert(avatars, 1, forced)
+			if avatars[index].unit == forced and index > 1 then
+				local forcedAvatar = table.remove(avatars, index)
+				table.insert(avatars, 1, forcedAvatar)
 				break
 			end
 		end
 	end
 	for index = 1, #avatars do avatars[index].order = index end
+
+	-- 最高权换人时说一声（只在真正的换人时打，避免刷屏）。
+	-- 这段时间的排障全靠这一行：能直接看出"最高权是队友还是自己"。
+	local primary = avatars[1]
+	if primary ~= nil and runtime.primaryTag ~= primary.tag then
+		runtime.primaryTag = primary.tag
+		runtime.logger("[physbone][调度] 最高权=%s（相机距离 %.2f m%s）",
+			tostring(primary.tag or "?"),
+			primary.cameraDistance ~= nil and math.sqrt(primary.cameraDistance) or -1,
+			(primary.unit == runtime.selfUnit) and "，已识别为自己" or "")
+	end
 
 	local changed, moved = 0, {}
 	for _, session in ipairs(runtime.sessions or {}) do
@@ -1403,6 +1448,13 @@ local function fp_lock_watch(S_, runtime)
 	runtime.fpLockH = lockH
 	-- 只在"恰好达到帧数"时动作一次；动作后清零，这样万一又被判错还能再纠正。
 	if runtime.fpLockFrames ~= settings.fpLockFrames then return end
+	-- 学到"自己是谁"。**即使它已经是 order==1 也要记下来**：第三人称下队友可能把你顶掉，
+	-- 之后 F8 / 兜底重排要靠这个身份把你抢回来（见 redistribute 里的沿用逻辑）。
+	if runtime.selfUnit ~= lockAvatar.unit then
+		runtime.selfUnit = lockAvatar.unit
+		runtime.logger("[physbone][调度] 记住自己=%s（水平 %.3f m）⇒ 之后 F8 与兜底重排优先它",
+			tostring(lockAvatar.tag or "?"), lockH)
+	end
 	if (lockAvatar.order or 99) == 1 then return end
 	runtime.logger("[physbone][调度] 第一人称锁定（水平 %.3f m，%s）⇒ 立即重排",
 		lockH, tostring(lockAvatar.tag or "?"))
@@ -2658,6 +2710,18 @@ local function drive(runtime)
 	local options = runtime.options
 	local logger = runtime.logger
 	runtime.logContext.frame = frame
+
+	-- 诊断开关（`hardOff = 1`）：运行时**加载了但一个引擎调用都不发**。
+	-- 用途（2026-11-11）：确认"仅仅是这份 runtime 存在"是否已经足够引发崩溃。
+	-- 放在任何引擎调用之前，所以连 Compat.begin_frame 都不跑。
+	if (tune_values(runtime).hardOff or 0) ~= 0 then
+		if not runtime.hardOffLogged then
+			runtime.hardOffLogged = true
+			logger("[physbone][诊断] hardOff=1 ⇒ 运行时不动手（不发任何引擎调用）")
+		end
+		return
+	end
+
 	Compat.begin_frame(frame)
 
 	-- dt 用引擎自己的时间差，不写死 1/60。
@@ -2679,6 +2743,7 @@ local function drive(runtime)
 		elseif now > previous then
 			local delta = now - previous
 			-- 上限 0.25 与 compat 的稳定性闸一致：卡顿帧不该被当成"过了 0.5 秒"去积分。
+			runtime.rawDelta = delta               -- 限幅前的真实跨度，供"加载空档"判据用
 			if delta > 0.25 then delta = 0.25 end
 			if delta >= 0.001 then runtime.dt = delta end
 			advanced = true
@@ -2702,9 +2767,48 @@ local function drive(runtime)
 	end
 	if not advanced then return end
 
+	-- ---------- 加载空档：不查存活，直接整组重挂 ----------
+	-- 加载界面期间 `render`/`update` 根本不跑（实测：静默 4~15 秒是常态），而这一整段时间里
+	-- 引擎正在销毁上一场景的 unit。等我们再被调到，`runtime.sessions` 里那些句柄很可能
+	-- 已经指向被释放的对象 —— 而**逐条查存活本身就是一个引擎调用**（`Compat.session_health`
+	-- → `Unit.alive`）。在"unit 已经被覆盖/释放"的窗口里发这个调用，就是原生崩溃
+	-- （2026-11-11 实机：崩在 0x3e564b 读空指针，且**只在物理 + 软映射同时开**时发生 ——
+	-- 因为只有那时该 unit 是覆盖出来的自定义件；单独开任意一个都不崩）。
+	-- 所以这里**不逐条判定**，整组丢掉、按"场景已变"重挂。宁可闪一下，也不去碰可能已死的句柄。
+	local gap = runtime.rawDelta
+	if gap ~= nil and gap > (options.loadGapSeconds or 0.5)
+		and runtime.sessions ~= nil and #runtime.sessions > 0 then
+		logger("[physbone][LIFECYCLE] 检测到加载空档 %.2f s ⇒ 不查存活，直接整组重挂（%d 个会话）",
+			gap, #runtime.sessions)
+		runtime.sessions = nil
+		runtime.reconcile = nil
+		runtime.reArm = 1
+		runtime.rearmAt = frame + (options.reArmFrames or 60)
+	end
+	runtime.rawDelta = nil
+
 	if runtime.sessions ~= nil and #runtime.sessions > 0 then
 		local dropped = pruneSessions(runtime)
-		if #runtime.sessions == 0 then
+		-- **默认行为**：任何会话死亡 ⇒ 整组释放，一个句柄都不留。
+		--
+		-- 依据（2026-11-11 实机 + 用户对照实验 + 开关二分，已确认修复闪退）：
+		--   · `discoverOnly=1`（只扫描、**不持有句柄**）⇒ 不崩；
+		--   · `writeOff=1`（挂载但不写骨）⇒ 仍崩 ⇒ 与写骨无关；
+		--   · 两人**同时**切图才崩；多人局里自己一个人切图不崩；中途加入不崩。
+		-- 崩溃日志总是「掉了 N 个会话，**剩 M 个继续跑**」：那 M 个句柄被留着，
+		-- 紧接着是几十秒加载空档（render 不再回调、修剪跑不到），引擎在销毁它们
+		-- ⇒ 读空指针（转储 0x3e564b，异常参数 0x0 0x0）。
+		--
+		-- 代价：队友换甲/阵亡时全场会闪一下没物理（随后立刻重挂）。
+		-- 想退回旧行为（保留剩余会话）可在调参文件写 `dropAllOnDeath = 0`。
+		if dropped > 0 and (tune_values(runtime).dropAllOnDeath or 1) ~= 0 then
+			logger("[physbone][LIFECYCLE] dropAllOnDeath=1：掉了 %d 个会话 ⇒ 整组释放（不留任何句柄），随后重挂",
+				dropped)
+			runtime.sessions = nil
+			runtime.reconcile = nil
+			runtime.reArm = 1
+			runtime.rearmAt = frame + 1
+		elseif #runtime.sessions == 0 then
 			-- 全没了（换场景 / 全员阵亡）：退回等待，带退避（避免换甲期间每秒重挂一次）。
 			-- 存活时长决定退避：刚挂上就死 = 抖动（换甲中），要越等越久；
 			-- 稳定跑过 5 秒再死 = 正常换场景，下一次应当**立刻**重挂。
@@ -2841,6 +2945,28 @@ local function drive(runtime)
 			-- 用**会话下标**错峰，而不是玩家序号：同一个玩家的若干护甲件如果同帧，
 			-- 每 stride 帧就会出现一次成本尖峰（帧时间抖动比平均成本更影响手感）。
 			if stride > 1 and ((frame + index) % stride) ~= 0 then due = false end
+		end
+		-- 拆解窗口：任何会话死亡后的一小段里不写骨（理由见 pruneSessions 里那段注释）。
+		-- 仍然走"没轮到"的同一条路，所以 pendingDt 照常累积、物理速度不变。
+		if due and runtime.driveHoldUntil ~= nil and frame < runtime.driveHoldUntil then due = false end
+		-- 诊断开关（调参文件 `writeOff = 1`）：发现 / 挂载 / 调度 / 判活全都照旧，**只是不写骨**。
+		-- 用途（2026-11-11）：物理 + 软映射同时开、多人局换场景必崩，而崩溃时我们的 Lua 根本没在跑
+		-- （加载期间不回调，回来之前就崩了）。于是只剩两种可能，这个开关能把它们分开：
+		--   不崩 ⇒ 触发点是"写骨"这条路径（在写入侧加固）；
+		--   还崩 ⇒ 只要"挂着并持有 unit 句柄"就足够（要在换人/换场景时尽早放手）。
+		if due and (tune_values(runtime).writeOff or 0) ~= 0 then
+			if not runtime.writeOffLogged then
+				runtime.writeOffLogged = true
+				logger("[physbone][诊断] writeOff=1 ⇒ 只挂不写（用于分辨崩溃是否由写骨触发）")
+			end
+			due = false
+		end
+		-- 写骨前再复查一次存活：pruneSessions 只在**帧首**判过，
+		-- 而场景拆解会在本帧中途继续释放 unit —— 那一小段窗口正是"写进野对象"的来源。
+		-- unit_alive 是便宜的引擎调用，比赌一次野指针便宜得多。
+		if due and session.unit ~= nil and type(Compat.unit_alive) == "function" then
+			local okAlive, alive = pcall(Compat.unit_alive, S, session.unit)
+			if okAlive and alive == false then due = false end
 		end
 		if not due then
 			session.pendingDt = pending
@@ -3113,3 +3239,9 @@ M.fp_probe_poll_ = fp_probe_poll
 M.fp_lock_watch_ = fp_lock_watch
 
 return M
+
+
+
+
+
+
