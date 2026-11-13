@@ -4093,8 +4093,14 @@ local function drive(runtime)
 	-- "没进块"和"进了块但走了别的分支"。
 	-- 600 帧（60 fps 下 10 秒）足够回答这个问题；120 帧是每秒 2 行，一场长局光心跳就上百 KB。
 	local tune = tune_values(runtime)
-	local heartbeat = math.max(1, math.floor(tune.heartbeatFrames or options.heartbeatFrames or 600))
-	if (runtime.beatFrames % heartbeat) == 0 then
+	-- 调参文件 `heartbeatFrames = N` 优先，其次安装参数，最后 600。
+	-- **<= 0 = 关掉心跳**（调参文件里 0 一律表示关，`devLog` / `skirt` 都是这个约定）；
+	-- `0 < N < 1` 取整后同样是关——亚帧间隔没有意义。
+	-- 不能写成 `math.max(1, …)`：那会把 0 和负数都抬成 1，也就是「每帧一条」，
+	-- 一场长局刷出几万行，正好烧光心跳本来要省的那点日志预算。
+	local heartbeat = math.floor(tune.heartbeatFrames or options.heartbeatFrames or 600)
+	if heartbeat < 1 then heartbeat = 0 end
+	if heartbeat > 0 and (runtime.beatFrames % heartbeat) == 0 then
 		local chains = 0
 		for _, session in ipairs(runtime.sessions) do chains = chains + #session.sessions end
 		logger("[physbone] 驱动心跳 unit=%d 链=%d 玩家=%d 分帧=%d/%d 本帧驱动=%d 驱动=%.2f ms dt=%.4f 本帧 写入=%d 跳过=%d 引擎调用=%d 累计/帧=%.0f 静止链=%d 偏离绑定峰值=%.1f°(史上%.1f°) 最离谱=%s(限%.0f°) 同拍重复=%d",
@@ -4112,7 +4118,11 @@ local function drive(runtime)
 	-- 按**件**列：每件一段「unit 链数 件峰值 + 峰值最大的 3 条链」。旧版只列全场前 6 条链，
 	-- 头部那件有 17 条链时，前 6 条全是单节前发，长发根本轮不到。
 	local chainLog = options.debug or (tune.chainLog or 0) ~= 0
-	if chainLog and (runtime.beatFrames % (options.debugDetailFrames or 240)) == 0 then
+	-- 间隔同样按 "<= 0 = 关"：不能靠 `n % 0 = nan` 静默失效 —— 那是依赖底层取模行为，
+	-- 而且负间隔会变成"反向周期"，语义更说不清。
+	local detailEvery = math.floor(options.debugDetailFrames or 240)
+	if detailEvery < 1 then detailEvery = 0 end
+	if chainLog and detailEvery > 0 and (runtime.beatFrames % detailEvery) == 0 then
 		local peak, pieces = 0, {}
 		for _, session in ipairs(runtime.sessions) do
 			local chainPeaks = {}

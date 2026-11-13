@@ -735,7 +735,13 @@ function M.gains_of(params, lengthScale, gravityScale, opts)
 		-- 2026-11-13 实机（某转换模型的三条长发链，flags=0x35：只有 yawCon + angleCon）：
 		-- pitch 被锁在 0°，长发只能往一侧偏一点，跑动时最主要的前后甩全没了，看着像一根焊丝；
 		-- 同一颗头上走锥限位的前发/侧发却照常在动（日志里摆到 35°）。
-		-- 没约束的轴按"不限"（分量界限 ±1）处理，总偏角仍由锥（angleCon）兜住。
+		-- 没约束的轴按"不限"（分量界限 ±1）处理：对单位向量而言 ±1 等价于不夹分量。
+		-- ⚠️ **别把锥（angleCon）当成兜底**：`step_tip` 里锥对分轴骨**根本不生效**
+		-- （`if not gains.axisLimits and gains.limit > 0 …`）。所以这里只恢复了另一轴的运动，
+		-- **没有**同时保留 angleCon 的总偏角上限：单轴受限的骨是「已配置轴按区间夹、
+		-- 未配置轴不夹分量、且不执行锥约束」，运动仍受碰撞与求解器其它步骤影响。
+		-- 为什么不顺手把锥接上：轴夹取之后再投影到锥面，可能又把轴分量推出区间，
+		-- 投影顺序 / 坐标系 / 优先级都得重新定；修一个"锁死"不该顺带引入一组没测过的组合约束。
 		if axisLimits then
 			if not yawSet then yawMin, yawMax = -1, 1 end
 			if not pitchSet then pitchMin, pitchMax = -1, 1 end
@@ -1187,7 +1193,8 @@ function M.step_tip(item, dt, apx, apy, apz, qx, qy, qz, qw)
 		-- 预存 cosLimit = cos(limit)，判据变成 dot < cosLimit（dot 是单位向量点积 = cos 夹角）。
 		-- 只有**真的超限**时才需要角度值（而且下面用的是 limit 本身，连 acos 都不用）。
 		--
-		-- 分轴约束的骨**不走这条**：锥是相对父节的，会累加（见上面 axisLimits 的说明）。
+		-- 分轴约束的骨**不走这条**（见上面 axisLimits 的说明；单轴受限时另一轴不夹分量、
+		-- 锥也不生效，理由与投影顺序的顾虑见 `gains_of` 里单轴受限那段）。
 		local dot = nx * prevX + ny * prevY + nz * prevZ
 		if not gains.axisLimits and gains.limit > 0 and dot < gains.cosLimit then
 			local sx, sy, sz, _ = swing_axis(prevX, prevY, prevZ, nx, ny, nz)
