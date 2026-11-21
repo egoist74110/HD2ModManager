@@ -810,6 +810,8 @@ namespace HD2ModManager.ViewModels
 
         private void RefreshAssetStatus()
         {
+            _generateIasCommand?.RaiseCanExecuteChanged();
+            OnPropertyChanged(nameof(ShowGenerateIas));
             AssetTagsString = "未解析";
             AssetListSummary = "未解析";
             AssetOverrideSummary = "未检查";

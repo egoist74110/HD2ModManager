@@ -450,7 +450,9 @@ public partial class ModDetailsPageViewModel : IWardrobeTreeToggleStore
 		SelectedVpkTreeNodes = [];
 		NewVpkGroupName = string.Empty;
 		IsVpkMod = false;
+		HasSourceVpk = false;
 		HasSectionalSource = false;
+		_hasRetainedIasPatch = false;
 		OnPropertyChanged(nameof(IsVpkMod));
 		OnPropertyChanged(nameof(HasSectionalSource));
 		OnPropertyChanged(nameof(HasRebuildSource));
@@ -470,7 +472,9 @@ public partial class ModDetailsPageViewModel : IWardrobeTreeToggleStore
 		// 另一档来源：根上有 patch + 转换依据（legacy2sectional 的输入）。
 		// 两者都在时以 .vpk 为准（见 HasSectionalSource 的注释）。
 		HasSectionalSource = SectionalSourceFile.Exists(directory);
+		_hasRetainedIasPatch = HasSectionalSource && HasRootIasPatch(directory);
 		OnPropertyChanged(nameof(HasSectionalSource));
+		_generateIasCommand?.RaiseCanExecuteChanged();
 		OnPropertyChanged(nameof(HasRebuildSource));
 		if (!VpkModWardrobeService.IsVpkMod(directory)) return;
 

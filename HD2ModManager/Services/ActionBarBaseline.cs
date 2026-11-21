@@ -85,6 +85,7 @@ public static class ActionBarBaseline
 			or PageActionKind.Package or PageActionKind.Helmet or PageActionKind.Merge
 			=> page.ShowPatchTools,
 		PageActionKind.CustomModel => page.CanConvertToSectional,
+		PageActionKind.IasModel => page.ShowGenerateIas,
 		// PatchRebuild 的判据是 IsDecoration（恒 false，见 ModLibraryService.cs:1390-1392），
 		// 即它在本基线里永远是 visible=0——这正是它被判为"死动作"的证据，保留不删是为了让 diff 说话。
 		PageActionKind.PatchRebuild => page.IsDecoration,

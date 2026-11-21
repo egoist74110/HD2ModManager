@@ -563,15 +563,15 @@ public static class VpkRebuildService
 	/// 汉堡菜单据此决定要不要显示「用来源重构建」（转出来的分件模组没有来源包）。
 	/// </summary>
 	public static int FindSourceVpkCount(string modDirectory)
-		=> string.IsNullOrWhiteSpace(modDirectory) || !Directory.Exists(modDirectory)
-			? 0
-			: FindSourceVpks(modDirectory).Count;
+		=> FindSourceVpks(modDirectory).Count;
 
-	private static List<string> FindSourceVpks(string modDirectory)
-		=> Directory.EnumerateFiles(modDirectory, "*.vpk", SearchOption.TopDirectoryOnly)
+	public static IReadOnlyList<string> FindSourceVpks(string modDirectory)
+		=> string.IsNullOrWhiteSpace(modDirectory) || !Directory.Exists(modDirectory)
+			? []
+			: Directory.EnumerateFiles(modDirectory, "*.vpk", SearchOption.TopDirectoryOnly)
 			.Where(path => !IsVolume(path))
 			.OrderBy(path => path, StringComparer.OrdinalIgnoreCase)
-			.ToList();
+			.ToArray();
 
 	/// <summary>
 	/// 派生命名空间的**来源标识**：条目名（目录名）。

@@ -10,6 +10,7 @@
   </PropertyGroup>
   <ItemGroup>
     <ProjectReference Include="..\HD2ModCore\HD2ModCore.csproj" />
+    <ProjectReference Include="..\tools\IasModelCli\IasModelCli.csproj" />
     <!-- Build the headless companion with the desktop application, without
          making the WPF application depend on the CLI assembly at runtime. -->
     <ProjectReference Include="..\HD2ModCli\HD2ModCli.csproj" ReferenceOutputAssembly="false" />
@@ -28,6 +29,9 @@
            physical file beside the published application. -->
       <ExcludeFromSingleFile>true</ExcludeFromSingleFile>
     </Content>
+    <Content Include="..\tools\IasModelCli\package_model.py;..\tools\IasModelCli\ias_package.py"
+             Link="tools\ias\%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest"
+             CopyToPublishDirectory="PreserveNewest" ExcludeFromSingleFile="true" />
   </ItemGroup>
   
   <!-- Rely on implicit ApplicationDefinition for App.xaml -->

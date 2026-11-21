@@ -45,6 +45,7 @@ public enum PageActionKind
     // 详情页的「用来源重构建」：只重出**这一个** Mod（可选连带子级）。
     // 与 RebuildAllVpk 是两种粒度，所以不复用同一个值。
     RebuildVpk,
+    IasModel,
 }
 
 // 语义色调。逻辑层只说"这是主操作 / 普通操作 / 危险操作"，
@@ -91,6 +92,7 @@ internal static class PageActionIconCatalog
         PageActionKind.CloneVariant => "ActionIcon.Package",
         PageActionKind.RebuildAllVpk => "ActionIcon.Refresh",
         PageActionKind.RebuildVpk => "ActionIcon.Refresh",
+        PageActionKind.IasModel => "ActionIcon.Package",
         _ => "ActionIcon.Plus",
     };
 }
