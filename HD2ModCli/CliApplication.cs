@@ -1,5 +1,8 @@
+using System.Globalization;
+using System.Numerics;
 using System.Reflection;
 using System.Text.Json;
+using HD2ModAdaptation.PatchReconstruction.UnitMesh.Canonical;
 using HD2ModCore.Application;
 using AdaptationAssetKey = HD2ModAdaptation.PatchReconstruction.AssetKey;
 using HD2ModCore.Domain;
@@ -180,6 +183,56 @@ public static class CliApplication
 				new { ok = result.Failures.Count == 0, cleanup = result, residualFoldersRemoved = emptyFolders },
 				() => FormatLibraryCleanup(result, emptyFolders));
 			return result.Failures.Count == 0 ? 0 : 2;
+		}
+		// library adopt —— 把库根下「归档躺在子目录里」的外部包按导入链路收编。
+		//
+		// 这些目录来自别的 mod manager（包名/manifest.json + 包名/选项/patch）。重扫只读
+		// 节点根与 sectional/，看不见子目录里的 patch，于是它们一直躺在库里却不进库，
+		// 而且**没有任何日志**。默认只列候选、不写盘；--confirm 才真的导入。
+		if (Matches(command, "library", "adopt"))
+		{
+			EnsureLibraryAdoptOptions(invocation.Options);
+			var (adoptWorkspace, adoptState) = await LoadLibraryAsync(invocation.Options).ConfigureAwait(false);
+			var adoptRoot = adoptWorkspace.LibraryRoot
+				?? throw new CliUserException("LibraryNotConfigured", "请用 --library 指定 Mod 库。");
+			var adoptCandidates = ExternalPackageAdoptionPlanner.Plan(
+				adoptRoot,
+				adoptState.Snapshot.Nodes.Values.Select(node => node.RelativePath).ToHashSet(StringComparer.OrdinalIgnoreCase));
+			if (!invocation.Options.Confirm)
+			{
+				Emit(invocation.Options,
+					new
+					{
+						ok = true,
+						library = adoptRoot,
+						adoptable = adoptCandidates.Count(candidate => candidate.IsAdoptable),
+						candidates = adoptCandidates,
+					},
+					() => FormatLibraryAdopt(adoptRoot, adoptCandidates));
+				return 0;
+			}
+
+			var adoptPaths = new StoragePaths(
+				adoptWorkspace.ManagerRoot ?? Directory.GetCurrentDirectory(),
+				adoptRoot);
+			await using var adoptReader = CoreServices.CreateModInformationReader();
+			await using var adoptInformationCenter = CoreServices.CreateModInformationCenter(adoptPaths, adoptReader);
+			var adoptImporter = CoreServices.CreateModLibraryImporter(adoptPaths, adoptInformationCenter, adoptReader);
+			var adoptService = CoreServices.CreateExternalPackageAdoptionService(adoptPaths, adoptImporter);
+			var adoption = await adoptService.AdoptAsync(adoptState.Snapshot, adoptRoot).ConfigureAwait(false);
+			Emit(invocation.Options,
+				new
+				{
+					ok = adoption.Outcomes.All(outcome => outcome.Status != ExternalPackageAdoptionStatus.Failed),
+					library = adoptRoot,
+					adopted = adoption.Outcomes.Count(outcome => outcome.Status == ExternalPackageAdoptionStatus.Adopted),
+					queued = adoption.Outcomes.Count(outcome => outcome.Status == ExternalPackageAdoptionStatus.Queued),
+					failed = adoption.Outcomes.Count(outcome => outcome.Status == ExternalPackageAdoptionStatus.Failed),
+					notes = adoption.Notes,
+					outcomes = adoption.Outcomes,
+				},
+				() => FormatLibraryAdoption(adoptRoot, adoption));
+			return adoption.Outcomes.Any(outcome => outcome.Status == ExternalPackageAdoptionStatus.Failed) ? 2 : 0;
 		}
 		// settings get [key] / settings set <key> <value>
 		//
@@ -928,6 +981,10 @@ public static class CliApplication
 				workspace,
 				node,
 				invocation.Options.HeadScale,
+				invocation.Options.LegRefit,
+				invocation.Options.ShoulderTwist,
+				invocation.Options.KneeBlend,
+				invocation.Options.ShoulderFix,
 				stage => Console.Error.WriteLine("#progress " + stage)).ConfigureAwait(false);
 			Emit(invocation.Options, new { ok = outcome.Ok, rebuild = outcome }, () => FormatModRebuild(outcome));
 			return outcome.Ok ? 0 : 2;
@@ -1475,6 +1532,112 @@ public static class CliApplication
 				new { ok = hidden.Success, hideUnit = hidden },
 				() => $"已生成 {hidden.AffectedEntryCount} 个隐藏 Unit 的新 Patch：{hidden.OutputDirectory}");
 			return hidden.Success ? 0 : 2;
+		}
+		if (command.Length >= 2 && command[0] == "patch" && command[1] == "primitive")
+		{
+			EnsurePatchPrimitiveExportOptions(invocation.Options, "patch primitive");
+			if (command.Length < 5)
+				throw new CliUserException(
+					"InvalidArguments",
+					"patch primitive <源 patch.toc> <形状> <尺寸> [xy|yz] [x,y,z] [static] --keys <unit 列表> --output <目录> [--overwrite] [--json]\n" +
+					"  形状：tri | quad | cube | sphere\n" +
+					"  尺寸：quad/tri 用 \"宽,高\"；cube 用 \"边长\"；sphere 用 \"半径\"（单位：米）\n" +
+					"  yz   ：四边形落在 X=0 平面（宽沿 Y、高沿 Z，法线朝 +X）\n" +
+					"  x,y,z：中心点（默认 0,0,0）\n" +
+					"  static：不绑骨（骨骼权重全 0）");
+			var primitiveSource = command[2];
+			var shape = command[3].ToLowerInvariant() switch
+			{
+				"tri" or "triangle" => CanonicalPrimitiveShape.Triangle,
+				"quad" => CanonicalPrimitiveShape.Quad,
+				"cube" => CanonicalPrimitiveShape.Cube,
+				"sphere" => CanonicalPrimitiveShape.Sphere,
+				_ => throw new CliUserException("PatchPrimitiveShapeInvalid", $"不认识的形状：{command[3]}（tri | quad | cube | sphere）")
+			};
+			var sizeParts = command[4].Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+			if (sizeParts.Length == 0 ||
+				!float.TryParse(sizeParts[0], NumberStyles.Float, CultureInfo.InvariantCulture, out var sizeWidth) ||
+				sizeWidth <= 0)
+				throw new CliUserException("PatchPrimitiveSizeInvalid", $"尺寸无法解析：{command[4]}（示例：0.15,0.15 或 0.3）");
+			var sizeHeight = sizeWidth;
+			if (sizeParts.Length > 1 &&
+				(!float.TryParse(sizeParts[1], NumberStyles.Float, CultureInfo.InvariantCulture, out sizeHeight) || sizeHeight <= 0))
+				throw new CliUserException("PatchPrimitiveSizeInvalid", $"尺寸无法解析：{command[4]}");
+			var primitivePlane = CanonicalPrimitivePlane.Xy;
+			var primitiveCenter = Vector3.Zero;
+			var primitiveNoSkin = false;
+			ulong? primitiveMaterialId = null;
+			float primitiveBackdropScale = 0f;
+			float primitiveBackdropOffsetY = 0f;
+			for (var extra = 5; extra < command.Length; extra++)
+			{
+				var token = command[extra];
+				if (string.Equals(token, "xy", StringComparison.OrdinalIgnoreCase) ||
+					string.Equals(token, "yz", StringComparison.OrdinalIgnoreCase) ||
+					string.Equals(token, "xz", StringComparison.OrdinalIgnoreCase))
+				{
+					primitivePlane = token.ToLowerInvariant() switch
+					{
+						"yz" => CanonicalPrimitivePlane.Yz,
+						"xz" => CanonicalPrimitivePlane.Xz,
+						_ => CanonicalPrimitivePlane.Xy
+					};
+					continue;
+				}
+				if (string.Equals(token, "static", StringComparison.OrdinalIgnoreCase))
+				{
+					primitiveNoSkin = true;
+					continue;
+				}
+				if (token.StartsWith("backdy=", StringComparison.OrdinalIgnoreCase))
+				{
+					var rawDy = token.Substring(7);
+					if (!float.TryParse(rawDy, NumberStyles.Float, CultureInfo.InvariantCulture, out var dyValue))
+						throw new CliUserException("PatchPrimitiveBackdropInvalid", $"背景板横向偏移无法解析：{token}");
+					primitiveBackdropOffsetY = dyValue;
+					continue;
+				}
+				if (token.StartsWith("back=", StringComparison.OrdinalIgnoreCase))
+				{
+					var rawBack = token.Substring(5);
+					if (!float.TryParse(rawBack, NumberStyles.Float, CultureInfo.InvariantCulture, out var backScale) || backScale <= 0)
+						throw new CliUserException("PatchPrimitiveBackdropInvalid", $"背景板倍数无法解析：{token}（示例 back=1.25）");
+					primitiveBackdropScale = backScale;
+					continue;
+				}
+				if (token.StartsWith("mat=", StringComparison.OrdinalIgnoreCase))
+				{
+					var rawMaterial = token.Substring(4);
+					var hex = rawMaterial.StartsWith("0x", StringComparison.OrdinalIgnoreCase) ? rawMaterial.Substring(2) : rawMaterial;
+					if (!ulong.TryParse(hex, NumberStyles.HexNumber, CultureInfo.InvariantCulture, out var parsedMaterial))
+						throw new CliUserException("PatchPrimitiveMaterialInvalid", $"材质 id 无法解析：{token}（示例 mat=0x1234abcd5678ef90）");
+					primitiveMaterialId = parsedMaterial;
+					continue;
+				}
+				var centerParts = token.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+				if (centerParts.Length == 3 &&
+					float.TryParse(centerParts[0], NumberStyles.Float, CultureInfo.InvariantCulture, out var cx) &&
+					float.TryParse(centerParts[1], NumberStyles.Float, CultureInfo.InvariantCulture, out var cy) &&
+					float.TryParse(centerParts[2], NumberStyles.Float, CultureInfo.InvariantCulture, out var cz))
+				{
+					primitiveCenter = new Vector3(cx, cy, cz);
+					continue;
+				}
+				throw new CliUserException("PatchPrimitiveArgumentInvalid", $"无法识别的参数：{token}（可用：xy | yz | x,y,z | static）");
+			}
+			var primitiveSpec = new CanonicalPrimitiveSpec(
+				shape, sizeWidth, sizeHeight, Depth: 0f, Center: primitiveCenter, Segments: 12,
+				Plane: primitivePlane, NoSkin: primitiveNoSkin, MaterialId: primitiveMaterialId,
+				BackdropScale: primitiveBackdropScale, BackdropOffsetY: primitiveBackdropOffsetY);
+			var primitiveKeys = CliPatchPrimitives.ResolveKeys(invocation.Options.Keys, "patch primitive --keys");
+			var placed = await CliPatchPrimitives.PlacePrimitiveAsync(
+				primitiveSource, primitiveKeys, primitiveSpec,
+				RequireOutput(invocation.Options, "patch primitive"),
+				invocation.Options.Overwrite).ConfigureAwait(false);
+			Emit(invocation.Options,
+				new { ok = placed.Success, primitive = placed, shape = shape.ToString(), width = sizeWidth, height = sizeHeight },
+				() => $"已把 {placed.AffectedEntryCount} 个 Unit 的几何换成 {shape} {sizeWidth}x{sizeHeight}：{placed.OutputDirectory}");
+			return placed.Success ? 0 : 2;
 		}
 		if (command.Length >= 3 && command[0] == "unit" && command[1] == "show")
 		{
@@ -3918,11 +4081,24 @@ public static class CliApplication
 			}
 		}
 
-		// 头部缩放：只在显式给了 `--head-scale` 时才构造一份 options —— 其余字段继续用
-		// RetargetOptions 的默认值（那就是发货配置），不传时行为与以前逐字节一致。
-		var retargetOptions = options.HeadScale is { } headScale
-			? new RetargetOptions { HeadScale = headScale }
-			: null;
+		// 显式给了重定向参数才构造一份 options。
+		// 其余字段继续用 RetargetOptions 的默认值（那就是发货配置），都不传时行为与以前逐字节一致。
+		RetargetOptions? retargetOptions = null;
+		if (options.HeadScale is not null || options.LegRefit is not null
+			|| options.ShoulderTwist is not null || options.KneeBlend is not null || options.ShoulderFix is not null)
+		{
+			var defaults = new RetargetOptions();
+			retargetOptions = defaults with
+			{
+				HeadScale = options.HeadScale ?? defaults.HeadScale,
+				LegRefit = options.LegRefit is { } legRefit
+					? (legRefit ? LegRefitMode.Bone : LegRefitMode.Off)
+					: defaults.LegRefit,
+				ShoulderTwist = options.ShoulderTwist ?? defaults.ShoulderTwist,
+				ShoulderFix = options.ShoulderFix ?? defaults.ShoulderFix,
+				KneeBlend = options.KneeBlend ?? defaults.KneeBlend,
+			};
+		}
 		var retarget = SourceRetargetPipeline.Run(inputs, rig, null, retargetOptions);
 
 		var split = SourceSegmentation.Split(
@@ -5070,6 +5246,96 @@ public static class CliApplication
 				"CommandOptionNotSupported",
 				"library cleanup 仅接受 --manager-root、--library、--confirm 与 --json。 ");
 		}
+	}
+
+	/// <summary>认领只认 --confirm；不接受跟它无关的参数。</summary>
+	private static void EnsureLibraryAdoptOptions(CliGlobalOptions options)
+	{
+		if (!string.IsNullOrWhiteSpace(options.Output) || options.Overwrite || !string.IsNullOrWhiteSpace(options.Plan)
+			|| !string.IsNullOrWhiteSpace(options.Host) || options.Position is not null || options.SetActive
+			|| options.WithUnsharedOptions || !string.IsNullOrWhiteSpace(options.GameData)
+			|| !string.IsNullOrWhiteSpace(options.RegistryRoot))
+		{
+			throw new CliUserException(
+				"CommandOptionNotSupported",
+				"library adopt 仅接受 --manager-root、--library、--confirm 与 --json。 ");
+		}
+	}
+
+	/// <summary>
+	/// 认领候选的结论：先数清有几个能收，再逐个列出来，最后把不能收的原因说清楚。
+	/// <para>
+	/// 不能收的**也要列**：一个真实包被跳过却没有任何痕迹，正是这条命令要修的毛病。
+	/// </para>
+	/// </summary>
+	private static string FormatLibraryAdopt(string libraryRoot, IReadOnlyList<ExternalPackageAdoptionCandidate> candidates)
+	{
+		var adoptable = candidates.Count(candidate => candidate.IsAdoptable);
+		var lines = new List<string> { $"Mod 库：{libraryRoot}" };
+		if (candidates.Count == 0)
+		{
+			lines.Add("没有发现「归档在子目录、尚未进库」的外部包。");
+			return string.Join(Environment.NewLine, lines);
+		}
+
+		var archive = AdoptedArchiveOf(libraryRoot);		lines.Add($"发现 {candidates.Count} 个外部包，其中 {adoptable} 个可以认领。加 --confirm 才会真的导入（源目录会移到 {archive}，保留 30 天）。");
+		foreach (var candidate in candidates)
+		{
+			var options = candidate.OptionDirectoryNames.Count == 0
+				? "（未识别出选项目录）"
+				: string.Join("、", candidate.OptionDirectoryNames);
+			lines.Add($"  · {candidate.RelativePath}");
+			lines.Add($"      {candidate.BasePatchCount} 个归档 / {candidate.FileCount} 个文件；选项：{options}");
+			if (!string.IsNullOrWhiteSpace(candidate.ManifestName))
+				lines.Add($"      manifest 名称：{candidate.ManifestName}");
+			if (candidate.BlockedReason is { Length: > 0 } reason)
+				lines.Add($"      ! 不能认领：{reason}");
+			lines.AddRange(candidate.Warnings.Select(warning => "      · " + warning));
+		}
+		return string.Join(Environment.NewLine, lines);
+	}
+
+	/// <summary>
+	/// 认领副本目录（<c>&lt;库&gt;.adopted</c>）。规则只写在 <see cref="StoragePaths"/> 里一处，
+	/// 这里借它算一遍——dry-run 阶段还没构造完整的 StoragePaths。
+	/// </summary>
+	private static string AdoptedArchiveOf(string libraryRoot)
+		=> new StoragePaths(libraryRoot, libraryRoot).AdoptedArchiveDirectory;
+
+	/// <summary>认领执行完的结论：成功的说清搬了哪几个，失败的把原因和「源目录还在」讲明白。</summary>
+	private static string FormatLibraryAdoption(string libraryRoot, ExternalPackageAdoptionResult adoption)
+	{
+		var lines = new List<string> { $"Mod 库：{libraryRoot}" };
+		if (adoption.Outcomes.Count == 0)
+		{
+			lines.Add("没有需要认领的外部包。");
+			return string.Join(Environment.NewLine, lines);
+		}
+
+		var adopted = adoption.Outcomes.Count(outcome => outcome.Status == ExternalPackageAdoptionStatus.Adopted);
+		var queued = adoption.Outcomes.Count(outcome => outcome.Status == ExternalPackageAdoptionStatus.Queued);
+		var skipped = adoption.Outcomes.Count(outcome => outcome.Status == ExternalPackageAdoptionStatus.Skipped);
+		var failed = adoption.Outcomes.Count(outcome => outcome.Status == ExternalPackageAdoptionStatus.Failed);
+		// 「排队」与「跳过」分开报：前者只是没轮到，下次继续；后者是被判据挡下了。
+		lines.Add($"认领完成：导入 {adopted} 个，排队 {queued} 个，跳过 {skipped} 个，失败 {failed} 个。");
+		foreach (var note in adoption.Notes)
+			lines.Add($"  · {note}");
+		foreach (var outcome in adoption.Outcomes)
+		{
+			var mark = outcome.Status switch
+			{
+				ExternalPackageAdoptionStatus.Adopted => "+",
+				ExternalPackageAdoptionStatus.Queued => "…",
+				ExternalPackageAdoptionStatus.Skipped => "-",
+				_ => "!",
+			};
+			lines.Add($"  {mark} {outcome.RelativePath}");
+			if (outcome.NodeIds.Count != 0)
+				lines.Add($"      {outcome.NodeIds.Count} 个节点");
+			if (!string.IsNullOrWhiteSpace(outcome.Detail))
+				lines.Add($"      {outcome.Detail}");
+		}
+		return string.Join(Environment.NewLine, lines);
 	}
 
 	private static string FormatLibraryCleanup(CliLibraryCleanupResult result, int residualFoldersRemoved)
@@ -8619,6 +8885,7 @@ HD2 Mod Manager 命令行
 用法：
 	  hd2mod capabilities --json
 	  hd2mod library cleanup --manager-root <管理器目录> --library <Mod库目录> --confirm --json
+	  hd2mod library adopt --manager-root <管理器目录> --library <Mod库目录> [--confirm] --json
 	  hd2mod doctor --manager-root <管理器目录> --library <Mod库目录> --json
 	  hd2mod status --manager-root <管理器目录> --json
 	  hd2mod game locate [--manager-root <管理器目录>] --json
@@ -8809,7 +9076,7 @@ Unit 数据视图（只读；直接解析 Patch 内的 Unit 网格与骨骼，�
 	                    使用前必须明确告知用户「这是实验功能、可能让 Mod 与本工具的正常产物不一致」。
 	    --disabled <unit:1,2;unit:3>
 	                    要烘成关闭状态的 section（**来源** Unit 键空间，与 wardrobe.json 存的一致）。
-	  hd2mod vpk2patch <VPK文件> [<VPK文件> ...] --output <输出根目录> [--avatar-toc <avatar Unit TocData>] [--game-data <游戏data目录>] [--material-source <分号分隔的 VPK 或目录>] [--components merge|all|none|<名字,名字>] [--json]
+	  hd2mod vpk2patch <VPK文件> [<VPK文件> ...] --output <输出根目录> [--avatar-toc <avatar Unit TocData>] [--game-data <游戏data目录>] [--material-source <分号分隔的 VPK 或目录>] [--components merge|all|none|<名字,名字>] [--shoulder-twist on|off] [--shoulder-fix on|off] [--knee-blend on|off] [--json]
 	    把**一批** VPK 逐个翻译成 patch：每个 VPK 出**一个** patch，只含它自己的资源。
 	    自动识别类型：含 .mdl → 出 unit patch（零材质零贴图）；只有 .vmt/.vtf → 出材质/贴图 patch。
 	    整批构成**解析集合**：材质 VPK 从队列里找模型（算 matcap 平均色要几何），
