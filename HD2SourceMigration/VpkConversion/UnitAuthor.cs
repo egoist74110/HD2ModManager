@@ -53,7 +53,9 @@ public sealed class UnitAuthor
 	private readonly CanonicalMeshPreparation preparation = new();
 	private readonly CanonicalUnitRebuilder unitRebuilder = new();
 
-	public UnitAuthorResult Author(UnitAuthorRequest request)
+	public UnitAuthorResult Author(UnitAuthorRequest request) => Author(request, null);
+
+	internal UnitAuthorResult Author(UnitAuthorRequest request, IReadOnlyDictionary<int, RetargetedMesh>? nativeLods)
 	{
 		ArgumentNullException.ThrowIfNull(request);
 		var diagnostics = new List<string>();
@@ -115,13 +117,17 @@ public sealed class UnitAuthor
 				continue;
 			}
 
-			var built = BuildRawMesh(request, target, mesh, stream, diagnostics);
+			var meshRequest = nativeLods is null ? request : request with
+			{
+				Mesh = nativeLods.GetValueOrDefault(mesh.LodIndex) ?? nativeLods.OrderBy(pair => Math.Abs(pair.Key - mesh.LodIndex)).First().Value,
+			};
+			var built = BuildRawMesh(meshRequest, target, mesh, stream, diagnostics);
 			if (built is null)
 				return new(null, null, null, diagnostics);
 			finalMeshes.Add(built.Raw);
 			materialProvenance.AddRange(built.Provenance);
 			boneInfoByMesh[mesh.Index] = built.BoneInfo;
-			boundsByMesh[mesh.Index] = UpdateCullingBounds(mesh, request.Mesh.Vertices);
+			boundsByMesh[mesh.Index] = UpdateCullingBounds(mesh, meshRequest.Mesh.Vertices);
 		}
 
 		// 包围盒必须按我们自己的顶点重算，否则留下的是外壳的盒子（见 UpdateCullingBounds）。
@@ -471,6 +477,12 @@ public sealed class UnitAuthor
 		for (var i = 0; i < components.Length; i++)
 		{
 			var target = stream.Components[i];
+			var native = vertex.NativeSurfaceComponents?.FirstOrDefault(component => component.Type == target.Type && component.Index == target.Index);
+			if (native is not null)
+			{
+				components[i] = native;
+				continue;
+			}
 			var (floats, uints) = target.Type switch
 			{
 				0 => (new[] { (float)position.X, (float)position.Y, (float)position.Z }, Array.Empty<uint>()),

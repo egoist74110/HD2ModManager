@@ -1891,6 +1891,18 @@ namespace HD2ModManager.ViewModels
         /// <summary>物理模式的一句话说明。</summary>
         public string PhysicsModeDescription => PhysicsMode.Description();
 
+        /// <summary>实验性手臂姿态修正（默认关闭）。</summary>
+        public bool ArmPoseEnabled
+        {
+            get => SettingsService.GetArmPoseEnabled();
+            set
+            {
+                if (SettingsService.SetArmPoseEnabled(value) && PhysicsMode.UsesRuntimeLua())
+                    _profiles.RequestActiveProfileDeployment();
+                OnPropertyChanged(nameof(ArmPoseEnabled));
+            }
+        }
+
     public bool AutoUpdateAssetMetadata
         {
             get => SettingsService.GetAutoUpdateAssetMetadata();

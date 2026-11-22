@@ -26,13 +26,13 @@ public static class LuaAddonCatalog
 	public const string WardrobeModGuid = "3f9d5a12-8c47-4b93-a6e0-1d2f3a4b5c02";
 
 	/// <summary>物理功能的外置包描述。</summary>
-	public static LuaAddonPackageExport.Feature Physics() => new(
+	public static LuaAddonPackageExport.Feature Physics(bool armPoseEnabled = false) => new(
 		Key: "physbone",
 		Title: "HD2 物理骨骼运行时",
 		AddonId: PhysicsAddonId,
 		ModGuid: PhysicsModGuid,
 		LuaFileName: "hd2physbone.lua",
-		Source: PhysBoneLuaSource.ComposeStandalonePackage(PhysicsAddonId));
+		Source: PhysBoneLuaSource.ComposeStandalonePackage(PhysicsAddonId, armPoseEnabled: armPoseEnabled));
 
 	/// <summary>
 	/// 映射功能的外置包描述。

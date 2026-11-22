@@ -111,6 +111,11 @@
                                   SelectedValue="{Binding PhysicsMode, Mode=TwoWay}"/>
                     </Grid>
                     <TextBlock Text="{Binding PhysicsModeDescription}" Style="{StaticResource AppSupportingText}" Margin="150,8,0,0" TextWrapping="Wrap"/>
+                    <CheckBox Style="{StaticResource AppToggleSwitch}" Margin="0,14,0,0"
+                              Content="手臂姿态修正（实验）"
+                              IsChecked="{Binding ArmPoseEnabled, Mode=TwoWay}"
+                              ToolTip="需开启物理模式。无武器站立/奔跑时轻度内收手臂避免宽肩模型穿模或僵直，持枪时用 2-bone IK 保持手腕世界位姿。默认关闭。"/>
+                    <TextBlock Text="在 Lua 运行时对玩家手臂执行实验性姿态修正（无武器轻度内收 + 持枪 2-bone IK 锁定手腕），不影响没有开启物理模式的用户。" Style="{StaticResource AppSupportingText}" Margin="0,5,0,0" TextWrapping="Wrap"/>
                     <!--
                         低污染模式（规划 kit-instance-mapping-deploy-plan §15.1）：靠管理器内置 Lua（Hider）按人藏掉共用部件，
                         所以放在「内置 lua」卡里、排在映射/物理之后；总开关关着时禁用（也按关处理），下面的前置说明随映射/物理档位变化。

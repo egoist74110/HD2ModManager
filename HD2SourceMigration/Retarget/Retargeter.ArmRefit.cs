@@ -76,6 +76,29 @@ public sealed partial class Retargeter
 					+ (forward * (_options.ArmPerp * Vec3.Dot(perpendicular, forward)));
 			}
 
+			if (_nativeSourceNames is not null)
+			{
+				foreach (var (twistName, startName, endName) in new[]
+				{
+					($"{side}_shoulder_twist", $"{side}_shoulder", $"{side}_elbow"),
+					($"{side}_hand_twist", $"{side}_elbow", $"{side}_hand"),
+				})
+				{
+					if (!_byName.TryGetValue(twistName, out var twistBone)
+						|| !_byName.TryGetValue(startName, out var startBone)
+						|| !_byName.TryGetValue(endName, out var endBone)
+						|| !residual.TryGetValue(startBone.Index, out var startResidual)
+						|| !residual.TryGetValue(endBone.Index, out var endResidual))
+						continue;
+					var segment = _shippedRest[endBone.Index].Origin - _shippedRest[startBone.Index].Origin;
+					var t = RetargetMath.Clamp(
+						Vec3.Dot(_shippedRest[twistBone.Index].Origin - _shippedRest[startBone.Index].Origin, segment)
+						/ Math.Max(Vec3.Dot(segment, segment), 1e-9),
+						0, 1);
+					residual[twistBone.Index] = startResidual + ((endResidual - startResidual) * t);
+				}
+			}
+
 			if (residual.Count == 0)
 				continue;
 			bonesUsed += residual.Count;
@@ -84,7 +107,7 @@ public sealed partial class Retargeter
 			for (var k = 0; k < points.Length; k++)
 			{
 				var accumulated = Vec3.Zero;
-				for (var j = 0; j < 3; j++)
+				for (var j = 0; j < _weights[k].Length; j++)
 				{
 					var weight = _weights[k][j];
 					if (weight <= 0)

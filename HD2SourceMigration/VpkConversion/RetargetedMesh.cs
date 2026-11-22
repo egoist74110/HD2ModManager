@@ -1,4 +1,5 @@
 using HD2SourceModel;
+using HD2ModAdaptation.PatchReconstruction.UnitMesh;
 
 namespace HD2SourceMigration.VpkConversion;
 
@@ -18,7 +19,10 @@ public sealed record RetargetedVertex(
 	Vec3 Normal,
 	float U,
 	float V,
-	IReadOnlyList<RetargetedInfluence> Influences);
+	IReadOnlyList<RetargetedInfluence> Influences)
+{
+	internal IReadOnlyList<UnitVertexComponentValue>? NativeSurfaceComponents { get; init; }
+}
 
 /// <summary>
 /// 一份几何里按<b>源材质</b>分好的一段。

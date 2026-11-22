@@ -86,7 +86,7 @@ public static class RetargetedMeshBuilder
 		// （背离质心的比例只有 20.9%），而绕序已经翻成朝外 —— 法线与绕序矛盾。
 		// 根源是重定向里含镜像（L4D2 与 HD2 的坐标系手性不同），而 `TransformNormal`
 		// 用旋转部直接搬法线，对镜像不免疫；`final_normals` 从**最终几何**推法线，所以免疫。
-		var normals = ComputeFinalNormals(group, geometry, result, byMaterial);
+		var normals = ComputeFinalNormals(group, geometry, result.Output, byMaterial);
 		for (var i = 0; i < vertices.Length; i++)
 		{
 			var sourceIndex = group.VertexIndices[i];
@@ -203,10 +203,10 @@ public static class RetargetedMeshBuilder
 	/// ——不必真的构造 3×3 矩阵。
 	/// </para>
 	/// </summary>
-	private static Vec3[] ComputeFinalNormals(
+	internal static Vec3[] ComputeFinalNormals(
 		MeshGroup group,
 		SourceGeometry geometry,
-		RetargetResult result,
+		IReadOnlyList<Vec3> output,
 		Dictionary<int, List<(int A, int B, int C)>> byMaterial)
 	{
 		var count = group.VertexIndices.Count;
@@ -220,7 +220,7 @@ public static class RetargetedMeshBuilder
 			// ⚠️ **源法线要归一化**（Python 侧 `build_patch.py:228` 明确做了 `src_nrm /= ‖src_nrm‖`）。
 			// 不归一化的话，面积加权平均会被"长度大的那些法线"带偏 —— 大片噪声正是这个形状。
 			sourceNormals[i] = Unit(geometry.Vertices[sourceIndex].Normal);
-			finalPositions[i] = result.Output[sourceIndex];
+			finalPositions[i] = output[sourceIndex];
 		}
 
 		var accumulated = new Vec3[count];

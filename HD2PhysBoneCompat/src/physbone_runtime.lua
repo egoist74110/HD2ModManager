@@ -2648,8 +2648,8 @@ end
 local function parse_snapshot_request(text)
 	if type(text) ~= "string" or #text == 0 then return nil end
 	local request = { frames = 8, stride = 2, limit = 0, nodes = {}, names = {}, seq = nil }
-	for line in text:gmatch("[^\r\n]+") do
-		line = line:gsub("^%s+", ""):gsub("%s+$", "")
+	for rawLine in text:gmatch("[^\r\n]+") do
+		local line = rawLine:gsub("^%s+", ""):gsub("%s+$", "")
 		if #line > 0 and line:sub(1, 1) ~= "#" then
 			local key, value = line:match("^([%w_]+)%s*=%s*(.-)$")
 			if key ~= nil then
@@ -3622,6 +3622,105 @@ local function dump_api_surface(runtime)
 	logger("[physbone][诊断] 引擎 API 清单已写到 %s（共 %d 个命名空间）", path, #namespaces)
 end
 
+local function arm_pose_enabled(runtime)
+	local tune = tune_values(runtime)
+	if tune.armPose ~= nil then return tune.armPose ~= 0 end
+	if tune.text ~= nil and tune.text.armPose ~= nil then
+		return tune.text.armPose == "true" or tune.text.armPose == "1"
+	end
+	return runtime.options ~= nil and runtime.options.armPose == true
+end
+
+local function arm_pose_options(runtime)
+	local opts = runtime.options or {}
+	local tune = tune_values(runtime)
+	local mode = (tune.text and tune.text.armMode) or opts.armMode or "auto"
+	return {
+		armMode = mode,
+		-- 不在这里填默认值：有没有肩关节目标会改变默认（见 Compat.apply_arm_pose）。
+		armAdductionDeg = tune.armAdductionDeg or opts.armAdductionDeg,
+		armForearmCompDeg = tune.armForearmCompDeg or opts.armForearmCompDeg,
+		armShoulderTarget = opts.armShoulderTarget,
+		armShoulderNarrow = tune.armShoulderNarrow or opts.armShoulderNarrow or 0.025,
+		armIkPull = tune.armIkPull or opts.armIkPull or 0.09,
+		armBlendTime = tune.armBlendTime or opts.armBlendTime or 0.12,
+	}
+end
+
+local function resolve_local_avatar_for_arm(runtime)
+	if runtime.sessions ~= nil and runtime.avatars ~= nil and #runtime.avatars > 0 then
+		runtime.avatar = runtime.avatars[1].unit
+		runtime.avatarTag = runtime.avatars[1].tag
+		return runtime.avatar
+	end
+	if runtime.avatar ~= nil then return runtime.avatar end
+	local frame = runtime.frame or 0
+	if runtime.armScanAt ~= nil and frame < runtime.armScanAt then return nil end
+	local options = runtime.options or {}
+	runtime.armScanAt = frame + (options.armDiscoverFrames or 30)
+
+	local world, units = pickWorld(S, runtime.cache)
+	if world == nil or units == nil then return nil end
+	runtime.cache.world = world
+	runtime.world = world
+	local list = findAvatars(S, world, units, #units, SUPPORT_MG_NAME,
+		options.minNodes or 90, options, runtime.cache)
+	if list == nil or #list == 0 then return nil end
+
+	local chosen = list[1].unit
+	if #list > 1 then
+		local cx, cy, cz = cameraPosition(S, world, runtime.cache)
+		if cx ~= nil then
+			local bestD2 = math.huge
+			for index = 1, #list do
+				local p = readVector(S, try(S.Unit.world_position, list[index].unit, 1))
+				if p ~= nil then
+					local dx, dy, dz = p.x - cx, p.y - cy, p.z - cz
+					local d2 = dx * dx + dy * dy + dz * dz
+					if d2 < bestD2 then
+						bestD2 = d2
+						chosen = list[index].unit
+					end
+				end
+			end
+		end
+	end
+	local tag = unit_tag(S, chosen)
+	runtime.avatar = chosen
+	runtime.avatarTag = tag
+	return chosen
+end
+
+local function apply_arm_pose_frame(runtime)
+	if type(Compat.apply_arm_pose) ~= "function" then return 0, 0 end
+	local unit = runtime.avatar
+	if unit == nil then
+		unit = resolve_local_avatar_for_arm(runtime)
+	end
+	if unit == nil then
+		runtime.armState = nil
+		runtime.armCalls = 0
+		return 0, 0
+	end
+	if not Compat.unit_alive(S, unit) then
+		runtime.avatar = nil
+		runtime.avatarTag = nil
+		runtime.avatars = nil
+		runtime.armState = nil
+		runtime.armCalls = 0
+		return 0, 0
+	end
+	local world = runtime.cache and runtime.cache.world or nil
+	local written, calls, alpha, _, resolved = Compat.apply_arm_pose(
+		S, world, unit, runtime.armState, runtime.dt, arm_pose_options(runtime))
+	runtime.armState = resolved
+	runtime.armCalls = calls or 0
+	runtime.armCallsAccum = (runtime.armCallsAccum or 0) + (calls or 0)
+	runtime.armFrames = (runtime.armFrames or 0) + 1
+	runtime.armAlpha = alpha or 0
+	return written or 0, calls or 0
+end
+
 local function drive(runtime)
 	local frame = runtime.frame
 	local options = runtime.options
@@ -3661,7 +3760,7 @@ local function drive(runtime)
 	-- 句柄一失效，这一行就是野读 → 原生 AV（0x3e564b / 参数 0x0 0x0），Lua 层完全看不出来。
 	-- 所以会话**和** avatar 两套句柄都要过同一道闸。
 	local haveSessions = runtime.sessions ~= nil and #runtime.sessions > 0
-	local haveAvatars = runtime.avatars ~= nil and #runtime.avatars > 0
+	local haveAvatars = (runtime.avatars ~= nil and #runtime.avatars > 0) or runtime.avatar ~= nil
 	if haveSessions or haveAvatars then
 		local live = refresh_live_units(runtime, S)
 		if live == "world-gone" then
@@ -3671,10 +3770,11 @@ local function drive(runtime)
 			runtime.sessions = nil
 			runtime.avatars = nil
 			runtime.avatar = nil
+			runtime.armState = nil
 			runtime.liveUnits = nil
 			runtime.reArm = 1
 			runtime.rearmAt = frame + 1
-		elseif live == "ok" and haveAvatars then
+		elseif live == "ok" and runtime.avatars ~= nil and #runtime.avatars > 0 then
 			-- avatar 名单同样按指针过一遍：不在活体列表里的直接摘掉（不调任何 Unit API）。
 			local keptAvatars, droppedAvatars = {}, 0
 			for index = 1, #runtime.avatars do
@@ -3701,6 +3801,10 @@ local function drive(runtime)
 					runtime.avatarTag = keptAvatars[1].tag
 				end
 			end
+		elseif live == "ok" and runtime.avatar ~= nil and not session_unit_live(runtime, runtime.avatar) then
+			runtime.avatar = nil
+			runtime.avatarTag = nil
+			runtime.armState = nil
 		end
 	end
 
@@ -3863,9 +3967,24 @@ local function drive(runtime)
 		end
 	end
 
+	local function drive_arm_only_and_beat()
+		if not arm_pose_enabled(runtime) then return end
+		local armWritten, armCalls = apply_arm_pose_frame(runtime)
+		runtime.beatFrames = (runtime.beatFrames or 0) + 1
+		local tune = tune_values(runtime)
+		local heartbeat = math.floor(tune.heartbeatFrames or options.heartbeatFrames or 600)
+		if heartbeat < 1 then heartbeat = 0 end
+		if heartbeat > 0 and (runtime.beatFrames % heartbeat) == 0 then
+			local avgArm = (runtime.armFrames or 0) > 0 and ((runtime.armCallsAccum or 0) / runtime.armFrames) or 0
+			logger("[physbone] 手臂修正心跳 unit=%s 写入=%d 手臂调用=%d(%.0f/帧) alpha=%.2f",
+				tostring(runtime.avatarTag or "-"), armWritten, armCalls, avgArm, runtime.armAlpha or 0)
+		end
+	end
+
 	if runtime.sessions == nil then
 		if runtime.rearmAt ~= nil and frame < runtime.rearmAt then
 			note_wait(runtime, "退避等待重扫")
+			drive_arm_only_and_beat()
 			return
 		end
 		-- 等待中的轮询会跑一趟完整的 `discover`（扫所有 unit + 给每个候选打分，几千次引擎调用），
@@ -3878,8 +3997,14 @@ local function drive(runtime)
 		-- 观感就是"进图后十几秒完全没物理"。这期间每拍只多花预筛的钱（≈0.04 ms/件），
 		-- 真打分仍受 `scoreUnitsPerFrame` 限制，所以不会突破预算。
 		if waited > (options.waitSlowAfter or 200) and not runtime.fillPending then poll = poll * 3 end
-		if (frame % poll) ~= 0 then return end
-		if not tryAttach(runtime) then return end
+		if (frame % poll) ~= 0 then
+			drive_arm_only_and_beat()
+			return
+		end
+		if not tryAttach(runtime) then
+			drive_arm_only_and_beat()
+			return
+		end
 		runtime.waitSince = nil
 	else
 		runtime.waitSince = nil
@@ -4050,6 +4175,13 @@ local function drive(runtime)
 	-- 放在物理写入之后：这一帧渲染用的就是"抬过"的 avatar 根。
 	apply_lift(runtime)
 
+	local armSuffix = ""
+	if arm_pose_enabled(runtime) then
+		local _, armCalls = apply_arm_pose_frame(runtime)
+		local avgArm = (runtime.armFrames or 0) > 0 and ((runtime.armCallsAccum or 0) / runtime.armFrames) or 0
+		armSuffix = string.format(" 手臂调用=%d(%.0f/帧) alpha=%.2f", armCalls, avgArm, runtime.armAlpha or 0)
+	end
+
 	runtime.callsAccum = (runtime.callsAccum or 0) + engineCalls
 	runtime.staticChains = staticChains
 	runtime.lastChainTotal = primaryChains + nearChains + farChains
@@ -4103,14 +4235,14 @@ local function drive(runtime)
 	if heartbeat > 0 and (runtime.beatFrames % heartbeat) == 0 then
 		local chains = 0
 		for _, session in ipairs(runtime.sessions) do chains = chains + #session.sessions end
-		logger("[physbone] 驱动心跳 unit=%d 链=%d 玩家=%d 分帧=%d/%d 本帧驱动=%d 驱动=%.2f ms dt=%.4f 本帧 写入=%d 跳过=%d 引擎调用=%d 累计/帧=%.0f 静止链=%d 偏离绑定峰值=%.1f°(史上%.1f°) 最离谱=%s(限%.0f°) 同拍重复=%d",
+		logger("[physbone] 驱动心跳 unit=%d 链=%d 玩家=%d 分帧=%d/%d 本帧驱动=%d 驱动=%.2f ms dt=%.4f 本帧 写入=%d 跳过=%d 引擎调用=%d 累计/帧=%.0f 静止链=%d 偏离绑定峰值=%.1f°(史上%.1f°) 最离谱=%s(限%.0f°) 同拍重复=%d%s",
 			#runtime.sessions, chains, #(runtime.avatars or {}), runtime.nearStride or 1, runtime.farStride or 1, attempted,
 			(os.clock() - driveClock) * 1000,
 			runtime.dt or 0, written, skippedSame, engineCalls,
 			runtime.callsAccum / runtime.driveFrames, staticChains, framePeakDeg,
 			runtime.peakAngle or 0,
 			worstName ~= nil and tostring(worstName) or "-", worstLimit,
-			runtime.repeatCalls or 0)
+			runtime.repeatCalls or 0, armSuffix)
 	end
 
 	-- 逐链明细（默认关）：区分"求解器在动"和"参数算出来就是 0"——后者在画面上就是钢板。
@@ -4313,6 +4445,8 @@ M.make_logger_ = makeLogger
 M.snapshot_parse_ = parse_snapshot_request
 M.snapshot_ids_ = snapshot_ids
 M.snapshot_json_ = snapshot_json
+M.arm_pose_enabled_ = arm_pose_enabled
+M.apply_arm_pose_frame_ = apply_arm_pose_frame
 M.snapshot_poll_ = snapshot_poll
 M.snapshot_dir_ = snapshot_dir
 

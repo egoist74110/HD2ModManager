@@ -179,7 +179,10 @@ public sealed partial class Retargeter
 	{
 		var weights = _weights[vertexIndex];
 		var bones = _boneIndices[vertexIndex];
-		var best = weights[0] >= weights[1] && weights[0] >= weights[2] ? 0 : weights[1] >= weights[2] ? 1 : 2;
+		var best = 0;
+		for (var slot = 1; slot < weights.Length; slot++)
+			if (weights[slot] > weights[best])
+				best = slot;
 		if (weights[best] <= 0.0)
 		{
 			boneIndex = -1;

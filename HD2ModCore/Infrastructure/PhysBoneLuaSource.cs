@@ -34,7 +34,8 @@ public static class PhysBoneLuaSource
 	/// 而且要求它必须是首行——所以这里不能有任何前导空行或 BOM。
 	/// </param>
 	/// <param name="mode">boot / external，只影响日志里的措辞。</param>
-	public static string ComposeStandalonePackage(string? addonId = null, string mode = "external")
+	/// <param name="armPoseEnabled">是否在安装时开启运行时手臂姿态修正（默认关闭）。</param>
+	public static string ComposeStandalonePackage(string? addonId = null, string mode = "external", bool armPoseEnabled = false)
 	{
 		var compat = LoadCompat();
 		var runtime = LoadRuntime();
@@ -64,7 +65,8 @@ public static class PhysBoneLuaSource
 		builder.AppendLine("\tif engine == nil then return end");
 		builder.Append("\tPhysBoneRuntime.install(engine, { compat = PhysBoneCompat, mode = '")
 			.Append(mode)
-			.AppendLine("' })");
+			.Append(armPoseEnabled ? "', armPose = true })" : "' })")
+			.AppendLine();
 		builder.AppendLine("end)");
 		builder.AppendLine("if not ok then");
 		builder.AppendLine("\tlocal real = rawget(_G, 'print')");

@@ -35,6 +35,7 @@ public sealed partial class Retargeter
 	private readonly BodyPoseProfile _profile;
 	private readonly RetargetOptions _options;
 	private readonly Action<string, Vec3[]>? _stageCallback;
+	private readonly IReadOnlyList<string>? _nativeSourceNames;
 
 	// ---- 源侧（按骨下标索引） ---------------------------------------------
 	private readonly string[] _sourceNames;
@@ -79,6 +80,14 @@ public sealed partial class Retargeter
 		BodyPoseProfile? profile = null,
 		RetargetOptions? options = null,
 		Action<string, Vec3[]>? stageCallback = null)
+		: this(model, geometry, rig, profile, options, stageCallback, null, null)
+	{
+	}
+
+	private Retargeter(
+		SourceModelDocument model, SourceGeometry geometry, Hd2Rig rig,
+		BodyPoseProfile? profile, RetargetOptions? options, Action<string, Vec3[]>? stageCallback,
+		IReadOnlyList<string>? nativeSourceNames, IReadOnlyList<SourceVertexWeight[]>? nativeWeights)
 	{
 		_model = model ?? throw new ArgumentNullException(nameof(model));
 		_geometry = geometry ?? throw new ArgumentNullException(nameof(geometry));
@@ -86,6 +95,7 @@ public sealed partial class Retargeter
 		_profile = profile ?? BodyPoseProfile.Default;
 		_options = options ?? new RetargetOptions();
 		_stageCallback = stageCallback;
+		_nativeSourceNames = nativeSourceNames;
 
 		_sourceNames = new string[model.Bones.Count];
 		_sourceParents = new int[model.Bones.Count];
@@ -97,8 +107,9 @@ public sealed partial class Retargeter
 			_sourceNames[i] = bone.DisplayName;
 			_sourceParents[i] = bone.ParentIndex;
 			// 源侧单位是英寸：先把 bind 求逆，再把平移缩到米。不缩放不会报错，只会让整张对应表差 39.37 倍。
-			_sourceWorldMetres[i] = RetargetMath.ScaleTranslation(
-				bone.WorldBind, RetargetConstants.InchesToMetres);
+			_sourceWorldMetres[i] = nativeSourceNames is null
+				? RetargetMath.ScaleTranslation(bone.WorldBind, RetargetConstants.InchesToMetres)
+				: bone.WorldBind;
 			if (bone.HasName && bone.Name!.StartsWith(RetargetConstants.SourceBonePrefix, StringComparison.Ordinal))
 				_shortByName.TryAdd(bone.Name[RetargetConstants.SourceBonePrefix.Length..], i);
 		}
@@ -143,9 +154,13 @@ public sealed partial class Retargeter
 		{
 			var vertex = geometry.Vertices[i];
 			// Source 存的是英寸。
-			_sourcePoints[i] = vertex.Position * RetargetConstants.InchesToMetres;
-			_weights[i] = [vertex.Weight0.Weight, vertex.Weight1.Weight, vertex.Weight2.Weight];
-			_boneIndices[i] = [vertex.Weight0.BoneIndex, vertex.Weight1.BoneIndex, vertex.Weight2.BoneIndex];
+			_sourcePoints[i] = nativeWeights is null ? vertex.Position * RetargetConstants.InchesToMetres : vertex.Position;
+			_weights[i] = nativeWeights is null
+				? [vertex.Weight0.Weight, vertex.Weight1.Weight, vertex.Weight2.Weight]
+				: nativeWeights[i].Select(weight => (double)weight.Weight).ToArray();
+			_boneIndices[i] = nativeWeights is null
+				? [vertex.Weight0.BoneIndex, vertex.Weight1.BoneIndex, vertex.Weight2.BoneIndex]
+				: nativeWeights[i].Select(weight => weight.BoneIndex).ToArray();
 		}
 	}
 
@@ -216,9 +231,9 @@ public sealed partial class Retargeter
 		}
 
 		_sole = soleCount > 0 ? soleSum / soleCount : Vec3.Zero;
-		_sourceHeadJoint = _shortByName.TryGetValue("Head1", out var headIndex)
+		_sourceHeadJoint = _nativeHeadAnchor ?? (_shortByName.TryGetValue("Head1", out var headIndex)
 			? _sourceWorldMetres[headIndex].Origin
-			: Vec3.Zero;
+			: Vec3.Zero);
 		var headHd2 = _byName.TryGetValue("head", out var headBone)
 			? _restHd2[headBone.Index].Origin
 			: Vec3.Zero;
@@ -273,6 +288,17 @@ public sealed partial class Retargeter
 				_newHead[hd2Name] = Joint(sourceName);
 		}
 
+		if (_nativeSourceNames is not null)
+		{
+			for (var i = 0; i < _nativeSourceNames.Count; i++)
+			{
+				var name = _nativeSourceNames[i];
+				if (!_byName.TryGetValue(name, out var bone))
+					continue;
+				_sourceToHd2[i] = bone.Index;
+				_newHead[name] = AlignPoint(_sourceWorldMetres[i].Origin) + _translation;
+			}
+		}
 		FillHd2OnlyHeads(missing);
 
 		// ---- 2b / 2c. 站姿 --------------------------------------------------
@@ -599,7 +625,8 @@ public sealed partial class Retargeter
 				_newHead[$"{side}_toe"] = ball + ((ball - foot) * 0.35);
 		}
 
-		if (_byName.ContainsKey("head_tip"))
+		if (_byName.ContainsKey("head_tip") && (_nativeSourceNames is null ||
+			(_newHead.ContainsKey("head") && _newHead.ContainsKey("neck"))))
 			_newHead["head_tip"] = _newHead["head"] + (_newHead["head"] - _newHead["neck"]);
 	}
 

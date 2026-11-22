@@ -3175,4 +3175,486 @@ function M.update_tip(session, dt, maxWrite)
 	return written
 end
 
+-- ---------------------------------------------------------------------------
+-- P3：手臂姿态运行时修正（无武器内收 + 持枪 2-bone IK + 平滑过渡）
+-- ---------------------------------------------------------------------------
+
+local ARM_BONE_NAMES = {
+	"chest",
+	"l_clavicle", "l_shoulder", "l_elbow", "l_hand",
+	"r_clavicle", "r_shoulder", "r_elbow", "r_hand",
+}
+M.ARM_BONE_NAMES = ARM_BONE_NAMES
+
+local ARM_ANIM_VAR_CANDIDATES = {
+	"aim_weight", "aim", "is_aiming", "weapon_equipped", "stance",
+}
+
+local function mat3_to_quat(m11, m12, m13, m21, m22, m23, m31, m32, m33)
+	local trace = m11 + m22 + m33
+	local qx, qy, qz, qw
+	if trace > 0 then
+		local s = math.sqrt(trace + 1.0) * 2.0
+		qw = 0.25 * s
+		qx = (m32 - m23) / s
+		qy = (m13 - m31) / s
+		qz = (m21 - m12) / s
+	elseif m11 > m22 and m11 > m33 then
+		local s = math.sqrt(1.0 + m11 - m22 - m33) * 2.0
+		qw = (m32 - m23) / s
+		qx = 0.25 * s
+		qy = (m12 + m21) / s
+		qz = (m13 + m31) / s
+	elseif m22 > m33 then
+		local s = math.sqrt(1.0 + m22 - m11 - m33) * 2.0
+		qw = (m13 - m31) / s
+		qx = (m12 + m21) / s
+		qy = 0.25 * s
+		qz = (m23 + m32) / s
+	else
+		local s = math.sqrt(1.0 + m33 - m11 - m22) * 2.0
+		qw = (m21 - m12) / s
+		qx = (m13 + m31) / s
+		qy = (m23 + m32) / s
+		qz = 0.25 * s
+	end
+	local len = math.sqrt(qx * qx + qy * qy + qz * qz + qw * qw)
+	if len < 1e-9 then return 0, 0, 0, 1 end
+	return qx / len, qy / len, qz / len, qw / len
+end
+
+local function qslerp(ax, ay, az, aw, bx, by, bz, bw, t)
+	if t <= 0 then return ax, ay, az, aw end
+	if t >= 1 then return bx, by, bz, bw end
+	local dot = ax * bx + ay * by + az * bz + aw * bw
+	if dot < 0 then
+		bx, by, bz, bw, dot = -bx, -by, -bz, -bw, -dot
+	end
+	if dot > 0.9995 then
+		local x = ax + (bx - ax) * t
+		local y = ay + (by - ay) * t
+		local z = az + (bz - az) * t
+		local w = aw + (bw - aw) * t
+		local len = math.sqrt(x * x + y * y + z * z + w * w)
+		if len < 1e-9 then return 0, 0, 0, 1 end
+		return x / len, y / len, z / len, w / len
+	end
+	local theta0 = math.acos(math.max(-1, math.min(1, dot)))
+	local theta = theta0 * t
+	local sinT0 = math.sin(theta0)
+	local s1 = math.sin(theta) / sinT0
+	local s0 = math.cos(theta) - dot * s1
+	return s0 * ax + s1 * bx, s0 * ay + s1 * by, s0 * az + s1 * bz, s0 * aw + s1 * bw
+end
+
+local function min_arc_quat(fx, fy, fz, tx, ty, tz)
+	local fl = math.sqrt(fx * fx + fy * fy + fz * fz)
+	local tl = math.sqrt(tx * tx + ty * ty + tz * tz)
+	if fl < 1e-9 or tl < 1e-9 then return 0, 0, 0, 1 end
+	local ax, ay, az, angle = swing_axis(fx / fl, fy / fl, fz / fl, tx / tl, ty / tl, tz / tl)
+	if ax == nil then return 0, 0, 0, 1 end
+	return q_axis_angle(ax, ay, az, angle)
+end
+
+local function read_world_pose_lua(S, unit, node)
+	local pose = S.Unit.world_pose(unit, node)
+	if pose == nil then return nil end
+	local ok, e1, e2, e3, e4, e5, e6, e7, e8, e9, e10, e11, e12 = pcall(S.Matrix4x4.to_elements, pose)
+	if not ok or type(e12) ~= "number" or e12 ~= e12 then return nil end
+	local qx, qy, qz, qw = mat3_to_quat(e1, e4, e7, e2, e5, e8, e3, e6, e9)
+	return {
+		px = e10, py = e11, pz = e12,
+		qx = qx, qy = qy, qz = qz, qw = qw,
+		fwdx = e7, fwdy = e8, fwdz = e9,
+	}
+end
+
+local function write_arm_local(S, unit, node, qx, qy, qz, qw, px, py, pz, fallbackPos)
+	local calls = 0
+	if type(qx) ~= "number" or type(qy) ~= "number" or type(qz) ~= "number" or type(qw) ~= "number" then
+		return false, calls
+	end
+	if qx ~= qx or qy ~= qy or qz ~= qz or qw ~= qw then return false, calls end
+	local qLen2 = qx * qx + qy * qy + qz * qz + qw * qw
+	if qLen2 < 1e-12 or qLen2 > 1e12 then return false, calls end
+
+	local fastVerified = M._fastWrite == true and M._fastWriteVerified == true
+	if px == nil and fastVerified and type(S.Quaternion.from_elements) == "function" then
+		local q = S.Quaternion.from_elements(qx, qy, qz, qw)
+		calls = calls + 1
+		if q == nil then return false, calls end
+		S.Unit.set_local_rotation(unit, node, q)
+		calls = calls + 1
+		return true, calls
+	end
+
+	local posX, posY, posZ = px, py, pz
+	if posX == nil then
+		if fallbackPos == nil then return false, calls end
+		posX, posY, posZ = fallbackPos[1], fallbackPos[2], fallbackPos[3]
+	end
+	if type(posX) ~= "number" or posX ~= posX or type(posY) ~= "number" or posY ~= posY or type(posZ) ~= "number" or posZ ~= posZ then
+		return false, calls
+	end
+
+	local q
+	if M._fastWrite == true and type(S.Quaternion.from_elements) == "function" then
+		q = S.Quaternion.from_elements(qx, qy, qz, qw)
+		calls = calls + 1
+	else
+		local ax, ay, az, angle = q_to_axis_angle(qx, qy, qz, qw)
+		if ax == nil then
+			q = S.Quaternion.axis_angle(S.Vector3(0, 0, 1), 0)
+		else
+			q = S.Quaternion.axis_angle(S.Vector3(ax, ay, az), angle)
+		end
+		calls = calls + 2
+	end
+	if q == nil then return false, calls end
+	local pose = S.Matrix4x4.from_quaternion_position(q, S.Vector3(posX, posY, posZ))
+	calls = calls + 2
+	if pose == nil then return false, calls end
+	S.Unit.set_local_pose(unit, node, pose)
+	calls = calls + 1
+	return true, calls
+end
+
+--- 解析并缓存 avatar 的手臂骨骼节点索引；同时探测一次动画变量（如有）。
+function M.resolve_arm_bones(S, unit, state)
+	if unit == nil or type(S.Unit) ~= "table" or type(S.Unit.node) ~= "function" then return nil end
+	local nodeCount = nil
+	if type(S.Unit.num_scene_graph_items) == "function" then
+		local okN, n = pcall(S.Unit.num_scene_graph_items, unit)
+		if okN and type(n) == "number" then nodeCount = n end
+	end
+	if state ~= nil and state.unit == unit and state.nodes ~= nil
+		and (nodeCount == nil or state.nodeCount == nodeCount) then
+		return state
+	end
+	local hasNodeFn = type(S.Unit.has_node) == "function"
+	local nodes = {}
+	for index = 1, #ARM_BONE_NAMES do
+		local name = ARM_BONE_NAMES[index]
+		if hasNodeFn then
+			local okH, has = pcall(S.Unit.has_node, unit, name)
+			if not okH or has ~= true then return nil end
+		end
+		local ok, id = pcall(S.Unit.node, unit, name)
+		if not ok or type(id) ~= "number" or id < 1 or (nodeCount ~= nil and id > nodeCount) then
+			return nil
+		end
+		nodes[name] = id
+	end
+	local animVarId = nil
+	if type(S.Unit.animation_find_variable) == "function"
+		and type(S.Unit.animation_get_variable) == "function" then
+		local hasAnimVarFn = type(S.Unit.animation_has_variable) == "function"
+		for index = 1, #ARM_ANIM_VAR_CANDIDATES do
+			local varName = ARM_ANIM_VAR_CANDIDATES[index]
+			local allowed = true
+			if hasAnimVarFn then
+				local okA, hasA = pcall(S.Unit.animation_has_variable, unit, varName)
+				allowed = okA and hasA == true
+			end
+			if allowed then
+				local okV, vid = pcall(S.Unit.animation_find_variable, unit, varName)
+				if okV and type(vid) == "number" and vid >= 0 then
+					animVarId = vid
+					break
+				end
+			end
+		end
+	end
+	return {
+		unit = unit,
+		nodeCount = nodeCount,
+		nodes = nodes,
+		animVarId = animVarId,
+		alpha = (state and state.alpha) or 0,
+	}
+end
+
+--- 单侧无武器内收求解（1:1 移植 P2 solve_unarmed_side）。
+--- `shoulderTarget`（可选，锁骨局部坐标 {x,y,z}）：把肩关节直接放回模型自己的肩关节位置。
+--- 转换时手臂网格被整体平移到了潜兵的宽肩关节上；把关节挪回去，网格随之复原，
+--- 手臂就绕模型原来的转轴转动。给了它就不再做 `shoulderNarrowM` 收肩。
+function M.solve_unarmed_side(chest, clav, sh, el, side, adductionDeg, forearmCompDeg, shoulderNarrowM, shoulderTarget)
+	local sign = side == "l" and -1.0 or 1.0
+	local fwdLen = math.sqrt(chest.fwdx * chest.fwdx + chest.fwdy * chest.fwdy + chest.fwdz * chest.fwdz)
+	if fwdLen < 1e-9 then return nil end
+	local fx, fy, fz = chest.fwdx / fwdLen, chest.fwdy / fwdLen, chest.fwdz / fwdLen
+
+	local dqx, dqy, dqz, dqw = q_axis_angle(fx, fy, fz, sign * adductionDeg * math.pi / 180.0)
+	local shWx, shWy, shWz, shWw = qmul(dqx, dqy, dqz, dqw, sh.qx, sh.qy, sh.qz, sh.qw)
+	local cInvx, cInvy, cInvz, cInvw = qconj(clav.qx, clav.qy, clav.qz, clav.qw)
+	local shLx, shLy, shLz, shLw = qmul(cInvx, cInvy, cInvz, cInvw, shWx, shWy, shWz, shWw)
+
+	local dqElx, dqEly, dqElz, dqElw = q_axis_angle(fx, fy, fz, -sign * forearmCompDeg * math.pi / 180.0)
+	local elMidX, elMidY, elMidZ, elMidW = qmul(dqx, dqy, dqz, dqw, el.qx, el.qy, el.qz, el.qw)
+	local elWx, elWy, elWz, elWw = qmul(dqElx, dqEly, dqElz, dqElw, elMidX, elMidY, elMidZ, elMidW)
+	local shInvx, shInvy, shInvz, shInvw = qconj(shWx, shWy, shWz, shWw)
+	local elLx, elLy, elLz, elLw = qmul(shInvx, shInvy, shInvz, shInvw, elWx, elWy, elWz, elWw)
+
+	local px, py, pz = nil, nil, nil
+	if shoulderTarget ~= nil then
+		px, py, pz = shoulderTarget[1], shoulderTarget[2], shoulderTarget[3]
+	elseif shoulderNarrowM ~= nil and shoulderNarrowM ~= 0 then
+		local lx, ly, lz = qrot(cInvx, cInvy, cInvz, cInvw, sh.px - clav.px, sh.py - clav.py, sh.pz - clav.pz)
+		local len = math.sqrt(lx * lx + ly * ly + lz * lz)
+		if len > 1e-6 then
+			local s = math.max(0.05, (len - shoulderNarrowM) / len)
+			px, py, pz = lx * s, ly * s, lz * s
+		end
+	end
+
+	return {
+		shQ = { shLx, shLy, shLz, shLw },
+		shP = px ~= nil and { px, py, pz } or nil,
+		elQ = { elLx, elLy, elLz, elLw },
+	}
+end
+
+--- 单侧持枪 2-bone 解析 IK（1:1 移植 P2 solve_ik_side，锁定手腕世界位姿）。
+--- `shoulderTarget`（可选，锁骨局部坐标）：肩关节挪到这里之后再解 IK，手腕仍锁在原位（枪不动）。
+function M.solve_ik_side(chest, clav, sh, el, ha, inwardPullM, shoulderTarget)
+	local dx1, dy1, dz1 = el.px - sh.px, el.py - sh.py, el.pz - sh.pz
+	local dx2, dy2, dz2 = ha.px - el.px, ha.py - el.py, ha.pz - el.pz
+	local l1 = math.sqrt(dx1 * dx1 + dy1 * dy1 + dz1 * dz1)
+	local l2 = math.sqrt(dx2 * dx2 + dy2 * dy2 + dz2 * dz2)
+	local sx, sy, sz = sh.px, sh.py, sh.pz
+	if shoulderTarget ~= nil then
+		local ox, oy, oz = qrot(clav.qx, clav.qy, clav.qz, clav.qw, shoulderTarget[1], shoulderTarget[2], shoulderTarget[3])
+		sx, sy, sz = clav.px + ox, clav.py + oy, clav.pz + oz
+	end
+	local vx, vy, vz = ha.px - sx, ha.py - sy, ha.pz - sz
+	local dRaw = math.sqrt(vx * vx + vy * vy + vz * vz)
+	if l1 < 1e-6 or l2 < 1e-6 or dRaw < 1e-6 then return nil end
+
+	local minD = math.abs(l1 - l2) + 1e-4
+	local maxD = l1 + l2 - 1e-4
+	local d = math.max(minD, math.min(maxD, dRaw))
+	local ux, uy, uz = vx / dRaw, vy / dRaw, vz / dRaw
+
+	local cosA = math.max(-1.0, math.min(1.0, (l1 * l1 + d * d - l2 * l2) / (2.0 * l1 * d)))
+	local sinA = math.sqrt(math.max(0.0, 1.0 - cosA * cosA))
+
+	local dotOrig = dx1 * ux + dy1 * uy + dz1 * uz
+	local ox, oy, oz = dx1 - ux * dotOrig, dy1 - uy * dotOrig, dz1 - uz * dotOrig
+
+	local ix, iy, iz = chest.px - sx, chest.py - sy, chest.pz - sz
+	local iLen = math.sqrt(ix * ix + iy * iy + iz * iz)
+	iz = -0.35 * iLen
+	local iNorm = math.sqrt(ix * ix + iy * iy + iz * iz)
+	if iNorm > 1e-9 then ix, iy, iz = ix / iNorm, iy / iNorm, iz / iNorm else ix, iy, iz = 0, 0, -1 end
+
+	local tx, ty, tz = ox + ix * inwardPullM, oy + iy * inwardPullM, oz + iz * inwardPullM
+	local dotT = tx * ux + ty * uy + tz * uz
+	local px, py, pz = tx - ux * dotT, ty - uy * dotT, tz - uz * dotT
+	local pLen = math.sqrt(px * px + py * py + pz * pz)
+	if pLen < 1e-6 then
+		px, py, pz = ox, oy, oz
+		pLen = math.sqrt(px * px + py * py + pz * pz)
+		if pLen < 1e-6 then return nil end
+	end
+	local nx, ny, nz = px / pLen, py / pLen, pz / pLen
+
+	local elNewX = sx + ux * (l1 * cosA) + nx * (l1 * sinA)
+	local elNewY = sy + uy * (l1 * cosA) + ny * (l1 * sinA)
+	local elNewZ = sz + uz * (l1 * cosA) + nz * (l1 * sinA)
+
+	local dqShX, dqShY, dqShZ, dqShW = min_arc_quat(dx1, dy1, dz1, elNewX - sx, elNewY - sy, elNewZ - sz)
+	local shWx, shWy, shWz, shWw = qmul(dqShX, dqShY, dqShZ, dqShW, sh.qx, sh.qy, sh.qz, sh.qw)
+	local elMidX, elMidY, elMidZ, elMidW = qmul(dqShX, dqShY, dqShZ, dqShW, el.qx, el.qy, el.qz, el.qw)
+	local fxMid, fyMid, fzMid = qrot(dqShX, dqShY, dqShZ, dqShW, dx2, dy2, dz2)
+	local dqElX, dqElY, dqElZ, dqElW = min_arc_quat(fxMid, fyMid, fzMid, ha.px - elNewX, ha.py - elNewY, ha.pz - elNewZ)
+	local elWx, elWy, elWz, elWw = qmul(dqElX, dqElY, dqElZ, dqElW, elMidX, elMidY, elMidZ, elMidW)
+
+	local cInvx, cInvy, cInvz, cInvw = qconj(clav.qx, clav.qy, clav.qz, clav.qw)
+	local shInvx, shInvy, shInvz, shInvw = qconj(shWx, shWy, shWz, shWw)
+	local elInvx, elInvy, elInvz, elInvw = qconj(elWx, elWy, elWz, elWw)
+
+	local shLx, shLy, shLz, shLw = qmul(cInvx, cInvy, cInvz, cInvw, shWx, shWy, shWz, shWw)
+	local elLx, elLy, elLz, elLw = qmul(shInvx, shInvy, shInvz, shInvw, elWx, elWy, elWz, elWw)
+	local haLx, haLy, haLz, haLw = qmul(elInvx, elInvy, elInvz, elInvw, ha.qx, ha.qy, ha.qz, ha.qw)
+
+	return {
+		shQ = { shLx, shLy, shLz, shLw },
+		elQ = { elLx, elLy, elLz, elLw },
+		haQ = { haLx, haLy, haLz, haLw },
+		shP = shoulderTarget,
+	}
+end
+
+--- 状态判定：优先探测动画变量，否则退回角色局部几何判据。返回目标 alpha ∈ [0, 1]。
+function M.detect_arm_target_alpha(S, unit, armState, poses, mode)
+	if mode == "unarmed" then return 0.0, 0 end
+	if mode == "ik" or mode == "rifle" then return 1.0, 0 end
+	local calls = 0
+	if armState ~= nil and armState.animVarId ~= nil and type(S.Unit.animation_get_variable) == "function" then
+		local ok, val = pcall(S.Unit.animation_get_variable, unit, armState.animVarId)
+		calls = calls + 1
+		if ok and type(val) == "number" then
+			return (val > 0.5 and 1.0 or 0.0), calls
+		end
+	end
+	local chest = poses.chest
+	local lSh, rSh = poses.l_shoulder, poses.r_shoulder
+	local lHa, rHa = poses.l_hand, poses.r_hand
+	local raised = (lHa.pz - lSh.pz > -0.18) or (rHa.pz - rSh.pz > -0.18)
+	local hdx, hdy, hdz = rHa.px - lHa.px, rHa.py - lHa.py, rHa.pz - lHa.pz
+	local handDist = math.sqrt(hdx * hdx + hdy * hdy + hdz * hdz)
+	local mx = 0.5 * (lHa.px + rHa.px) - chest.px
+	local my = 0.5 * (lHa.py + rHa.py) - chest.py
+	local mz = 0.5 * (lHa.pz + rHa.pz) - chest.pz
+	local fwdLen = math.sqrt(chest.fwdx * chest.fwdx + chest.fwdy * chest.fwdy + chest.fwdz * chest.fwdz)
+	local inFront = false
+	if fwdLen > 1e-9 then
+		local dotFwd = (mx * chest.fwdx + my * chest.fwdy + mz * chest.fwdz) / fwdLen
+		inFront = dotFwd > 0.15
+	end
+	if (raised and inFront) or (handDist < 0.38 and inFront) then
+		return 1.0, calls
+	end
+	return 0.0, calls
+end
+
+--- 校验 `armShoulderTarget = { l = {x,y,z}, r = {x,y,z} }`（锁骨局部坐标，米）。
+--- 两侧都是 3 个有限数才算有效；否则返回 nil，整套回到旧的「内收 + 收肩」行为。
+function M.arm_shoulder_targets(value)
+	if type(value) ~= "table" then return nil end
+	local out = {}
+	for _, side in ipairs({ "l", "r" }) do
+		local v = value[side]
+		if type(v) ~= "table" then return nil end
+		for i = 1, 3 do
+			local c = v[i]
+			if type(c) ~= "number" or c ~= c or c == math.huge or c == -math.huge or math.abs(c) > 1.0 then return nil end
+		end
+		out[side] = { v[1], v[2], v[3] }
+	end
+	return out
+end
+
+--- 对单个 avatar unit 执行一帧手臂姿态修正。返回 written, calls, alpha, targetAlpha。
+function M.apply_arm_pose(S, world, unit, armState, dt, opts)
+	opts = opts or {}
+	local mode = opts.armMode or "auto"
+	if mode == "off" or mode == "vanilla" then
+		return 0, 0, armState and armState.alpha or 0, 0
+	end
+	local resolved = M.resolve_arm_bones(S, unit, armState)
+	if resolved == nil then return 0, 0, 0, 0 end
+
+	if M._fastWrite == nil then
+		M.probe_fast_write(S, opts.logger)
+	end
+	if M._fastWrite == true and not M._fastWriteVerified then
+		M.verify_fast_write(S, unit, resolved.nodes.l_elbow, opts.logger)
+	end
+
+	local poses = {}
+	local calls = 0
+	for index = 1, #ARM_BONE_NAMES do
+		local name = ARM_BONE_NAMES[index]
+		local p = read_world_pose_lua(S, unit, resolved.nodes[name])
+		calls = calls + 2
+		if p == nil then return 0, calls, resolved.alpha or 0, 0 end
+		poses[name] = p
+	end
+
+	local targetAlpha, varCalls = M.detect_arm_target_alpha(S, unit, resolved, poses, mode)
+	calls = calls + varCalls
+	local blendTime = opts.armBlendTime or 0.12
+	local alpha = resolved.alpha or 0
+	if dt ~= nil and dt > 0 and blendTime > 0 then
+		local step = math.min(1.0, dt / blendTime)
+		if alpha < targetAlpha then
+			alpha = math.min(targetAlpha, alpha + step)
+		elseif alpha > targetAlpha then
+			alpha = math.max(targetAlpha, alpha - step)
+		end
+	else
+		alpha = targetAlpha
+	end
+	resolved.alpha = alpha
+
+	-- 给了肩关节目标位置（转换时从模型自己的骨架算出来）就只挪关节、不再额外转角：
+	-- 内收 16° 原本是在错误的转轴上凑形状，挪回原位后它会把手臂拉成竖直的「钢管」。
+	local targets = M.arm_shoulder_targets(opts.armShoulderTarget)
+	local adductionDeg = opts.armAdductionDeg or (targets ~= nil and 0.0 or 16.0)
+	local forearmCompDeg = opts.armForearmCompDeg or (targets ~= nil and 0.0 or 5.0)
+	local shoulderNarrowM = opts.armShoulderNarrow or 0.025
+	local inwardPullM = opts.armIkPull or 0.09
+
+	local written = 0
+	local sides = { "l", "r" }
+	for sIdx = 1, 2 do
+		local side = sides[sIdx]
+		local clav = poses[side .. "_clavicle"]
+		local sh = poses[side .. "_shoulder"]
+		local el = poses[side .. "_elbow"]
+		local ha = poses[side .. "_hand"]
+
+		local target = targets ~= nil and targets[side] or nil
+		local un = alpha < 1.0 and M.solve_unarmed_side(poses.chest, clav, sh, el, side, adductionDeg, forearmCompDeg, shoulderNarrowM, target) or nil
+		local ik = alpha > 0.0 and M.solve_ik_side(poses.chest, clav, sh, el, ha, inwardPullM, target) or nil
+
+		local shQ, shP, elQ, haQ
+		if alpha <= 0.0 and un ~= nil then
+			shQ, shP, elQ = un.shQ, un.shP, un.elQ
+		elseif alpha >= 1.0 and ik ~= nil then
+			shQ, shP, elQ, haQ = ik.shQ, ik.shP, ik.elQ, ik.haQ
+		elseif un ~= nil and ik ~= nil then
+			shQ = { qslerp(un.shQ[1], un.shQ[2], un.shQ[3], un.shQ[4], ik.shQ[1], ik.shQ[2], ik.shQ[3], ik.shQ[4], alpha) }
+			elQ = { qslerp(un.elQ[1], un.elQ[2], un.elQ[3], un.elQ[4], ik.elQ[1], ik.elQ[2], ik.elQ[3], ik.elQ[4], alpha) }
+			local elInvx, elInvy, elInvz, elInvw = qconj(el.qx, el.qy, el.qz, el.qw)
+			local haOrigX, haOrigY, haOrigZ, haOrigW = qmul(elInvx, elInvy, elInvz, elInvw, ha.qx, ha.qy, ha.qz, ha.qw)
+			haQ = { qslerp(haOrigX, haOrigY, haOrigZ, haOrigW, ik.haQ[1], ik.haQ[2], ik.haQ[3], ik.haQ[4], alpha) }
+			if ik.shP ~= nil then
+				shP = ik.shP
+			elseif un.shP ~= nil then
+				local cInvx, cInvy, cInvz, cInvw = qconj(clav.qx, clav.qy, clav.qz, clav.qw)
+				local ox, oy, oz = qrot(cInvx, cInvy, cInvz, cInvw, sh.px - clav.px, sh.py - clav.py, sh.pz - clav.pz)
+				shP = {
+					un.shP[1] + (ox - un.shP[1]) * alpha,
+					un.shP[2] + (oy - un.shP[2]) * alpha,
+					un.shP[3] + (oz - un.shP[3]) * alpha,
+				}
+			end
+		end
+
+		local shFallback, elFallback, haFallback
+		if not (M._fastWrite == true and M._fastWriteVerified == true) then
+			local cInvx, cInvy, cInvz, cInvw = qconj(clav.qx, clav.qy, clav.qz, clav.qw)
+			shFallback = { qrot(cInvx, cInvy, cInvz, cInvw, sh.px - clav.px, sh.py - clav.py, sh.pz - clav.pz) }
+			local sInvx, sInvy, sInvz, sInvw = qconj(sh.qx, sh.qy, sh.qz, sh.qw)
+			elFallback = { qrot(sInvx, sInvy, sInvz, sInvw, el.px - sh.px, el.py - sh.py, el.pz - sh.pz) }
+			local eInvx, eInvy, eInvz, eInvw = qconj(el.qx, el.qy, el.qz, el.qw)
+			haFallback = { qrot(eInvx, eInvy, eInvz, eInvw, ha.px - el.px, ha.py - el.py, ha.pz - el.pz) }
+		end
+
+		if shQ ~= nil then
+			local okW, cW = write_arm_local(S, unit, resolved.nodes[side .. "_shoulder"], shQ[1], shQ[2], shQ[3], shQ[4], shP and shP[1] or nil, shP and shP[2] or nil, shP and shP[3] or nil, shFallback)
+			calls = calls + cW
+			if okW then written = written + 1 end
+		end
+		if elQ ~= nil then
+			local okW, cW = write_arm_local(S, unit, resolved.nodes[side .. "_elbow"], elQ[1], elQ[2], elQ[3], elQ[4], nil, nil, nil, elFallback)
+			calls = calls + cW
+			if okW then written = written + 1 end
+		end
+		if haQ ~= nil then
+			local okW, cW = write_arm_local(S, unit, resolved.nodes[side .. "_hand"], haQ[1], haQ[2], haQ[3], haQ[4], nil, nil, nil, haFallback)
+			calls = calls + cW
+			if okW then written = written + 1 end
+		end
+	end
+
+	if written > 0 and world ~= nil then
+		pcall(S.World.update_unit, world, unit)
+		calls = calls + 1
+	end
+	return written, calls, alpha, targetAlpha, resolved
+end
+
 return M

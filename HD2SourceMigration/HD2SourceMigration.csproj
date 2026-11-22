@@ -31,6 +31,7 @@
   -->
   <ItemGroup>
     <InternalsVisibleTo Include="HD2SourceMigration.Tests" />
+    <InternalsVisibleTo Include="HD2ModCli.Tests" />
   </ItemGroup>
 
   <!--

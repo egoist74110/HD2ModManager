@@ -40,12 +40,46 @@ RUNTIME_TESTS = {"runtime-harness-test.lua", "log-budget-test.lua", "mp_harness.
                  "schedule-test.lua"}
 
 
-def find_lua() -> str:
+def find_lua() -> str | None:
     for name in ("luajit", "lua51", "lua5.1", "lua"):
         found = shutil.which(name)
         if found:
             return found
-    raise SystemExit("找不到 Lua 5.1 解释器（luajit / lua51 / lua5.1 / lua 任一即可）")
+    return None
+
+
+LUPA_RUNNER = r"""
+import sys
+from pathlib import Path
+from lupa import LuaRuntime
+
+test_path, mod_path = sys.argv[1], sys.argv[2]
+lua = LuaRuntime(unpack_returned_tuples=True)
+lua.execute('''
+math.atan2 = math.atan2 or math.atan
+unpack = unpack or table.unpack
+loadstring = loadstring or load
+local _next = next
+next = function(t, k)
+    if k ~= nil and rawget(t, k) == nil then return nil end
+    return _next(t, k)
+end
+''')
+arg_tbl = lua.table()
+arg_tbl[0] = test_path
+arg_tbl[1] = mod_path
+lua.globals().arg = arg_tbl
+code = [0]
+def py_exit(c=0):
+    code[0] = int(c or 0)
+    raise SystemExit(code[0])
+lua.globals().os.exit = py_exit
+try:
+    lua.execute(Path(test_path).read_text(encoding="utf-8"))
+except SystemExit:
+    pass
+sys.exit(code[0])
+"""
 
 
 def main() -> int:
@@ -55,6 +89,14 @@ def main() -> int:
     args = parser.parse_args()
 
     lua = find_lua()
+    use_lupa = False
+    if lua is None:
+        try:
+            import lupa  # noqa: F401
+            use_lupa = True
+        except ImportError:
+            raise SystemExit("找不到 Lua 5.1 解释器（luajit / lua51 / lua5.1 / lua），且未安装 Python lupa")
+
     tests = sorted(p for p in TEST_DIR.glob("*.lua") if p.name not in LIBRARY_FILES)
     if args.filter:
         tests = [p for p in tests if args.filter in p.name]
@@ -64,8 +106,10 @@ def main() -> int:
     rows: list[tuple[str, str, int, int, int]] = []
     for test in tests:
         module = SRC_DIR / ("physbone_runtime.lua" if test.name in RUNTIME_TESTS else "physbone_compat.lua")
+        cmd = ([sys.executable, "-c", LUPA_RUNNER, str(test), str(module.relative_to(ROOT))]
+               if use_lupa else [lua, str(test), str(module.relative_to(ROOT))])
         result = subprocess.run(
-            [lua, str(test), str(module.relative_to(ROOT))],
+            cmd,
             cwd=ROOT,
             capture_output=True,
             text=True,

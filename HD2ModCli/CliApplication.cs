@@ -76,6 +76,10 @@ public static class CliApplication
 	private static async Task<int> DispatchAsync(CliInvocation invocation)
 	{
 		var command = invocation.Command.Select(value => value.Trim().ToLowerInvariant()).ToArray();
+		if (command.Length == 3 && command[0] == "ias" && command[1] == "convert")
+			return await CliIasConversion.ConvertAsync(invocation.Command[2], invocation.Options.GameData, invocation.Options.Output).ConfigureAwait(false);
+		if (command.Length == 3 && command[0] == "ias" && command[1] == "preview")
+			return await CliIasConversion.PreviewAsync(invocation.Command[2], invocation.Options.GameData, invocation.Options.Output).ConfigureAwait(false);
 		var addToProfileSupported = (command.Length == 3 && command[0] == "import" && command[1] == "plan")
 			|| (command.Length >= 4 && command[0] == "import" && command[1] == "batch" && command[2] == "plan");
 		if (!string.IsNullOrWhiteSpace(invocation.Options.AddToProfile) && !addToProfileSupported)
@@ -3339,7 +3343,7 @@ public static class CliApplication
 	private static readonly string[] KnownCommands =
 	[
 		"agent", "armor-registry", "assets", "capabilities", "context", "custom-model", "deploy", "doctor",
-		"equipment", "game", "gamedata", "help", "import", "library", "mod", "option", "patch", "physbone",
+		"equipment", "game", "gamedata", "help", "ias", "import", "library", "mod", "option", "patch", "physbone",
 		"profile", "repair", "settings", "source", "status", "unit", "version", "vpk", "vpk2patch", "wardrobe",
 	];
 

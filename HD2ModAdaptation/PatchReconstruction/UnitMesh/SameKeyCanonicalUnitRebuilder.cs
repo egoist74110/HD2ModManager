@@ -45,7 +45,7 @@ public sealed class SameKeyCanonicalUnitRebuilder
     private readonly CanonicalMeshSkinningRouter skinningRouter = new();
     private readonly CanonicalMeshSemanticMerger merger = new();
     private readonly CanonicalMeshPreparation preparation = new();
-    private readonly CanonicalPlaceholderMinifier minifier = new();
+    private readonly HiddenUnitGenerator hiddenUnitGenerator = new();
     private readonly CanonicalLodBonePaletteCompiler paletteCompiler = new();
     private readonly CanonicalStreamContractCompiler streamCompiler = new();
     private readonly CanonicalUnitRebuilder unitRebuilder = new();
@@ -118,7 +118,7 @@ public sealed class SameKeyCanonicalUnitRebuilder
 				else
 				{
 					var minifyStopwatch = System.Diagnostics.Stopwatch.StartNew();
-                    var hidden = minifier.TryMinify(targetRaw, targetStream);
+                    var hidden = hiddenUnitGenerator.Generate(targetRaw, targetStream);
 					minifyElapsed += minifyStopwatch.Elapsed;
                     diagnostics.AddRange(hidden.Diagnostics);
                     if (hidden.Mesh is not null) finalMeshes.Add(hidden.Mesh);
