@@ -39,7 +39,7 @@ public static class PhysBoneLuaSource
 	/// 关节修正数据的 Lua 片段（<see cref="JointPoseData.ToLuaOptions"/>），只在 <paramref name="armPoseEnabled"/> 时注入。
 	/// </param>
 	public static string ComposeStandalonePackage(string? addonId = null, string mode = "external", bool armPoseEnabled = false,
-		string? jointPoseOptions = null)
+		string? jointPoseOptions = null, int iasPhysicsGroups = 0)
 	{
 		var compat = LoadCompat();
 		var runtime = LoadRuntime();
@@ -68,11 +68,15 @@ public static class PhysBoneLuaSource
 		builder.AppendLine("\tlocal engine = rawget(_G, 'stingray')");
 		builder.AppendLine("\tif engine == nil then return end");
 		builder.Append("\tPhysBoneRuntime.install(engine, { compat = PhysBoneCompat, mode = '")
-			.Append(mode)
-			.Append(!armPoseEnabled ? "' })"
-				: string.IsNullOrWhiteSpace(jointPoseOptions) ? "', armPose = true })"
-				: "', armPose = true, " + jointPoseOptions + " })")
-			.AppendLine();
+			.Append(mode).Append("'");
+		if (armPoseEnabled)
+		{
+			builder.Append(", armPose = true");
+			if (!string.IsNullOrWhiteSpace(jointPoseOptions))
+				builder.Append(", ").Append(jointPoseOptions);
+		}
+		builder.Append(", iasPhysicsGroups = ").Append((iasPhysicsGroups & 15).ToString(System.Globalization.CultureInfo.InvariantCulture));
+		builder.AppendLine(" })");
 		builder.AppendLine("end)");
 		builder.AppendLine("if not ok then");
 		builder.AppendLine("\tlocal real = rawget(_G, 'print')");

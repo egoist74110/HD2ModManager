@@ -2005,6 +2005,55 @@ do
 	Runtime.uninstall()
 end
 
+print("T27 IAS 可选链在探测和挂载前过滤")
+do
+	local entries = { { "Back", 0 }, { "Bang", 1 }, { "Ahoge", 1 },
+		{ "ACC", 2 }, { "Breast", 3 }, { "Butt", 4 } }
+	local rig = { version = 2, bones = {} }
+	local names = {}
+	local wear = newUnit("t27wear", 171, false, "#ID[t27wear]")
+	wear.ids.head, wear.nodeOf.head = true, 9
+	for _, entry in ipairs(entries) do
+		local short, group = entry[1], entry[2]
+		local name = "ias_phys_fixture/" .. short
+		local index = #rig.bones + 1
+		names[name], names[S.Application.string_to_id32(name)] = group, group
+		wear.ids[name], wear.nodeOf[name] = true, 9 + index
+		rig.bones[index] = { name = name, index = index, parent = 0, parentName = "head",
+			pos = { 0, 0, 0 }, flags = 0x1021 + 256 * group, params = RIG.bones[1].params }
+	end
+	armors = { wear }
+	local hasNode = S.Unit.has_node
+	for _, case in ipairs({ { expected = 1 }, { mask = 4, expected = 2 }, { mask = 15, expected = 6 } }) do
+		local forbidden = 0
+		local function enabled(group)
+			return group == 0 or math.floor((case.mask or 0) / 2 ^ (group - 1)) % 2 == 1
+		end
+		S.Unit.has_node = function(unit, key)
+			local group = names[key]
+			if group ~= nil and not enabled(group) then forbidden = forbidden + 1 end
+			return hasNode(unit, key)
+		end
+		local runtime = Runtime.install(S, {
+			compat = Compat, iasPhysicsGroups = case.mask,
+			carriers = { { rig = rig, path = "ias.patch_1.gpu_resources" } },
+			log = false, snapshot = false, settleFrames = 1, pollFrames = 1,
+			tunePath = "nonexistent-hd2pbx-tune.txt",
+		})
+		for _ = 1, 20 do engine.time = engine.time + 1 / 60; render() end
+		local chains = runtime.sessions and runtime.sessions[1] and runtime.sessions[1].sessions or {}
+		local allowed = #chains == case.expected
+		for _, chain in ipairs(chains) do
+			local name = chain.chain[1].name
+			allowed = allowed and enabled(names[name]) and chain.nodes[1] == wear.nodeOf[name]
+		end
+		check("T27 mask=" .. tostring(case.mask) .. " 只挂启用组且不查询关闭组", allowed and forbidden == 0,
+			string.format("链=%d 禁用查询=%d", #chains, forbidden))
+		Runtime.uninstall()
+	end
+	S.Unit.has_node = hasNode
+end
+
 print("")
 if failures == 0 then
 	print("=== 全部通过 ===")

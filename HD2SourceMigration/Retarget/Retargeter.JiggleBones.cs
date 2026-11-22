@@ -76,10 +76,12 @@ public sealed partial class Retargeter
 		IReadOnlyList<SourceBone> bones,
 		Dictionary<int, int> resolved,
 		int baseCount,
-		Func<int, Vec3> jointOf)
+		Func<int, Vec3> jointOf,
+		IReadOnlySet<int>? selected = null)
 	{
 		var extras = new List<RetargetExtraBone>();
-		var jiggle = bones.Where(bone => bone.Jiggle is not null).OrderBy(bone => bone.Index).ToList();
+		var jiggle = bones.Where(bone => selected?.Contains(bone.Index) ?? bone.Jiggle is not null)
+			.OrderBy(bone => bone.Index).ToList();
 		if (jiggle.Count == 0)
 			return extras;
 

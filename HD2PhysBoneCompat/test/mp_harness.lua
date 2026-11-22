@@ -123,6 +123,7 @@ local function newCompat()
 	local compat = { attached = {}, released = {}, dtByUnit = {}, calls = {} }
 	compat.unit_alive = function(_, unit) return unit ~= nil and unit.alive == true end
 	compat.begin_frame = function() end
+	compat.filter_ias_groups = function(rig) return rig, 0 end
 	compat.select_rig = function(_, units, _)
 		local unit = units[1]
 		return { rig = { bones = { { name = "hair" } } }, path = "data/fake.gpu_resources", full = true, score = 1, total = #unit.name }

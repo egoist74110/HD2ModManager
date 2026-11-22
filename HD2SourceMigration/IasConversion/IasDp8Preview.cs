@@ -1,3 +1,4 @@
+using System.Buffers.Binary;
 using System.Security.Cryptography;
 using System.Text.Json;
 using HD2ModAdaptation.PatchReconstruction;
@@ -22,6 +23,9 @@ public static class IasDp8Preview
 		var models = new List<object>();
 		var resolver = new GameDataPackageResolver(gameData);
 		var avatar = await new CanonicalAvatarRigReader(resolver).ReadTransformInfoAsync().ConfigureAwait(false);
+		// 不是 avatar 骨的节点（改名的独立骨 ias_*、追加的物理骨等），按名字哈希去重；父骨也按哈希给。
+		// 各 Unit 的节点下标不一定和 avatar 对齐，所以不能按下标合并。
+		var independent = new SortedDictionary<uint, object>();
 		foreach (var folder in new[] { "", "coat/on", "coat/off", "shoes/on", "shoes/off" })
 		{
 			foreach (var archive in folder.Length == 0 ? new[] { IasDp8Routes.TargetBody, IasDp8Routes.TargetHelmet } : [IasDp8Routes.TargetBody])
@@ -36,13 +40,28 @@ public static class IasDp8Preview
 						throw new InvalidDataException($"Unaligned GPU entry in {path}.");
 					var unit = await patches.ReadCanonicalSourceAsync(entry, entries).ConfigureAwait(false);
 					var slot = IasDp8Routes.Slots.Single(item => item.Target == entry.AssetKey.FileId);
-					var lod0 = unit.Model.RawMeshData.Where(mesh => mesh.LodIndex == 0).Select(mesh => ExportMesh(unit.Model, mesh, avatar)).ToArray();
+					var renamed = IndependentIndexes(unit.Model.TransformInfo, avatar);
+					foreach (var index in renamed)
+					{
+						var info = unit.Model.TransformInfo;
+						var parent = info.Entries[index].ParentIndex;
+						independent.TryAdd(info.NameHashes[index], new
+						{
+							Hash = info.NameHashes[index], info.Matrices[index].Values,
+							ParentHash = parent == index || parent >= info.NameHashes.Count ? (uint?)null : info.NameHashes[parent],
+						});
+					}
+					var lod0 = unit.Model.RawMeshData.Where(mesh => mesh.LodIndex == 0)
+						.Select(mesh => ExportMesh(unit.Model, mesh, avatar, extra: renamed.Select(index => unit.Model.TransformInfo.NameHashes[index]).ToHashSet())).ToArray();
 					models.Add(new
 					{
 						slot.Part, slot.Body, Option = folder,
 						FileId = slot.Target.ToString("x16"),
 						Patch = Path.GetRelativePath(mod, path), patchSha256,
 						TransformCount = unit.Model.TransformInfo.Matrices.Count,
+						NodeHashes = unit.Model.TransformInfo.NameHashes,
+						BindGeometry = unit.Model.RawMeshData.Where(mesh => mesh.LodIndex >= 0)
+							.Select(mesh => BindGeometry(unit.Model, mesh)).ToArray(),
 						Meshes = lod0,
 					});
 				}
@@ -52,7 +71,7 @@ public static class IasDp8Preview
 		Directory.CreateDirectory(output);
 		var bones = avatar.Matrices.Select((matrix, index) => new { matrix.Values, Parent = avatar.Entries[index].ParentIndex, Hash = avatar.NameHashes[index] });
 		await File.WriteAllTextAsync(Path.Combine(output, "patch-preview.json"),
-			JsonSerializer.Serialize(new { Bones = bones, Units = models }, Json)).ConfigureAwait(false);
+			JsonSerializer.Serialize(new { Bones = bones, Independent = independent.Values, Units = models }, Json)).ConfigureAwait(false);
 
 		var vanillaReader = new GameDataUnitMeshReader(resolver);
 		var vanillaUnits = new List<object>();
@@ -80,7 +99,38 @@ public static class IasDp8Preview
 			JsonSerializer.Serialize(new { Bones = bones, Units = vanillaUnits }, Json)).ConfigureAwait(false);
 	}
 
-	private static object ExportMesh(UnitMeshModel model, UnitRawMeshData mesh, UnitTransformInfo avatar, bool allowParentFallback = false)
+	/// <summary>Unit 骨架里不是 avatar 骨的节点：同下标被改名的独立骨，以及 avatar 之后追加的节点。</summary>
+	private static int[] IndependentIndexes(UnitTransformInfo unit, UnitTransformInfo avatar)
+	{
+		if (unit.NameHashes.Count < avatar.NameHashes.Count)
+			return [];
+		var avatarHashes = avatar.NameHashes.ToHashSet();
+		// 另外 avatar 之后追加的节点（物理骨等）也一起导出：预览里它们跟着父骨走。
+		return Enumerable.Range(0, unit.NameHashes.Count)
+			.Where(index => !avatarHashes.Contains(unit.NameHashes[index]))
+			.ToArray();
+	}
+
+	private static object BindGeometry(UnitMeshModel model, UnitRawMeshData mesh)
+	{
+		var info = model.Meshes.Single(item => item.Index == mesh.MeshInfoIndex);
+		var world = Hd2RigReader.FromHd2RowVector(model.TransformInfo.Matrices[(int)info.TransformIndex].Values);
+		using var digest = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+		Span<byte> encoded = stackalloc byte[24];
+		foreach (var vertex in mesh.Vertices)
+		{
+			var p = IasNativeMesh.Component(vertex, 0).FloatValues;
+			var v = world.TransformPoint(new(p[0], p[1], p[2]));
+			BinaryPrimitives.WriteDoubleLittleEndian(encoded, v.X);
+			BinaryPrimitives.WriteDoubleLittleEndian(encoded[8..], v.Y);
+			BinaryPrimitives.WriteDoubleLittleEndian(encoded[16..], v.Z);
+			digest.AppendData(encoded);
+		}
+		return new { mesh.MeshInfoIndex, mesh.LodIndex, VertexCount = mesh.Vertices.Count, Sha256 = Convert.ToHexString(digest.GetHashAndReset()) };
+	}
+
+	private static object ExportMesh(UnitMeshModel model, UnitRawMeshData mesh, UnitTransformInfo avatar, bool allowParentFallback = false,
+		IReadOnlySet<uint>? extra = null)
 	{
 		var map = CanonicalVertexMaterialResolver.Resolve(mesh);
 		if (!map.IsValid)
@@ -96,6 +146,8 @@ public static class IasDp8Preview
 		var uv = new float[order.Length][];
 		var weights = new object[order.Length];
 		var avatarHashes = avatar.NameHashes.ToHashSet();
+		if (extra is not null)
+			avatarHashes.UnionWith(extra);
 		for (var i = 0; i < order.Length; i++)
 		{
 			var vertex = mesh.Vertices[(int)order[i]];
@@ -125,7 +177,7 @@ public static class IasDp8Preview
 					}
 				}
 				if (!avatarHashes.Contains(hash))
-					throw new InvalidDataException($"Patch vertex references non-avatar transform {hash:x8}.");
+					throw new InvalidDataException($"Patch vertex references non-avatar transform {hash:x8} (slot {slotIndex}, unit {model.TransformNameHashes.Count} vs avatar {avatar.NameHashes.Count}, avatar at slot {(slotIndex < avatar.NameHashes.Count ? avatar.NameHashes[slotIndex].ToString("x8") : "-")}).");
 				return (Hash: hash, item.Weight);
 			}).GroupBy(item => item.Hash).Select(group => new { Hash = group.Key, Weight = group.Sum(item => item.Weight) }).ToArray();
 			var sum = resolvedWeights.Sum(item => item.Weight);

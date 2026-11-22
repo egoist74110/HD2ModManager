@@ -5,6 +5,17 @@ namespace HD2ModCore.Tests;
 
 public sealed class PhysBoneArmPoseTests
 {
+	[Theory]
+	[InlineData("boot")]
+	[InlineData("external")]
+	public void IasOptionalGroupsAreInjectedWithoutArmPose(string mode)
+	{
+		var source = PhysBoneLuaSource.ComposeStandalonePackage(mode: mode, iasPhysicsGroups: 5);
+		Assert.Contains($"mode = '{mode}', iasPhysicsGroups = 5 }})", source, StringComparison.Ordinal);
+		var defaults = PhysBoneLuaSource.ComposeStandalonePackage(mode: mode);
+		Assert.Contains($"mode = '{mode}', iasPhysicsGroups = 0 }})", defaults, StringComparison.Ordinal);
+	}
+
 	[Fact]
 	public void ComposeStandalonePackage_DefaultOmitsArmPoseFlag()
 	{
@@ -12,7 +23,7 @@ public sealed class PhysBoneArmPoseTests
 		var explicitOff = PhysBoneLuaSource.ComposeStandalonePackage(LuaAddonCatalog.PhysicsAddonId, "external", armPoseEnabled: false);
 
 		Assert.Equal(defaultExternal, explicitOff);
-		Assert.Contains("PhysBoneRuntime.install(engine, { compat = PhysBoneCompat, mode = 'external' })", defaultExternal);
+		Assert.Contains("PhysBoneRuntime.install(engine, { compat = PhysBoneCompat, mode = 'external', iasPhysicsGroups = 0 })", defaultExternal);
 		Assert.DoesNotContain("armPose = true", defaultExternal);
 	}
 
@@ -22,8 +33,8 @@ public sealed class PhysBoneArmPoseTests
 		var enabledExternal = PhysBoneLuaSource.ComposeStandalonePackage(LuaAddonCatalog.PhysicsAddonId, "external", armPoseEnabled: true);
 		var enabledBoot = PhysBoneLuaSource.ComposeStandalonePackage(LuaAddonCatalog.PhysicsAddonId, "boot", armPoseEnabled: true);
 
-		Assert.Contains("PhysBoneRuntime.install(engine, { compat = PhysBoneCompat, mode = 'external', armPose = true })", enabledExternal);
-		Assert.Contains("PhysBoneRuntime.install(engine, { compat = PhysBoneCompat, mode = 'boot', armPose = true })", enabledBoot);
+		Assert.Contains("PhysBoneRuntime.install(engine, { compat = PhysBoneCompat, mode = 'external', armPose = true, iasPhysicsGroups = 0 })", enabledExternal);
+		Assert.Contains("PhysBoneRuntime.install(engine, { compat = PhysBoneCompat, mode = 'boot', armPose = true, iasPhysicsGroups = 0 })", enabledBoot);
 	}
 
 	[Fact]

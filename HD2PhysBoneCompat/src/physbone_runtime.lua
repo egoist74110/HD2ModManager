@@ -100,7 +100,7 @@ local M = {}
 --        flags=0x35（yawCon + angleCon，没有 pitchCon）的长发链：pitch 区间留着初值 [0, 0]，
 --        而求解器在 axisLimits 打开时两个分量都夹 ⇒ 前后甩被锁在 0°，长发看着像一根焊丝。
 --        现在没约束的轴按"不限"处理，总偏角仍由锥兜住。
-M.VERSION = "2.1.45"
+M.VERSION = "2.1.47"
 
 --- 安装标记用的全局键。只写这一个全局，且值就是模块本身（便于外部检查是否已装）。
 local INSTALL_KEY = "__hd2physbone_runtime"
@@ -555,7 +555,8 @@ end
 --- 那 +5 是余量：万一部署序列中间出现空洞（理论上不会，管理器每次从 0 连续重编），
 --- 二分可能低估，多探五格兜住。
 local function loadCarriers(S_, cache, options, logger)
-	local archive = options.archiveId or "9ba626afa44a3aa3"
+	local archives = options.archiveId and { options.archiveId }
+		or { "9ba626afa44a3aa3", "59d238094a164c88", "d2fde496226be96f" }
 	local carriers = {}
 	local seen = {}
 
@@ -567,6 +568,7 @@ local function loadCarriers(S_, cache, options, logger)
 	local prefixes = { "data/", "data\\", "./data/", "../data/", "..\\data\\" }
 	local poked = {}
 	local scannedTo = -1
+	for _, archive in ipairs(archives) do
 	for _, prefix in ipairs(prefixes) do
 		if not canProbe or Compat.detect_prefix(archive, { prefix }) ~= nil then
 			local maxIndex = options.maxPatchIndex
@@ -597,6 +599,7 @@ local function loadCarriers(S_, cache, options, logger)
 			end
 		end
 	end
+	end
 
 	if #carriers > 0 then
 		logger(string.format("[physbone] 读到 %d 份物理容器（扫了 patch 0..%d）", #carriers, scannedTo))
@@ -610,6 +613,22 @@ local function loadCarriers(S_, cache, options, logger)
 		logger("[physbone] 没找到任何物理容器（data 目录下没有这个归档的 patch 文件——游戏是否还没部署过？）")
 	end
 	return carriers
+end
+
+-- Both discovery paths must filter before scoring or resolving any nodes.
+local function filterCarriers(carriers, mask)
+	local filtered, removed = {}, 0
+	for _, carrier in ipairs(carriers) do
+		local rig, count = Compat.filter_ias_groups(carrier.rig, mask)
+		removed = removed + count
+		if #rig.bones > 0 then
+			local entry = {}
+			for key, value in pairs(carrier) do entry[key] = value end
+			entry.rig = rig
+			filtered[#filtered + 1] = entry
+		end
+	end
+	return filtered, removed
 end
 
 -- ---------------------------------------------------------------------------
@@ -1090,12 +1109,19 @@ local function tryAttach(runtime)
 
 	-- 逐 unit 选容器：每个 unit 只认"全命中"的那一份，没有就跳过（宁可不驱动也不写错参数）。
 	-- `options.carriers` 可以直接注入（测试 / 由管理器把容器内容传进来时用），省掉扫盘。
-	local carriers = runtime.carriers or {}
-	if #carriers == 0 and options.carriers ~= nil then
-		carriers = options.carriers
-		runtime.carriers = carriers
+	local carriers = runtime.carriers
+	if carriers == nil then
+		local raw = options.carriers
+		if raw == nil or #raw == 0 then raw = loadCarriers(S, cache, options, runtime.logger) end
+		local removed
+		carriers, removed = filterCarriers(raw, runtime.iasPhysicsGroups)
+		if #raw > 0 then runtime.carriers = carriers end
+		if removed > 0 and not runtime.iasFilterLogged then
+			runtime.logger("[physbone] IAS 可选组掩码=%d，排除 %d 条骨记录",
+				runtime.iasPhysicsGroups, removed)
+			runtime.iasFilterLogged = true
+		end
 	end
-	if #carriers == 0 then carriers = loadCarriers(S, cache, options, runtime.logger); runtime.carriers = carriers end
 	local allowPartial = options.allowPartial == true
 	-- 只挂**离它那个玩家**近的护甲件。为什么必须过滤：阵亡后尸体留在原地、unit 一直活着，
 	-- 而复活点常在别处 ⇒ 不过滤的话会把尸体也一起挂上（既浪费，也让"给尸体关物理"落空）。
@@ -3701,7 +3727,7 @@ end
 -- 旋转抄过去。位置不写——留着绑定里的模型位置，这正是"绕模型自己的关节转"。
 --
 -- 选项 `independentBones = { { "ias_l_shoulder", "l_shoulder" }, ... }`（父骨在前）。
--- 每帧开销：每根骨读 avatar 1 次 + 每件护甲写 1 次，每件护甲 1 次 update_unit。
+-- `independentIk = false` 只拷贝旋转，每根骨读 avatar 1 次 + 每件护甲写 1 次，每件护甲 1 次 update_unit。
 -- ---------------------------------------------------------------------------
 local INDEPENDENT_RESCAN_FRAMES = 1800
 local INDEPENDENT_LOG_FRAMES = { [1] = true, [600] = true }
@@ -3727,7 +3753,7 @@ end
 
 --- 找 avatar 1 m 内、带独立骨的护甲件；同时解出 avatar 上的源骨。返回 state 或 nil。
 local function independent_scan(runtime, avatar, world, list)
-	local sources = {}
+	local sources, slots = {}, {}
 	for index = 1, #list do
 		local node = safe_node(S, avatar, list[index][2])
 		if node == nil then
@@ -3735,6 +3761,12 @@ local function independent_scan(runtime, avatar, world, list)
 			return { avatar = avatar, pieces = {}, broken = true }
 		end
 		sources[index] = node
+		if list[index][1] == "ias_" .. list[index][2] then slots[list[index][2]] = index end
+	end
+	local arms = {}
+	for _, side in ipairs({ "l", "r" }) do
+		local sh, el, ha = slots[side .. "_shoulder"], slots[side .. "_elbow"], slots[side .. "_hand"]
+		if sh and el and ha then arms[#arms + 1] = { sh = sh, el = el, ha = ha } end
 	end
 	local units = try(S.World.units, world)
 	if type(units) ~= "table" then return nil end
@@ -3765,7 +3797,7 @@ local function independent_scan(runtime, avatar, world, list)
 	for i = 1, #pieces do tags[#tags + 1] = pieces[i].tag end
 	runtime.logger("[physbone][独立骨] 找到 %d 件带独立骨的护甲（%d 根骨）：%s",
 		#pieces, #list, #tags > 0 and table.concat(tags, "、") or "无")
-	return { avatar = avatar, sources = sources, pieces = pieces, frames = 0,
+	return { avatar = avatar, sources = sources, pieces = pieces, arms = arms, frames = 0,
 		rescanAt = (runtime.frame or 0) + INDEPENDENT_RESCAN_FRAMES }
 end
 
@@ -3793,6 +3825,16 @@ local function independent_frame(runtime, avatar, world, list)
 		rotations[b] = try(S.Unit.local_rotation, avatar, state.sources[b])
 		calls = calls + 1
 	end
+	local targets
+	if runtime.options.independentIk ~= false and #state.arms > 0 then
+		targets = {}
+		for _, arm in ipairs(state.arms) do
+			local target, cost = Compat.independent_ik_target(S, avatar, state.sources[arm.el],
+				state.sources[arm.ha], rotations[arm.sh])
+			calls = calls + cost
+			if target then targets[#targets + 1] = { arm = arm, pose = target } end
+		end
+	end
 	for index = #state.pieces, 1, -1 do
 		local piece = state.pieces[index]
 		if not Compat.unit_alive(S, piece.unit) then
@@ -3800,14 +3842,33 @@ local function independent_frame(runtime, avatar, world, list)
 			table.remove(state.pieces, index)
 			state.rescanAt = frame + 1
 		else
+			local failed
 			for b = 1, #list do
 				if rotations[b] ~= nil and pcall(S.Unit.set_local_rotation, piece.unit, piece.nodes[b], rotations[b]) then
 					written = written + 1
+				elseif targets then
+					failed = failed or {}
+					failed[b] = true
 				end
 				calls = calls + 1
 			end
-			pcall(S.World.update_unit, world, piece.unit)
+			local updated = pcall(S.World.update_unit, world, piece.unit)
 			calls = calls + 1
+			if updated and targets then
+				local ikWrites = 0
+				for _, target in ipairs(targets) do
+					local arm = target.arm
+					if not failed or not (failed[arm.sh] or failed[arm.el] or failed[arm.ha]) then
+						local count, cost = Compat.apply_independent_ik(S, piece.unit, piece.nodes[arm.sh],
+							piece.nodes[arm.el], piece.nodes[arm.ha], target.pose)
+						ikWrites, calls = ikWrites + count, calls + cost
+					end
+				end
+				if ikWrites > 0 then
+					pcall(S.World.update_unit, world, piece.unit)
+					written, calls = written + ikWrites, calls + 1
+				end
+			end
 		end
 	end
 
@@ -4375,13 +4436,14 @@ local function drive(runtime)
 		for _, item in ipairs(session.sessions) do
 			local rotations = item.lastRotations
 			if rotations ~= nil then
+				local simBones = item.tip and item.tip.bones or item.bones
 				for index = 1, #rotations do
 					local angle = rotations[index][4]
 					if angle > framePeak then
 						framePeak = angle
 						local chainBone = item.chain and item.chain[index]
 						worstName = chainBone and chainBone.name or nil
-						local simBone = item.bones and item.bones[index]
+						local simBone = simBones and simBones[index]
 						local gains = simBone and simBone.gains
 						worstLimit = (gains and gains.limit or 0) * 180 / math.pi
 					end
@@ -4524,6 +4586,7 @@ function M.install(stingray, options)
 	local logger, logContext = makeLogger(options)
 	state = {
 		options = options,
+		iasPhysicsGroups = math.floor(tonumber(options.iasPhysicsGroups) or 0) % 16,
 		logger = logger,
 		logContext = logContext,
 		cache = {},
@@ -4571,6 +4634,9 @@ function M.install(stingray, options)
 		M.VERSION,
 		options.mode == "boot" and "独占 boot" or "外置模块",
 		os.date("%Y-%m-%d %H:%M:%S"))
+	if options.iasPhysicsGroups ~= nil then
+		logger("[physbone] IAS 可选组掩码=%d（刘海/呆毛=1 挂件=2 胸部=4 臀部=8）", state.iasPhysicsGroups)
+	end
 	if options.armPose == true then
 		local legs = Compat.leg_joint_targets ~= nil and Compat.leg_joint_targets(options.legJointTarget) or nil
 		logger("[physbone] 姿态修正已开：肩目标=%s 腿目标=%s 独立骨=%s",

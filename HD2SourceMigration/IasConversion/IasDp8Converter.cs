@@ -4,6 +4,7 @@ using HD2ModAdaptation.PatchReconstruction;
 using HD2ModAdaptation.PatchReconstruction.UnitMesh;
 using HD2ModAdaptation.PatchReconstruction.UnitMesh.Canonical;
 using HD2SourceMigration.VpkConversion;
+using HD2SourceModel;
 
 namespace HD2SourceMigration.IasConversion;
 
@@ -53,6 +54,21 @@ public sealed class IasDp8Converter(Func<string, uint> boneHash, Func<ulong, boo
 			.ToDictionary(entry => entry.AssetKey);
 
 		var profiles = ReadProfiles(companion);
+		var physicsSources = Directory.EnumerateFiles(companion, "*.hd2phys")
+			.Select(path => IasPhysicsReader.Read(File.ReadAllBytes(path))).ToDictionary(source => source.UnitId);
+		var sharedPhysics = physicsSources.Values.SingleOrDefault(source => !profiles.ContainsKey(source.UnitId));
+		var physicsProfiles = new Dictionary<ulong, IasRigProfile>(profiles);
+		if (sharedPhysics is not null)
+		{
+			foreach (var path in Directory.EnumerateFiles(companion, "*.canonical.rigbin"))
+			{
+				using var stream = File.OpenRead(path);
+				if (IasRigReader.Read(stream).TryGetValue(sharedPhysics.UnitId, out var canonical))
+					physicsProfiles.Add(sharedPhysics.UnitId, canonical);
+			}
+			if (!physicsProfiles.ContainsKey(sharedPhysics.UnitId))
+				throw new InvalidDataException($"Missing IAS canonical rig for physics unit {sharedPhysics.UnitId:x16}.");
+		}
 		var sourceTorso = plan.Base.First(route => route.Slot.Part == "Torso");
 		var sourceHead = profiles[sourceTorso.Published].Nodes.Single(node => node.Name == "head").World.Origin;
 		var resolver = new GameDataPackageResolver(game);
@@ -66,6 +82,7 @@ public sealed class IasDp8Converter(Func<string, uint> boneHash, Func<ulong, boo
 		// 这些骨全部改名、绑定放模型关节，由运行时每帧抄 avatar 的旋转。腿照旧。
 		var arms = IasIndependentBones.ArmRoots.SelectMany(root => IasIndependentBones.Subtree(targetRig, root)).ToHashSet();
 		var independentBones = IasIndependentBones.Collect(targetRig, IasIndependentBones.ArmRoots);
+		var independentNames = independentBones.ToHashSet(StringComparer.Ordinal);
 		var boneShifts = IasArmPose.ComputeBoneShifts(targetRig, profiles[sourceTorso.Published].Nodes)
 			.Concat(IasArmPose.ComputeLegShifts(targetRig, profiles[sourceTorso.Published].Nodes))
 			.Where(pair => !arms.Contains(pair.Key))
@@ -111,6 +128,8 @@ public sealed class IasDp8Converter(Func<string, uint> boneHash, Func<ulong, boo
 				{
 					var archive = group.Key ? IasDp8Routes.TargetHelmet : IasDp8Routes.TargetBody;
 					var entries = new List<PatchArchiveAdditionalEntry>();
+					var facts = new List<SourceJiggleBoneFact>();
+					var writtenPhysics = new HashSet<ulong>();
 					foreach (var route in group)
 					{
 						var key = new AssetKey(PatchUnitMeshReader.UnitTypeId, route.Slot.Target);
@@ -130,18 +149,36 @@ public sealed class IasDp8Converter(Func<string, uint> boneHash, Func<ulong, boo
 						}
 						var sourceUnit = await new PatchUnitMeshReader().ReadCanonicalSourceAsync(source, inputs[group.Key],
 							cancellationToken: cancellationToken).ConfigureAwait(false);
-						var (lods, materials) = IasNativeMesh.Convert(sourceUnit.Model, profiles[route.Published], targetRig, skinRig,
-							sourceHead, boneHash, refitArms: true, boneShifts);
+						var profile = profiles[route.Published];
+						var physicsSource = physicsSources.GetValueOrDefault(route.Published) ?? (group.Key ? null : sharedPhysics);
+						var physics = physicsSource is null ? null
+							: new IasPhysicsMigration(physicsSource, route.Published, profile, physicsProfiles[physicsSource.UnitId]);
+						if (physics?.HasBones == false)
+							physics = null;
+						var (lods, materials) = IasNativeMesh.Convert(sourceUnit.Model, profile, targetRig, skinRig,
+							sourceHead, boneHash, refitArms: true, boneShifts, physics);
+						var unitRig = physics?.Append(skinRig, lods.Values, compact: group.Key) ?? skinRig;
 						var shell = IasNativeMesh.UseFourWeightStreams(donor.Model);
-						var result = new UnitAuthor().Author(new UnitAuthorRequest(shell, donor.Payload.TocData, skinRig,
+						var result = new UnitAuthor().Author(new UnitAuthorRequest(shell, donor.Payload.TocData, unitRig,
 							lods[0], donor.Model.CustomizationInfo, key.FileId, materials), lods);
 						if (!result.IsValid || result.Model!.TransformNameHashes.Count > 256)
-							throw new InvalidDataException($"IAS Unit {route.Slot.Part}/{route.Slot.Body} -> {key.FileId:x16}: {string.Join("; ", result.Diagnostics)}");
+							throw new InvalidDataException($"IAS Unit {route.Slot.Part}/{route.Slot.Body} -> {key.FileId:x16} ({result.Model?.TransformNameHashes.Count} nodes): {string.Join("; ", result.Diagnostics)}");
+						if (physics is not null && writtenPhysics.Add(route.Published))
+							physics.AddFacts(facts, targetRig, independentNames);
 						usedMaterials.UnionWith(materials.Values);
 						entries.Add(new(key, result.TocData!, [], result.GpuData!, entry.Unknown1, entry.Unknown2, entry.Unknown3, entry.Unknown4));
 					}
 					var inputPath = group.Key ? helmetPath : bodyPath;
 					await WritePatchAsync(inputPath, archive + ".patch_0", template, directory, entries, cancellationToken).ConfigureAwait(false);
+					if (facts.Count > 0)
+					{
+						var rigDirectory = Path.Combine(directory, "physics", archive);
+						Directory.CreateDirectory(rigDirectory);
+						var rigPath = PhysBoneRigSidecar.Write(rigDirectory, facts, null)!;
+						var rig = await File.ReadAllBytesAsync(rigPath, cancellationToken).ConfigureAwait(false);
+						await PhysBoneContainerEmbedder.EmbedNewPatchAsync(Path.Combine(directory, archive + ".patch_0"),
+							rig, cancellationToken).ConfigureAwait(false);
+					}
 				}
 			}
 		}

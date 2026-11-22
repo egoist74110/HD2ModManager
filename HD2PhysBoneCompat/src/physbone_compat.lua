@@ -441,6 +441,11 @@ end
 --- </para>
 ---@return table chains 每条路径是一个骨记录数组；首节的 `isBranch` 为 true 表示它有 jiggle 父骨
 ---@return table byIndex 源骨下标 → 骨记录
+local function ias_chain_start(bone)
+	return type(bone.name) == "string" and bone.name:match("^ias_phys_")
+		and math.floor((bone.flags or 0) / 4096) % 2 == 1
+end
+
 function M.build_chains(bones)
 	local byIndex = {}
 	for _, bone in ipairs(bones) do byIndex[bone.index] = bone end
@@ -448,8 +453,10 @@ function M.build_chains(bones)
 	local children = {}
 	for _, bone in ipairs(bones) do
 		local key = bone.parent
-		children[key] = children[key] or {}
-		children[key][#children[key] + 1] = bone
+		if not ias_chain_start(bone) then
+			children[key] = children[key] or {}
+			children[key][#children[key] + 1] = bone
+		end
 	end
 
 	M.apply_world_segments(bones)
@@ -486,7 +493,7 @@ function M.build_chains(bones)
 	local starts = {}
 	for _, bone in ipairs(bones) do
 		local parent = byIndex[bone.parent]
-		if parent == nil or isForkParent(parent) then
+		if parent == nil or isForkParent(parent) or ias_chain_start(bone) then
 			starts[#starts + 1] = bone
 		end
 	end
@@ -510,6 +517,29 @@ function M.build_chains(bones)
 		end
 	end
 	return chains, byIndex
+end
+
+local function ias_group(bone)
+	return bone.name:match("^ias_phys_") and math.floor((bone.flags or 0) / 256) % 16 or 0
+end
+
+-- The group occupies bits 8–11 only on IAS records. Filter before any engine node lookup.
+function M.filter_ias_groups(rig, mask)
+	local bones = {}
+	local removed = 0
+	for _, bone in ipairs(rig.bones) do
+		local group = ias_group(bone)
+		if group == 0 or math.floor((mask or 0) / 2 ^ (group - 1)) % 2 == 1 then
+			bones[#bones + 1] = bone
+		else
+			removed = removed + 1
+		end
+	end
+	if removed == 0 then return rig, 0 end
+	local filtered = {}
+	for key, value in pairs(rig) do filtered[key] = value end
+	filtered.bones = bones
+	return filtered, removed
 end
 
 -- ---------------------------------------------------------------------------
@@ -1062,7 +1092,7 @@ function M.step_tip(item, dt, apx, apy, apz, qx, qy, qz, qw)
 		--      各节转角 7.66° / 0.00° / 0.00°）。
 		--   ② k==1 ⇒ 真的没有父节。
 		local rest, rel = restDirs[k], relDevs[k]
-		if k == 1 then
+		if k == 1 or gains.ias then
 			prevX, prevY, prevZ = rest[1], rest[2], rest[3]
 		elseif rel == nil then
 			local d = item.dirs[k - 1]
@@ -1090,10 +1120,18 @@ function M.step_tip(item, dt, apx, apy, apz, qx, qy, qz, qw)
 		local velPitch = ux * tip.vx + uy * tip.vy + uz * tip.vz
 		local accYaw = gains.kYaw * errYaw - gains.cYaw * velYaw
 		local accPitch = gains.kPitch * errPitch - gains.cPitch * velPitch
+		local gravity = gains.g
+		if gains.ias then
+			-- Solve the full transverse force implicitly. Applying damping to the spring
+			-- alone raises the gravity equilibrium by a factor of (1 + dt * c).
+			accYaw = (accYaw - gravity * lz) / (1 + dt * gains.cYaw + dt * dt * gains.kYaw)
+			accPitch = (accPitch - gravity * uz) / (1 + dt * gains.cPitch + dt * dt * gains.kPitch)
+			gravity = 0
+		end
 		-- 重力：上的反面（一致性电池 E1 实测世界 +Z 朝上）
 		local ax = accYaw * lx + accPitch * ux
 		local ay = accYaw * ly + accPitch * uy
-		local az = accYaw * lz + accPitch * uz - gains.g
+		local az = accYaw * lz + accPitch * uz - gravity
 		tip.vx, tip.vy, tip.vz = tip.vx + ax * dt, tip.vy + ay * dt, tip.vz + az * dt
 		tip.px, tip.py, tip.pz = tip.px + tip.vx * dt, tip.py + tip.vy * dt, tip.pz + tip.vz * dt
 		-- 定长约束（样本 flags=0x31 含 lenC ⇒ 尖端钉在半径 L 的球面上，且没有 along 弹簧）
@@ -1196,10 +1234,11 @@ function M.step_tip(item, dt, apx, apy, apz, qx, qy, qz, qw)
 		-- 分轴约束的骨**不走这条**（见上面 axisLimits 的说明；单轴受限时另一轴不夹分量、
 		-- 锥也不生效，理由与投影顺序的顾虑见 `gains_of` 里单轴受限那段）。
 		local dot = nx * prevX + ny * prevY + nz * prevZ
-		if not gains.axisLimits and gains.limit > 0 and dot < gains.cosLimit then
+		local cone, cosCone = gains.limit, gains.cosLimit
+		if not gains.axisLimits and cone > 0 and dot < cosCone then
 			local sx, sy, sz, _ = swing_axis(prevX, prevY, prevZ, nx, ny, nz)
 			if sx ~= nil then
-				local rqx, rqy, rqz, rqw = q_axis_angle(sx, sy, sz, gains.limit)
+				local rqx, rqy, rqz, rqw = q_axis_angle(sx, sy, sz, cone)
 				local obx, oby, obz = nx, ny, nz
 				nx, ny, nz = qrot(rqx, rqy, rqz, rqw, prevX, prevY, prevZ)
 				-- 同上：把**朝墙外**的那份速度去掉。否则它会一直堆在墙外，
@@ -1799,7 +1838,7 @@ local function rig_root_positions(rig)
 	for position = 1, #rig.bones do
 		local bone = rig.bones[position]
 		-- 父骨不在本 rig 里 ⇒ 这是链根（父是 HD2 原生骨，运行时按 `parentName` 找锚点）。
-		if bone.parent == nil or byIndex[bone.parent] == nil then
+		if bone.parent == nil or byIndex[bone.parent] == nil or ias_chain_start(bone) then
 			positions[#positions + 1] = position
 		end
 	end
@@ -1941,17 +1980,20 @@ end
 --- 有了这个键，第 2 个玩家起直接复用下标表，attach 成本从 N× 降到 1× + (N-1)×(读姿态)。
 --- </para>
 --- 拿不到资源哈希时返回 nil（退回不缓存，行为与优化前一致）。
-function M.attach_cache_key(S, unit, nodeCount)
+function M.attach_cache_key(S, unit, nodeCount, rig)
 	local ok, value = pcall(function() return S.Unit.name_hash(unit) end)
 	if not ok or type(value) ~= "string" or #value < 8 then return nil, nil end
 	local cache = M._attachCache
-	if cache == nil then cache = {}; M._attachCache = cache end
-	return value .. "|" .. tostring(nodeCount), cache
+	if cache == nil then cache = setmetatable({}, { __mode = "k" }); M._attachCache = cache end
+	-- Chain ordinals only identify nodes within this particular (possibly filtered) rig.
+	local scope = rig or M
+	if cache[scope] == nil then cache[scope] = {} end
+	return value .. "|" .. tostring(nodeCount), cache[scope]
 end
 
 --- 清空 attach 缓存。换关卡 / 换模型后可以调一次（不清也不会错，只是多占一点内存）。
 function M.clear_attach_cache()
-	M._attachCache = {}
+	M._attachCache = nil
 end
 
 --- 把 rig 挂到一个 Unit 上。
@@ -2033,7 +2075,7 @@ function M.attach(S, unit, rig, options)
 
 	-- 多玩家穿同一套护甲时，节点下标完全一样（同一个资源的不同实例）。
 	-- 缓存"链 → 节点下标"，第 2 个玩家起就不用再跑几百次 has_node/node。
-	local cacheKey, attachCache = M.attach_cache_key(S, unit, nodeCount)
+	local cacheKey, attachCache = M.attach_cache_key(S, unit, nodeCount, rig)
 	local cachedChains = cacheKey and attachCache[cacheKey]
 	if cachedChains ~= nil then
 		logger("[physbone] 复用同款护甲的节点解析缓存（%d 条链，省掉约 %d 次引擎调用）",
@@ -2062,6 +2104,7 @@ function M.attach(S, unit, rig, options)
 			break
 		else
 
+		local isIas = chain[1].name:match("^ias_phys_") ~= nil
 		-- 1) 链上每一节都必须是真实存在的节点
 		--    同款护甲复用缓存时，抽第一根骨做一次 has_node 抽查：万一实例的节点布局不同
 		--    （理论上不会），抽查失败就退回逐根解析。
@@ -2089,9 +2132,9 @@ function M.attach(S, unit, rig, options)
 			-- 2) 锚点：链根挂在哪根 HD2 骨上（用它的世界位置算加速度）
 			-- 锚点**名字**要在锚点解析之前就算好：世界朝向锚定的判据要用它判断
 			-- "这条链挂在手臂上还是躯干上"（见 M.world_anchor_of）。
-			local anchorName = M.anchor_name(chain[1].parentName, options.anchorMap)
-				or chain[1].parentName
-			local anchorNode = cached and cached.anchorNode or nil
+			local anchorName = chain[1].parentName
+			if not isIas then anchorName = M.anchor_name(anchorName, options.anchorMap) or anchorName end
+			local anchorNode = cached and nodes == cached.nodes and cached.anchorNode or nil
 			if anchorNode == nil then
 				-- rig v2 直接带父骨名字，所以这里能跨到 HD2 的骨名表上。
 				-- 映射表没命中时**把名字本身当成 HD2 骨名**再试一次：链是我们自己插进 Unit 的，
@@ -2138,15 +2181,28 @@ function M.attach(S, unit, rig, options)
 				local tipData = nil
 				if not snapshotFailed then
 					local bindWorld, okWorld = {}, true
-					for index = 1, #nodes do
-						local wx, wy, wz = read_vec3(S, S.Unit.world_position(unit, nodes[index]))
-						if wx == nil then okWorld = false break end
-						bindWorld[index] = { wx, wy, wz }
+					local qbx, qby, qbz, qbw, awx, awy, awz
+					if isIas then
+						-- IAS appends joints with identity local bind rotations. Accumulating
+						-- their local translations gives the bind shape in the actual parent
+						-- frame, including on reattach after another chain has moved that parent.
+						local x, y, z = 0, 0, 0
+						for index, base in ipairs(basePoses) do
+							x, y, z = x + base.px, y + base.py, z + base.pz
+							bindWorld[index] = { x, y, z }
+						end
+						qbx, qby, qbz, qbw, awx, awy, awz = 0, 0, 0, 1, 0, 0, 0
+					else
+						for index = 1, #nodes do
+							local wx, wy, wz = read_vec3(S, S.Unit.world_position(unit, nodes[index]))
+							if wx == nil then okWorld = false break end
+							bindWorld[index] = { wx, wy, wz }
+						end
+						qbx, qby, qbz, qbw = read_quat4(S, unit, anchorNode)
+						awx, awy, awz = read_vec3(S, S.Unit.world_position(unit, anchorNode))
 					end
-					local qbx, qby, qbz, qbw = read_quat4(S, unit, anchorNode)
-					if okWorld and qbx ~= nil then
+					if okWorld and qbx ~= nil and awx ~= nil then
 						-- 锚点 bind 世界位置（用它把每节的 bind 位置换成锚点局部系）
-						local awx, awy, awz = read_vec3(S, S.Unit.world_position(unit, anchorNode))
 						local cqx, cqy, cqz, cqw = qconj(qbx, qby, qbz, qbw)
 						local bonesNew, tipsNew, segDirLocal = {}, {}, {}
 						for index = 1, #chain do
@@ -2155,6 +2211,26 @@ function M.attach(S, unit, rig, options)
 							local lx, ly, lz = qrot(cqx, cqy, cqz, cqw, ox, oy, oz)
 							local gains = M.gains_of(chain[index].params, lengthScale, gravityScale,
 								{ flags = chain[index].flags, limitRelax = options.limitRelax })
+							if isIas then
+								gains.ias = true
+								-- IAS stiffness is an authored response rate. Preserve that
+								-- time scale in the overdamped target spring (response ≈ k/c).
+								gains.kYaw = gains.kYaw * math.max(gains.cYaw, gains.kYaw, 1)
+								gains.kPitch = gains.kPitch * math.max(gains.cPitch, gains.kPitch, 1)
+								-- Preserve the sign and relative effect of gravity up to
+								-- 7° of static bending per segment. Adjacent segment
+								-- corrections can oppose each other at a skin joint.
+								gains.g = math.min(gains.g, math.sin(math.rad(7)) * gains.L
+									* math.min(gains.kYaw, gains.kPitch))
+								-- The transverse spring has no restoring force at 180°.
+								-- Keep unconstrained tissue within a small elastic arc to
+								-- avoid folding the chest/hips during anchor translation.
+								local group = ias_group(chain[index])
+								local ceiling = (group == 3 or group == 4) and math.rad(7) or (math.pi / 2 - 0.01)
+								if gains.limit == 0 or gains.limit > ceiling then
+									gains.limit, gains.cosLimit = ceiling, math.cos(ceiling)
+								end
+							end
 							bonesNew[index] = {
 								gains = gains,
 								offLocal = { lx, ly, lz },
@@ -2249,6 +2325,7 @@ function M.attach(S, unit, rig, options)
 						-- 实机是"胸口反重力立起来/往上飘"。判据交给 M.world_anchor_of：
 						-- flags 齐全 **且** 锚点不是躯干/头/胯。
 						local worldAnchored, anchorReason = M.world_anchor_of(chain[1].flags or 0, anchorName)
+						if isIas then worldAnchored = false end
 						if worldAnchored then
 							logger("[physbone] 链 %s：flags=0x%02x，锚点 %s ⇒ 世界朝向锚定（父级只带动平移）",
 								tostring(chain[1] and chain[1].name), chain[1].flags or 0,
@@ -2263,7 +2340,7 @@ function M.attach(S, unit, rig, options)
 							dirs = {}, anchorBindQ = { qbx, qby, qbz, qbw },
 							goalQ = worldAnchored and { qbx, qby, qbz, qbw } or nil,
 						}
-						tipData.bendBlend = options.bendBlend == nil and 1.0 or options.bendBlend
+						tipData.bendBlend = not isIas and (options.bendBlend == nil and 1.0 or options.bendBlend) or nil
 						-- 分轴限位的**静止参考系**：右/上/前三个轴一次性在 goalQ 里算好。
 						--
 						-- ⚠️ 必须和"绑定方向"用同一个参考系。曾经混用过（方向用 goalQ、轴用当前 q），
@@ -3257,16 +3334,16 @@ local function min_arc_quat(fx, fy, fz, tx, ty, tz)
 end
 
 local function read_world_pose_lua(S, unit, node)
-	local pose = S.Unit.world_pose(unit, node)
-	if pose == nil then return nil end
+	local okPose, pose = pcall(S.Unit.world_pose, unit, node)
+	if not okPose or pose == nil then return nil, 1 end
 	local ok, e1, e2, e3, e4, e5, e6, e7, e8, e9, e10, e11, e12 = pcall(S.Matrix4x4.to_elements, pose)
-	if not ok or type(e12) ~= "number" or e12 ~= e12 then return nil end
+	if not ok or type(e12) ~= "number" or e12 ~= e12 then return nil, 2 end
 	local qx, qy, qz, qw = mat3_to_quat(e1, e4, e7, e2, e5, e8, e3, e6, e9)
 	return {
 		px = e10, py = e11, pz = e12,
 		qx = qx, qy = qy, qz = qz, qw = qw,
 		fwdx = e7, fwdy = e8, fwdz = e9,
-	}
+	}, 2
 end
 
 local function write_arm_local(S, unit, node, qx, qy, qz, qw, px, py, pz, fallbackPos)
@@ -3414,6 +3491,25 @@ function M.solve_unarmed_side(chest, clav, sh, el, side, adductionDeg, forearmCo
 	}
 end
 
+-- 最短弧先转上臂，再在旋转后的肩下转前臂，最后锁定手腕世界旋转。
+local function aim_arm(clav, sh, el, ha, dx1, dy1, dz1, dx2, dy2, dz2, ax, ay, az, bx, by, bz)
+	local dqShX, dqShY, dqShZ, dqShW = min_arc_quat(dx1, dy1, dz1, ax, ay, az)
+	local shWx, shWy, shWz, shWw = qmul(dqShX, dqShY, dqShZ, dqShW, sh.qx, sh.qy, sh.qz, sh.qw)
+	local elMidX, elMidY, elMidZ, elMidW = qmul(dqShX, dqShY, dqShZ, dqShW, el.qx, el.qy, el.qz, el.qw)
+	local fxMid, fyMid, fzMid = qrot(dqShX, dqShY, dqShZ, dqShW, dx2, dy2, dz2)
+	local dqElX, dqElY, dqElZ, dqElW = min_arc_quat(fxMid, fyMid, fzMid, bx, by, bz)
+	local elWx, elWy, elWz, elWw = qmul(dqElX, dqElY, dqElZ, dqElW, elMidX, elMidY, elMidZ, elMidW)
+
+	local cInvx, cInvy, cInvz, cInvw = qconj(clav.qx, clav.qy, clav.qz, clav.qw)
+	local shInvx, shInvy, shInvz, shInvw = qconj(shWx, shWy, shWz, shWw)
+	local elInvx, elInvy, elInvz, elInvw = qconj(elWx, elWy, elWz, elWw)
+	return {
+		shQ = { qmul(cInvx, cInvy, cInvz, cInvw, shWx, shWy, shWz, shWw) },
+		elQ = { qmul(shInvx, shInvy, shInvz, shInvw, elWx, elWy, elWz, elWw) },
+		haQ = { qmul(elInvx, elInvy, elInvz, elInvw, ha.qx, ha.qy, ha.qz, ha.qw) },
+	}
+end
+
 --- 单侧持枪 2-bone 解析 IK（1:1 移植 P2 solve_ik_side，锁定手腕世界位姿）。
 --- `shoulderTarget`（可选，锁骨局部坐标）：肩关节挪到这里之后再解 IK，手腕仍锁在原位（枪不动）。
 function M.solve_ik_side(chest, clav, sh, el, ha, inwardPullM, shoulderTarget)
@@ -3462,27 +3558,97 @@ function M.solve_ik_side(chest, clav, sh, el, ha, inwardPullM, shoulderTarget)
 	local elNewY = sy + uy * (l1 * cosA) + ny * (l1 * sinA)
 	local elNewZ = sz + uz * (l1 * cosA) + nz * (l1 * sinA)
 
-	local dqShX, dqShY, dqShZ, dqShW = min_arc_quat(dx1, dy1, dz1, elNewX - sx, elNewY - sy, elNewZ - sz)
-	local shWx, shWy, shWz, shWw = qmul(dqShX, dqShY, dqShZ, dqShW, sh.qx, sh.qy, sh.qz, sh.qw)
-	local elMidX, elMidY, elMidZ, elMidW = qmul(dqShX, dqShY, dqShZ, dqShW, el.qx, el.qy, el.qz, el.qw)
-	local fxMid, fyMid, fzMid = qrot(dqShX, dqShY, dqShZ, dqShW, dx2, dy2, dz2)
-	local dqElX, dqElY, dqElZ, dqElW = min_arc_quat(fxMid, fyMid, fzMid, ha.px - elNewX, ha.py - elNewY, ha.pz - elNewZ)
-	local elWx, elWy, elWz, elWw = qmul(dqElX, dqElY, dqElZ, dqElW, elMidX, elMidY, elMidZ, elMidW)
+	local result = aim_arm(clav, sh, el, ha, dx1, dy1, dz1, dx2, dy2, dz2,
+		elNewX - sx, elNewY - sy, elNewZ - sz, ha.px - elNewX, ha.py - elNewY, ha.pz - elNewZ)
+	result.shP = shoulderTarget
+	return result
+end
 
-	local cInvx, cInvy, cInvz, cInvw = qconj(clav.qx, clav.qy, clav.qz, clav.qw)
-	local shInvx, shInvy, shInvz, shInvw = qconj(shWx, shWy, shWz, shWw)
-	local elInvx, elInvy, elInvz, elInvw = qconj(elWx, elWy, elWz, elWw)
+local function read_arm_position(S, unit, node)
+	local ok, p = pcall(S.Unit.world_position, unit, node)
+	if not ok or p == nil then return nil, 1 end
+	local okV, x, y, z = pcall(S.Vector3.to_elements, p)
+	if not okV or type(z) ~= "number" then return nil, 2 end
+	return { px = x, py = y, pz = z }, 2
+end
 
-	local shLx, shLy, shLz, shLw = qmul(cInvx, cInvy, cInvz, cInvw, shWx, shWy, shWz, shWw)
-	local elLx, elLy, elLz, elLw = qmul(shInvx, shInvy, shInvz, shInvw, elWx, elWy, elWz, elWw)
-	local haLx, haLy, haLz, haLw = qmul(elInvx, elInvy, elInvz, elInvw, ha.qx, ha.qy, ha.qz, ha.qw)
+--- 每侧的 avatar 目标在同一帧供所有护甲件复用。
+function M.independent_ik_target(S, avatar, elbow, hand, shoulderRotation)
+	if shoulderRotation == nil then return nil, 0 end
+	local ha, handCalls = read_world_pose_lua(S, avatar, hand)
+	local el, elbowCalls = read_arm_position(S, avatar, elbow)
+	local ok, x, y, z, w = pcall(S.Quaternion.to_elements, shoulderRotation)
+	local calls = handCalls + elbowCalls + 1
+	if ha == nil or el == nil or not ok or type(w) ~= "number" then return nil, calls end
+	return { hand = ha, elbow = el, shoulderLocal = { x, y, z, w } }, calls
+end
 
-	return {
-		shQ = { shLx, shLy, shLz, shLw },
-		elQ = { elLx, elLy, elLz, elLw },
-		haQ = { haLx, haLy, haLz, haLw },
-		shP = shoulderTarget,
-	}
+local function project_arm_pole(x, y, z, ux, uy, uz)
+	local dot = x * ux + y * uy + z * uz
+	x, y, z = x - dot * ux, y - dot * uy, z - dot * uz
+	local len = math.sqrt(x * x + y * y + z * z)
+	if len < 1e-6 then return nil end
+	return x / len, y / len, z / len
+end
+
+local function solve_independent_arm(sh, el, wrist, target)
+	local ha, pole = target.hand, target.elbow
+	local dx1, dy1, dz1 = el.px - sh.px, el.py - sh.py, el.pz - sh.pz
+	local dx2, dy2, dz2 = wrist.px - el.px, wrist.py - el.py, wrist.pz - el.pz
+	local l1 = math.sqrt(dx1 * dx1 + dy1 * dy1 + dz1 * dz1)
+	local l2 = math.sqrt(dx2 * dx2 + dy2 * dy2 + dz2 * dz2)
+	if l1 < 1e-6 or l2 < 1e-6 then return nil end
+	local vx, vy, vz = ha.px - sh.px, ha.py - sh.py, ha.pz - sh.pz
+	local raw = math.sqrt(vx * vx + vy * vy + vz * vz)
+	local ux, uy, uz = dx1 / l1, dy1 / l1, dz1 / l1
+	if raw >= 1e-6 then ux, uy, uz = vx / raw, vy / raw, vz / raw end
+	local d = math.max(math.abs(l1 - l2), 1e-6, math.min(l1 + l2, raw))
+	local along = math.max(-l1, math.min(l1, (l1 * l1 + d * d - l2 * l2) / (2 * d)))
+	local height = math.sqrt(math.max(0, l1 * l1 - along * along))
+	local nx, ny, nz = project_arm_pole(pole.px - sh.px, pole.py - sh.py, pole.pz - sh.pz, ux, uy, uz)
+	if nx == nil then nx, ny, nz = project_arm_pole(dx1, dy1, dz1, ux, uy, uz) end
+	if nx == nil then
+		-- 共线且需要弯肘：取稳定的垂直方向。
+		if math.abs(uz) < 0.9 then
+			nx, ny, nz = project_arm_pole(0, 0, -1, ux, uy, uz)
+		else
+			nx, ny, nz = project_arm_pole(0, 1, 0, ux, uy, uz)
+		end
+	end
+	local ax, ay, az = along * ux + height * nx, along * uy + height * ny, along * uz + height * nz
+	-- 由拷贝后的肩世界旋转和已知 local 旋转反推父骨，无需再读父骨世界矩阵。
+	local q = target.shoulderLocal
+	local ix, iy, iz, iw = qconj(q[1], q[2], q[3], q[4])
+	local px, py, pz, pw = qmul(sh.qx, sh.qy, sh.qz, sh.qw, ix, iy, iz, iw)
+	return aim_arm({ qx = px, qy = py, qz = pz, qw = pw }, sh, el, ha, dx1, dy1, dz1, dx2, dy2, dz2,
+		ax, ay, az, d * ux - ax, d * uy - ay, d * uz - az)
+end
+
+local function write_independent_rotation(S, unit, node, rotation)
+	local x, y, z, w = rotation[1], rotation[2], rotation[3], rotation[4]
+	local len2 = x * x + y * y + z * z + w * w
+	if not (len2 > 1e-12 and len2 < 1e12) then return false, 0 end
+	local ax, ay, az, angle = q_to_axis_angle(x, y, z, w)
+	local okAxis, axis = pcall(S.Vector3, ax, ay, az)
+	if not okAxis or axis == nil then return false, 1 end
+	local okQ, q = pcall(S.Quaternion.axis_angle, axis, angle)
+	if not okQ or q == nil then return false, 2 end
+	return pcall(S.Unit.set_local_rotation, unit, node, q), 3
+end
+
+--- 护甲的世界矩阵必须在拷贝旋转后刷新。只写直接 IK 链，扭转骨和手指仍跟各自父骨走。
+function M.apply_independent_ik(S, unit, shoulder, elbow, hand, target)
+	local sh, shCalls = read_world_pose_lua(S, unit, shoulder)
+	local el, elCalls = read_world_pose_lua(S, unit, elbow)
+	local wrist, handCalls = read_arm_position(S, unit, hand)
+	local calls = shCalls + elCalls + handCalls
+	if sh == nil or el == nil or wrist == nil then return 0, calls end
+	local solved = solve_independent_arm(sh, el, wrist, target)
+	if solved == nil then return 0, calls end
+	local s, sw = write_independent_rotation(S, unit, shoulder, solved.shQ)
+	local e, ew = write_independent_rotation(S, unit, elbow, solved.elQ)
+	local h, hw = write_independent_rotation(S, unit, hand, solved.haQ)
+	return (s and 1 or 0) + (e and 1 or 0) + (h and 1 or 0), calls + sw + ew + hw
 end
 
 --- 状态判定：优先探测动画变量，否则退回角色局部几何判据。返回目标 alpha ∈ [0, 1]。

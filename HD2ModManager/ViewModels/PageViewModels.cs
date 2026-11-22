@@ -1903,6 +1903,37 @@ namespace HD2ModManager.ViewModels
             }
         }
 
+        public bool IasFringePhysics
+        {
+            get => (LuaDeploymentService.IasPhysicsGroups & 1) != 0;
+            set => SetIasPhysicsGroup(1, value, nameof(IasFringePhysics));
+        }
+
+        public bool IasAccessoryPhysics
+        {
+            get => (LuaDeploymentService.IasPhysicsGroups & 2) != 0;
+            set => SetIasPhysicsGroup(2, value, nameof(IasAccessoryPhysics));
+        }
+
+        public bool IasChestPhysics
+        {
+            get => (LuaDeploymentService.IasPhysicsGroups & 4) != 0;
+            set => SetIasPhysicsGroup(4, value, nameof(IasChestPhysics));
+        }
+
+        public bool IasHipPhysics
+        {
+            get => (LuaDeploymentService.IasPhysicsGroups & 8) != 0;
+            set => SetIasPhysicsGroup(8, value, nameof(IasHipPhysics));
+        }
+
+        private void SetIasPhysicsGroup(int bit, bool enabled, string property)
+        {
+            if (SettingsService.SetIasPhysicsGroup(bit, enabled) && PhysicsMode.UsesRuntimeLua())
+                _profiles.RequestActiveProfileDeployment();
+            OnPropertyChanged(property);
+        }
+
     public bool AutoUpdateAssetMetadata
         {
             get => SettingsService.GetAutoUpdateAssetMetadata();

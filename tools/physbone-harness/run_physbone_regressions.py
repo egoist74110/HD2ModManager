@@ -107,8 +107,12 @@ def main() -> int:
     # 用例不改 LOCALAPPDATA 就会往里混进假的「已安装 / 首次生效」行，实机排查时分不清（2026-11-22 踩过）。
     import os
     import tempfile
-    sandbox = tempfile.mkdtemp(prefix="hd2pbx-regress-")
-    env = dict(os.environ, LOCALAPPDATA=sandbox)
+    import uuid
+    # Windows applies a restrictive ACL to mkdir(0700). In a restricted worker the
+    # child can execute the Lua harness but cannot write or read logs under that ACL.
+    sandbox = Path(tempfile.gettempdir()) / f"hd2pbx-regress-{uuid.uuid4().hex}"
+    sandbox.mkdir()
+    env = dict(os.environ, LOCALAPPDATA=str(sandbox))
 
     rows: list[tuple[str, str, int, int, int]] = []
     for test in tests:

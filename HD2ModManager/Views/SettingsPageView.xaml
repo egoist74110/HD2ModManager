@@ -111,6 +111,13 @@
                                   SelectedValue="{Binding PhysicsMode, Mode=TwoWay}"/>
                     </Grid>
                     <TextBlock Text="{Binding PhysicsModeDescription}" Style="{StaticResource AppSupportingText}" Margin="150,8,0,0" TextWrapping="Wrap"/>
+                    <TextBlock Text="IAS 可选物理" FontWeight="SemiBold" Margin="0,14,0,0"/>
+                    <WrapPanel Margin="0,6,0,0">
+                        <CheckBox Style="{StaticResource AppToggleSwitch}" Content="刘海与呆毛" IsChecked="{Binding IasFringePhysics, Mode=TwoWay}" Margin="0,0,15,0"/>
+                        <CheckBox Style="{StaticResource AppToggleSwitch}" Content="头部挂件" IsChecked="{Binding IasAccessoryPhysics, Mode=TwoWay}" Margin="0,0,15,0"/>
+                        <CheckBox Style="{StaticResource AppToggleSwitch}" Content="胸部" IsChecked="{Binding IasChestPhysics, Mode=TwoWay}" Margin="0,0,15,0"/>
+                        <CheckBox Style="{StaticResource AppToggleSwitch}" Content="臀部" IsChecked="{Binding IasHipPhysics, Mode=TwoWay}"/>
+                    </WrapPanel>
                     <CheckBox Style="{StaticResource AppToggleSwitch}" Margin="0,14,0,0"
                               Content="手臂姿态修正（实验）"
                               IsChecked="{Binding ArmPoseEnabled, Mode=TwoWay}"

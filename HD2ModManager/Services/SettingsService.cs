@@ -63,6 +63,7 @@ namespace HD2ModManager.Services
             public bool LowPollutionMode { get; set; } = false;
             // 手臂姿态修正（实验）：运行时在无武器下垂时内收、持枪时 2-bone IK 保持手腕，默认关闭。
             public bool ArmPoseEnabled { get; set; } = false;
+            public int IasPhysicsGroups { get; set; }
         }
 
         public const string DefaultAssetMetadataRepository = GitHubAssetMetadataSyncService.DefaultRepositoryRawBaseUrl;
@@ -439,6 +440,7 @@ namespace HD2ModManager.Services
             GetArmorMappingMode();
             GetPhysicsMode();
             GetArmPoseEnabled();
+            LuaDeploymentService.IasPhysicsGroups = LoadAll()?.IasPhysicsGroups ?? 0;
             // 求解器也必须在启动时同步一次。
             // 教训（2026-11-01）：物理那几项曾经只读静态字段、启动时漏同步一项，
             // 结果"配了也不生效"，而日志里什么线索都没有。
@@ -499,6 +501,22 @@ namespace HD2ModManager.Services
             try
             {
                 Update(model => model.ArmPoseEnabled = enabled);
+                return true;
+            }
+            catch { return false; }
+        }
+
+        public static bool SetIasPhysicsGroup(int bit, bool enabled)
+        {
+            try
+            {
+                var next = 0;
+                Update(model =>
+                {
+                    next = enabled ? model.IasPhysicsGroups | bit : model.IasPhysicsGroups & ~bit;
+                    model.IasPhysicsGroups = next;
+                });
+                LuaDeploymentService.IasPhysicsGroups = next;
                 return true;
             }
             catch { return false; }

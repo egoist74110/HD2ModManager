@@ -83,6 +83,7 @@ public sealed class LuaDeploymentService : ILuaDeploymentService
 	/// 实验性手臂姿态修正（P3）。默认关闭，开启后在安装物理骨骼运行时时注入 <c>armPose = true</c>。
 	/// </summary>
 	public static bool ArmPoseEnabled { get; set; } = false;
+	public static int IasPhysicsGroups { get; set; }
 
 
 	/// <summary>
@@ -496,7 +497,7 @@ public sealed class LuaDeploymentService : ILuaDeploymentService
 		{
 			try
 			{
-				var feature = LuaAddonCatalog.Physics(ArmPoseEnabled, jointPoseOptions);
+				var feature = LuaAddonCatalog.Physics(ArmPoseEnabled, jointPoseOptions, IasPhysicsGroups);
 				physicsFingerprint = LuaOnlyAddonFingerprint("physbone-addon:v1", feature.AddonId, feature.Source);
 				physicsAddon = await CreateLuaOnlyAddonAsync(
 					modsRootDirectory, "physbone-addon", physicsFingerprint, feature.AddonId, feature.Source,
@@ -552,7 +553,7 @@ public sealed class LuaDeploymentService : ILuaDeploymentService
 					[new BootBlock(
 						"HD2 Physics Bone Runtime",
 						PhysBoneLuaSource.ComposeStandalonePackage(LuaAddonCatalog.PhysicsAddonId, mode: "boot", armPoseEnabled: ArmPoseEnabled,
-							jointPoseOptions: jointPoseOptions),
+							jointPoseOptions: jointPoseOptions, iasPhysicsGroups: IasPhysicsGroups),
 						LuaAddonCatalog.PhysicsAddonId)],
 					cancellationToken).ConfigureAwait(false);
 				physicsBootDocument = new LuaDocumentSource(

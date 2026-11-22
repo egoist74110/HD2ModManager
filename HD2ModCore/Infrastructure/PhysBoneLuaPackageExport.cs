@@ -24,7 +24,7 @@ public static class PhysBoneLuaPackageExport
 		if (string.IsNullOrEmpty(parent) || string.IsNullOrEmpty(key))
 			throw new ArgumentException("需要形如 <root>/<feature> 的目录。", nameof(directory));
 
-		var feature = LuaAddonCatalog.Physics() with { Key = key };
+		var feature = LuaAddonCatalog.Physics(iasPhysicsGroups: LuaDeploymentService.IasPhysicsGroups) with { Key = key };
 		return LuaAddonPackageExport.Export(parent, feature);
 	}
 }

@@ -551,7 +551,7 @@ do
 	Runtime.uninstall()
 end
 
--- 6) 独立骨：给了 independentBones 就只把 avatar 源骨的 local 旋转抄到护甲改名骨上，不写 avatar
+-- 6) 独立骨：关闭 IK 时沿用原来的旋转拷贝和调用预算。
 do
 	Compat._fastWrite = nil
 	Compat._fastWriteVerified = nil
@@ -573,6 +573,7 @@ do
 	local state = Runtime.install(S, {
 		compat = Compat,
 		armPose = true,
+		independentIk = false,
 		independentBones = { { "ias_l_shoulder", "l_shoulder" }, { "ias_l_elbow", "l_elbow" }, { "ias_l_hand", "l_hand" } },
 		carriers = {},
 		pollFrames = 20,
@@ -597,6 +598,80 @@ do
 	check("独立骨：首次生效", string.find(text, "独立骨首次生效", 1, true) ~= nil, text)
 	-- 稳态每帧：读 3 + 写 3 + update 1
 	check("独立骨：稳态每帧 7 次调用", state.armCalls == 7, "calls=" .. tostring(state.armCalls))
+end
+
+-- 7) 独立骨 IK：默认开启，走真实 render 钩子，护甲姿势只有 update_unit 后才刷新。
+do
+	local function run(armScale, ik)
+		local avatar, armor = make_rig("rifle"), make_rig("rifle")
+		local map = {}
+		for _, side in ipairs({ "l", "r" }) do
+			for _, joint in ipairs({ "shoulder", "elbow", "hand" }) do
+				local name = side .. "_" .. joint
+				armor.names["ias_" .. name] = armor.names[name]
+				map[#map + 1] = { "ias_" .. name, name }
+				if joint ~= "shoulder" then armor.locals[name].p[3] = armor.locals[name].p[3] * armScale end
+			end
+		end
+		armor.update_world()
+		local shoulders = { l = armor.worldPoses.l_shoulder.p, r = armor.worldPoses.r_shoulder.p }
+		local S, _, calls, resetCalls = make_env(avatar)
+		S.World.units = function() return { avatar, armor } end
+		local avatarWrites = 0
+		for _, setter in ipairs({ "set_local_position", "set_local_rotation", "set_local_pose" }) do
+			local write = S.Unit[setter]
+			S.Unit[setter] = function(unit, ...)
+				if unit == avatar then avatarWrites = avatarWrites + 1 end
+				return write(unit, ...)
+			end
+		end
+		_G.render = nil
+		local state = Runtime.install(S, {
+			compat = Compat, armPose = true, independentIk = ik, independentBones = map, carriers = {},
+			pollFrames = 20, log = false, tunePath = "nonexistent-hd2pbx-tune.txt",
+		})
+		for _ = 1, 3 do _G.render() end
+		resetCalls()
+		_G.render()
+		local engineCalls = calls()
+		Runtime.uninstall()
+		return avatar, armor, shoulders, avatarWrites, state.armCalls, engineCalls
+	end
+
+	local avatar, armor, shoulders, writes, calls, engineCalls = run(0.96)
+	for _, side in ipairs({ "l", "r" }) do
+		local a, b = avatar.worldPoses[side .. "_hand"], armor.worldPoses[side .. "_hand"]
+		check("独立骨 IK：手到达目标 < 1 mm " .. side, dist(a.p, b.p) < 0.001)
+		check("独立骨 IK：锁手腕世界朝向 " .. side, qangle(a.q, b.q) < 1e-6)
+		check("独立骨 IK：肩的世界位置固定 " .. side, dist(armor.worldPoses[side .. "_shoulder"].p, shoulders[side]) < 1e-12)
+		local sh = shoulders[side]
+		local avatarElbow, armorElbow = avatar.worldPoses[side .. "_elbow"].p, armor.worldPoses[side .. "_elbow"].p
+		local function plane_normal(elbow)
+			local x, y, z = a.p[1] - sh[1], a.p[2] - sh[2], a.p[3] - sh[3]
+			local ex, ey, ez = elbow[1] - sh[1], elbow[2] - sh[2], elbow[3] - sh[3]
+			return { y * ez - z * ey, z * ex - x * ez, x * ey - y * ex }
+		end
+		local n, m = plane_normal(avatarElbow), plane_normal(armorElbow)
+		check("独立骨 IK：肘朝 avatar pole 同侧 " .. side, n[1] * m[1] + n[2] * m[2] + n[3] * m[3] > 0)
+	end
+	check("独立骨 IK：avatar 零写入", writes == 0)
+	local _, _, _, _, disabledCalls, disabledEngineCalls = run(0.96, false)
+	check("独立骨 IK：双侧每件护甲额外 41 次调用",
+		calls - disabledCalls == 41 and engineCalls - disabledEngineCalls == 41,
+		string.format("armCalls +%d，mock +%d", calls - disabledCalls, engineCalls - disabledEngineCalls))
+
+	local farAvatar, shortArmor = run(0.4)
+	for _, side in ipairs({ "l", "r" }) do
+		local sh = shortArmor.worldPoses[side .. "_shoulder"].p
+		local wrist = shortArmor.worldPoses[side .. "_hand"].p
+		local target = farAvatar.worldPoses[side .. "_hand"].p
+		local reach = (0.28 + 0.26) * 0.4
+		local goalDist = dist(sh, target)
+		local closest = {}
+		for i = 1, 3 do closest[i] = sh[i] + (target[i] - sh[i]) * reach / goalDist end
+		-- NaN 亦会使此比较失败。
+		check("独立骨 IK：够不到时有限且伸直指向目标 " .. side, goalDist > reach and dist(wrist, closest) < 0.001)
+	end
 end
 
 print(string.format("\n失败 %d 项", failures))
