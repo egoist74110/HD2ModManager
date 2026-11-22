@@ -10,7 +10,7 @@ namespace HD2SourceMigration.IasConversion;
 public sealed record IasDependency(ulong Id, string? GameArchive);
 public sealed record IasDp8Result(string ModDirectory, int BaseUnits, int OptionUnits,
 	IReadOnlyList<IasDependency> ExternalTextures, IReadOnlyList<IasDependency> ExternalMaterials,
-	IasShoulderTargets ShoulderTargets);
+	IasShoulderTargets ShoulderTargets, IReadOnlyDictionary<string, HD2SourceModel.Vec3> LegTargets);
 
 public sealed class IasDp8Converter(Func<string, uint> boneHash, Func<ulong, bool, ulong> matchSlot)
 {
@@ -60,7 +60,11 @@ public sealed class IasDp8Converter(Func<string, uint> boneHash, Func<ulong, boo
 		var names = profiles.Values.SelectMany(profile => profile.SourceNames).Distinct(StringComparer.Ordinal).ToArray();
 		var targetRig = Hd2RigReader.FromTransformInfo(avatar, new UnitBoneNames(names.Select(boneHash).ToArray(), names));
 		var shoulderTargets = IasArmPose.ComputeShoulderTargets(targetRig, profiles[sourceTorso.Published].Nodes);
-		var armShifts = IasArmPose.ComputeBoneShifts(targetRig, profiles[sourceTorso.Published].Nodes);
+		var legTargets = IasArmPose.ComputeLegTargets(targetRig, profiles[sourceTorso.Published].Nodes);
+		// 手臂与腿两条链互不重叠：合成一张逐骨平移表。
+		var boneShifts = IasArmPose.ComputeBoneShifts(targetRig, profiles[sourceTorso.Published].Nodes)
+			.Concat(IasArmPose.ComputeLegShifts(targetRig, profiles[sourceTorso.Published].Nodes))
+			.ToDictionary(pair => pair.Key, pair => pair.Value);
 		var vanilla = new GameDataUnitMeshReader(resolver);
 		var units = new Dictionary<ulong, GameDataUnitMesh>();
 		var usedMaterials = new HashSet<ulong>();
@@ -87,10 +91,10 @@ public sealed class IasDp8Converter(Func<string, uint> boneHash, Func<ulong, boo
 				ExternalTextures = externalTextures.Select(entry => new { Id = entry.Id.ToString("x16"), entry.GameArchive }),
 				ExternalMaterials = externalMaterials.Select(entry => new { Id = entry.Id.ToString("x16"), entry.GameArchive }),
 			}, JsonOptions), cancellationToken).ConfigureAwait(false);
-			await File.WriteAllTextAsync(Path.Combine(output, "arm-pose.json"), SerializeArmPose(shoulderTargets), cancellationToken).ConfigureAwait(false);
+			await File.WriteAllTextAsync(Path.Combine(output, "arm-pose.json"), SerializeArmPose(shoulderTargets, legTargets), cancellationToken).ConfigureAwait(false);
 			Directory.Move(package, mod);
 			return new(mod, plan.Base.Count, plan.Groups.SelectMany(group => group.Options).Sum(option => option.Routes.Count),
-				externalTextures, externalMaterials, shoulderTargets);
+				externalTextures, externalMaterials, shoulderTargets, legTargets);
 
 			async Task WriteRoutesAsync(IReadOnlyList<IasRoute> routes, string directory)
 			{
@@ -118,7 +122,7 @@ public sealed class IasDp8Converter(Func<string, uint> boneHash, Func<ulong, boo
 						var sourceUnit = await new PatchUnitMeshReader().ReadCanonicalSourceAsync(source, inputs[group.Key],
 							cancellationToken: cancellationToken).ConfigureAwait(false);
 						var (lods, materials) = IasNativeMesh.Convert(sourceUnit.Model, profiles[route.Published], targetRig, avatar,
-							sourceHead, boneHash, refitArms: true, armShifts);
+							sourceHead, boneHash, refitArms: true, boneShifts);
 						var shell = IasNativeMesh.UseFourWeightStreams(donor.Model);
 						var result = new UnitAuthor().Author(new UnitAuthorRequest(shell, donor.Payload.TocData, avatar,
 							lods[0], donor.Model.CustomizationInfo, key.FileId, materials), lods);
@@ -138,10 +142,13 @@ public sealed class IasDp8Converter(Func<string, uint> boneHash, Func<ulong, boo
 		}
 	}
 
-	/// <summary>运行时手臂修正的参数：<c>armShoulderTarget</c> 原样就是 Lua 选项的形状。</summary>
-	internal static string SerializeArmPose(IasShoulderTargets targets) => JsonSerializer.Serialize(new
+	/// <summary>运行时手臂/腿部修正的参数：<c>armShoulderTarget</c> 原样就是 Lua 选项的形状。</summary>
+	internal static string SerializeArmPose(IasShoulderTargets targets,
+		IReadOnlyDictionary<string, HD2SourceModel.Vec3>? legTargets = null) => JsonSerializer.Serialize(new
 	{
 		armShoulderTarget = new { l = ToArray(targets.Left), r = ToArray(targets.Right) },
+		// 骨名 → 父骨局部位置；按 thigh、knee、foot、ball 的顺序写回。
+		legJointTarget = legTargets?.ToDictionary(pair => pair.Key, pair => ToArray(pair.Value)),
 		shoulderShiftMeters = new { l = ToArray(targets.LeftShift), r = ToArray(targets.RightShift) },
 	}, JsonOptions);
 

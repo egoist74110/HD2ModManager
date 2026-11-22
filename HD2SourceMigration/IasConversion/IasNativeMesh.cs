@@ -43,12 +43,12 @@ internal static class IasNativeMesh
 	internal static (IReadOnlyDictionary<int, RetargetedMesh> Meshes, IReadOnlyDictionary<int, ulong> Materials)
 		Convert(UnitMeshModel model, IasRigProfile profile, Hd2Rig target, UnitTransformInfo avatar,
 			Vec3 headAnchor, Func<string, uint> hash, bool refitArms,
-			IReadOnlyDictionary<int, Vec3>? armShifts = null)
+			IReadOnlyDictionary<int, Vec3>? boneShifts = null)
 	{
 		// 给了逐骨平移就不走 ArmRefit：两者都在把手臂搬到潜兵关节上，只能用一个。
-		if (armShifts is not null)
+		if (boneShifts is not null)
 			refitArms = false;
-		var shiftByHash = armShifts?.ToDictionary(pair => avatar.NameHashes[pair.Key], pair => pair.Value);
+		var shiftByHash = boneShifts?.ToDictionary(pair => avatar.NameHashes[pair.Key], pair => pair.Value);
 		var transform = model.TransformInfo;
 		var byPaletteSlot = profile.Nodes.Select((node, index) => (node.Slot, index)).ToDictionary(item => item.Slot, item => item.index);
 		var sourceBones = profile.Nodes.Select((node, index) =>

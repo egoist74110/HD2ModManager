@@ -404,6 +404,63 @@ public sealed class IasConversionTests
 	}
 
 	[Fact]
+	public void LegTargetsPutEveryJointBackOnTheModelAndShiftsCancel()
+	{
+		static Mat4 At(double x, double y, double z) => new(1, 0, 0, x, 0, 1, 0, y, 0, 0, 1, z, 0, 0, 0, 1);
+		// hips 绕 Z 转 90°：目标必须是父骨 bind 朝向下的局部坐标，而不是世界差值。
+		var hips = new Mat4(0, -1, 0, 0, 1, 0, 0, -0.02, 0, 0, 1, 0.97, 0, 0, 0, 1);
+		var bones = new List<Hd2RigBone> { new(0, "hips", 0, hips) };
+		var model = new List<IasRigNode>();
+		foreach (var (side, sign) in new[] { ("l", -1.0), ("r", 1.0) })
+		{
+			var b = bones.Count;
+			bones.Add(new(b, side + "_thigh", 0, At(sign * 0.087, -0.019, 0.94)));
+			bones.Add(new(b + 1, side + "_thigh_twist", b, At(sign * 0.10, -0.02, 0.75)));
+			bones.Add(new(b + 2, side + "_knee", b, At(sign * 0.1445, -0.0345, 0.516)));
+			bones.Add(new(b + 3, side + "_foot", b + 2, At(sign * 0.19, -0.1175, 0.104)));
+			bones.Add(new(b + 4, side + "_ball", b + 3, At(sign * 0.194, 0.011, 0.008)));
+			bones.Add(new(b + 5, side + "_toe", b + 4, At(sign * 0.197, 0.131, 0.006)));
+			model.Add(new(side + "_thigh", -1, 0, 0, 0, At(sign * 0.082, 0.004, 1.065)));
+			model.Add(new(side + "_knee", -1, 0, 0, 0, At(sign * 0.082, 0.005, 0.6235)));
+			model.Add(new(side + "_foot", -1, 0, 0, 0, At(sign * 0.082, -0.038, 0.127)));
+			model.Add(new(side + "_ball", -1, 0, 0, 0, At(sign * 0.082, 0.0995, 0.062)));
+			model.Add(new(side + "_toe", -1, 0, 0, 0, At(sign * 0.082, 0.148, 0.039)));
+		}
+		var rig = new Hd2Rig(bones);
+
+		var shifts = IasArmPose.ComputeLegShifts(rig, model);
+		var targets = IasArmPose.ComputeLegTargets(rig, model);
+
+		Assert.DoesNotContain(0, shifts.Keys);              // hips 不在腿链里
+		Assert.Equal(shifts[1], shifts[2]);                 // 扭转骨沿用 thigh
+		Assert.Equal(shifts[5], shifts[6]);                 // toe 沿用 ball，不单独归位
+		Assert.Equal(8, targets.Count);
+		Assert.DoesNotContain("l_toe", targets.Keys);
+		// 按 thigh → knee → foot → ball 依次把局部目标放回去，每根骨都落在模型关节上，
+		// 且挪动量正好是 −平移，顶点逐一抵消。
+		var modelAt = model.ToDictionary(node => node.Name, node => node.World.Origin);
+		foreach (var side in new[] { "l", "r" })
+		{
+			var parentAt = rig.Find("hips")!.WorldOrigin;
+			foreach (var name in IasArmPose.LegTargetBones.Select(bone => side + "_" + bone))
+			{
+				var own = rig.Find(name)!;
+				var parent = rig.Bones[own.ParentIndex];
+				var placed = parentAt + (parent.WorldBind.TransformPoint(targets[name]) - parent.WorldOrigin);
+				var miss = placed - modelAt[name];
+				Assert.True(miss.Length < 1e-6, $"{name} 偏 {miss.Length}");
+				var undone = own.WorldOrigin - placed - shifts[own.Index];
+				Assert.True(undone.Length < 1e-6, $"{name} 残差 {undone.Length}");
+				parentAt = placed;
+			}
+		}
+
+		var json = IasDp8Converter.SerializeArmPose(new(default, default, default, default), targets);
+		using var document = JsonDocument.Parse(json);
+		Assert.Equal(3, document.RootElement.GetProperty("legJointTarget").GetProperty("r_knee").GetArrayLength());
+	}
+
+	[Fact]
 	public void ShoulderTargetRefusesASkeletonWithoutShoulders()
 	{
 		var rig = new Hd2Rig([new Hd2RigBone(0, "l_clavicle", 0, Mat4.Identity)]);

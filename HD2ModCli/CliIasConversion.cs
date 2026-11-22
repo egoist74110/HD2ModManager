@@ -21,6 +21,8 @@ internal static class CliIasConversion
 		var targets = result.ShoulderTargets;
 		Console.WriteLine(FormattableString.Invariant(
 			$"肩关节目标（锁骨局部，米）左 ({targets.Left.X:F4}, {targets.Left.Y:F4}, {targets.Left.Z:F4}) 右 ({targets.Right.X:F4}, {targets.Right.Y:F4}, {targets.Right.Z:F4})；左肩需挪动 {targets.LeftShift.Length * 100:F1} cm"));
+		foreach (var (name, local) in result.LegTargets)
+			Console.WriteLine(FormattableString.Invariant($"腿关节目标 {name} ({local.X:F4}, {local.Y:F4}, {local.Z:F4})"));
 		return 0;
 	}
 

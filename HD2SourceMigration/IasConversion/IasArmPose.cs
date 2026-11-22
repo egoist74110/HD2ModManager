@@ -25,17 +25,39 @@ internal static class IasArmPose
 	/// 和这里加上去的一一抵消——不会像按空间位置渐变的 ArmRefit 那样在肩顶留下凸起。
 	/// 扭转骨（模型里的扭转骨位置语义不同）和模型没有的骨沿用父骨的平移。
 	/// </summary>
-	internal static IReadOnlyDictionary<int, Vec3> ComputeBoneShifts(Hd2Rig target, IReadOnlyList<IasRigNode> modelNodes)
+	internal static IReadOnlyDictionary<int, Vec3> ComputeBoneShifts(Hd2Rig target, IReadOnlyList<IasRigNode> modelNodes) =>
+		ComputeChainShifts(target, modelNodes, ["l_shoulder", "r_shoulder"],
+			name => !name.Contains("twist", StringComparison.Ordinal));
+
+	/// <summary>
+	/// 腿部运行时归位的骨：每帧把它们的局部位置写回模型自己的关节（<see cref="ComputeLegTargets"/>）。
+	/// 和手臂不同，腿要整条回到模型的转轴上——潜兵的膝、踝比模型低 11 cm 且偏外，膝盖会在小腿中段弯。
+	/// <c>toe</c> 不在里面：它沿用 <c>ball</c> 的平移，省一次写入。
+	/// </summary>
+	internal static readonly string[] LegTargetBones = ["thigh", "knee", "foot", "ball"];
+
+	/// <summary>
+	/// 腿部链每根潜兵骨的平移量，规则同 <see cref="ComputeBoneShifts"/>，
+	/// 但只有 <see cref="LegTargetBones"/> 用自己的平移，其余（toe、扭转骨、模型没有的骨）沿用父骨——
+	/// 只有这样，运行时只挪这几根骨时每个顶点才逐一抵消。
+	/// </summary>
+	internal static IReadOnlyDictionary<int, Vec3> ComputeLegShifts(Hd2Rig target, IReadOnlyList<IasRigNode> modelNodes) =>
+		ComputeChainShifts(target, modelNodes, ["l_thigh", "r_thigh"], IsLegTarget);
+
+	private static bool IsLegTarget(string name) =>
+		name.Length > 2 && name[1] == '_' && LegTargetBones.Contains(name[2..], StringComparer.Ordinal);
+
+	private static IReadOnlyDictionary<int, Vec3> ComputeChainShifts(Hd2Rig target, IReadOnlyList<IasRigNode> modelNodes,
+		IReadOnlyList<string> roots, Func<string, bool> ownShift)
 	{
-		var model = modelNodes.GroupBy(node => node.Name, StringComparer.Ordinal)
-			.ToDictionary(group => group.Key, group => group.First().World.Origin, StringComparer.Ordinal);
+		var model = ModelOrigins(modelNodes);
 		var shifts = new Dictionary<int, Vec3>();
-		foreach (var side in new[] { "l", "r" })
+		foreach (var rootName in roots)
 		{
-			var root = target.Find(side + "_shoulder")
-				?? throw new InvalidDataException($"潜兵骨架缺少 {side}_shoulder。");
+			var root = target.Find(rootName)
+				?? throw new InvalidDataException($"潜兵骨架缺少 {rootName}。");
 			if (!model.TryGetValue(root.DisplayName, out var rootModel))
-				throw new InvalidDataException($"模型骨架缺少 {side}_shoulder。");
+				throw new InvalidDataException($"模型骨架缺少 {rootName}。");
 			shifts[root.Index] = root.WorldOrigin - rootModel;
 			// 父子下标不保证有序：按层展开。
 			var frontier = new Queue<int>([root.Index]);
@@ -43,7 +65,7 @@ internal static class IasArmPose
 			{
 				foreach (var child in target.Bones.Where(bone => bone.ParentIndex == parent && bone.Index != parent))
 				{
-					var own = child.HasName && !child.Name!.Contains("twist", StringComparison.Ordinal)
+					var own = child.HasName && ownShift(child.Name!)
 						&& model.TryGetValue(child.Name!, out var origin)
 						? child.WorldOrigin - origin
 						: shifts[parent];
@@ -54,6 +76,38 @@ internal static class IasArmPose
 		}
 		return shifts;
 	}
+
+	/// <summary>
+	/// 腿部归位目标：骨名 → 在潜兵父骨 bind 朝向下的局部位置（米）。
+	/// 父骨也在归位表里时，相对的是父骨归位后的位置（即模型的父关节），
+	/// 所以按 thigh → knee → foot → ball 依次写回，静止姿势下每根骨都正好落在模型关节上。
+	/// </summary>
+	internal static IReadOnlyDictionary<string, Vec3> ComputeLegTargets(Hd2Rig target, IReadOnlyList<IasRigNode> modelNodes)
+	{
+		var model = ModelOrigins(modelNodes);
+		var targets = new Dictionary<string, Vec3>(StringComparer.Ordinal);
+		foreach (var side in new[] { "l", "r" })
+		{
+			foreach (var bone in LegTargetBones)
+			{
+				var name = side + "_" + bone;
+				var own = target.Find(name) ?? throw new InvalidDataException($"潜兵骨架缺少 {name}。");
+				if (!model.TryGetValue(name, out var ownModel))
+					throw new InvalidDataException($"模型骨架缺少 {name}。");
+				var parent = target.Bones[own.ParentIndex];
+				var parentAt = parent.HasName && IsLegTarget(parent.Name!) && model.TryGetValue(parent.Name!, out var parentModel)
+					? parentModel
+					: parent.WorldOrigin;
+				// WorldBind⁻¹ 去掉父骨的 bind 平移和朝向；先把「相对父骨的位移」放回父骨 bind 原点上。
+				targets[name] = parent.WorldBind.Inverse().TransformPoint(ownModel - parentAt + parent.WorldOrigin);
+			}
+		}
+		return targets;
+	}
+
+	private static Dictionary<string, Vec3> ModelOrigins(IReadOnlyList<IasRigNode> modelNodes) =>
+		modelNodes.GroupBy(node => node.Name, StringComparer.Ordinal)
+			.ToDictionary(group => group.Key, group => group.First().World.Origin, StringComparer.Ordinal);
 
 	/// <summary>顶点的平移 = Σ 权重 × 该骨平移；不在表里的骨（躯干、头、腿）平移为 0。</summary>
 	internal static Vec3 BlendShift(IEnumerable<VpkConversion.RetargetedInfluence> influences, IReadOnlyDictionary<uint, Vec3> shiftByHash)
