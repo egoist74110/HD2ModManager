@@ -3701,6 +3701,12 @@ local function apply_arm_pose_frame(runtime)
 	if unit == nil then
 		runtime.armState = nil
 		runtime.armCalls = 0
+		-- 一次性：开着却一直找不到玩家角色（实机排查"到底跑没跑"用）。
+		runtime.armMissFrames = (runtime.armMissFrames or 0) + 1
+		if runtime.armMissFrames == 600 and not runtime.armMissLogged then
+			runtime.armMissLogged = true
+			runtime.logger("[physbone][警告] 姿态修正：开着但 600 帧内没找到玩家角色（avatar），一次都没写")
+		end
 		return 0, 0
 	end
 	if not Compat.unit_alive(S, unit) then
@@ -3715,6 +3721,17 @@ local function apply_arm_pose_frame(runtime)
 	local written, calls, alpha, _, resolved = Compat.apply_arm_pose(
 		S, world, unit, runtime.armState, runtime.dt, arm_pose_options(runtime))
 	runtime.armState = resolved
+	-- 一次性：第一次真正写进去 / 腿骨查不到。只记一行，用来在实机日志里确认"跑起来了没有"。
+	if not runtime.armFirstLogged and (written or 0) > 0 then
+		runtime.armFirstLogged = true
+		runtime.logger("[physbone] 姿态修正首次生效 unit=%s 写入=%d 调用=%d 腿=%s",
+			tostring(unit_tag(S, unit)), written or 0, calls or 0,
+			resolved ~= nil and (resolved.legNodes == false and "缺骨" or resolved.legNodes ~= nil and "已写" or "无目标") or "-")
+	end
+	if resolved ~= nil and resolved.legNodes == false and not runtime.legMissLogged then
+		runtime.legMissLogged = true
+		runtime.logger("[physbone][警告] 姿态修正：给了腿关节目标，但这个 unit 找不到腿骨，腿不修")
+	end
 	runtime.armCalls = calls or 0
 	runtime.armCallsAccum = (runtime.armCallsAccum or 0) + (calls or 0)
 	runtime.armFrames = (runtime.armFrames or 0) + 1
@@ -4400,6 +4417,12 @@ function M.install(stingray, options)
 		M.VERSION,
 		options.mode == "boot" and "独占 boot" or "外置模块",
 		os.date("%Y-%m-%d %H:%M:%S"))
+	if options.armPose == true then
+		local legs = Compat.leg_joint_targets ~= nil and Compat.leg_joint_targets(options.legJointTarget) or nil
+		logger("[physbone] 姿态修正已开：肩目标=%s 腿目标=%s",
+			Compat.arm_shoulder_targets(options.armShoulderTarget) ~= nil and "有" or (options.armShoulderTarget ~= nil and "无效" or "无"),
+			legs ~= nil and (#legs .. " 根") or (options.legJointTarget ~= nil and "无效" or "无"))
+	end
 	return state
 end
 

@@ -56,7 +56,7 @@ public static class IasDp8Preview
 
 		var vanillaReader = new GameDataUnitMeshReader(resolver);
 		var vanillaUnits = new List<object>();
-		foreach (var slot in IasDp8Routes.Slots.Where(item => item.Body != "Stocky"))
+		foreach (var slot in IasDp8Routes.Slots.Where(item => item.Body != "Stocky" && !item.Empty))
 		{
 			var archive = slot.Helmet ? IasDp8Routes.TargetHelmet : IasDp8Routes.TargetBody;
 			var key = new AssetKey(PatchUnitMeshReader.UnitTypeId, slot.Target);

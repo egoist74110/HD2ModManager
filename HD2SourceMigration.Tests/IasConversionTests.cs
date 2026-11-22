@@ -96,8 +96,11 @@ public sealed class IasConversionTests
 		AddOptions("Torso_Armor", "coat", "外套", "穿外套", "脱外套");
 		AddOptions("LeftLeg", "shoes", "鞋子", "穿鞋", "脱鞋");
 		var plan = IasDp8Routes.Plan(aliases, lines);
-		Assert.Equal(10, plan.Base.Count);
-		Assert.Equal(13, IasDp8Routes.Slots.Select(slot => slot.Target).Distinct().Count());
+		// 10 条有网格的本体路由 + 10 个藏起来的 DP-8 护甲层部件（肩甲、腿甲、腰带等）。
+		Assert.Equal(20, plan.Base.Count);
+		Assert.Equal(10, plan.Base.Count(route => route.Hidden));
+		Assert.All(plan.Base.Where(route => route.Hidden), route => Assert.True(route.Slot.Empty));
+		Assert.Equal(23, IasDp8Routes.Slots.Select(slot => slot.Target).Distinct().Count());
 		Assert.Equal(0x510291bd9b94c994ul, plan.Base.Single(route => route.Slot.Helmet).Slot.Target);
 		Assert.Equal(new[] { 0xe3c2ff7999bd66adul, 0xd438f72d512e082eul },
 			plan.Groups[0].Options[1].Routes.Select(route => route.Slot.Target));
