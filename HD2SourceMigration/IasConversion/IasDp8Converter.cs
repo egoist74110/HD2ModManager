@@ -92,6 +92,8 @@ public sealed class IasDp8Converter(Func<string, uint> boneHash, Func<ulong, boo
 				ExternalMaterials = externalMaterials.Select(entry => new { Id = entry.Id.ToString("x16"), entry.GameArchive }),
 			}, JsonOptions), cancellationToken).ConfigureAwait(false);
 			await File.WriteAllTextAsync(Path.Combine(output, "arm-pose.json"), SerializeArmPose(shoulderTargets, legTargets), cancellationToken).ConfigureAwait(false);
+			// 同一份数据放进 Mod 根目录：开了「手臂姿态修正」时，管理器部署会读它（HD2ModCore JointPoseData.FileName）。
+			await File.WriteAllTextAsync(Path.Combine(package, "joint-pose.json"), SerializeArmPose(shoulderTargets, legTargets), cancellationToken).ConfigureAwait(false);
 			Directory.Move(package, mod);
 			return new(mod, plan.Base.Count, plan.Groups.SelectMany(group => group.Options).Sum(option => option.Routes.Count),
 				externalTextures, externalMaterials, shoulderTargets, legTargets);

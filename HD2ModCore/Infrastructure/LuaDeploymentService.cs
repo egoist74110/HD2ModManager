@@ -192,6 +192,48 @@ public sealed class LuaDeploymentService : ILuaDeploymentService
 		return new LuaDeploymentPreparation(result.PatchIndex, result.GeneratedPatchGroups, result.ExternalFiles, result.Issues);
 	}
 
+	/// <summary>
+	/// 实验（C1）：从启用中的 Mod 里找关节修正数据（<see cref="JointPoseData.FileName"/>），
+	/// 转成物理运行时的 install 选项。只取第一份；坏数据只报错、不注入。
+	/// </summary>
+	private static string? ReadJointPoseOptions(IReadOnlyList<ProfileEntry> orderedEntries, LibrarySnapshot snapshot,
+		string modsRootDirectory, List<CoreIssue> issues)
+	{
+		var directories = orderedEntries
+			.Where(entry => snapshot.Nodes.ContainsKey(entry.NodeId))
+			.Select(entry => Path.Combine(modsRootDirectory, snapshot.Nodes[entry.NodeId].RelativePath));
+		IReadOnlyList<string> files;
+		try
+		{
+			files = JointPoseData.Find(directories, modsRootDirectory);
+		}
+		catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or ArgumentException)
+		{
+			issues.Add(new CoreIssue(CoreIssueSeverity.Warning, "JointPoseScanFailed",
+				$"查找关节修正数据失败，本次不注入：{exception.Message}", ExceptionMessage: exception.ToString()));
+			return null;
+		}
+		if (files.Count == 0)
+			return null;
+		if (files.Count > 1)
+			issues.Add(new CoreIssue(CoreIssueSeverity.Warning, "JointPoseMultipleSources",
+				$"有 {files.Count} 个启用中的 Mod 带关节修正数据，目前只用第一个：{files[0]}。"));
+		try
+		{
+			var options = JointPoseData.ToLuaOptions(File.ReadAllText(files[0]));
+			issues.Add(new CoreIssue(CoreIssueSeverity.Info, "JointPoseInjected",
+				$"已注入关节修正数据（实验）：{files[0]}。它会作用于你操作的角色，不管穿的是哪件护甲。"));
+			return options;
+		}
+		catch (Exception exception) when (exception is IOException or UnauthorizedAccessException
+			or InvalidDataException or System.Text.Json.JsonException or InvalidOperationException)
+		{
+			issues.Add(new CoreIssue(CoreIssueSeverity.Warning, "JointPoseInvalid",
+				$"关节修正数据无效，本次不注入：{files[0]}：{exception.Message}", ExceptionMessage: exception.ToString()));
+			return null;
+		}
+	}
+
 	private async ValueTask<LuaBuildResult> BuildAsync(
 		Profile profile,
 		LibrarySnapshot snapshot,
@@ -443,6 +485,10 @@ public sealed class LuaDeploymentService : ILuaDeploymentService
 				$"物理运行时现在由管理器在部署时自动投放，库里以前手动加的物理包不再部署：{string.Join("、", legacyPhysicsNodes)}。可以把它从库里删掉。"));
 		}
 
+		var jointPoseOptions = ArmPoseEnabled
+			? ReadJointPoseOptions(orderedEntries, snapshot, modsRootDirectory, issues)
+			: null;
+
 		// 物理「外置加载器兼容」：部署时自动投放独立 addon（§15.2），不再让玩家手动加包。
 		GeneratedPatchGroup? physicsAddon = null;
 		string? physicsFingerprint = null;
@@ -450,7 +496,7 @@ public sealed class LuaDeploymentService : ILuaDeploymentService
 		{
 			try
 			{
-				var feature = LuaAddonCatalog.Physics(ArmPoseEnabled);
+				var feature = LuaAddonCatalog.Physics(ArmPoseEnabled, jointPoseOptions);
 				physicsFingerprint = LuaOnlyAddonFingerprint("physbone-addon:v1", feature.AddonId, feature.Source);
 				physicsAddon = await CreateLuaOnlyAddonAsync(
 					modsRootDirectory, "physbone-addon", physicsFingerprint, feature.AddonId, feature.Source,
@@ -505,7 +551,8 @@ public sealed class LuaDeploymentService : ILuaDeploymentService
 					gameDataDirectory,
 					[new BootBlock(
 						"HD2 Physics Bone Runtime",
-						PhysBoneLuaSource.ComposeStandalonePackage(LuaAddonCatalog.PhysicsAddonId, mode: "boot", armPoseEnabled: ArmPoseEnabled),
+						PhysBoneLuaSource.ComposeStandalonePackage(LuaAddonCatalog.PhysicsAddonId, mode: "boot", armPoseEnabled: ArmPoseEnabled,
+							jointPoseOptions: jointPoseOptions),
 						LuaAddonCatalog.PhysicsAddonId)],
 					cancellationToken).ConfigureAwait(false);
 				physicsBootDocument = new LuaDocumentSource(

@@ -3641,6 +3641,7 @@ local function arm_pose_options(runtime)
 		armAdductionDeg = tune.armAdductionDeg or opts.armAdductionDeg,
 		armForearmCompDeg = tune.armForearmCompDeg or opts.armForearmCompDeg,
 		armShoulderTarget = opts.armShoulderTarget,
+		legJointTarget = opts.legJointTarget,
 		armShoulderNarrow = tune.armShoulderNarrow or opts.armShoulderNarrow or 0.025,
 		armIkPull = tune.armIkPull or opts.armIkPull or 0.09,
 		armBlendTime = tune.armBlendTime or opts.armBlendTime or 0.12,

@@ -3535,6 +3535,78 @@ function M.arm_shoulder_targets(value)
 	return out
 end
 
+--- 腿关节归位目标（转换时写的 `legJointTarget`：骨名 → 父骨局部位置 {x,y,z}，米）。
+--- 返回按写入顺序排好的列表 { {name, x, y, z}, ... }：每侧 thigh → knee → foot → ball，
+--- 父骨先于子骨——子骨的目标是相对"父骨归位后"算的。缺骨、非数、越界（|c| > 1）一律整体无效。
+local LEG_TARGET_BONES = { "thigh", "knee", "foot", "ball" }
+local legTargetCache = setmetatable({}, { __mode = "k" })
+function M.leg_joint_targets(value)
+	if type(value) ~= "table" then return nil end
+	local cached = legTargetCache[value]
+	if cached ~= nil then return cached or nil end
+	local out = {}
+	for _, side in ipairs({ "l", "r" }) do
+		for _, bone in ipairs(LEG_TARGET_BONES) do
+			local name = side .. "_" .. bone
+			local v = value[name]
+			if type(v) ~= "table" then legTargetCache[value] = false; return nil end
+			for i = 1, 3 do
+				local c = v[i]
+				if type(c) ~= "number" or c ~= c or math.abs(c) > 1.0 then
+					legTargetCache[value] = false
+					return nil
+				end
+			end
+			out[#out + 1] = { name, v[1], v[2], v[3] }
+		end
+	end
+	legTargetCache[value] = out
+	return out
+end
+
+--- 把腿关节的局部位置写成目标值，旋转不动（动画每帧会把位置改回潜兵的，所以每帧都要写）。
+--- 节点下标缓存在 `state.legNodes`，unit 或场景图节点数变了才重查。
+--- 返回 written, calls。任何一根骨查不到就整条腿都不写——只挪一半比不挪更难看。
+function M.apply_leg_pose(S, unit, state, targets)
+	if targets == nil or state == nil or type(S.Unit.set_local_position) ~= "function" then return 0, 0 end
+	local calls = 0
+	if state.legNodes == nil or state.legNodesFor ~= targets then
+		local nodes = {}
+		local hasNodeFn = type(S.Unit.has_node) == "function"
+		for index = 1, #targets do
+			local name = targets[index][1]
+			if hasNodeFn then
+				local okH, has = pcall(S.Unit.has_node, unit, name)
+				calls = calls + 1
+				if not okH or has ~= true then state.legNodes = false; state.legNodesFor = targets; return 0, calls end
+			end
+			local ok, id = pcall(S.Unit.node, unit, name)
+			calls = calls + 1
+			if not ok or type(id) ~= "number" or id < 1 or (state.nodeCount ~= nil and id > state.nodeCount) then
+				state.legNodes = false
+				state.legNodesFor = targets
+				return 0, calls
+			end
+			nodes[index] = id
+		end
+		state.legNodes = nodes
+		state.legNodesFor = targets
+	end
+	if state.legNodes == false then return 0, calls end
+	local written = 0
+	for index = 1, #targets do
+		local t = targets[index]
+		local okV, v = pcall(S.Vector3, t[2], t[3], t[4])
+		calls = calls + 1
+		if okV and v ~= nil then
+			local okW = pcall(S.Unit.set_local_position, unit, state.legNodes[index], v)
+			calls = calls + 1
+			if okW then written = written + 1 end
+		end
+	end
+	return written, calls
+end
+
 --- 对单个 avatar unit 执行一帧手臂姿态修正。返回 written, calls, alpha, targetAlpha。
 function M.apply_arm_pose(S, world, unit, armState, dt, opts)
 	opts = opts or {}
@@ -3648,6 +3720,15 @@ function M.apply_arm_pose(S, world, unit, armState, dt, opts)
 			calls = calls + cW
 			if okW then written = written + 1 end
 		end
+	end
+
+	-- 腿关节归位放在最后：手臂求解读的是写入前的姿态，腿和手臂两条链互不影响；
+	-- 写完一起做一次 update_unit。
+	local legTargets = M.leg_joint_targets(opts.legJointTarget)
+	if legTargets ~= nil then
+		local legWritten, legCalls = M.apply_leg_pose(S, unit, resolved, legTargets)
+		written = written + legWritten
+		calls = calls + legCalls
 	end
 
 	if written > 0 and world ~= nil then

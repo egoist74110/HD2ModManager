@@ -89,6 +89,21 @@ local function make_rig(mode)
 			support_mg = { p = { 0, 0, 0 },       q = { 0, 0, 0, 1 } },
 		}
 	end
+	-- 腿：hips → thigh → knee → foot → ball（局部位置取潜兵的大致尺寸）
+	for _, side in ipairs({ "l", "r" }) do
+		local sx = side == "l" and -1 or 1
+		local chain = {
+			{ side .. "_thigh", "hips", { sx * 0.09, -0.02, -0.03 } },
+			{ side .. "_knee", side .. "_thigh", { sx * 0.06, -0.02, -0.43 } },
+			{ side .. "_foot", side .. "_knee", { sx * 0.05, -0.08, -0.41 } },
+			{ side .. "_ball", side .. "_foot", { 0, 0.13, -0.10 } },
+		}
+		for _, item in ipairs(chain) do
+			names[#names + 1] = item[1]
+			parents[item[1]] = item[2]
+			locals[item[1]] = { p = item[3], q = { 0, 0, 0, 1 } }
+		end
+	end
 	for i, name in ipairs(names) do
 		local q = locals[name].q
 		local len = math.sqrt(q[1]^2 + q[2]^2 + q[3]^2 + q[4]^2)
@@ -205,6 +220,11 @@ local function make_env(unit, opts)
 			local name = type(node) == "number" and u.names[node] or "root"
 			local wp = u.worldPoses[name] or { p = { 0, 0, 0 } }
 			return { wp.p[1], wp.p[2], wp.p[3] }
+		end,
+		set_local_position = function(u, node, v)
+			engineCalls = engineCalls + 1
+			local name = u.names[node]
+			u.locals[name].p = { v[1], v[2], v[3] }
 		end,
 		set_local_rotation = function(u, node, q)
 			engineCalls = engineCalls + 1
@@ -349,6 +369,67 @@ do
 	check("肩目标：非数/越界时无效", Compat.arm_shoulder_targets({ l = { 0, 0, 0 / 0 }, r = { 0, 0, 0 } }) == nil
 		and Compat.arm_shoulder_targets({ l = { 0, 0, 2 }, r = { 0, 0, 0 } }) == nil)
 	check("肩目标：合法时原样返回", Compat.arm_shoulder_targets(SHOULDER_TARGET) ~= nil)
+end
+
+-- 2d) 腿关节归位：每帧把 thigh/knee/foot/ball 的局部位置写成目标值，旋转不动
+local LEG_TARGET = {
+	l_thigh = { -0.08, 0.02, 0.09 }, l_knee = { 0.0, 0.0, -0.44 }, l_foot = { 0.0, -0.04, -0.50 }, l_ball = { 0, 0.14, -0.06 },
+	r_thigh = { 0.08, 0.02, 0.09 }, r_knee = { 0.0, 0.0, -0.44 }, r_foot = { 0.0, -0.04, -0.50 }, r_ball = { 0, 0.14, -0.06 },
+}
+do
+	Compat._fastWrite = nil
+	Compat._fastWriteVerified = nil
+	local u = make_rig("unarmed")
+	local S, world = make_env(u)
+	local kneeQ = { u.locals.l_knee.q[1], u.locals.l_knee.q[2], u.locals.l_knee.q[3], u.locals.l_knee.q[4] }
+	local written, calls = Compat.apply_arm_pose(S, world, u, nil, 1/60,
+		{ armMode = "auto", armShoulderTarget = SHOULDER_TARGET, legJointTarget = LEG_TARGET })
+	local ok = true
+	for name, t in pairs(LEG_TARGET) do
+		if dist(u.locals[name].p, t) > 1e-9 then ok = false end
+	end
+	check("腿目标：8 根腿骨局部位置都写成目标值", ok)
+	check("腿目标：旋转不动", qangle(u.locals.l_knee.q, kneeQ) < 1e-9)
+	-- 世界位置随父骨链传下来：knee 落在 thigh + 目标（测试骨架腿上没有旋转）
+	local th, kn = u.worldPoses.l_thigh.p, u.worldPoses.l_knee.p
+	check("腿目标：update_unit 后世界位置随之更新", math.abs(kn[3] - (th[3] - 0.44)) < 1e-6,
+		string.format("%.4f vs %.4f", kn[3], th[3] - 0.44))
+	check("腿目标·无武器：写 4 + 8 根骨", written == 12, "written=" .. tostring(written))
+	check("腿目标·首帧调用（含查节点）<= 34 + 32", calls <= 66, "calls=" .. tostring(calls))
+	-- 第二帧：节点已缓存，只剩 8 ×（Vector3 + set_local_position）
+	local _, calls2 = Compat.apply_arm_pose(S, world, u, select(5, Compat.apply_arm_pose(S, world, u, nil, 1/60,
+		{ armMode = "auto", armShoulderTarget = SHOULDER_TARGET, legJointTarget = LEG_TARGET })), 1/60,
+		{ armMode = "auto", armShoulderTarget = SHOULDER_TARGET, legJointTarget = LEG_TARGET })
+	local _, armOnly = Compat.apply_arm_pose(S, world, u, nil, 1/60, { armMode = "auto", armShoulderTarget = SHOULDER_TARGET })
+	print(string.format("       （参考）无武器：只肩 %d 次，肩 + 腿（缓存后）%d 次", armOnly, calls2))
+end
+do
+	local u = make_rig("rifle")
+	local S, world = make_env(u)
+	local opts = { armMode = "ik", armShoulderTarget = SHOULDER_TARGET, legJointTarget = LEG_TARGET }
+	local _, _, _, _, st = Compat.apply_arm_pose(S, world, u, { alpha = 1.0 }, 1/60, opts)
+	local lHa = { u.worldPoses.l_hand.p[1], u.worldPoses.l_hand.p[2], u.worldPoses.l_hand.p[3] }
+	local written, calls = Compat.apply_arm_pose(S, world, u, st, 1/60, opts)
+	check("腿目标·持枪：写 6 + 8 根骨", written == 14, "written=" .. tostring(written))
+	check("腿目标·持枪：手腕仍锁住", dist(u.worldPoses.l_hand.p, lHa) < 1e-3)
+	print(string.format("       （参考）持枪：肩 + 腿（缓存后）%d 次", calls))
+end
+do
+	local bad = {}
+	for k, v in pairs(LEG_TARGET) do bad[k] = v end
+	bad.r_ball = nil
+	check("腿目标：缺一根骨整体无效", Compat.leg_joint_targets(bad) == nil)
+	bad.r_ball = { 0, 0, 0 / 0 }
+	check("腿目标：非数无效", Compat.leg_joint_targets(bad) == nil)
+	local list = Compat.leg_joint_targets(LEG_TARGET)
+	check("腿目标：顺序 thigh → knee → foot → ball", list ~= nil and list[1][1] == "l_thigh" and list[4][1] == "l_ball"
+		and list[5][1] == "r_thigh")
+	-- 没有腿骨的 unit：一根都不写，也不报错
+	local u = make_rig("unarmed")
+	u.names.l_knee = nil
+	local S, world = make_env(u)
+	local written = Compat.apply_arm_pose(S, world, u, nil, 1/60, { armMode = "auto", legJointTarget = LEG_TARGET })
+	check("腿目标：缺腿骨时整条腿都不写", written == 4, "written=" .. tostring(written))
 end
 
 -- 2b) verify_fast_write 失败时安全退回 set_local_pose（绝不调用 set_local_rotation）
