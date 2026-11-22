@@ -3692,6 +3692,145 @@ local function resolve_local_avatar_for_arm(runtime)
 	return chosen
 end
 
+-- ---------------------------------------------------------------------------
+-- 独立骨（2026-11-22，实验 1，见 docs/agent/ias-independent-bones-plan-20261122.md）
+--
+-- 实机证实（护甲探针 1、2）：护甲网格里和 avatar 同名的骨，画面直接用角色动画，
+-- 运行时写 avatar 或护甲上的同名骨都不认。转换器把要换转轴的骨改了名（`ias_` + 原名），
+-- 它们就成了普通场景节点：绑定里是模型自己的关节位置，这里每帧把 avatar 源骨的 local
+-- 旋转抄过去。位置不写——留着绑定里的模型位置，这正是"绕模型自己的关节转"。
+--
+-- 选项 `independentBones = { { "ias_l_shoulder", "l_shoulder" }, ... }`（父骨在前）。
+-- 每帧开销：每根骨读 avatar 1 次 + 每件护甲写 1 次，每件护甲 1 次 update_unit。
+-- ---------------------------------------------------------------------------
+local INDEPENDENT_RESCAN_FRAMES = 1800
+local INDEPENDENT_LOG_FRAMES = { [1] = true, [600] = true }
+
+local function safe_node(S_, unit, name)
+	if try(S_.Unit.has_node, unit, name) ~= true then return nil end
+	local id = try(S_.Unit.node, unit, name)
+	local count = try(S_.Unit.num_scene_graph_items, unit)
+	if type(id) ~= "number" or id < 1 or (type(count) == "number" and id > count) then return nil end
+	return id
+end
+
+local function vec_dist(ax, ay, az, bx, by, bz)
+	if ax == nil or bx == nil then return nil end
+	local dx, dy, dz = ax - bx, ay - by, az - bz
+	return math.sqrt(dx * dx + dy * dy + dz * dz)
+end
+
+local function format_mm(value)
+	if value == nil then return "?" end
+	return string.format("%.1fmm", value * 1000)
+end
+
+--- 找 avatar 1 m 内、带独立骨的护甲件；同时解出 avatar 上的源骨。返回 state 或 nil。
+local function independent_scan(runtime, avatar, world, list)
+	local sources = {}
+	for index = 1, #list do
+		local node = safe_node(S, avatar, list[index][2])
+		if node == nil then
+			runtime.logger("[physbone][独立骨][警告] avatar 上没有源骨 %s，独立骨不驱动", tostring(list[index][2]))
+			return { avatar = avatar, pieces = {}, broken = true }
+		end
+		sources[index] = node
+	end
+	local units = try(S.World.units, world)
+	if type(units) ~= "table" then return nil end
+	local ax, ay, az = readVector(S, try(S.Unit.world_position, avatar, 1))
+	if ax == nil then return nil end
+	local pieces = {}
+	for index = 1, #units do
+		local unit = units[index]
+		if unit ~= avatar and Compat.unit_alive(S, unit) and #pieces < 16 then
+			local first = safe_node(S, unit, list[1][1])
+			if first ~= nil then
+				local ux, uy, uz = readVector(S, try(S.Unit.world_position, unit, 1))
+				local d = vec_dist(ux, uy, uz, ax, ay, az)
+				if d ~= nil and d <= 1.0 then
+					local nodes, complete = { first }, true
+					for b = 2, #list do
+						nodes[b] = safe_node(S, unit, list[b][1])
+						if nodes[b] == nil then complete = false end
+					end
+					if complete then
+						pieces[#pieces + 1] = { unit = unit, nodes = nodes, tag = unit_tag(S, unit) }
+					end
+				end
+			end
+		end
+	end
+	local tags = {}
+	for i = 1, #pieces do tags[#tags + 1] = pieces[i].tag end
+	runtime.logger("[physbone][独立骨] 找到 %d 件带独立骨的护甲（%d 根骨）：%s",
+		#pieces, #list, #tags > 0 and table.concat(tags, "、") or "无")
+	return { avatar = avatar, sources = sources, pieces = pieces, frames = 0,
+		rescanAt = (runtime.frame or 0) + INDEPENDENT_RESCAN_FRAMES }
+end
+
+--- 一帧：抄旋转。返回 written, calls。
+local function independent_frame(runtime, avatar, world, list)
+	if world == nil then return 0, 0 end
+	local state = runtime.independent
+	local frame = runtime.frame or 0
+	if state ~= nil and (state.avatar ~= avatar or (state.rescanAt ~= nil and frame >= state.rescanAt)) then
+		state = nil
+	end
+	if state == nil then
+		if runtime.independentScanAt ~= nil and frame < runtime.independentScanAt then return 0, 0 end
+		-- 没找到时 300 帧后再扫，别每帧扫全世界。
+		runtime.independentScanAt = frame + 300
+		state = independent_scan(runtime, avatar, world, list)
+		if state == nil then return 0, 0 end
+		runtime.independent = state
+	end
+	if state.broken or #state.pieces == 0 then return 0, 0 end
+
+	local calls, written = 0, 0
+	local rotations = {}
+	for b = 1, #list do
+		rotations[b] = try(S.Unit.local_rotation, avatar, state.sources[b])
+		calls = calls + 1
+	end
+	for index = #state.pieces, 1, -1 do
+		local piece = state.pieces[index]
+		if not Compat.unit_alive(S, piece.unit) then
+			-- 换甲 / 销毁：下一帧重扫。
+			table.remove(state.pieces, index)
+			state.rescanAt = frame + 1
+		else
+			for b = 1, #list do
+				if rotations[b] ~= nil and pcall(S.Unit.set_local_rotation, piece.unit, piece.nodes[b], rotations[b]) then
+					written = written + 1
+				end
+				calls = calls + 1
+			end
+			pcall(S.World.update_unit, world, piece.unit)
+			calls = calls + 1
+		end
+	end
+
+	state.frames = state.frames + 1
+	if INDEPENDENT_LOG_FRAMES[state.frames] == true and #state.pieces > 0 then
+		-- 肩和手在模型上和 avatar 上各差多少（左右各报一次；没有就跳过）。
+		local piece = state.pieces[1]
+		local parts = {}
+		for b = 1, #list do
+			local source = list[b][2]
+			if source == "l_shoulder" or source == "l_hand" or source == "r_shoulder" or source == "r_hand" then
+				local px, py, pz = readVector(S, try(S.Unit.world_position, piece.unit, piece.nodes[b]))
+				local qx, qy, qz = readVector(S, try(S.Unit.world_position, avatar, state.sources[b]))
+				calls = calls + 2
+				parts[#parts + 1] = source .. "差=" .. format_mm(vec_dist(px, py, pz, qx, qy, qz))
+			end
+		end
+		runtime.logger("[physbone][独立骨] 第%d帧 %d根骨 写入=%d 调用=%d ｜%s：%s",
+			state.frames, #list, written, calls, piece.tag, table.concat(parts, "，"))
+	end
+	return written, calls
+end
+
 local function apply_arm_pose_frame(runtime)
 	if type(Compat.apply_arm_pose) ~= "function" then return 0, 0 end
 	local unit = runtime.avatar
@@ -3718,6 +3857,21 @@ local function apply_arm_pose_frame(runtime)
 		return 0, 0
 	end
 	local world = runtime.cache and runtime.cache.world or nil
+	local independent = runtime.options and runtime.options.independentBones
+	if type(independent) == "table" and #independent > 0 then
+		-- 给了独立骨就只驱动独立骨：写 avatar 同名骨画面不认（实机证实），白花调用。
+		local written, calls = independent_frame(runtime, unit, world, independent)
+		if not runtime.armFirstLogged and written > 0 then
+			runtime.armFirstLogged = true
+			runtime.logger("[physbone] 独立骨首次生效 unit=%s 写入=%d 调用=%d",
+				tostring(unit_tag(S, unit)), written, calls)
+		end
+		runtime.armCalls = calls
+		runtime.armCallsAccum = (runtime.armCallsAccum or 0) + calls
+		runtime.armFrames = (runtime.armFrames or 0) + 1
+		runtime.armAlpha = 0
+		return written, calls
+	end
 	local written, calls, alpha, _, resolved = Compat.apply_arm_pose(
 		S, world, unit, runtime.armState, runtime.dt, arm_pose_options(runtime))
 	runtime.armState = resolved
@@ -4419,9 +4573,10 @@ function M.install(stingray, options)
 		os.date("%Y-%m-%d %H:%M:%S"))
 	if options.armPose == true then
 		local legs = Compat.leg_joint_targets ~= nil and Compat.leg_joint_targets(options.legJointTarget) or nil
-		logger("[physbone] 姿态修正已开：肩目标=%s 腿目标=%s",
+		logger("[physbone] 姿态修正已开：肩目标=%s 腿目标=%s 独立骨=%s",
 			Compat.arm_shoulder_targets(options.armShoulderTarget) ~= nil and "有" or (options.armShoulderTarget ~= nil and "无效" or "无"),
-			legs ~= nil and (#legs .. " 根") or (options.legJointTarget ~= nil and "无效" or "无"))
+			legs ~= nil and (#legs .. " 根") or (options.legJointTarget ~= nil and "无效" or "无"),
+			type(options.independentBones) == "table" and (#options.independentBones .. " 根") or "无")
 	end
 	return state
 end

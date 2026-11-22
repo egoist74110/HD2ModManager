@@ -464,6 +464,90 @@ public sealed class IasConversionTests
 	}
 
 	[Fact]
+	public void IndependentBonesRenameTheChainAndPutItOnTheModelJoints()
+	{
+		static Mat4 At(double x, double y, double z) => new(1, 0, 0, x, 0, 1, 0, y, 0, 0, 1, z, 0, 0, 0, 1);
+		// 锁骨绕 Z 转 90°：局部平移必须在父骨朝向下算。
+		var clavicle = new Mat4(0, -1, 0, 0.1, 1, 0, 0, 0, 0, 0, 1, 1.4, 0, 0, 0, 1);
+		var bones = new Hd2RigBone[]
+		{
+			new(0, "chest", 0, At(0, 0, 1.3)),
+			new(1, "l_clavicle", 0, clavicle),
+			new(2, "l_shoulder", 1, At(0.2, 0, 1.4)),
+			new(3, "l_shoulder_twist", 2, At(0.3, 0, 1.38)),
+			new(4, "l_elbow", 2, At(0.48, 0, 1.35)),
+			new(5, "r_shoulder", 0, At(-0.2, 0, 1.4)),
+		};
+		var rig = new Hd2Rig(bones);
+		static float[] Row(Mat4 m) => [(float)m.M11, (float)m.M21, (float)m.M31, (float)m.M41,
+			(float)m.M12, (float)m.M22, (float)m.M32, (float)m.M42,
+			(float)m.M13, (float)m.M23, (float)m.M33, (float)m.M43,
+			(float)m.M14, (float)m.M24, (float)m.M34, (float)m.M44];
+		uint Hash(string name) => (uint)name.GetHashCode(StringComparison.Ordinal);
+		var avatar = new UnitTransformInfo(0, 0, 0,
+			bones.Select(_ => new UnitLocalTransform([0, 0, 0, 1], [9, 9, 9], [1, 1, 1], 0)).ToArray(),
+			bones.Select(bone => new UnitTransformMatrix(Row(bone.WorldBind))).ToArray(),
+			bones.Select(bone => new UnitTransformEntry(1, (ushort)bone.ParentIndex)).ToArray(),
+			bones.Select(bone => Hash(bone.Name!)).ToArray());
+		var model = new List<IasRigNode>
+		{
+			new("l_shoulder", -1, 0, 0, 0, At(0.17, 0.01, 1.45)),
+			new("l_shoulder_twist", -1, 0, 0, 0, At(9, 9, 9)),   // 扭转骨不用模型位置
+			new("l_elbow", -1, 0, 0, 0, At(0.44, 0.02, 1.36)),
+		};
+
+		var skin = IasIndependentBones.Apply(avatar, rig, model, ["l_elbow", "l_shoulder", "l_shoulder_twist"], Hash);
+
+		Assert.Equal(Hash("ias_l_shoulder"), skin.NameHashes[2]);
+		Assert.Equal(Hash("ias_l_elbow"), skin.NameHashes[4]);
+		Assert.Equal(Hash("r_shoulder"), skin.NameHashes[5]);                 // 没列出的骨不动
+		Assert.Equal(avatar.Matrices[5].Values, skin.Matrices[5].Values);
+		Vec3 World(int index) => Hd2RigReader.FromHd2RowVector(skin.Matrices[index].Values).Origin;
+		Assert.True((World(2) - new Vec3(0.17, 0.01, 1.45)).Length < 1e-6);
+		Assert.True((World(4) - new Vec3(0.44, 0.02, 1.36)).Length < 1e-6);
+		// 扭转骨：保持潜兵里相对父骨的位置（父骨挪到哪，它跟到哪）。
+		Assert.True((World(3) - (new Vec3(0.17, 0.01, 1.45) + new Vec3(0.1, 0, -0.02))).Length < 1e-6);
+		// 局部平移 = 改过的父骨全局矩阵的逆 × 新位置（父骨是转过 90° 的锁骨）。
+		for (var index = 2; index <= 4; index++)
+		{
+			var parent = Hd2RigReader.FromHd2RowVector(skin.Matrices[bones[index].ParentIndex].Values);
+			var local = skin.LocalTransforms[index].Position;
+			var placed = parent.TransformPoint(new Vec3(local[0], local[1], local[2]));
+			Assert.True((placed - World(index)).Length < 1e-5, $"bone {index}");
+		}
+		Assert.Equal(avatar.LocalTransforms[2].Rotation, skin.LocalTransforms[2].Rotation);
+		Assert.Equal([0, 2, 3, 4], IasIndependentBones.Subtree(rig, "l_shoulder").Prepend(0).Order());
+	}
+
+	[Fact]
+	public void IndependentBonesSerializeParentFirst()
+	{
+		using var document = JsonDocument.Parse(IasDp8Converter.SerializeIndependentBones(["l_shoulder", "l_elbow", "l_hand"]));
+		var items = document.RootElement.GetProperty("independentBones");
+		Assert.Equal(3, items.GetArrayLength());
+		Assert.Equal("ias_l_shoulder", items[0].GetProperty("bone").GetString());
+		Assert.Equal("l_hand", items[2].GetProperty("source").GetString());
+	}
+
+	[Fact]
+	public void IndependentBonesTakeTheWholeArmIncludingFingers()
+	{
+		var bones = new Hd2RigBone[]
+		{
+			new(0, "chest", 0, Mat4.Identity),
+			new(1, "l_index_finger1", 3, Mat4.Identity),   // 子骨下标在父骨前面：照样父先子后
+			new(2, "l_shoulder", 0, Mat4.Identity),
+			new(3, "l_hand", 2, Mat4.Identity),
+			new(4, null, 3, Mat4.Identity),                 // 没名字的不要
+			new(5, "r_shoulder", 0, Mat4.Identity),
+			new(6, "r_thumb_finger1", 5, Mat4.Identity),
+			new(7, "neck", 0, Mat4.Identity),
+		};
+		Assert.Equal(["l_shoulder", "r_shoulder", "l_hand", "r_thumb_finger1", "l_index_finger1"],
+			IasIndependentBones.Collect(new Hd2Rig(bones), IasIndependentBones.ArmRoots));
+	}
+
+	[Fact]
 	public void ShoulderTargetRefusesASkeletonWithoutShoulders()
 	{
 		var rig = new Hd2Rig([new Hd2RigBone(0, "l_clavicle", 0, Mat4.Identity)]);

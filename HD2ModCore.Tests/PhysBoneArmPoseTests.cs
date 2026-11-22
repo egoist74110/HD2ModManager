@@ -64,7 +64,20 @@ public sealed class PhysBoneArmPoseTests
 		Assert.DoesNotContain("legJointTarget = {", off, StringComparison.Ordinal);
 	}
 
+	[Fact]
+	public void JointPoseData_IndependentBonesBecomeALuaList()
+	{
+		var options = JointPoseData.ToLuaOptions("""
+			{ "independentBones": [ { "bone": "ias_l_shoulder", "source": "l_shoulder" }, { "bone": "ias_l_hand", "source": "l_hand" } ] }
+			""");
+		Assert.Equal("""independentBones = { { "ias_l_shoulder", "l_shoulder" }, { "ias_l_hand", "l_hand" } }""", options);
+	}
+
 	[Theory]
+	[InlineData("""{ "independentBones": [] }""")]
+	[InlineData("""{ "independentBones": [ { "bone": "ias_l\"", "source": "l_hand" } ] }""")]
+	[InlineData("""{ "independentBones": [ { "bone": "IAS_L", "source": "l_hand" } ] }""")]
+	[InlineData("""{ "independentBones": [ { "bone": "ias_l_hand" } ] }""")]
 	[InlineData("""{ "legJointTarget": { "l_thigh": [0, 0, 0] } }""")]
 	[InlineData("""{ "armShoulderTarget": { "l": [0, 0, 2], "r": [0, 0, 0] } }""")]
 	[InlineData("""{ "other": 1 }""")]

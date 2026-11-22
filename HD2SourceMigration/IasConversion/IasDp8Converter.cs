@@ -62,9 +62,16 @@ public sealed class IasDp8Converter(Func<string, uint> boneHash, Func<ulong, boo
 		var shoulderTargets = IasArmPose.ComputeShoulderTargets(targetRig, profiles[sourceTorso.Published].Nodes);
 		var legTargets = IasArmPose.ComputeLegTargets(targetRig, profiles[sourceTorso.Published].Nodes);
 		// 手臂与腿两条链互不重叠：合成一张逐骨平移表。
+		// 独立骨（实验 2）：两条手臂整棵子树（肩以下，含手指）不做平移，顶点留在模型原位；
+		// 这些骨全部改名、绑定放模型关节，由运行时每帧抄 avatar 的旋转。腿照旧。
+		var arms = IasIndependentBones.ArmRoots.SelectMany(root => IasIndependentBones.Subtree(targetRig, root)).ToHashSet();
+		var independentBones = IasIndependentBones.Collect(targetRig, IasIndependentBones.ArmRoots);
 		var boneShifts = IasArmPose.ComputeBoneShifts(targetRig, profiles[sourceTorso.Published].Nodes)
 			.Concat(IasArmPose.ComputeLegShifts(targetRig, profiles[sourceTorso.Published].Nodes))
+			.Where(pair => !arms.Contains(pair.Key))
 			.ToDictionary(pair => pair.Key, pair => pair.Value);
+		var skinRig = IasIndependentBones.Apply(avatar, targetRig, profiles[sourceTorso.Published].Nodes,
+			independentBones, boneHash);
 		var vanilla = new GameDataUnitMeshReader(resolver);
 		var units = new Dictionary<ulong, GameDataUnitMesh>();
 		var usedMaterials = new HashSet<ulong>();
@@ -93,7 +100,7 @@ public sealed class IasDp8Converter(Func<string, uint> boneHash, Func<ulong, boo
 			}, JsonOptions), cancellationToken).ConfigureAwait(false);
 			await File.WriteAllTextAsync(Path.Combine(output, "arm-pose.json"), SerializeArmPose(shoulderTargets, legTargets), cancellationToken).ConfigureAwait(false);
 			// 同一份数据放进 Mod 根目录：开了「手臂姿态修正」时，管理器部署会读它（HD2ModCore JointPoseData.FileName）。
-			await File.WriteAllTextAsync(Path.Combine(package, "joint-pose.json"), SerializeArmPose(shoulderTargets, legTargets), cancellationToken).ConfigureAwait(false);
+			await File.WriteAllTextAsync(Path.Combine(package, "joint-pose.json"), SerializeIndependentBones(independentBones), cancellationToken).ConfigureAwait(false);
 			Directory.Move(package, mod);
 			return new(mod, plan.Base.Count, plan.Groups.SelectMany(group => group.Options).Sum(option => option.Routes.Count),
 				externalTextures, externalMaterials, shoulderTargets, legTargets);
@@ -123,10 +130,10 @@ public sealed class IasDp8Converter(Func<string, uint> boneHash, Func<ulong, boo
 						}
 						var sourceUnit = await new PatchUnitMeshReader().ReadCanonicalSourceAsync(source, inputs[group.Key],
 							cancellationToken: cancellationToken).ConfigureAwait(false);
-						var (lods, materials) = IasNativeMesh.Convert(sourceUnit.Model, profiles[route.Published], targetRig, avatar,
+						var (lods, materials) = IasNativeMesh.Convert(sourceUnit.Model, profiles[route.Published], targetRig, skinRig,
 							sourceHead, boneHash, refitArms: true, boneShifts);
 						var shell = IasNativeMesh.UseFourWeightStreams(donor.Model);
-						var result = new UnitAuthor().Author(new UnitAuthorRequest(shell, donor.Payload.TocData, avatar,
+						var result = new UnitAuthor().Author(new UnitAuthorRequest(shell, donor.Payload.TocData, skinRig,
 							lods[0], donor.Model.CustomizationInfo, key.FileId, materials), lods);
 						if (!result.IsValid || result.Model!.TransformNameHashes.Count > 256)
 							throw new InvalidDataException($"IAS Unit {route.Slot.Part}/{route.Slot.Body} -> {key.FileId:x16}: {string.Join("; ", result.Diagnostics)}");
@@ -152,6 +159,15 @@ public sealed class IasDp8Converter(Func<string, uint> boneHash, Func<ulong, boo
 		// 骨名 → 父骨局部位置；按 thigh、knee、foot、ball 的顺序写回。
 		legJointTarget = legTargets?.ToDictionary(pair => pair.Key, pair => ToArray(pair.Value)),
 		shoulderShiftMeters = new { l = ToArray(targets.LeftShift), r = ToArray(targets.RightShift) },
+	}, JsonOptions);
+
+	/// <summary>
+	/// 独立骨的运行时参数：改名后的骨 → avatar 上抄旋转的源骨，父骨在前。
+	/// 部署时由 HD2ModCore <c>JointPoseData</c> 转成 Lua 选项 <c>independentBones</c>。
+	/// </summary>
+	internal static string SerializeIndependentBones(IReadOnlyList<string> bones) => JsonSerializer.Serialize(new
+	{
+		independentBones = bones.Select(name => new { bone = IasIndependentBones.Prefix + name, source = name }),
 	}, JsonOptions);
 
 	private static double[] ToArray(HD2SourceModel.Vec3 value) =>

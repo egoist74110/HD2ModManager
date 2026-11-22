@@ -202,6 +202,11 @@ local function make_env(unit, opts)
 			local c = q_to_mat3_colmajor(lp.q)
 			return { c[1], c[2], c[3], c[4], c[5], c[6], c[7], c[8], c[9], lp.p[1], lp.p[2], lp.p[3] }
 		end,
+		local_position = function(u, node)
+			engineCalls = engineCalls + 1
+			local p = u.locals[u.names[node]].p
+			return { p[1], p[2], p[3] }
+		end,
 		local_rotation = function(u, node)
 			engineCalls = engineCalls + 1
 			local name = u.names[node]
@@ -544,6 +549,54 @@ do
 	check("多人 runtime.avatars 不被手臂修正覆盖",
 		#state.avatars == 2 and state.avatars[1].unit == u and state.avatars[2].unit == teammate and state.avatar == u)
 	Runtime.uninstall()
+end
+
+-- 6) 独立骨：给了 independentBones 就只把 avatar 源骨的 local 旋转抄到护甲改名骨上，不写 avatar
+do
+	Compat._fastWrite = nil
+	Compat._fastWriteVerified = nil
+	local u = make_rig("rifle")
+	local armor = make_rig("unarmed")
+	-- 护甲上的改名骨：名字不同，节点和原骨同一个（测试桩按节点号回查骨名）。
+	for _, name in ipairs({ "l_shoulder", "l_elbow", "l_hand" }) do
+		armor.names["ias_" .. name] = armor.names[name]
+	end
+	local S = make_env(u)
+	S.World.units = function() return { u, armor } end
+	local logPath = (os.getenv("TEMP") or os.getenv("TMP") or ".") .. "\\hd2-independent-test.log"
+	os.remove(logPath)
+	local function copy(v) return { v[1], v[2], v[3], v[4] } end
+	local avatarShoulderP = { u.locals.l_shoulder.p[1], u.locals.l_shoulder.p[2], u.locals.l_shoulder.p[3] }
+	local armorShoulderP = { armor.locals.l_shoulder.p[1], armor.locals.l_shoulder.p[2], armor.locals.l_shoulder.p[3] }
+	local armorRightQ = copy(armor.locals.r_shoulder.q)
+	_G.render = nil
+	local state = Runtime.install(S, {
+		compat = Compat,
+		armPose = true,
+		independentBones = { { "ias_l_shoulder", "l_shoulder" }, { "ias_l_elbow", "l_elbow" }, { "ias_l_hand", "l_hand" } },
+		carriers = {},
+		pollFrames = 20,
+		logPath = logPath,
+		tunePath = "nonexistent-hd2pbx-tune.txt",
+	})
+	for _ = 1, 4 do _G.render() end
+	Runtime.uninstall()
+	local f = io.open(logPath, "r")
+	local text = f and f:read("*a") or ""
+	if f then f:close() end
+	local same = true
+	for _, name in ipairs({ "l_shoulder", "l_elbow", "l_hand" }) do
+		if qangle(armor.locals[name].q, u.locals[name].q) > 1e-9 then same = false end
+	end
+	check("独立骨：护甲改名骨的旋转 = avatar 源骨", same)
+	check("独立骨：护甲改名骨的位置不动", dist(armor.locals.l_shoulder.p, armorShoulderP) < 1e-12)
+	check("独立骨：护甲没列出的骨不动", qangle(armor.locals.r_shoulder.q, armorRightQ) < 1e-12)
+	check("独立骨：不再写 avatar", dist(u.locals.l_shoulder.p, avatarShoulderP) < 1e-12)
+	check("独立骨：日志报告找到 1 件", string.find(text, "找到 1 件带独立骨的护甲（3 根骨）", 1, true) ~= nil, text)
+	check("独立骨：日志报肩和手的偏差", string.find(text, "l_shoulder差=", 1, true) ~= nil and string.find(text, "l_hand差=", 1, true) ~= nil, text)
+	check("独立骨：首次生效", string.find(text, "独立骨首次生效", 1, true) ~= nil, text)
+	-- 稳态每帧：读 3 + 写 3 + update 1
+	check("独立骨：稳态每帧 7 次调用", state.armCalls == 7, "calls=" .. tostring(state.armCalls))
 end
 
 print(string.format("\n失败 %d 项", failures))

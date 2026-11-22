@@ -39,9 +39,34 @@ public static class JointPoseData
 					entries.Add(side + "_" + bone + " = " + Vector(legs, side + "_" + bone));
 			parts.Add("legJointTarget = { " + string.Join(", ", entries) + " }");
 		}
+		if (root.TryGetProperty("independentBones", out var independent))
+			parts.Add("independentBones = " + IndependentBones(independent));
 		if (parts.Count == 0)
-			throw new InvalidDataException($"{FileName} 里既没有 armShoulderTarget 也没有 legJointTarget。");
+			throw new InvalidDataException($"{FileName} 里没有 armShoulderTarget、legJointTarget 或 independentBones。");
 		return string.Join(", ", parts);
+	}
+
+	/// <summary>
+	/// 独立骨（实验）：<c>[{ "bone": "ias_l_shoulder", "source": "l_shoulder" }, ...]</c>，父骨在前。
+	/// 骨名只允许小写字母、数字和下划线（直接拼进 Lua 源码，不能让任何引号、换行混进去）。
+	/// </summary>
+	private static string IndependentBones(JsonElement value)
+	{
+		if (value.ValueKind != JsonValueKind.Array || value.GetArrayLength() == 0 || value.GetArrayLength() > 64)
+			throw new InvalidDataException($"{FileName} 的 independentBones 必须是 1–64 项的数组。");
+		var entries = new List<string>();
+		foreach (var item in value.EnumerateArray())
+			entries.Add("{ \"" + BoneName(item, "bone") + "\", \"" + BoneName(item, "source") + "\" }");
+		return "{ " + string.Join(", ", entries) + " }";
+	}
+
+	private static string BoneName(JsonElement item, string property)
+	{
+		var name = item.ValueKind == JsonValueKind.Object && item.TryGetProperty(property, out var value)
+			&& value.ValueKind == JsonValueKind.String ? value.GetString() : null;
+		if (string.IsNullOrEmpty(name) || name.Length > 64 || !name.All(c => c is >= 'a' and <= 'z' or >= '0' and <= '9' or '_'))
+			throw new InvalidDataException($"{FileName} 的 independentBones.{property} 不合法：{name}");
+		return name;
 	}
 
 	/// <summary>
