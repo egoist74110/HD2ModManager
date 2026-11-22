@@ -49,6 +49,35 @@
    - 放弃：`git -C … checkout -- .` 加删掉新增文件，回到 `e3d3a55`（先和用户确认）。
 4. 任何结果都要：Lua 回归 `python tools/physbone-harness/run_physbone_regressions.py` 全过、C# 构建 0 警告/测试全绿（游戏开着时 5 个部署用例会被挡），再让用户实机量帧数。
 
+### IAS 是怎么处理换弹的（2026-11-23 读 `tmp/ias-lab/upstream/ias-1.6.3`，只看思路，不抄代码）
+
+- 用户不走 IAS 路线（记忆 `no-ias-runtime-route`），想参考 IAS 的写法。结论：**不能直接运行它的代码**，原因有三：
+  1. 核心求解（重定向和物理）在原生 DLL `ArmorAssets/runtime/hd2ias_native_bridge_pluginw64_release.dll` 和 Python 伴随进程里（Lua 通过 `E.HD2IASNative` 或 WebSocket 调用）。Lua 只是外壳。
+  2. `runtime.lua` 里用了 83 处 `ffi`（调 kernel32）和 `io.open` 读游戏 bundle，都不在白名单里，我们的加载器沙箱也禁止。
+  3. 没有许可证，不能抄代码。
+- **可借的思路**（`runtime.lua` 约 3349–3480 行）：
+  - 每帧用 `Unit.animation_get_state(unit)` 取 31 层状态元组，加上 `animation_layer_info(unit, 11)` 的片段长度，判断当前动作：
+    - 持枪姿势（`native-weapon-posture`）：手钉到枪的 `IK_left`/`IK_right`。
+    - 换弹和其它主动作（`verified-native-reload`/`native-hand-motion`）：**跟随原生手部轨迹，绝不把手钉在移动的武器挂点上**。
+    - 菜单（上半身层 76/77）、未识别的动作：不处理。
+  - 调用 `animation_get_state` 之前必须先 `has_animation_state_machine(unit)`：尸体或刚生成的 unit 没有状态机，直接调用会原生崩溃，pcall 接不住。
+  - 这些 API **全部在白名单里**。
+  - IAS 的状态编号表是从游戏 bundle 提出来、和版本绑定的；游戏更新对不上就整体停用，只保留基础动作。
+- 对我们的意义：现在的 IK 无论什么动作都把手拉到 avatar 手上，换弹诡异很可能就是这个原因。下一步：
+  1. 加状态日志，用户实机做站、举枪、换弹、冲刺各一次，记下状态编号。
+  2. 按状态给 IK 降权或关掉，遇到不认识的状态就关 IK（安全默认）。
+
+### 下次新会话从这里开始（2026-11-23 收尾）
+
+- 已提交 `e1d6b9a`（性能优化 + 2.1.49 崩溃修复），实机能进游戏。
+- 用户报了两个问题：换弹姿势诡异、手臂偶尔弹出。线索见上文。
+- 已经反编译 IAS 的原生 DLL 学了它的思路，见 `docs/agent/ias-runtime-study-20261123.md` §3.5。三份详细报告在 `D:\gitCode\HD2ModManager\tmp\ias-lab\decomp\report-*.md`。
+- 建议的改法：
+  1. 握枪 IK 只在持枪姿态打开（`has_animation_state_machine` → `animation_get_state` 判断）；换弹和其它动作放手；够不着时学 IAS 把枪拉近（≤ 18 cm），不硬拉手臂。
+  2. 骨头换算改为世界增量：`D = 头像当前世界 × inv(头像静止世界)`，再乘模型静止世界旋转。
+  3. 修手臂弹出（重扫漏件；不可信的件整件退回）。
+- 用户不再派 GPT，由 Claude 自己做。
+
 ## 3. 待办（用户已确认放后面）
 
 1. **轻量身体碰撞**（还有一点穿模）：只给必须组，只用 IAS 的 3 个胶囊（chest/hips/spine1），带开关。注意 2026-11-03 全量碰撞层因性能被删过（`git show 55fbff6`）。等性能优化后实机再定。
