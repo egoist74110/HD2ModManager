@@ -79,10 +79,10 @@ public sealed class IasDp8Converter(Func<string, uint> boneHash, Func<ulong, boo
 		var legTargets = IasArmPose.ComputeLegTargets(targetRig, profiles[sourceTorso.Published].Nodes);
 		// 手臂与腿两条链互不重叠：合成一张逐骨平移表。
 		// 独立骨（实验 2）：两条手臂整棵子树（肩以下，含手指）不做平移，顶点留在模型原位；
-		// 这些骨全部改名、绑定放模型关节，由运行时每帧抄 avatar 的旋转。腿照旧。
+		// 按 Unit 的最终蒙皮权重选改名骨；腿照旧。
 		var arms = IasIndependentBones.ArmRoots.SelectMany(root => IasIndependentBones.Subtree(targetRig, root)).ToHashSet();
 		var independentBones = IasIndependentBones.Collect(targetRig, IasIndependentBones.ArmRoots);
-		var independentNames = independentBones.ToHashSet(StringComparer.Ordinal);
+		var packagedIndependentNames = new HashSet<string>(StringComparer.Ordinal);
 		var boneShifts = IasArmPose.ComputeBoneShifts(targetRig, profiles[sourceTorso.Published].Nodes)
 			.Concat(IasArmPose.ComputeLegShifts(targetRig, profiles[sourceTorso.Published].Nodes))
 			.Where(pair => !arms.Contains(pair.Key))
@@ -117,7 +117,8 @@ public sealed class IasDp8Converter(Func<string, uint> boneHash, Func<ulong, boo
 			}, JsonOptions), cancellationToken).ConfigureAwait(false);
 			await File.WriteAllTextAsync(Path.Combine(output, "arm-pose.json"), SerializeArmPose(shoulderTargets, legTargets), cancellationToken).ConfigureAwait(false);
 			// 同一份数据放进 Mod 根目录：开了「手臂姿态修正」时，管理器部署会读它（HD2ModCore JointPoseData.FileName）。
-			await File.WriteAllTextAsync(Path.Combine(package, "joint-pose.json"), SerializeIndependentBones(independentBones), cancellationToken).ConfigureAwait(false);
+			await File.WriteAllTextAsync(Path.Combine(package, "joint-pose.json"),
+				SerializeIndependentBones(independentBones.Where(packagedIndependentNames.Contains).ToArray()), cancellationToken).ConfigureAwait(false);
 			Directory.Move(package, mod);
 			return new(mod, plan.Base.Count, plan.Groups.SelectMany(group => group.Options).Sum(option => option.Routes.Count),
 				externalTextures, externalMaterials, shoulderTargets, legTargets);
@@ -157,14 +158,22 @@ public sealed class IasDp8Converter(Func<string, uint> boneHash, Func<ulong, boo
 							physics = null;
 						var (lods, materials) = IasNativeMesh.Convert(sourceUnit.Model, profile, targetRig, skinRig,
 							sourceHead, boneHash, refitArms: true, boneShifts, physics);
-						var unitRig = physics?.Append(skinRig, lods.Values, compact: group.Key) ?? skinRig;
+						var weighted = lods.Values.SelectMany(mesh => mesh.Vertices)
+							.SelectMany(vertex => vertex.Influences).Select(influence => influence.BoneHash).ToHashSet();
+						physics?.KeepWeightedChains(weighted, avatar.NameHashes.Count);
+						var independentNames = IasIndependentBones.SelectWeighted(targetRig, skinRig, independentBones,
+							arms, weighted, physics?.NativeParents(avatar.NameHashes.Count));
+						packagedIndependentNames.UnionWith(independentNames);
+						var unitSkinRig = IasIndependentBones.Apply(avatar, targetRig, profiles[sourceTorso.Published].Nodes,
+							independentNames, boneHash);
+						var unitRig = physics?.Append(unitSkinRig, lods.Values, compact: group.Key) ?? unitSkinRig;
 						var shell = IasNativeMesh.UseFourWeightStreams(donor.Model);
 						var result = new UnitAuthor().Author(new UnitAuthorRequest(shell, donor.Payload.TocData, unitRig,
 							lods[0], donor.Model.CustomizationInfo, key.FileId, materials), lods);
 						if (!result.IsValid || result.Model!.TransformNameHashes.Count > 256)
 							throw new InvalidDataException($"IAS Unit {route.Slot.Part}/{route.Slot.Body} -> {key.FileId:x16} ({result.Model?.TransformNameHashes.Count} nodes): {string.Join("; ", result.Diagnostics)}");
 						if (physics is not null && writtenPhysics.Add(route.Published))
-							physics.AddFacts(facts, targetRig, independentNames);
+							physics.AddFacts(facts, targetRig, independentNames.ToHashSet(StringComparer.Ordinal));
 						usedMaterials.UnionWith(materials.Values);
 						entries.Add(new(key, result.TocData!, [], result.GpuData!, entry.Unknown1, entry.Unknown2, entry.Unknown3, entry.Unknown4));
 					}

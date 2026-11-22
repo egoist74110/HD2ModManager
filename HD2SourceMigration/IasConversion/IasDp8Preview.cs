@@ -102,8 +102,6 @@ public static class IasDp8Preview
 	/// <summary>Unit 骨架里不是 avatar 骨的节点：同下标被改名的独立骨，以及 avatar 之后追加的节点。</summary>
 	private static int[] IndependentIndexes(UnitTransformInfo unit, UnitTransformInfo avatar)
 	{
-		if (unit.NameHashes.Count < avatar.NameHashes.Count)
-			return [];
 		var avatarHashes = avatar.NameHashes.ToHashSet();
 		// 另外 avatar 之后追加的节点（物理骨等）也一起导出：预览里它们跟着父骨走。
 		return Enumerable.Range(0, unit.NameHashes.Count)

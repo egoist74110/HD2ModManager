@@ -100,7 +100,7 @@ local M = {}
 --        flags=0x35（yawCon + angleCon，没有 pitchCon）的长发链：pitch 区间留着初值 [0, 0]，
 --        而求解器在 axisLimits 打开时两个分量都夹 ⇒ 前后甩被锁在 0°，长发看着像一根焊丝。
 --        现在没约束的轴按"不限"处理，总偏角仍由锥兜住。
-M.VERSION = "2.1.47"
+M.VERSION = "2.1.49"
 
 --- 安装标记用的全局键。只写这一个全局，且值就是模块本身（便于外部检查是否已装）。
 local INSTALL_KEY = "__hd2physbone_runtime"
@@ -3772,32 +3772,61 @@ local function independent_scan(runtime, avatar, world, list)
 	if type(units) ~= "table" then return nil end
 	local ax, ay, az = readVector(S, try(S.Unit.world_position, avatar, 1))
 	if ax == nil then return nil end
-	local pieces = {}
+	-- 先用肩骨名筛（has_node 对任何 unit 都安全），命中了才读位置。
+	-- 2.1.48 首版先对场景里每个 unit 调 world_position(unit, 1)：没有第 1 个节点的小物件会让引擎直接崩
+	-- （pcall 接不住，2026-11-23 实机进飞船加载即崩 4 次）。转换器保证一侧手臂要么整条改名要么不改，所以有任何独立骨的件一定有肩。
+	local probes = {}
+	for _, side in ipairs({ "l", "r" }) do
+		if slots[side .. "_shoulder"] then probes[#probes + 1] = list[slots[side .. "_shoulder"]][1] end
+	end
+	if #probes == 0 then probes[1] = list[1][1] end
+	local pieces, used, usedArms = {}, {}, {}
 	for index = 1, #units do
 		local unit = units[index]
 		if unit ~= avatar and Compat.unit_alive(S, unit) and #pieces < 16 then
-			local first = safe_node(S, unit, list[1][1])
-			if first ~= nil then
+			local hit = false
+			for p = 1, #probes do
+				if safe_node(S, unit, probes[p]) ~= nil then hit = true break end
+			end
+			local d
+			if hit then
 				local ux, uy, uz = readVector(S, try(S.Unit.world_position, unit, 1))
-				local d = vec_dist(ux, uy, uz, ax, ay, az)
-				if d ~= nil and d <= 1.0 then
-					local nodes, complete = { first }, true
-					for b = 2, #list do
-						nodes[b] = safe_node(S, unit, list[b][1])
-						if nodes[b] == nil then complete = false end
+				d = vec_dist(ux, uy, uz, ax, ay, az)
+			end
+			if d ~= nil and d <= 1.0 then
+				local nodes, bones, pieceArms = {}, {}, {}
+				for b = 1, #list do
+					local node = safe_node(S, unit, list[b][1])
+					if node ~= nil then
+						nodes[b] = node
+						bones[#bones + 1] = b
+						used[b] = true
 					end
-					if complete then
-						pieces[#pieces + 1] = { unit = unit, nodes = nodes, tag = unit_tag(S, unit) }
+				end
+				if #bones > 0 then
+					for a, arm in ipairs(arms) do
+						if nodes[arm.sh] and nodes[arm.el] and nodes[arm.ha] then
+							pieceArms[#pieceArms + 1] = a
+							usedArms[a] = true
+						end
 					end
+					pieces[#pieces + 1] = { unit = unit, nodes = nodes, bones = bones, arms = pieceArms, tag = unit_tag(S, unit) }
 				end
 			end
 		end
 	end
+	if next(usedArms) ~= nil and runtime.options.independentIk ~= false and runtime.options.fastWrite ~= false then
+		Compat.probe_fast_write(S, runtime.logger)
+	end
+	local sourceBones = {}
+	for b = 1, #list do
+		if used[b] then sourceBones[#sourceBones + 1] = b end
+	end
 	local tags = {}
 	for i = 1, #pieces do tags[#tags + 1] = pieces[i].tag end
 	runtime.logger("[physbone][独立骨] 找到 %d 件带独立骨的护甲（%d 根骨）：%s",
-		#pieces, #list, #tags > 0 and table.concat(tags, "、") or "无")
-	return { avatar = avatar, sources = sources, pieces = pieces, arms = arms, frames = 0,
+		#pieces, #sourceBones, #tags > 0 and table.concat(tags, "、") or "无")
+	return { avatar = avatar, sources = sources, sourceBones = sourceBones, pieces = pieces, arms = arms, usedArms = usedArms, frames = 0,
 		rescanAt = (runtime.frame or 0) + INDEPENDENT_RESCAN_FRAMES }
 end
 
@@ -3821,20 +3850,22 @@ local function independent_frame(runtime, avatar, world, list)
 
 	local calls, written = 0, 0
 	local rotations = {}
-	for b = 1, #list do
+	for _, b in ipairs(state.sourceBones) do
 		rotations[b] = try(S.Unit.local_rotation, avatar, state.sources[b])
 		calls = calls + 1
 	end
 	local targets
-	if runtime.options.independentIk ~= false and #state.arms > 0 then
+	if runtime.options.independentIk ~= false and next(state.usedArms) ~= nil then
 		targets = {}
-		for _, arm in ipairs(state.arms) do
+		for a in pairs(state.usedArms) do
+			local arm = state.arms[a]
 			local target, cost = Compat.independent_ik_target(S, avatar, state.sources[arm.el],
 				state.sources[arm.ha], rotations[arm.sh])
 			calls = calls + cost
-			if target then targets[#targets + 1] = { arm = arm, pose = target } end
+			targets[a] = target
 		end
 	end
+	local fastWrite = runtime.options.fastWrite ~= false and Compat._fastWrite == true
 	for index = #state.pieces, 1, -1 do
 		local piece = state.pieces[index]
 		if not Compat.unit_alive(S, piece.unit) then
@@ -3843,7 +3874,7 @@ local function independent_frame(runtime, avatar, world, list)
 			state.rescanAt = frame + 1
 		else
 			local failed
-			for b = 1, #list do
+			for _, b in ipairs(piece.bones) do
 				if rotations[b] ~= nil and pcall(S.Unit.set_local_rotation, piece.unit, piece.nodes[b], rotations[b]) then
 					written = written + 1
 				elseif targets then
@@ -3856,11 +3887,11 @@ local function independent_frame(runtime, avatar, world, list)
 			calls = calls + 1
 			if updated and targets then
 				local ikWrites = 0
-				for _, target in ipairs(targets) do
-					local arm = target.arm
-					if not failed or not (failed[arm.sh] or failed[arm.el] or failed[arm.ha]) then
+				for _, a in ipairs(piece.arms) do
+					local arm, target = state.arms[a], targets[a]
+					if target and (not failed or not (failed[arm.sh] or failed[arm.el] or failed[arm.ha])) then
 						local count, cost = Compat.apply_independent_ik(S, piece.unit, piece.nodes[arm.sh],
-							piece.nodes[arm.el], piece.nodes[arm.ha], target.pose)
+							piece.nodes[arm.el], piece.nodes[arm.ha], target, fastWrite)
 						ikWrites, calls = ikWrites + count, calls + cost
 					end
 				end
@@ -3877,7 +3908,7 @@ local function independent_frame(runtime, avatar, world, list)
 		-- 肩和手在模型上和 avatar 上各差多少（左右各报一次；没有就跳过）。
 		local piece = state.pieces[1]
 		local parts = {}
-		for b = 1, #list do
+		for _, b in ipairs(piece.bones) do
 			local source = list[b][2]
 			if source == "l_shoulder" or source == "l_hand" or source == "r_shoulder" or source == "r_hand" then
 				local px, py, pz = readVector(S, try(S.Unit.world_position, piece.unit, piece.nodes[b]))
@@ -3887,7 +3918,7 @@ local function independent_frame(runtime, avatar, world, list)
 			end
 		end
 		runtime.logger("[physbone][独立骨] 第%d帧 %d根骨 写入=%d 调用=%d ｜%s：%s",
-			state.frames, #list, written, calls, piece.tag, table.concat(parts, "，"))
+			state.frames, #state.sourceBones, written, calls, piece.tag, table.concat(parts, "，"))
 	end
 	return written, calls
 end

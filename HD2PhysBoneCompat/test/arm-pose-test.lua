@@ -602,13 +602,15 @@ end
 
 -- 7) 独立骨 IK：默认开启，走真实 render 钩子，护甲姿势只有 update_unit 后才刷新。
 do
-	local function run(armScale, ik)
+	local function run(armScale, ik, fastWrite, partial)
 		local avatar, armor = make_rig("rifle"), make_rig("rifle")
 		local map = {}
 		for _, side in ipairs({ "l", "r" }) do
 			for _, joint in ipairs({ "shoulder", "elbow", "hand" }) do
 				local name = side .. "_" .. joint
-				armor.names["ias_" .. name] = armor.names[name]
+				if not partial or side == "r" or joint == "elbow" then
+					armor.names["ias_" .. name] = armor.names[name]
+				end
 				map[#map + 1] = { "ias_" .. name, name }
 				if joint ~= "shoulder" then armor.locals[name].p[3] = armor.locals[name].p[3] * armScale end
 			end
@@ -627,7 +629,7 @@ do
 		end
 		_G.render = nil
 		local state = Runtime.install(S, {
-			compat = Compat, armPose = true, independentIk = ik, independentBones = map, carriers = {},
+			compat = Compat, armPose = true, independentIk = ik, fastWrite = fastWrite, independentBones = map, carriers = {},
 			pollFrames = 20, log = false, tunePath = "nonexistent-hd2pbx-tune.txt",
 		})
 		for _ = 1, 3 do _G.render() end
@@ -656,9 +658,18 @@ do
 	end
 	check("独立骨 IK：avatar 零写入", writes == 0)
 	local _, _, _, _, disabledCalls, disabledEngineCalls = run(0.96, false)
-	check("独立骨 IK：双侧每件护甲额外 41 次调用",
-		calls - disabledCalls == 41 and engineCalls - disabledEngineCalls == 41,
+	check("独立骨 IK：快路径双侧每件护甲额外 35 次调用",
+		calls - disabledCalls == 35 and engineCalls - disabledEngineCalls == 35,
 		string.format("armCalls +%d，mock +%d", calls - disabledCalls, engineCalls - disabledEngineCalls))
+	local _, fallback, _, _, fallbackCalls = run(0.96, nil, false)
+	check("独立骨 IK：回退多 6 次调用，手腕姿态相同",
+		fallbackCalls - calls == 6 and qangle(fallback.worldPoses.l_hand.q, armor.worldPoses.l_hand.q) < 1e-6
+			and dist(fallback.worldPoses.r_hand.p, armor.worldPoses.r_hand.p) < 1e-9)
+
+	local partialAvatar, partialArmor, _, _, partialCalls = run(0.96, nil, nil, true)
+	check("独立骨 IK：首骨缺失仍扫描，只解具备肩肘手的一侧",
+		partialCalls == 27 and dist(partialAvatar.worldPoses.r_hand.p, partialArmor.worldPoses.r_hand.p) < 0.001
+			and qangle(partialAvatar.locals.l_elbow.q, partialArmor.locals.l_elbow.q) < 1e-9)
 
 	local farAvatar, shortArmor = run(0.4)
 	for _, side in ipairs({ "l", "r" }) do

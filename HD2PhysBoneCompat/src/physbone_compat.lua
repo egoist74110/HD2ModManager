@@ -3624,20 +3624,29 @@ local function solve_independent_arm(sh, el, wrist, target)
 		ax, ay, az, d * ux - ax, d * uy - ay, d * uz - az)
 end
 
-local function write_independent_rotation(S, unit, node, rotation)
+local function write_independent_rotation(S, unit, node, rotation, fastWrite)
 	local x, y, z, w = rotation[1], rotation[2], rotation[3], rotation[4]
 	local len2 = x * x + y * y + z * z + w * w
 	if not (len2 > 1e-12 and len2 < 1e12) then return false, 0 end
+	local calls = 0
+	if fastWrite then
+		local scale = (w < 0 and -1 or 1) / math.sqrt(len2)
+		local ok, q = pcall(S.Quaternion.from_elements, x * scale, y * scale, z * scale, w * scale)
+		if ok and q ~= nil then
+			return pcall(S.Unit.set_local_rotation, unit, node, q), 2
+		end
+		calls = 1
+	end
 	local ax, ay, az, angle = q_to_axis_angle(x, y, z, w)
 	local okAxis, axis = pcall(S.Vector3, ax, ay, az)
-	if not okAxis or axis == nil then return false, 1 end
+	if not okAxis or axis == nil then return false, calls + 1 end
 	local okQ, q = pcall(S.Quaternion.axis_angle, axis, angle)
-	if not okQ or q == nil then return false, 2 end
-	return pcall(S.Unit.set_local_rotation, unit, node, q), 3
+	if not okQ or q == nil then return false, calls + 2 end
+	return pcall(S.Unit.set_local_rotation, unit, node, q), calls + 3
 end
 
 --- 护甲的世界矩阵必须在拷贝旋转后刷新。只写直接 IK 链，扭转骨和手指仍跟各自父骨走。
-function M.apply_independent_ik(S, unit, shoulder, elbow, hand, target)
+function M.apply_independent_ik(S, unit, shoulder, elbow, hand, target, fastWrite)
 	local sh, shCalls = read_world_pose_lua(S, unit, shoulder)
 	local el, elCalls = read_world_pose_lua(S, unit, elbow)
 	local wrist, handCalls = read_arm_position(S, unit, hand)
@@ -3645,9 +3654,9 @@ function M.apply_independent_ik(S, unit, shoulder, elbow, hand, target)
 	if sh == nil or el == nil or wrist == nil then return 0, calls end
 	local solved = solve_independent_arm(sh, el, wrist, target)
 	if solved == nil then return 0, calls end
-	local s, sw = write_independent_rotation(S, unit, shoulder, solved.shQ)
-	local e, ew = write_independent_rotation(S, unit, elbow, solved.elQ)
-	local h, hw = write_independent_rotation(S, unit, hand, solved.haQ)
+	local s, sw = write_independent_rotation(S, unit, shoulder, solved.shQ, fastWrite)
+	local e, ew = write_independent_rotation(S, unit, elbow, solved.elQ, fastWrite)
+	local h, hw = write_independent_rotation(S, unit, hand, solved.haQ, fastWrite)
 	return (s and 1 or 0) + (e and 1 or 0) + (h and 1 or 0), calls + sw + ew + hw
 end
 

@@ -16,12 +16,11 @@ internal static class IasIndependentBones
 {
 	internal const string Prefix = "ias_";
 
-	/// <summary>两条手臂的根：每条肩以下（含手指）整棵子树都改名。</summary>
+	/// <summary>两条手臂的候选子树，从肩起，含手指。</summary>
 	internal static readonly string[] ArmRoots = ["l_shoulder", "r_shoulder"];
 
 	/// <summary>
-	/// 要改名的骨：<paramref name="roots"/> 下面所有有名字的骨，父先子后。
-	/// 实验 1 只改了肩到手 5 根，手指留在 avatar 的手上，被拉成"鸡爪"——所以一条链改名就整棵子树都改。
+	/// 候选骨：<paramref name="roots"/> 下面所有有名字的骨，父先子后。
 	/// </summary>
 	internal static IReadOnlyList<string> Collect(Hd2Rig target, IEnumerable<string> roots) =>
 		roots.SelectMany(root => Subtree(target, root))
@@ -33,6 +32,33 @@ internal static class IasIndependentBones
 			.ToArray();
 
 	/// <summary>
+	/// 按最终蒙皮权重和物理锚点选择骨：先闭合到肩的父链，再把选中骨下面整棵子树都带上。
+	/// 实机（2026-11-23 E4）：只改名一部分（肩改名、肘/手指仍叫 avatar 原名挂在改名骨下面）→ 进飞船加载即崩。
+	/// 所以一侧手臂要么整条改名，要么整条保持原名（和 E3 的结构一致）。
+	/// </summary>
+	internal static IReadOnlyList<string> SelectWeighted(Hd2Rig target, UnitTransformInfo renamed,
+		IReadOnlyList<string> candidates, IReadOnlySet<int> arms, IReadOnlySet<uint> weighted,
+		IEnumerable<int>? physicsParents)
+	{
+		var keep = new HashSet<int>();
+		var used = arms.Where(index => weighted.Contains(renamed.NameHashes[index]));
+		foreach (var index in used.Concat(physicsParents ?? []))
+		{
+			var current = index;
+			while (arms.Contains(current) && keep.Add(current))
+				current = target.Bones[current].ParentIndex;
+		}
+		for (var grew = true; grew;)
+		{
+			grew = false;
+			foreach (var index in arms)
+				if (!keep.Contains(index) && keep.Contains(target.Bones[index].ParentIndex))
+					grew |= keep.Add(index);
+		}
+		return candidates.Where(name => keep.Contains(target.Find(name)!.Index)).ToArray();
+	}
+
+	/// <summary>
 	/// 返回改过的 avatar 骨架：<paramref name="bones"/> 里每根骨换成新名字的哈希，
 	/// 全局矩阵的平移换成模型关节位置（旋转不变），局部平移按新的父骨全局矩阵重算。
 	/// 扭转骨和模型里没有的骨：保持它和父骨在潜兵骨架里的相对位置。
@@ -41,6 +67,8 @@ internal static class IasIndependentBones
 	internal static UnitTransformInfo Apply(UnitTransformInfo avatar, Hd2Rig target, IReadOnlyList<IasRigNode> modelNodes,
 		IReadOnlyList<string> bones, Func<string, uint> hash)
 	{
+		if (bones.Count == 0)
+			return avatar;
 		var model = modelNodes.GroupBy(node => node.Name, StringComparer.Ordinal)
 			.ToDictionary(group => group.Key, group => group.First().World.Origin, StringComparer.Ordinal);
 		var chosen = bones.Select(name => target.Find(name) ?? throw new InvalidDataException($"潜兵骨架缺少 {name}。"))
@@ -70,10 +98,12 @@ internal static class IasIndependentBones
 			matrices[bone.Index] = new UnitTransformMatrix(values);
 			hashes[bone.Index] = hash(Prefix + bone.Name);
 		}
-		foreach (var bone in chosen)
+		foreach (var bone in target.Bones)
 		{
+			if (!origins.ContainsKey(bone.Index) && !origins.ContainsKey(bone.ParentIndex))
+				continue;
 			var parentWorld = Hd2RigReader.FromHd2RowVector(matrices[bone.ParentIndex].Values);
-			var local = parentWorld.Inverse().TransformPoint(origins[bone.Index]);
+			var local = parentWorld.Inverse().TransformPoint(origins.GetValueOrDefault(bone.Index, bone.WorldOrigin));
 			locals[bone.Index] = locals[bone.Index] with { Position = [(float)local.X, (float)local.Y, (float)local.Z] };
 		}
 		return avatar with { NameHashes = hashes, Matrices = matrices, LocalTransforms = locals };

@@ -97,6 +97,43 @@ internal sealed class IasPhysicsMigration
 
 	internal uint? WeightTarget(int slot) => bySlot.GetValueOrDefault(slot)?.NameHash;
 
+	/// <summary>保留有最终顶点权重的整条模拟链，以及它依赖的父链。</summary>
+	internal void KeepWeightedChains(IReadOnlySet<uint> weighted, int nativeCount)
+	{
+		var chainsByName = joints.Values.ToDictionary(joint => prefix + joint.Parameters.Name, joint => joint.Chain);
+		var chainByIndex = extras.Select(extra => chainsByName[extra.Name]).ToArray();
+		var keep = new HashSet<IasPhysicsChain>();
+		var pending = new Queue<IasPhysicsChain>(extras.Select((extra, index) => (extra, index))
+			.Where(pair => weighted.Contains(pair.extra.NameHash)).Select(pair => chainByIndex[pair.index]));
+		var members = Enumerable.Range(0, extras.Length).ToLookup(index => chainByIndex[index]);
+		while (pending.TryDequeue(out var chain))
+		{
+			if (!keep.Add(chain))
+				continue;
+			foreach (var index in members[chain])
+			{
+				var parent = extras[index].ParentIndex - nativeCount;
+				if (parent >= 0 && chainByIndex[parent] != chain)
+					pending.Enqueue(chainByIndex[parent]);
+			}
+		}
+		var retained = new List<RetargetExtraBone>();
+		var remap = new int[extras.Length];
+		for (var i = 0; i < extras.Length; i++)
+		{
+			if (!keep.Contains(chainByIndex[i]))
+				continue;
+			var extra = extras[i];
+			var parent = extra.ParentIndex - nativeCount;
+			remap[i] = nativeCount + retained.Count;
+			retained.Add(parent < 0 ? extra : extra with { ParentIndex = remap[parent] });
+		}
+		extras = retained.ToArray();
+	}
+
+	internal IEnumerable<int> NativeParents(int nativeCount) => extras
+		.Select(extra => extra.ParentIndex).Where(parent => parent < nativeCount).Distinct();
+
 	internal UnitTransformInfo Append(UnitTransformInfo rig, IEnumerable<RetargetedMesh> lods, bool compact)
 	{
 		var combined = UnitTransformInfoAppender.Append(rig, extras)!;
