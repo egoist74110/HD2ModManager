@@ -1049,6 +1049,10 @@ public sealed class ModLibraryImporter : IModLibraryImporter
 				? ModNodeKind.ReShade
 				: ModNodeKind.Standard;
 
+	internal static IEnumerable<string> GetManifestOptionIncludes(StandardModManifest manifest, IReadOnlySet<string> optionKeys) =>
+		BuildManifestEntries(manifest).Where(entry => entry.Kind == ModNodeKind.Option && optionKeys.Contains(entry.Key))
+			.SelectMany(entry => entry.IncludePaths);
+
 	private static List<ManifestEntry> BuildManifestEntries(StandardModManifest manifest)
 	{
 		var result = new List<ManifestEntry>

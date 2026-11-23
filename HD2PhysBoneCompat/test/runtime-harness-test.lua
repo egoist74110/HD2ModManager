@@ -697,6 +697,28 @@ do
 	for _ = 1, 60 do engine.time = engine.time + 1 / 120; probeRender() end
 	check("T9 先全部挂上", runtime.sessions ~= nil and #runtime.sessions == #ARMOR_NODES,
 		string.format("会话=%s", tostring(runtime.sessions and #runtime.sessions)))
+	local last = runtime.sessions[1].sessions[1]
+	engine.time = engine.time + 0.26
+	probeRender()
+	check("T9 0.26 s 时间跳变直接清积分", last.tip and not last.tip.tips[1].ready)
+	engine.time = engine.time + 1 / 120
+	probeRender()
+	check("T9 时间跳变后可重新求解", last.tip and last.tip.tips[1].ready)
+	engine.pos[t9Avatar] = { 2.01, 0, 0 }
+	engine.time = engine.time + 1 / 120
+	probeRender()
+	check("T9 avatar 根一帧传送超过 2 m 即使护甲锚点未移动也重置", last.tip and not last.tip.tips[1].ready)
+	engine.time = engine.time + 1 / 120
+	probeRender()
+	local lastWrites = engine.writes
+	engine.anim[t9Avatar] = false
+	engine.time = engine.time + 1 / 120
+	probeRender()
+	check("T9 没有状态机时物理冻结在最后姿态", last.tip and last.tip.tips[1].ready and engine.writes == lastWrites)
+	engine.anim[t9Avatar] = true
+	engine.time = engine.time + 1 / 120
+	probeRender()
+	check("T9 状态机恢复先重置物理，跳过冻结期间的积分", last.tip and not last.tip.tips[1].ready)
 
 	-- 统计这一帧会发多少次 Unit.alive
 	local originalAlive = S.Unit.alive

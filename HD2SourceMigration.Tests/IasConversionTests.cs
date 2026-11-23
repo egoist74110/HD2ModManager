@@ -517,6 +517,24 @@ public sealed class IasConversionTests
 		}
 		Assert.Equal(avatar.LocalTransforms[2].Rotation, skin.LocalTransforms[2].Rotation);
 		Assert.Equal([0, 2, 3, 4], IasIndependentBones.Subtree(rig, "l_shoulder").Prepend(0).Order());
+
+		const string id = "#ID[0102030405060708]";
+		var turned = skin.Matrices.ToArray();
+		turned[2] = new UnitTransformMatrix(Row(clavicle));
+		using var json = JsonDocument.Parse(IasDp8Converter.SerializeIndependentBones(["l_shoulder", "l_elbow"],
+			rig, skin with { Matrices = turned }, new Dictionary<string, IasDp8Converter.IndependentPiece>
+			{
+				[id] = new(["l_shoulder", "l_elbow"], "Torso_Armor", "coat/on", "coat/off"),
+			}));
+		var root = json.RootElement;
+		var rest = root.GetProperty("independentRest")[0];
+		Assert.Equal("l_clavicle", rest.GetProperty("parent").GetString());
+		Assert.Equal(1f, rest.GetProperty("avatar")[3].GetSingle());
+		Assert.Equal(MathF.Sqrt(0.5f), rest.GetProperty("model")[2].GetSingle(), 6);
+		Assert.Equal(skin.LocalTransforms[2].Position[0], rest.GetProperty("position")[0].GetSingle());
+		Assert.Equal("ias_l_elbow", root.GetProperty("independentPieces").GetProperty(id)[1].GetString());
+		Assert.Equal("coat/on", root.GetProperty("independentPieceRoutes").GetProperty(id).GetProperty("option").GetString());
+		Assert.Equal("coat/off", root.GetProperty("independentPieceRoutes").GetProperty(id).GetProperty("disabledBy").GetString());
 	}
 
 	[Fact]

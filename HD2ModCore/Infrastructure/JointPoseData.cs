@@ -5,12 +5,8 @@ using System.Text.Json;
 namespace HD2ModCore.Infrastructure;
 
 /// <summary>
-/// 运行时关节修正数据（实验，C1 阶段）：转换器把 <see cref="FileName"/> 放在 Mod 根目录，
-/// 部署时开了「手臂姿态修正」就读出来，拼成物理运行时 <c>install</c> 的选项。
-/// <para>
-/// C1 只是先把数据送进游戏做实机验证：运行时还不区分玩家穿的是哪件护甲，
-/// 启用中的 Mod 里只取第一份（按加载顺序）。按护甲绑定是下一步的事。
-/// </para>
+/// 读取 Mod 根目录的关节修正数据。部署时将启用的护甲件、静止姿态及旧版关节目标
+/// 转成物理运行时 <c>install</c> 的选项。
 /// </summary>
 public static class JointPoseData
 {
@@ -20,11 +16,9 @@ public static class JointPoseData
 	private static readonly string[] LegBones = ["thigh", "knee", "foot", "ball"];
 
 	/// <summary>
-	/// 把 JSON 转成 Lua 表构造片段：<c>armShoulderTarget = {...}, legJointTarget = {...}</c>。
-	/// 只认这两个键，其余忽略；坐标必须有限且 |c| ≤ 1 米，否则抛 <see cref="InvalidDataException"/>
-	/// （运行时也会再校验一次，这里先挡住，免得部署出去才发现）。
+	/// 验证 JSON 并生成 Lua 表构造片段。给定启用选项时，只注入该配置里实际可驱动的资源。
 	/// </summary>
-	public static string ToLuaOptions(string json)
+	public static string ToLuaOptions(string json, IReadOnlySet<string>? activeOptions = null)
 	{
 		using var document = JsonDocument.Parse(json);
 		var root = document.RootElement;
@@ -40,7 +34,22 @@ public static class JointPoseData
 			parts.Add("legJointTarget = { " + string.Join(", ", entries) + " }");
 		}
 		if (root.TryGetProperty("independentBones", out var independent))
+		{
 			parts.Add("independentBones = " + IndependentBones(independent));
+			if (root.TryGetProperty("independentRest", out var rest) && rest.ValueKind != JsonValueKind.Null)
+			{
+				if (rest.ValueKind != JsonValueKind.Array || rest.GetArrayLength() != independent.GetArrayLength())
+					throw new InvalidDataException("independentRest must match independentBones.");
+				parts.Add("independentRest = { " + string.Join(", ", rest.EnumerateArray().Select(item =>
+					"{ \"" + BoneName(item, "parent") + "\", " + Vector(item, "avatar", 4) + ", "
+					+ Vector(item, "model", 4) + ", " + Vector(item, "position") + " }")) + " }");
+			}
+			if (root.TryGetProperty("independentPieces", out var pieces) && pieces.ValueKind != JsonValueKind.Null)
+			{
+				var names = independent.EnumerateArray().Select(item => BoneName(item, "bone")).ToHashSet(StringComparer.Ordinal);
+				parts.AddRange(Pieces(root, pieces, names, activeOptions));
+			}
+		}
 		if (parts.Count == 0)
 			throw new InvalidDataException($"{FileName} 里没有 armShoulderTarget、legJointTarget 或 independentBones。");
 		return string.Join(", ", parts);
@@ -60,11 +69,45 @@ public static class JointPoseData
 		return "{ " + string.Join(", ", entries) + " }";
 	}
 
-	private static string BoneName(JsonElement item, string property)
+	private static IEnumerable<string> Pieces(JsonElement root, JsonElement pieces, HashSet<string> names,
+		IReadOnlySet<string>? activeOptions)
+	{
+		var entries = new List<string>();
+		var slots = new List<string>();
+		root.TryGetProperty("independentPieceRoutes", out var routes);
+		foreach (var piece in pieces.EnumerateObject())
+		{
+			var id = piece.Name;
+			if (id.Length != 21 || !id.StartsWith("#ID[", StringComparison.Ordinal) || id[^1] != ']'
+				|| !id.AsSpan(4, 16).ToString().All(c => c is >= '0' and <= '9' or >= 'a' and <= 'f'))
+				throw new InvalidDataException($"Invalid independent unit ID: {id}");
+			var slot = id;
+			if (routes.ValueKind == JsonValueKind.Object && routes.TryGetProperty(id, out var route))
+			{
+				if (activeOptions is not null && route.TryGetProperty("option", out var option)
+					&& option.ValueKind != JsonValueKind.Null && !activeOptions.Contains(option.GetString()!))
+					continue;
+				if (activeOptions is not null && route.TryGetProperty("disabledBy", out var disabledBy)
+					&& disabledBy.ValueKind != JsonValueKind.Null && activeOptions.Contains(disabledBy.GetString()!))
+					continue;
+				slot = BoneName(route, "slot", allowUppercase: true);
+			}
+			var bones = piece.Value.EnumerateArray().Select(bone => bone.GetString()).ToArray();
+			if (bones.Length == 0 || bones.Any(bone => bone is null || !names.Contains(bone)) || bones.Distinct().Count() != bones.Length)
+				throw new InvalidDataException($"Invalid independent bones for {id}.");
+			entries.Add($"[\"{id}\"] = {{ " + string.Join(", ", bones.Select(bone => $"\"{bone}\"")) + " }");
+			slots.Add($"[\"{id}\"] = \"{slot}\"");
+		}
+		return ["independentPieces = { " + string.Join(", ", entries) + " }",
+			"independentPieceSlots = { " + string.Join(", ", slots) + " }"];
+	}
+
+	private static string BoneName(JsonElement item, string property, bool allowUppercase = false)
 	{
 		var name = item.ValueKind == JsonValueKind.Object && item.TryGetProperty(property, out var value)
 			&& value.ValueKind == JsonValueKind.String ? value.GetString() : null;
-		if (string.IsNullOrEmpty(name) || name.Length > 64 || !name.All(c => c is >= 'a' and <= 'z' or >= '0' and <= '9' or '_'))
+		if (string.IsNullOrEmpty(name) || name.Length > 64 || !name.All(c => c is >= 'a' and <= 'z' or >= '0' and <= '9' or '_'
+			|| allowUppercase && c is >= 'A' and <= 'Z'))
 			throw new InvalidDataException($"{FileName} 的 independentBones.{property} 不合法：{name}");
 		return name;
 	}
@@ -96,21 +139,25 @@ public static class JointPoseData
 		return found;
 	}
 
-	private static string Vector(JsonElement owner, string name)
+	private static string Vector(JsonElement owner, string name, int length = 3)
 	{
-		if (!owner.TryGetProperty(name, out var value) || value.ValueKind != JsonValueKind.Array || value.GetArrayLength() != 3)
-			throw new InvalidDataException($"{FileName} 缺少 {name}，或它不是 3 个数。");
+		if (!owner.TryGetProperty(name, out var value) || value.ValueKind != JsonValueKind.Array || value.GetArrayLength() != length)
+			throw new InvalidDataException($"{FileName} 缺少 {name}，或它不是 {length} 个数。");
 		var builder = new StringBuilder("{ ");
 		var index = 0;
+		var norm = 0.0;
 		foreach (var item in value.EnumerateArray())
 		{
 			var number = item.GetDouble();
-			if (!double.IsFinite(number) || Math.Abs(number) > 1.0)
+			if (!double.IsFinite(number) || Math.Abs(number) > (length == 4 ? 1.000001 : 1.0))
 				throw new InvalidDataException($"{FileName} 的 {name} 超出范围：{number}");
+			norm += number * number;
 			if (index++ > 0)
 				builder.Append(", ");
 			builder.Append(number.ToString("R", CultureInfo.InvariantCulture));
 		}
+		if (length == 4 && Math.Abs(norm - 1) > 0.001)
+			throw new InvalidDataException($"{FileName} 的 {name} 不是单位四元数。");
 		return builder.Append(" }").ToString();
 	}
 }

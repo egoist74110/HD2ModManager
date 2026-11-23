@@ -197,15 +197,17 @@ public sealed class LuaDeploymentService : ILuaDeploymentService
 	/// 实验（C1）：从启用中的 Mod 里找关节修正数据（<see cref="JointPoseData.FileName"/>），
 	/// 转成物理运行时的 install 选项。只取第一份；坏数据只报错、不注入。
 	/// </summary>
-	private static string? ReadJointPoseOptions(IReadOnlyList<ProfileEntry> orderedEntries, LibrarySnapshot snapshot,
+	internal static string? ReadJointPoseOptions(IReadOnlyList<ProfileEntry> orderedEntries, LibrarySnapshot snapshot,
 		string modsRootDirectory, List<CoreIssue> issues)
 	{
-		var directories = orderedEntries
+		var nodes = orderedEntries
 			.Where(entry => snapshot.Nodes.ContainsKey(entry.NodeId))
-			.Select(entry => Path.Combine(modsRootDirectory, snapshot.Nodes[entry.NodeId].RelativePath));
+			.Select(entry => snapshot.Nodes[entry.NodeId]).ToArray();
+		string[] directories;
 		IReadOnlyList<string> files;
 		try
 		{
+			directories = nodes.Select(node => Path.GetFullPath(Path.Combine(modsRootDirectory, node.RelativePath))).ToArray();
 			files = JointPoseData.Find(directories, modsRootDirectory);
 		}
 		catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or ArgumentException)
@@ -221,9 +223,22 @@ public sealed class LuaDeploymentService : ILuaDeploymentService
 				$"有 {files.Count} 个启用中的 Mod 带关节修正数据，目前只用第一个：{files[0]}。"));
 		try
 		{
-			var options = JointPoseData.ToLuaOptions(File.ReadAllText(files[0]));
+			var mod = Path.GetDirectoryName(files[0])!;
+			var activeOptions = directories.Select(directory => Path.GetRelativePath(mod, directory).Replace('\\', '/'))
+				.ToHashSet(StringComparer.OrdinalIgnoreCase);
+			var modIndex = Array.FindIndex(directories, directory => string.Equals(directory, mod, StringComparison.OrdinalIgnoreCase));
+			if (modIndex >= 0 && StandardModManifest.TryLoad(mod) is { } manifest)
+			{
+				// 导入会摊平目录。用选项关系和原 manifest 的 Include 还原实际启用的来源路径。
+				var enabled = nodes.Select(node => node.Id).ToHashSet();
+				var keys = OptionRelationshipGraph.Create(snapshot).GetDescendantOptions(nodes[modIndex].Id)
+					.Where(node => enabled.Contains(node.Id) && node.Metadata.SourcePackagePath is not null)
+					.Select(node => node.Metadata.SourcePackagePath!).ToHashSet(StringComparer.OrdinalIgnoreCase);
+				activeOptions.UnionWith(ModLibraryImporter.GetManifestOptionIncludes(manifest, keys));
+			}
+			var options = JointPoseData.ToLuaOptions(File.ReadAllText(files[0]), activeOptions);
 			issues.Add(new CoreIssue(CoreIssueSeverity.Info, "JointPoseInjected",
-				$"已注入关节修正数据（实验）：{files[0]}。它会作用于你操作的角色，不管穿的是哪件护甲。"));
+				$"已注入本地角色的关节修正数据：{files[0]}。"));
 			return options;
 		}
 		catch (Exception exception) when (exception is IOException or UnauthorizedAccessException

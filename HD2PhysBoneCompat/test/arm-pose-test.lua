@@ -192,7 +192,20 @@ local function make_env(unit, opts)
 	S.Unit = {
 		alive = function(u) engineCalls = engineCalls + 1; return u.alive == true end,
 		num_scene_graph_items = function(u) engineCalls = engineCalls + 1; return u.nodeCount end,
-		has_animation_state_machine = function() engineCalls = engineCalls + 1; return true end,
+		has_animation_state_machine = function(u) engineCalls = engineCalls + 1; return u.machine ~= false end,
+		animation_get_state = function(u)
+			engineCalls = engineCalls + 1
+			assert(u.machine ~= false)
+			local tuple = {}
+			for i = 1, 31 do tuple[i] = 0 end
+			tuple[4] = u.menu and 76 or 67
+			return unpack(tuple)
+		end,
+		animation_layer_info = function(u, layer)
+			engineCalls = engineCalls + 1
+			assert(u.machine ~= false and layer == 11)
+			return 0, u.clip or 1e37
+		end,
 		has_node = function(u, name) engineCalls = engineCalls + 1; return u.names[name] ~= nil end,
 		node = function(u, name) engineCalls = engineCalls + 1; return u.names[name] or 1 end,
 		local_pose = function(u, node)
@@ -213,6 +226,12 @@ local function make_env(unit, opts)
 			local q = u.locals[name].q
 			return { q[1], q[2], q[3], q[4] }
 		end,
+		local_scale = function(u, node) engineCalls = engineCalls + 1; return u.scale or { 1, 1, 1 } end,
+		world_rotation = function(u, node)
+			engineCalls = engineCalls + 1
+			return u.worldPoses[u.names[node]].q
+		end,
+		set_unit_visibility = function(u, visible) engineCalls = engineCalls + 1; u.visible = visible end,
 		world_pose = function(u, node)
 			engineCalls = engineCalls + 1
 			local name = u.names[node]
@@ -263,7 +282,7 @@ local function make_env(unit, opts)
 			end
 			u.locals[name].q = { qx, qy, qz, qw }
 		end,
-		debug_name = function() return "#ID[avatar]" end,
+		debug_name = function(u) return u.tag or "#ID[avatar]" end,
 	}
 	local world = {}
 	S.World = {
@@ -551,7 +570,127 @@ do
 	Runtime.uninstall()
 end
 
--- 6) 独立骨：关闭 IK 时沿用原来的旋转拷贝和调用预算。
+-- 动作状态日志通过真实 render 入口采集，假引擎检查调用顺序和目标。
+do
+	local avatar = make_rig("rifle")
+	local S, world = make_env(avatar)
+	local teammate = make_rig("rifle")
+	S.World.units = function() return { avatar, teammate } end
+	local calls, order, logs = {}, {}, {}
+	local otherCalls = 0
+	local hasMachine, layerAvailable = false, true
+	local tuple = {}
+	for i = 1, 31 do tuple[i] = i end
+	tuple[5], tuple[12] = 67, 585
+	local second, realTime = 100, os.time
+	os.time = function() return second end
+	local function record(api, unit)
+		if unit ~= avatar then
+			otherCalls = otherCalls + 1
+			error("动作采集读到了其它 unit")
+		end
+		calls[api] = (calls[api] or 0) + 1
+		order[#order + 1] = api
+	end
+	local alive = S.Unit.alive
+	S.Unit.alive = function(unit)
+		if unit == avatar then record("alive", unit) end
+		return alive(unit)
+	end
+	S.Unit.has_animation_state_machine = function(unit)
+		record("machine", unit)
+		return hasMachine
+	end
+	S.Unit.animation_get_state = function(unit)
+		record("state", unit)
+		assert(order[#order - 2] == "alive" and order[#order - 1] == "machine" and hasMachine)
+		return unpack(tuple)
+	end
+	S.Unit.animation_layer_info = function(unit, layer)
+		record("layer", unit)
+		assert(layer == 11)
+		if not layerAvailable then error("missing clip") end
+		return 0.12, 2.917
+	end
+	_G.render = nil
+	local state = Runtime.install(S, {
+		compat = Compat, armPose = true, stateLog = true, carriers = {}, pollFrames = 1000,
+		log = false, tunePath = "nonexistent-hd2pbx-tune.txt",
+	})
+	state.avatar, state.world = avatar, world
+	state.logger = function(fmt, ...)
+		if fmt:find("[动作状态]", 1, true) then logs[#logs + 1] = string.format(fmt, ...) end
+	end
+	_G.render()
+	check("动作日志：活体无状态机时不读状态", calls.machine == 1 and calls.state == nil)
+	hasMachine = true
+	_G.render()
+	_G.render()
+	check("动作日志：显式打开，首个元组写一次且相同时不读片段",
+		#logs == 2 and (logs[1] or ""):find("开始采集 avatar=", 1, true)
+		and (logs[2] or ""):find("n=31", 1, true) and calls.state == 2 and calls.layer == 1)
+	tuple[5], tuple[12] = 76, 636
+	_G.render()
+	check("动作日志：输出零基层号、片段时间和完整元组",
+		(logs[3] or ""):find("变化层=4:67→76,11:585→636 L11片段=2.917s/t=0.12s 全部=["
+			.. table.concat(tuple, ",") .. "]", 1, true))
+	layerAvailable = false
+	tuple[31] = nil
+	_G.render()
+	check("动作日志：保留非 31 项，片段读取抛错时回退为问号",
+		(logs[4] or ""):find("n=30 变化层=30:31→nil L11片段=? 全部=[" .. table.concat(tuple, ",") .. "]", 1, true))
+	for i = 1, 25 do
+		tuple[1] = i + 100
+		_G.render()
+	end
+	check("动作日志：限流时仍采状态，跳过片段查询", #logs == 19 and calls.state == 29 and calls.layer == 18)
+	second = second + 1
+	_G.render()
+	check("动作日志：下一秒合并省略数量，无变化时没有补写元组",
+		#logs == 20 and (logs[20] or ""):find("省略 10 次变化", 1, true))
+	local sampled, machineChecks = calls.state, calls.machine
+	avatar.alive = false
+	_G.render()
+	check("动作日志：死体先停在 alive，不读状态机", calls.machine == machineChecks and calls.state == sampled)
+	avatar = make_rig("rifle")
+	state.avatar = avatar
+	_G.render()
+	check("动作日志：avatar 更换时重新宣告并记录首个元组",
+		#logs == 22 and (logs[21] or ""):find("开始采集 avatar=", 1, true)
+		and (logs[22] or ""):find("变化层=初始", 1, true))
+	calls, order = {}, {}
+	state.options.stateLog = false
+	_G.render()
+	check("动作日志：选项关闭时仅保留原有手臂 alive 调用",
+		calls.alive == 1 and calls.machine == nil and calls.state == nil and calls.layer == nil and #logs == 22,
+		"alive=" .. tostring(calls.alive))
+	state.options.stateLog = true
+	state.tune = { frame = state.frame, values = { stateLog = 0 } }
+	calls, order = {}, {}
+	_G.render()
+	check("动作日志：调参 stateLog=0 优先关闭且零额外引擎调用",
+		calls.alive == 1 and calls.machine == nil and calls.state == nil and calls.layer == nil and #logs == 22,
+		"alive=" .. tostring(calls.alive))
+	state.tune = nil
+	for i = 1, 25 do
+		tuple[1] = i + 200
+		_G.render()
+	end
+	avatar = make_rig("rifle")
+	state.avatar = avatar
+	_G.render()
+	check("动作日志：同秒汇总、重新打开和换 avatar 合计最多 20 行", #logs == 39)
+	second = second + 1
+	_G.render()
+	check("动作日志：满额时将换 avatar 通知延至下一秒",
+		#logs == 41 and (logs[40] or ""):find("省略 10 次变化", 1, true)
+		and (logs[41] or ""):find("开始采集 avatar=" .. tostring(avatar), 1, true))
+	check("动作日志：从未读取队友的状态机、元组或片段", otherCalls == 0)
+	Runtime.uninstall()
+	os.time = realTime
+end
+
+-- 6) 独立骨：旧数据可继续使用旋转拷贝。
 do
 	Compat._fastWrite = nil
 	Compat._fastWriteVerified = nil
@@ -593,18 +732,18 @@ do
 	check("独立骨：护甲改名骨的位置不动", dist(armor.locals.l_shoulder.p, armorShoulderP) < 1e-12)
 	check("独立骨：护甲没列出的骨不动", qangle(armor.locals.r_shoulder.q, armorRightQ) < 1e-12)
 	check("独立骨：不再写 avatar", dist(u.locals.l_shoulder.p, avatarShoulderP) < 1e-12)
-	check("独立骨：日志报告找到 1 件", string.find(text, "找到 1 件带独立骨的护甲（3 根骨）", 1, true) ~= nil, text)
+	check("独立骨：日志报告找到 1 件", string.find(text, "找到 1 件 / 缺 无", 1, true) ~= nil, text)
 	check("独立骨：日志报肩和手的偏差", string.find(text, "l_shoulder差=", 1, true) ~= nil and string.find(text, "l_hand差=", 1, true) ~= nil, text)
 	check("独立骨：首次生效", string.find(text, "独立骨首次生效", 1, true) ~= nil, text)
-	-- 稳态每帧：读 3 + 写 3 + update 1
-	check("独立骨：稳态每帧 7 次调用", state.armCalls == 7, "calls=" .. tostring(state.armCalls))
+	-- 无抽样帧：读旋转并拆分 6 + 写 3 + update 1。
+	check("独立骨：旧数据无抽样帧 10 次调用", state.armCalls == 10, "calls=" .. tostring(state.armCalls))
 end
 
 -- 7) 独立骨 IK：默认开启，走真实 render 钩子，护甲姿势只有 update_unit 后才刷新。
 do
-	local function run(armScale, ik, fastWrite, partial)
+	local function run(armScale, ik, fastWrite, partial, withRest)
 		local avatar, armor = make_rig("rifle"), make_rig("rifle")
-		local map = {}
+		local map, rest = {}, {}
 		for _, side in ipairs({ "l", "r" }) do
 			for _, joint in ipairs({ "shoulder", "elbow", "hand" }) do
 				local name = side .. "_" .. joint
@@ -613,6 +752,7 @@ do
 				end
 				map[#map + 1] = { "ias_" .. name, name }
 				if joint ~= "shoulder" then armor.locals[name].p[3] = armor.locals[name].p[3] * armScale end
+				rest[#rest + 1] = { armor.parents[name], { 0, 0, 0, 1 }, { 0, 0, 0, 1 }, armor.locals[name].p }
 			end
 		end
 		armor.update_world()
@@ -630,14 +770,17 @@ do
 		_G.render = nil
 		local state = Runtime.install(S, {
 			compat = Compat, armPose = true, independentIk = ik, fastWrite = fastWrite, independentBones = map, carriers = {},
+			independentRest = withRest and rest or nil,
 			pollFrames = 20, log = false, tunePath = "nonexistent-hd2pbx-tune.txt",
 		})
 		for _ = 1, 3 do _G.render() end
 		resetCalls()
 		_G.render()
 		local engineCalls = calls()
+		local length = dist(armor.worldPoses.l_shoulder.p, armor.worldPoses.l_elbow.p)
+		local forearm = dist(armor.worldPoses.l_elbow.p, armor.worldPoses.l_hand.p)
 		Runtime.uninstall()
-		return avatar, armor, shoulders, avatarWrites, state.armCalls, engineCalls
+		return avatar, armor, shoulders, avatarWrites, state.armCalls, engineCalls, length, forearm
 	end
 
 	local avatar, armor, shoulders, writes, calls, engineCalls = run(0.96)
@@ -646,20 +789,19 @@ do
 		check("独立骨 IK：手到达目标 < 1 mm " .. side, dist(a.p, b.p) < 0.001)
 		check("独立骨 IK：锁手腕世界朝向 " .. side, qangle(a.q, b.q) < 1e-6)
 		check("独立骨 IK：肩的世界位置固定 " .. side, dist(armor.worldPoses[side .. "_shoulder"].p, shoulders[side]) < 1e-12)
-		local sh = shoulders[side]
-		local avatarElbow, armorElbow = avatar.worldPoses[side .. "_elbow"].p, armor.worldPoses[side .. "_elbow"].p
-		local function plane_normal(elbow)
+		local function plane_normal(sh, elbow)
 			local x, y, z = a.p[1] - sh[1], a.p[2] - sh[2], a.p[3] - sh[3]
 			local ex, ey, ez = elbow[1] - sh[1], elbow[2] - sh[2], elbow[3] - sh[3]
 			return { y * ez - z * ey, z * ex - x * ez, x * ey - y * ex }
 		end
-		local n, m = plane_normal(avatarElbow), plane_normal(armorElbow)
-		check("独立骨 IK：肘朝 avatar pole 同侧 " .. side, n[1] * m[1] + n[2] * m[2] + n[3] * m[3] > 0)
+		local n = plane_normal(avatar.worldPoses[side .. "_shoulder"].p, avatar.worldPoses[side .. "_elbow"].p)
+		local m = plane_normal(shoulders[side], armor.worldPoses[side .. "_elbow"].p)
+		check("独立骨 IK：肘平面朝 avatar 当前法线同侧 " .. side, n[1] * m[1] + n[2] * m[2] + n[3] * m[3] > 0)
 	end
 	check("独立骨 IK：avatar 零写入", writes == 0)
 	local _, _, _, _, disabledCalls, disabledEngineCalls = run(0.96, false)
-	check("独立骨 IK：快路径双侧每件护甲额外 35 次调用",
-		calls - disabledCalls == 35 and engineCalls - disabledEngineCalls == 35,
+	check("独立骨 IK：快路径双侧每件护甲额外 40 次调用",
+		calls - disabledCalls == 40 and engineCalls - disabledEngineCalls == 40,
 		string.format("armCalls +%d，mock +%d", calls - disabledCalls, engineCalls - disabledEngineCalls))
 	local _, fallback, _, _, fallbackCalls = run(0.96, nil, false)
 	check("独立骨 IK：回退多 6 次调用，手腕姿态相同",
@@ -668,7 +810,7 @@ do
 
 	local partialAvatar, partialArmor, _, _, partialCalls = run(0.96, nil, nil, true)
 	check("独立骨 IK：首骨缺失仍扫描，只解具备肩肘手的一侧",
-		partialCalls == 27 and dist(partialAvatar.worldPoses.r_hand.p, partialArmor.worldPoses.r_hand.p) < 0.001
+		partialCalls == 35 and dist(partialAvatar.worldPoses.r_hand.p, partialArmor.worldPoses.r_hand.p) < 0.001
 			and qangle(partialAvatar.locals.l_elbow.q, partialArmor.locals.l_elbow.q) < 1e-9)
 
 	local farAvatar, shortArmor = run(0.4)
@@ -683,6 +825,241 @@ do
 		-- NaN 亦会使此比较失败。
 		check("独立骨 IK：够不到时有限且伸直指向目标 " .. side, goalDist > reach and dist(wrist, closest) < 0.001)
 	end
+	local _, stretch, _, _, _, _, upper, lower = run(0.4, nil, nil, nil, true)
+	check("独立骨 IK：连续多帧求解后拉伸仍封顶 5%", math.abs(upper - 0.28*0.4*1.05) < 1e-6
+		and math.abs(lower - 0.26*0.4*1.05) < 1e-6)
+	check("独立骨 IK：卸载还原拉伸前的骨长", math.abs(dist(stretch.worldPoses.l_shoulder.p, stretch.worldPoses.l_elbow.p) - 0.28*0.4) < 1e-6)
+	local straight = make_rig("unarmed")
+	local straightEnv = make_env(straight)
+	local previous = { 0, 1, 0 }
+	local target = Compat.independent_ik_target(straightEnv, straight, straight.names.l_shoulder,
+		straight.names.l_elbow, straight.names.l_hand, previous)
+	check("独立骨 IK：肘平面退化时沿用上一帧法线", target and target.normal == previous)
+end
+
+-- 8) 新清单、逐件健康与生命周期均经过 render。
+do
+	local avatar, partner = make_rig("rifle"), make_rig("rifle")
+	local function piece(id, x)
+		local armor = make_rig("rifle")
+		armor.tag = id
+		for _, name in ipairs({ "l_shoulder", "l_elbow", "l_hand" }) do
+			armor.names["ias_" .. name] = armor.names[name]
+		end
+		armor.locals.root.p[1] = x
+		armor.update_world()
+		return armor
+	end
+	local first = piece("#ID[0000000000000001]", 0)
+	local late = piece("#ID[0000000000000002]", -0.7)
+	local remote = piece(first.tag, 1.5)
+	local tiny = { alive = true, names = {}, nodeCount = 0 }
+	partner.locals.root.p[1] = 1.6
+	partner.update_world()
+	local S, world = make_env(avatar)
+	local units = { avatar, partner, remote, first, tiny }
+	S.World.units = function() return units end
+	S.World.units_by_resource = function() return { avatar, partner } end
+	local position = S.Unit.world_position
+	S.Unit.world_position = function(u, node)
+		assert(u ~= tiny, "must filter shoulder before world_position")
+		return position(u, node)
+	end
+	local expected = { "ias_l_shoulder", "ias_l_elbow", "ias_l_hand" }
+	local map, rest = {}, {}
+	local identity = { 0, 0, 0, 1 }
+	for i, name in ipairs(expected) do
+		local source = name:sub(5)
+		map[i] = { name, source }
+		rest[i] = { first.parents[source], identity, identity, first.locals[source].p }
+	end
+	_G.render = nil
+	local state = Runtime.install(S, { compat = Compat, armPose = true, carriers = {}, pollFrames = 1000,
+		independentPieces = { [first.tag] = expected, [late.tag] = expected }, independentBones = map, independentRest = rest,
+		log = false, tunePath = "nonexistent-hd2pbx-tune.txt" })
+	state.avatar, state.world, state.cache.world = avatar, world, world
+	local log = {}
+	state.logger = function(fmt, ...) log[#log + 1] = string.format(fmt, ...) end
+	local function render(n) for _ = 1, n do _G.render() end end
+	render(1)
+	local tracked = state.independent.pieces[1]
+	check("清单：同 ID 的队友件在本地件之前也不会错绑", tracked and tracked.unit == first and #state.independent.pieces == 1)
+	check("动作日志默认关闭", state.actionStateLog == nil)
+	check("清单：首次明确记录缺件", table.concat(log, "\n"):find("缺 " .. late.tag, 1, true) ~= nil)
+	units[#units + 1] = late
+	first.locals.root.p[1] = -2
+	first.update_world()
+	render(29)
+	check("清单：未到 30 帧不重扫", #state.independent.pieces == 1)
+	render(1)
+	check("清单：30 帧补齐，存活件越过旧距离阈值仍保留", #state.independent.pieces == 2 and state.independent.pieces[1] == tracked)
+	check("清单：肩骨离本地根超过 1 m 仍可找到", state.independent.pieces[2].unit == late)
+
+	avatar.clip = 0.9
+	render(1)
+	local fraction = state.independent.alpha
+	check("动作：0.9 s 关 IK 并平滑过渡", state.independent.mode == false and fraction > 0 and fraction < 1)
+	avatar.clip = 0.3
+	render(8)
+	check("动作：短片段保持关，直到过渡完成", state.independent.mode == false and state.independent.alpha == 0)
+	avatar.clip = 1e37
+	render(8)
+	avatar.clip = 0.3
+	render(1)
+	check("动作：无限片段开，短片段也保持开", state.independent.mode == true and state.independent.alpha == 1)
+	avatar.menu = true
+	render(8)
+	check("动作：菜单优先关 IK", state.independent.alpha == 0)
+	avatar.menu, avatar.clip = false, 1e37
+	render(8)
+	avatar.machine = false
+	render(1)
+	check("动作：状态机消失立即停 IK", state.independent.alpha == 0 and next(state.independent.normals) == nil)
+	avatar.machine = true
+	local layer = S.Unit.animation_layer_info
+	S.Unit.animation_layer_info = function() error("clip unavailable") end
+	render(8)
+	check("动作：有 31 层状态但读不到片段时按 §E 打开 IK", state.independent.mode == true and state.independent.alpha == 1)
+	S.Unit.animation_layer_info = layer
+
+	local actionCalls, onlyLocal = {}, true
+	for _, name in ipairs({ "has_animation_state_machine", "animation_get_state", "animation_layer_info" }) do
+		local original = S.Unit[name]
+		S.Unit[name] = function(u, ...)
+			if u == avatar then actionCalls[name] = (actionCalls[name] or 0) + 1
+			elseif name ~= "has_animation_state_machine" then onlyLocal = false end
+			return original(u, ...)
+		end
+	end
+	state.options.stateLog = true
+	state.independent.rescanAt = state.frame + 1
+	render(1)
+	check("动作：同帧补扫、日志和两件 IK 共用本地 avatar 状态",
+		onlyLocal and actionCalls.has_animation_state_machine == 1
+		and actionCalls.animation_get_state == 1 and actionCalls.animation_layer_info == 1)
+	state.options.stateLog = false
+
+	state.options.independentIk = false
+	local rotation = S.Unit.world_rotation
+	S.Unit.world_rotation = function(u, node)
+		if u == first and node == first.names.l_clavicle then error("missing parent") end
+		return rotation(u, node)
+	end
+	render(2)
+	check("隔离：前两帧失败仍可走旋转拷贝", not tracked.isolated and first.visible ~= false
+		and qangle(first.locals.l_shoulder.q, avatar.locals.l_shoulder.q) < 1e-6)
+	render(1)
+	check("隔离：第三帧进入隔离，其它件继续驱动", tracked.isolated and not state.independent.pieces[2].isolated and first.visible ~= false)
+	first.scale = { 1, 1, 2 }
+	render(1)
+	check("隔离：旋转兜底也失败则隐藏本件", first.visible == false and late.visible ~= false)
+	first.scale = nil
+	S.Unit.world_rotation = rotation
+	render(2)
+	check("隔离：两帧正常仍隐藏", first.visible == false)
+	render(1)
+	check("隔离：三帧正常重新显示", first.visible == true and not tracked.isolated)
+
+	S.Unit.world_position = function(u, node)
+		local p = position(u, node)
+		if u == first and node == first.names.l_hand then p[1] = p[1] + 0.021 end
+		return p
+	end
+	for _ = 1, 30 do
+		render(1)
+		if tracked.failures == 1 then break end
+	end
+	check("隔离：30 帧内采样发现 21 mm 世界残差", tracked.failures == 1 and state.independent.pieces[2].failures == 0)
+	render(4)
+	check("隔离：持续回读超差会隔离本件", tracked.isolated and not state.independent.pieces[2].isolated)
+	S.Unit.world_position = position
+	render(4)
+	check("隔离：回读恢复后本件重新显示", first.visible == true and not tracked.isolated)
+
+	local readScale = S.Unit.local_scale
+	local piecesPerFrame, scaleReads = 0, {}
+	S.Unit.local_scale = function(u, node)
+		if not scaleReads[u] then piecesPerFrame = piecesPerFrame + 1 end
+		scaleReads[u] = true
+		return readScale(u, node)
+	end
+	first.scale = { 1, 1, 2 }
+	local maxSamplePieces = 0
+	for _ = 1, 34 do
+		piecesPerFrame, scaleReads = 0, {}
+		render(1)
+		maxSamplePieces = math.max(maxSamplePieces, piecesPerFrame)
+		if tracked.isolated then break end
+	end
+	check("隔离：仅缩放异常也会在轮询后隔离本件", tracked.isolated and first.visible == false and late.visible ~= false)
+	check("隔离：常规抽样和缩放复查每帧最多一件", maxSamplePieces == 1)
+	first.scale = nil
+	render(4)
+	check("隔离：缩放恢复后本件重新显示", first.visible == true and not tracked.isolated)
+	S.Unit.local_scale = readScale
+
+	local write = S.Unit.set_local_rotation
+	S.Unit.set_local_rotation = function(u, node, value)
+		if u == first then return false end
+		return write(u, node, value)
+	end
+	render(3)
+	check("隔离：setter 返回 false 也算写入失败", tracked.isolated and first.visible == false)
+	S.Unit.set_local_rotation = write
+	render(3)
+
+	local before = state.independent
+	local newWorld = {}
+	S.Application.worlds = function() return { newWorld } end
+	state.world, state.cache.world = newWorld, newWorld
+	render(1)
+	check("生命周期：世界变化重建独立件状态", state.independent ~= before and state.independent.world == newWorld)
+	before = state.independent
+	state.avatar = partner
+	render(1)
+	check("生命周期：avatar 变化重建动作与件状态", state.independent ~= before and state.independent.avatar == partner)
+	Runtime.uninstall()
+end
+
+-- 9) 有非同轴绑定时，世界增量沿目标父链换算并保持四元数同半球。
+do
+	local avatar, armor = make_rig("unarmed"), make_rig("unarmed")
+	local s = math.sqrt(0.5)
+	local qx, qy, qz = { s, 0, 0, s }, { 0, s, 0, s }, { 0, 0, s, s }
+	avatar.locals.l_shoulder.q = qz
+	avatar.locals.l_elbow.q = qy
+	armor.locals.l_clavicle.q = qmul(armor.locals.l_clavicle.q, qy)
+	armor.names.ias_l_shoulder = armor.names.l_shoulder
+	armor.names.ias_l_elbow = armor.names.l_elbow
+	avatar.update_world()
+	armor.update_world()
+	local S, world = make_env(avatar)
+	S.World.units = function() return { avatar, armor } end
+	_G.render = nil
+	local options = { compat = Compat, armPose = true, independentIk = false, carriers = {}, log = false,
+		independentBones = { { "ias_l_shoulder", "l_shoulder" }, { "ias_l_elbow", "l_elbow" } },
+		independentRest = { { "l_clavicle", { 0, 0, 0, 1 }, qx, armor.locals.l_shoulder.p },
+			{ "l_shoulder", { 0, 0, 0, 1 }, qz, armor.locals.l_elbow.p } },
+		tunePath = "nonexistent-hd2pbx-tune.txt" }
+	local state = Runtime.install(S, options)
+	state.avatar, state.world, state.cache.world = avatar, world, world
+	_G.render()
+	local expected = qmul(qz, qx)
+	local previous = armor.locals.l_shoulder.q
+	check("世界增量：按模型静止世界旋转与实际目标父骨反算", qangle(armor.worldPoses.l_shoulder.q, expected) < 1e-6)
+	check("世界增量：非同轴子骨的约简与直接世界旋转一致",
+		qangle(armor.worldPoses.l_elbow.q, qmul(qmul(qz, qy), qz)) < 1e-6)
+	avatar.locals.l_shoulder.q = { -qz[1], -qz[2], -qz[3], -qz[4] }
+	avatar.update_world()
+	_G.render()
+	local current = armor.locals.l_shoulder.q
+	local dot = 0
+	for i = 1, 4 do dot = dot + previous[i] * current[i] end
+	check("世界增量：源符号翻转后仍保持同半球", dot > 0.99999)
+	state.options.independentRetarget = "localCopy"
+	_G.render()
+	check("世界增量：localCopy 开关恢复旧局部复制", qangle(armor.locals.l_shoulder.q, qz) < 1e-6)
+	Runtime.uninstall()
 end
 
 print(string.format("\n失败 %d 项", failures))

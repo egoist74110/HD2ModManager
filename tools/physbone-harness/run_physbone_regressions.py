@@ -28,12 +28,12 @@ TEST_DIR = ROOT / "HD2PhysBoneCompat" / "test"
 SRC_DIR = ROOT / "HD2PhysBoneCompat" / "src"
 
 # 需要外部产物/夹具的用例：它们在本仓里一直是红的，不算回归（见移植记录的"未验证"一节）。
-KNOWN_EXTERNAL = {"conform-stub-test.lua", "lift-probe-test.lua"}
+KNOWN_EXTERNAL = {"conform-stub-test.lua"}
 # 被别的用例 require 的库（不是用例本身）。`mp_harness.lua` 名字像库，其实是一整套
 # 多人局场景（它自己 os.exit），以前被错列在这里，于是那 24 项检查从来没跑过。
 LIBRARY_FILES: set[str] = set()
 # 这几个是驱动 runtime 而不是 compat 的。
-RUNTIME_TESTS = {"runtime-harness-test.lua", "log-budget-test.lua", "mp_harness.lua", "snapshot-test.lua",
+RUNTIME_TESTS = {"runtime-harness-test.lua", "log-budget-test.lua", "lift-probe-test.lua", "mp_harness.lua", "snapshot-test.lua",
                  # 读的是**源码文本**的静态护栏，必须给它 runtime 路径（给 compat 会直接判失败）
                  "skirt-guard-test.lua",
                  # 调度器：驱动的是 runtime 的 redistribute/schedule_budget 钩子
@@ -112,7 +112,7 @@ def main() -> int:
     # child can execute the Lua harness but cannot write or read logs under that ACL.
     sandbox = Path(tempfile.gettempdir()) / f"hd2pbx-regress-{uuid.uuid4().hex}"
     sandbox.mkdir()
-    env = dict(os.environ, LOCALAPPDATA=str(sandbox))
+    env = dict(os.environ, LOCALAPPDATA=str(sandbox), TEMP=str(sandbox), TMP=str(sandbox))
 
     rows: list[tuple[str, str, int, int, int]] = []
     for test in tests:

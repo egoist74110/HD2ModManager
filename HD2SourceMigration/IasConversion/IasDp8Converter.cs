@@ -1,4 +1,5 @@
 using System.Buffers.Binary;
+using System.Numerics;
 using System.Text.Json;
 using HD2ModAdaptation.PatchReconstruction;
 using HD2ModAdaptation.PatchReconstruction.UnitMesh;
@@ -15,6 +16,8 @@ public sealed record IasDp8Result(string ModDirectory, int BaseUnits, int Option
 
 public sealed class IasDp8Converter(Func<string, uint> boneHash, Func<ulong, bool, ulong> matchSlot)
 {
+	internal sealed record IndependentPiece(IReadOnlyList<string> Bones, string Slot, string? Option, string? DisabledBy = null);
+
 	private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web) { WriteIndented = true };
 	private readonly PatchTocScanner scanner = new();
 	private readonly PatchEntryPayloadReader payloadReader = new();
@@ -34,6 +37,9 @@ public sealed class IasDp8Converter(Func<string, uint> boneHash, Func<ulong, boo
 		var main = Path.Combine(sample, "main");
 		var companion = Path.Combine(sample, "companion", "HD2IndependentRig");
 		var plan = IasDp8Routes.Read(companion);
+		var hiddenOptions = plan.Groups.SelectMany(group => group.Options)
+			.SelectMany(option => option.Routes.Where(route => route.Hidden).Select(route => (route.Slot.Target, option.Folder)))
+			.ToDictionary(route => route.Target, route => route.Folder);
 		foreach (var slot in IasDp8Routes.Slots)
 		{
 			var target = matchSlot(slot.Source, slot.Helmet);
@@ -83,6 +89,7 @@ public sealed class IasDp8Converter(Func<string, uint> boneHash, Func<ulong, boo
 		var arms = IasIndependentBones.ArmRoots.SelectMany(root => IasIndependentBones.Subtree(targetRig, root)).ToHashSet();
 		var independentBones = IasIndependentBones.Collect(targetRig, IasIndependentBones.ArmRoots);
 		var packagedIndependentNames = new HashSet<string>(StringComparer.Ordinal);
+		var independentPieces = new Dictionary<string, IndependentPiece>();
 		var boneShifts = IasArmPose.ComputeBoneShifts(targetRig, profiles[sourceTorso.Published].Nodes)
 			.Concat(IasArmPose.ComputeLegShifts(targetRig, profiles[sourceTorso.Published].Nodes))
 			.Where(pair => !arms.Contains(pair.Key))
@@ -100,7 +107,7 @@ public sealed class IasDp8Converter(Func<string, uint> boneHash, Func<ulong, boo
 			var template = Path.Combine(staging, "template");
 			await WriteRoutesAsync(plan.Base, package).ConfigureAwait(false);
 			foreach (var option in plan.Groups.SelectMany(group => group.Options))
-				await WriteRoutesAsync(option.Routes, Path.Combine(package, option.Folder)).ConfigureAwait(false);
+				await WriteRoutesAsync(option.Routes, Path.Combine(package, option.Folder), option.Folder).ConfigureAwait(false);
 
 			var (dependencies, externalTextures, externalMaterials) = await ResolveMaterialsAsync(resources, usedMaterials, resolver, cancellationToken).ConfigureAwait(false);
 			await WritePatchAsync(materialsPath, IasDp8Routes.Materials + ".patch_2", template, package, dependencies, cancellationToken).ConfigureAwait(false);
@@ -118,12 +125,13 @@ public sealed class IasDp8Converter(Func<string, uint> boneHash, Func<ulong, boo
 			await File.WriteAllTextAsync(Path.Combine(output, "arm-pose.json"), SerializeArmPose(shoulderTargets, legTargets), cancellationToken).ConfigureAwait(false);
 			// 同一份数据放进 Mod 根目录：开了「手臂姿态修正」时，管理器部署会读它（HD2ModCore JointPoseData.FileName）。
 			await File.WriteAllTextAsync(Path.Combine(package, "joint-pose.json"),
-				SerializeIndependentBones(independentBones.Where(packagedIndependentNames.Contains).ToArray()), cancellationToken).ConfigureAwait(false);
+				SerializeIndependentBones(independentBones.Where(packagedIndependentNames.Contains).ToArray(),
+					targetRig, skinRig, independentPieces), cancellationToken).ConfigureAwait(false);
 			Directory.Move(package, mod);
 			return new(mod, plan.Base.Count, plan.Groups.SelectMany(group => group.Options).Sum(option => option.Routes.Count),
 				externalTextures, externalMaterials, shoulderTargets, legTargets);
 
-			async Task WriteRoutesAsync(IReadOnlyList<IasRoute> routes, string directory)
+			async Task WriteRoutesAsync(IReadOnlyList<IasRoute> routes, string directory, string? option = null)
 			{
 				foreach (var group in routes.GroupBy(route => route.Slot.Helmet))
 				{
@@ -164,6 +172,9 @@ public sealed class IasDp8Converter(Func<string, uint> boneHash, Func<ulong, boo
 						var independentNames = IasIndependentBones.SelectWeighted(targetRig, skinRig, independentBones,
 							arms, weighted, physics?.NativeParents(avatar.NameHashes.Count));
 						packagedIndependentNames.UnionWith(independentNames);
+						if (independentNames.Count > 0)
+							independentPieces.Add($"#ID[{key.FileId:x16}]", new(independentNames, route.Slot.Part, option,
+								hiddenOptions.GetValueOrDefault(key.FileId)));
 						var unitSkinRig = IasIndependentBones.Apply(avatar, targetRig, profiles[sourceTorso.Published].Nodes,
 							independentNames, boneHash);
 						var unitRig = physics?.Append(unitSkinRig, lods.Values, compact: group.Key) ?? unitSkinRig;
@@ -211,10 +222,40 @@ public sealed class IasDp8Converter(Func<string, uint> boneHash, Func<ulong, boo
 	/// 独立骨的运行时参数：改名后的骨 → avatar 上抄旋转的源骨，父骨在前。
 	/// 部署时由 HD2ModCore <c>JointPoseData</c> 转成 Lua 选项 <c>independentBones</c>。
 	/// </summary>
-	internal static string SerializeIndependentBones(IReadOnlyList<string> bones) => JsonSerializer.Serialize(new
+	internal static string SerializeIndependentBones(IReadOnlyList<string> bones, Hd2Rig? avatar = null,
+		UnitTransformInfo? model = null, IReadOnlyDictionary<string, IndependentPiece>? pieces = null) => JsonSerializer.Serialize(new
 	{
 		independentBones = bones.Select(name => new { bone = IasIndependentBones.Prefix + name, source = name }),
+		independentPieces = pieces?.ToDictionary(pair => pair.Key,
+			pair => pair.Value.Bones.Select(name => IasIndependentBones.Prefix + name).ToArray()),
+		independentPieceRoutes = pieces?.ToDictionary(pair => pair.Key,
+			pair => new { pair.Value.Slot, pair.Value.Option, pair.Value.DisabledBy }),
+		independentRest = avatar is null || model is null ? null : bones.Select(name =>
+		{
+			var bone = avatar.Find(name)!;
+			var parent = avatar.Bones[bone.ParentIndex];
+			return new
+			{
+				parent = parent.Name ?? throw new InvalidDataException($"Missing parent name for {name}."),
+				avatar = Rotation(bone.WorldBind),
+				// Use the authored unit bind axes. The mesh and its inverse binds use these same axes.
+				model = Rotation(Hd2RigReader.FromHd2RowVector(model.Matrices[bone.Index].Values)),
+				position = model.LocalTransforms[bone.Index].Position.ToArray(),
+			};
+		}),
 	}, JsonOptions);
+
+	private static float[] Rotation(Mat4 world)
+	{
+		var row = new Matrix4x4(
+			(float)world.M11, (float)world.M21, (float)world.M31, 0,
+			(float)world.M12, (float)world.M22, (float)world.M32, 0,
+			(float)world.M13, (float)world.M23, (float)world.M33, 0,
+			0, 0, 0, 1);
+		if (!Matrix4x4.Decompose(row, out _, out var rotation, out _))
+			throw new InvalidDataException("Cannot extract IAS bind rotation.");
+		return [rotation.X, rotation.Y, rotation.Z, rotation.W];
+	}
 
 	private static double[] ToArray(HD2SourceModel.Vec3 value) =>
 		[Math.Round(value.X, 5), Math.Round(value.Y, 5), Math.Round(value.Z, 5)];

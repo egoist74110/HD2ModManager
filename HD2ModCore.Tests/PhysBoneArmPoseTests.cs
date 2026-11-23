@@ -1,3 +1,4 @@
+using HD2ModCore.Domain;
 using HD2ModCore.Infrastructure;
 using Xunit;
 
@@ -82,6 +83,64 @@ public sealed class PhysBoneArmPoseTests
 			{ "independentBones": [ { "bone": "ias_l_shoulder", "source": "l_shoulder" }, { "bone": "ias_l_hand", "source": "l_hand" } ] }
 			""");
 		Assert.Equal("""independentBones = { { "ias_l_shoulder", "l_shoulder" }, { "ias_l_hand", "l_hand" } }""", options);
+	}
+
+	[Fact]
+	public void JointPoseData_InjectsRestPoseAndOnlySelectedPieces()
+	{
+		const string json = """
+			{
+			  "independentBones": [{ "bone": "ias_l_shoulder", "source": "l_shoulder" }],
+			  "independentRest": [{ "parent": "l_clavicle", "avatar": [0,0,0,1], "model": [0,0,1,0], "position": [0.125,0,0] }],
+			  "independentPieces": { "#ID[0102030405060708]": ["ias_l_shoulder"], "#ID[1111111111111111]": ["ias_l_shoulder"] },
+			  "independentPieceRoutes": { "#ID[0102030405060708]": { "slot": "LeftArm" }, "#ID[1111111111111111]": { "slot": "Torso_Armor", "option": "coat/on", "disabledBy": "coat/off" } }
+			}
+			""";
+		var withoutCoat = JointPoseData.ToLuaOptions(json, new HashSet<string> { "coat/off" });
+		var withCoat = JointPoseData.ToLuaOptions(json, new HashSet<string> { "coat/on" });
+		Assert.Contains("""independentRest = { { "l_clavicle", { 0, 0, 0, 1 }, { 0, 0, 1, 0 }, { 0.125, 0, 0 } } }""", withoutCoat);
+		Assert.Contains("""["#ID[0102030405060708]"] = { "ias_l_shoulder" }""", withoutCoat);
+		Assert.DoesNotContain("1111111111111111", withoutCoat);
+		Assert.Contains("[\"#ID[1111111111111111]\"] = \"Torso_Armor\"", withCoat);
+		Assert.DoesNotContain("1111111111111111", JointPoseData.ToLuaOptions(json, new HashSet<string> { "coat/on", "coat/off" }));
+		Assert.Throws<InvalidDataException>(() => JointPoseData.ToLuaOptions(json.Replace("[0,0,1,0]", "[0,0,0,0]")));
+		Assert.Throws<InvalidDataException>(() => JointPoseData.ToLuaOptions(json.Replace("#ID[0102030405060708]", "invalid")));
+		Assert.Throws<InvalidDataException>(() => JointPoseData.ToLuaOptions(json.Replace("[\"ias_l_shoulder\"]", "[\"ias_unknown\"]")));
+	}
+
+	[Fact]
+	public void JointPoseDeployment_FlattenedOptionsUseActiveSourceIncludes()
+	{
+		var root = Path.Combine(Path.GetTempPath(), "jointpose-flat-" + Guid.NewGuid().ToString("N"));
+		try
+		{
+			var mod = Directory.CreateDirectory(Path.Combine(root, "IAS")).FullName;
+			File.WriteAllText(Path.Combine(mod, "manifest.json"), """
+				{ "options": [{ "include": ["coat/on"], "subOptions": [{}, { "include": ["coat/off"] }] }] }
+				""");
+			File.WriteAllText(Path.Combine(mod, JointPoseData.FileName), """
+				{
+				  "independentBones": [{ "bone": "ias_l_shoulder", "source": "l_shoulder" }],
+				  "independentPieces": { "#ID[1111111111111111]": ["ias_l_shoulder"] },
+				  "independentPieceRoutes": { "#ID[1111111111111111]": { "slot": "Torso_Armor", "option": "coat/on", "disabledBy": "coat/off" } }
+				}
+				""");
+			var owner = new ModNode(ModNodeId.New(), "IAS", new("IAS", null, DateTimeOffset.UtcNow, null), [], []);
+			var on = new ModNode(ModNodeId.New(), "IAS-coat-on", new("On", null, DateTimeOffset.UtcNow, null, ModNodeKind.Option,
+				[owner.Id.Value.ToString("N")], SourcePackagePath: "option:0"), [], []);
+			var off = new ModNode(ModNodeId.New(), "IAS-coat-off", new("Off", null, DateTimeOffset.UtcNow, null, ModNodeKind.Option,
+				[on.Id.Value.ToString("N")], SourcePackagePath: "option:0/option:1"), [], []);
+			var snapshot = new LibrarySnapshot(1, DateTimeOffset.UtcNow, new[] { owner, on, off }.ToDictionary(node => node.Id), []);
+			var withCoat = LuaDeploymentService.ReadJointPoseOptions([new(owner.Id, 0), new(on.Id, 1)], snapshot, root, []);
+			var withoutCoat = LuaDeploymentService.ReadJointPoseOptions([new(owner.Id, 0), new(on.Id, 1), new(off.Id, 2)], snapshot, root, []);
+			Assert.Contains("1111111111111111", withCoat);
+			Assert.NotNull(withoutCoat);
+			Assert.DoesNotContain("1111111111111111", withoutCoat);
+		}
+		finally
+		{
+			Directory.Delete(root, recursive: true);
+		}
 	}
 
 	[Theory]

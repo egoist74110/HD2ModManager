@@ -217,6 +217,45 @@ public sealed class ApplyExecutorCleanupSafetyTests
 	}
 
 	[Fact]
+	public async Task DeactivateAsync_DeletesReadOnlyHardLinkedPatch_AndKeepsLibrarySourceReadOnly()
+	{
+		// 2026-11-23 实机：库文件只读，硬链接共用属性 ⇒ 停用时 File.Delete "拒绝访问"，10 个文件全部删不掉。
+		var root = Path.Combine(Path.GetTempPath(), "hd2coretests", Guid.NewGuid().ToString("N"));
+		var data = Path.Combine(root, "data");
+		var library = Path.Combine(root, "library");
+		Directory.CreateDirectory(data);
+		Directory.CreateDirectory(library);
+		var source = Path.Combine(library, "9ba626afa44a3aa3.patch_0");
+		var target = Path.Combine(data, "9ba626afa44a3aa3.patch_0");
+		await File.WriteAllTextAsync(source, "P");
+		Assert.True(CreateHardLinkW(target, source, IntPtr.Zero));
+		File.SetAttributes(source, File.GetAttributes(source) | FileAttributes.ReadOnly);
+		Assert.True((File.GetAttributes(target) & FileAttributes.ReadOnly) != 0);
+		await new JsonActivationStateStore().SaveAsync(data, new ActivationState(2, null, 0, DateTimeOffset.UtcNow, true,
+		[
+			new ActivationStateFileEntry(target, source, DeploymentMethod.HardLink, "9ba626afa44a3aa3", 0, 0, PatchSidecarKind.Base, null, 1, string.Empty),
+		], []));
+		try
+		{
+			var result = await new ApplyExecutor().DeactivateAsync(data);
+
+			Assert.True(result.Success, string.Join("; ", result.Issues.Select(issue => issue.Message)));
+			Assert.False(File.Exists(target));
+			Assert.True(File.Exists(source));
+			Assert.True((File.GetAttributes(source) & FileAttributes.ReadOnly) != 0);
+			Assert.Equal("P", await File.ReadAllTextAsync(source));
+		}
+		finally
+		{
+			try { File.SetAttributes(source, FileAttributes.Normal); } catch { }
+			try { Directory.Delete(root, recursive: true); } catch { }
+		}
+	}
+
+	[System.Runtime.InteropServices.DllImport("kernel32.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode, SetLastError = true)]
+	private static extern bool CreateHardLinkW(string fileName, string existingFileName, IntPtr securityAttributes);
+
+	[Fact]
 	public async Task DeactivateAsync_DoesNotDeletePatchThatIsNotRecordedInActivationState()
 	{
 		var root = Path.Combine(Path.GetTempPath(), "hd2coretests", Guid.NewGuid().ToString("N"));

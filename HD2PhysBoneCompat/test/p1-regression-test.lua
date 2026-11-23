@@ -120,7 +120,7 @@ for i = 1, #logs do
 end
 check("稳定状态不误报护栏", not trippedEarly, "")
 
--- 再把末节推出去 2 m：护栏必须抓到并停用这条链
+-- 再把末节推出去 2 m：护栏必须抓到，回到基准姿态并清空状态。
 world.tipDrift = 2.0
 for i = 1, 5 do M.update(session, 1 / 60) end
 local tripped, tripLine = false, nil
@@ -128,8 +128,7 @@ for i = 1, #logs do
 	if logs[i]:find("护栏", 1, true) then tripped, tripLine = true, logs[i] end
 end
 check("漂移 2 m 时护栏触发", tripped, tripLine or "护栏一次都没执行（旧版就是这样）")
-check("触发后该链被停用", session.sessions[1].disabled == true,
-	"disabled=" .. tostring(session.sessions[1].disabled))
+check("触发后该链下帧可恢复", not session.sessions[1].disabled and session.sessions[1].previousPosition == nil)
 
 -- ---------------------------------------------------------------------------
 -- R2：release 只用数字重建，不碰任何句柄
@@ -194,6 +193,23 @@ do
 	check("没有触发写入失败", tipSession.skippedWrites == nil or tipSession.skippedWrites == 0,
 		"skippedWrites=" .. tostring(tipSession.skippedWrites))
 	check("G4 未误报冻结", not tipSession.sessions[1].frozenLogged, "")
+
+	-- 让同件上的第二条链继续求解，第一条的 NaN/异常伸长仅重置自己。
+	local healthy = M.attach(S, {}, rig, { world = {} }).sessions[1]
+	local faulty = tipSession.sessions[1]
+	tipSession.sessions[2] = healthy
+	M.update(tipSession, 1 / 60)
+	faulty.tip.tips[1].px = 0/0
+	M.update(tipSession, 1 / 60)
+	check("尖端链 NaN 仅回退故障链", not faulty.tip.tips[1].ready and healthy.tip.tips[1].ready)
+	M.update(tipSession, 1 / 60)
+	check("故障链下一帧可以重建", faulty.tip.tips[1].ready)
+	faulty.tip.tips[1].px = faulty.tip.tips[1].px + 2 * faulty.tip.bones[1].gains.L
+	M.update(tipSession, 1 / 60)
+	check("尖端链超过 1.5 倍长度时仅回退该链", not faulty.tip.tips[1].ready and healthy.tip.tips[1].ready)
+	M.update(tipSession, 1 / 60)
+	M.update(tipSession, 0.251)
+	check("dt 超过 0.25 s 时各链回写基准，不再积分", not faulty.tip.tips[1].ready and not healthy.tip.tips[1].ready)
 end
 
 print("")

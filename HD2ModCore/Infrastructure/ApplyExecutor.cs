@@ -199,7 +199,7 @@ public sealed class ApplyExecutor : IApplyExecutor
 				continue;
 			}
 			var operation = new ApplyOperation(ApplyOperationKind.DeletePatch, file.TargetPath, null, file.ArchiveHex16, file.SourcePatchIndex, file.TargetPatchIndex, file.SidecarKind, file.NodeId);
-			var result = DeletePatch(operation);
+			var result = DeletePatch(operation, file.SourcePath);
 			operations.Add(result);
 			if (!result.Success) issues.Add(ToIssue(result, operation));
 		}
@@ -840,13 +840,25 @@ public sealed class ApplyExecutor : IApplyExecutor
 		}
 	}
 
-	private static ApplyOperationResult DeletePatch(ApplyOperation operation)
+	/// <summary>
+	/// 删除已部署的 Patch。库文件是只读的，硬链接与库文件共用属性 ⇒ 目标也是只读，直接 Delete 会"拒绝访问"
+	/// （2026-11-23 实机：停用活动配置 10 个文件全部失败）。先去只读再删；给了 <paramref name="librarySource"/>
+	/// 且它原本是只读，删完把库文件的只读设回去（去只读那一下作用在同一个文件上）。
+	/// </summary>
+	private static ApplyOperationResult DeletePatch(ApplyOperation operation, string? librarySource = null)
 	{
 		try
 		{
 			if (File.Exists(operation.TargetPath))
 			{
+				var wasReadOnly = (File.GetAttributes(operation.TargetPath) & FileAttributes.ReadOnly) != 0;
+				ClearReadOnlyAttribute(operation.TargetPath);
 				File.Delete(operation.TargetPath);
+				if (wasReadOnly && !string.IsNullOrWhiteSpace(librarySource) && File.Exists(librarySource))
+				{
+					try { File.SetAttributes(librarySource, File.GetAttributes(librarySource) | FileAttributes.ReadOnly); }
+					catch (Exception exception) when (exception is IOException or UnauthorizedAccessException) { }
+				}
 			}
 			else if (Directory.Exists(operation.TargetPath))
 			{

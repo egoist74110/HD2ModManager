@@ -100,7 +100,7 @@ local M = {}
 --        flags=0x35（yawCon + angleCon，没有 pitchCon）的长发链：pitch 区间留着初值 [0, 0]，
 --        而求解器在 axisLimits 打开时两个分量都夹 ⇒ 前后甩被锁在 0°，长发看着像一根焊丝。
 --        现在没约束的轴按"不限"处理，总偏角仍由锥兜住。
-M.VERSION = "2.1.49"
+M.VERSION = "2.1.53"
 
 --- 安装标记用的全局键。只写这一个全局，且值就是模块本身（便于外部检查是否已装）。
 local INSTALL_KEY = "__hd2physbone_runtime"
@@ -246,7 +246,8 @@ end
 local function readVector(S_, vector)
 	if vector == nil then return nil end
 	local ok, x, y, z = pcall(function() return S_.Vector3.to_elements(vector) end)
-	if ok and type(x) == "number" and x == x then return x, y, z end
+	if ok and type(x) == "number" and type(y) == "number" and type(z) == "number"
+		and math.abs(x) < math.huge and math.abs(y) < math.huge and math.abs(z) < math.huge then return x, y, z end
 	return nil
 end
 
@@ -353,7 +354,20 @@ end
 ---   ① `World.units_by_resource(world, avatar 资源路径)` —— 精确、一次调用。
 ---   ② 拿不到（老版本没这个函数 / 资源路径变了）才退回全量扫描"有动画状态机 + 带 support_mg"。
 --- 两种都要求"带 support_mg"：那是玩家 avatar 的挂点骨，人台/敌人没有。
-local function findAvatars(S_, world, units, count, supportMg, minNodes, options, cache)
+local function frame_animation_machine(runtime, unit)
+	local cache = runtime.frameAnimation
+	if not cache then
+		cache = {}
+		runtime.frameAnimation = cache
+	end
+	local animation = cache[unit]
+	if animation then return animation, 0 end
+	animation = { active = try(S.Unit.has_animation_state_machine, unit) == true }
+	cache[unit] = animation
+	return animation, 1
+end
+
+local function findAvatars(S_, world, units, count, supportMg, minNodes, options, cache, runtime)
 	local resource = options.avatarResource or DEFAULT_AVATAR_RESOURCE
 	local byResource = nil
 	if type(S_.World) == "table" and type(S_.World.units_by_resource) == "function" then
@@ -368,10 +382,9 @@ local function findAvatars(S_, world, units, count, supportMg, minNodes, options
 				seen[unit] = true
 				if Compat.unit_alive(S_, unit) then
 					local nodes = try(S_.Unit.num_scene_graph_items, unit)
-					local animated = try(S_.Unit.has_animation_state_machine, unit) == true
 					if type(nodes) == "number" and nodes >= minNodes
 						and (supportMg == nil or try(S_.Unit.has_node, unit, supportMg) == true) then
-						if requireAnim and not animated then
+						if requireAnim and not frame_animation_machine(runtime, unit).active then
 							noAnim = noAnim + 1
 						else
 							list[#list + 1] = { unit = unit, nodes = nodes }
@@ -395,9 +408,7 @@ local function findAvatars(S_, world, units, count, supportMg, minNodes, options
 		local scanned = {}
 		for index = 1, count do
 			local unit = units[index]
-			if try(S_.Unit.has_animation_state_machine, unit) == true then
-				scanned[#scanned + 1] = unit
-			end
+			if unit ~= nil and frame_animation_machine(runtime, unit).active then scanned[#scanned + 1] = unit end
 		end
 		list = collect(scanned, true)
 	end
@@ -410,7 +421,7 @@ end
 --- 一趟扫完：**所有**玩家 avatar + 候选护甲件（存活、节点数够），
 --- 每个护甲件归属到"离它最近的那个玩家"，按玩家顺序排序。
 --- 返回 nil + 原因 表示"还没准备好"（场景在变 / 找不到目标），调用方下一拍再来。
-local function discover(S_, cache, options, logger)
+local function discover(S_, cache, options, logger, runtime)
 	local world, units = pickWorld(S_, cache)
 	if world == nil or units == nil then return nil, "读不到世界或 unit 列表" end
 	local count = #units
@@ -432,7 +443,7 @@ local function discover(S_, cache, options, logger)
 	local maxAvatars = options.maxAvatars or 4
 
 	-- ① 找全所有玩家。
-	local avatars = findAvatars(S_, world, units, count, supportMg, minNodes, options, cache)
+	local avatars = findAvatars(S_, world, units, count, supportMg, minNodes, options, cache, runtime)
 	if #avatars == 0 then
 		cache.worldIndex = nil   -- 可能选错了世界，下一拍重新挑
 		return nil, string.format("没找到玩家 avatar（%d 个 unit，判据=%s%s）",
@@ -1063,7 +1074,7 @@ end
 local function tryAttach(runtime)
 	local options, cache = runtime.options, runtime.cache
 	local frame = runtime.frame
-	local world, units, avatars, armorList, reason = discover(S, cache, options, runtime.logger)
+	local world, units, avatars, armorList, reason = discover(S, cache, options, runtime.logger, runtime)
 	if world == nil or armorList == nil or avatars == nil then
 		note_wait(runtime, reason or "发现目标失败（未给出原因）")
 		return false
@@ -1631,7 +1642,7 @@ end
 ---          | "unavailable"（引擎没这两个 API ⇒ 不据此判死，退回旧行为）
 local function refresh_live_units(runtime, S_)
 	local worlds = try(S_.Application.worlds)
-	if type(worlds) ~= "table" or #worlds == 0 then return "unavailable" end
+	if type(worlds) ~= "table" then return "unavailable" end
 	local found = false
 	for index = 1, #worlds do
 		if worlds[index] == runtime.world then found = true break end
@@ -1643,6 +1654,7 @@ local function refresh_live_units(runtime, S_)
 		return "unavailable"
 	end
 	runtime.liveUnits = units
+	runtime.liveUnitsWorld = runtime.world
 	runtime.liveUnitCount = #units
 	return "ok"
 end
@@ -1722,7 +1734,7 @@ local function scanAvatars(runtime)
 	local supportMg = SUPPORT_MG_NAME
 	local options = runtime.options or {}
 	local list = findAvatars(S, world, units, #units, supportMg,
-		options.minNodes or 90, options, runtime.cache)
+		options.minNodes or 90, options, runtime.cache, runtime)
 	local found = {}
 	for index = 1, #list do
 		if Compat.unit_alive(S, list[index].unit) then found[#found + 1] = list[index].unit end
@@ -3691,7 +3703,7 @@ local function resolve_local_avatar_for_arm(runtime)
 	runtime.cache.world = world
 	runtime.world = world
 	local list = findAvatars(S, world, units, #units, SUPPORT_MG_NAME,
-		options.minNodes or 90, options, runtime.cache)
+		options.minNodes or 90, options, runtime.cache, runtime)
 	if list == nil or #list == 0 then return nil end
 
 	local chosen = list[1].unit
@@ -3700,9 +3712,10 @@ local function resolve_local_avatar_for_arm(runtime)
 		if cx ~= nil then
 			local bestD2 = math.huge
 			for index = 1, #list do
-				local p = readVector(S, try(S.Unit.world_position, list[index].unit, 1))
-				if p ~= nil then
-					local dx, dy, dz = p.x - cx, p.y - cy, p.z - cz
+				-- readVector 返回 x, y, z 三个数，不是表（2026-11-23 实机：多个 avatar 时这里 index 数字报错，驱动整个停掉）。
+				local px, py, pz = readVector(S, try(S.Unit.world_position, list[index].unit, 1))
+				if px ~= nil then
+					local dx, dy, dz = px - cx, py - cy, pz - cz
 					local d2 = dx * dx + dy * dy + dz * dz
 					if d2 < bestD2 then
 						bestD2 = d2
@@ -3723,11 +3736,10 @@ end
 --
 -- 实机证实（护甲探针 1、2）：护甲网格里和 avatar 同名的骨，画面直接用角色动画，
 -- 运行时写 avatar 或护甲上的同名骨都不认。转换器把要换转轴的骨改了名（`ias_` + 原名），
--- 它们就成了普通场景节点：绑定里是模型自己的关节位置，这里每帧把 avatar 源骨的 local
--- 旋转抄过去。位置不写——留着绑定里的模型位置，这正是"绕模型自己的关节转"。
+-- 它们就成了普通场景节点。以模型关节为转轴，按 avatar 的世界旋转增量驱动。
 --
 -- 选项 `independentBones = { { "ias_l_shoulder", "l_shoulder" }, ... }`（父骨在前）。
--- `independentIk = false` 只拷贝旋转，每根骨读 avatar 1 次 + 每件护甲写 1 次，每件护甲 1 次 update_unit。
+-- `independentRetarget = "localCopy"` 可切回局部旋转拷贝。旧 Mod 无静止姿态时也用这条路径。
 -- ---------------------------------------------------------------------------
 local INDEPENDENT_RESCAN_FRAMES = 1800
 local INDEPENDENT_LOG_FRAMES = { [1] = true, [600] = true }
@@ -3751,158 +3763,642 @@ local function format_mm(value)
 	return string.format("%.1fmm", value * 1000)
 end
 
---- 找 avatar 1 m 内、带独立骨的护甲件；同时解出 avatar 上的源骨。返回 state 或 nil。
-local function independent_scan(runtime, avatar, world, list)
-	local sources, slots = {}, {}
-	for index = 1, #list do
-		local node = safe_node(S, avatar, list[index][2])
-		if node == nil then
-			runtime.logger("[physbone][独立骨][警告] avatar 上没有源骨 %s，独立骨不驱动", tostring(list[index][2]))
-			return { avatar = avatar, pieces = {}, broken = true }
-		end
-		sources[index] = node
-		if list[index][1] == "ias_" .. list[index][2] then slots[list[index][2]] = index end
-	end
-	local arms = {}
-	for _, side in ipairs({ "l", "r" }) do
-		local sh, el, ha = slots[side .. "_shoulder"], slots[side .. "_elbow"], slots[side .. "_hand"]
-		if sh and el and ha then arms[#arms + 1] = { sh = sh, el = el, ha = ha } end
-	end
-	local units = try(S.World.units, world)
-	if type(units) ~= "table" then return nil end
-	local ax, ay, az = readVector(S, try(S.Unit.world_position, avatar, 1))
-	if ax == nil then return nil end
-	-- 先用肩骨名筛（has_node 对任何 unit 都安全），命中了才读位置。
-	-- 2.1.48 首版先对场景里每个 unit 调 world_position(unit, 1)：没有第 1 个节点的小物件会让引擎直接崩
-	-- （pcall 接不住，2026-11-23 实机进飞船加载即崩 4 次）。转换器保证一侧手臂要么整条改名要么不改，所以有任何独立骨的件一定有肩。
-	local probes = {}
-	for _, side in ipairs({ "l", "r" }) do
-		if slots[side .. "_shoulder"] then probes[#probes + 1] = list[slots[side .. "_shoulder"]][1] end
-	end
-	if #probes == 0 then probes[1] = list[1][1] end
-	local pieces, used, usedArms = {}, {}, {}
-	for index = 1, #units do
-		local unit = units[index]
-		if unit ~= avatar and Compat.unit_alive(S, unit) and #pieces < 16 then
-			local hit = false
-			for p = 1, #probes do
-				if safe_node(S, unit, probes[p]) ~= nil then hit = true break end
-			end
-			local d
-			if hit then
-				local ux, uy, uz = readVector(S, try(S.Unit.world_position, unit, 1))
-				d = vec_dist(ux, uy, uz, ax, ay, az)
-			end
-			if d ~= nil and d <= 1.0 then
-				local nodes, bones, pieceArms = {}, {}, {}
-				for b = 1, #list do
-					local node = safe_node(S, unit, list[b][1])
-					if node ~= nil then
-						nodes[b] = node
-						bones[#bones + 1] = b
-						used[b] = true
-					end
-				end
-				if #bones > 0 then
-					for a, arm in ipairs(arms) do
-						if nodes[arm.sh] and nodes[arm.el] and nodes[arm.ha] then
-							pieceArms[#pieceArms + 1] = a
-							usedArms[a] = true
-						end
-					end
-					pieces[#pieces + 1] = { unit = unit, nodes = nodes, bones = bones, arms = pieceArms, tag = unit_tag(S, unit) }
-				end
-			end
-		end
-	end
-	if next(usedArms) ~= nil and runtime.options.independentIk ~= false and runtime.options.fastWrite ~= false then
-		Compat.probe_fast_write(S, runtime.logger)
-	end
-	local sourceBones = {}
-	for b = 1, #list do
-		if used[b] then sourceBones[#sourceBones + 1] = b end
-	end
-	local tags = {}
-	for i = 1, #pieces do tags[#tags + 1] = pieces[i].tag end
-	runtime.logger("[physbone][独立骨] 找到 %d 件带独立骨的护甲（%d 根骨）：%s",
-		#pieces, #sourceBones, #tags > 0 and table.concat(tags, "、") or "无")
-	return { avatar = avatar, sources = sources, sourceBones = sourceBones, pieces = pieces, arms = arms, usedArms = usedArms, frames = 0,
-		rescanAt = (runtime.frame or 0) + INDEPENDENT_RESCAN_FRAMES }
+local function pack_animation_state(ok, ...)
+	if ok then return { n = select("#", ...), ... } end
 end
 
---- 一帧：抄旋转。返回 written, calls。
-local function independent_frame(runtime, avatar, world, list)
-	if world == nil then return 0, 0 end
-	local state = runtime.independent
-	local frame = runtime.frame or 0
-	if state ~= nil and (state.avatar ~= avatar or (state.rescanAt ~= nil and frame >= state.rescanAt)) then
-		state = nil
-	end
-	if state == nil then
-		if runtime.independentScanAt ~= nil and frame < runtime.independentScanAt then return 0, 0 end
-		-- 没找到时 300 帧后再扫，别每帧扫全世界。
-		runtime.independentScanAt = frame + 300
-		state = independent_scan(runtime, avatar, world, list)
-		if state == nil then return 0, 0 end
-		runtime.independent = state
-	end
-	if state.broken or #state.pieces == 0 then return 0, 0 end
+local function frame_animation_state(animation, avatar)
+	if animation.readState then return animation.tuple, 0 end
+	animation.readState = true
+	animation.tuple = pack_animation_state(pcall(S.Unit.animation_get_state, avatar))
+	return animation.tuple, 1
+end
 
-	local calls, written = 0, 0
-	local rotations = {}
-	for _, b in ipairs(state.sourceBones) do
-		rotations[b] = try(S.Unit.local_rotation, avatar, state.sources[b])
-		calls = calls + 1
+local function frame_animation_layer(animation, avatar)
+	if animation.readLayer then return animation.time, animation.length, 0 end
+	animation.readLayer = true
+	animation.time, animation.length = try(S.Unit.animation_layer_info, avatar, 11)
+	return animation.time, animation.length, 1
+end
+
+local function independent_action(runtime, state, avatar)
+	local animation, calls = frame_animation_machine(runtime, avatar)
+	local enabled = false
+	if not animation.active then
+		state.mode, state.alpha, state.normals = false, 0, {}
+		return 0, calls
 	end
-	local targets
-	if runtime.options.independentIk ~= false and next(state.usedArms) ~= nil then
-		targets = {}
-		for a in pairs(state.usedArms) do
-			local arm = state.arms[a]
-			local target, cost = Compat.independent_ik_target(S, avatar, state.sources[arm.el],
-				state.sources[arm.ha], rotations[arm.sh])
-			calls = calls + cost
-			targets[a] = target
+	local tuple, stateCalls = frame_animation_state(animation, avatar)
+	calls = calls + stateCalls
+	if tuple and tuple.n == 31 and type(tuple[4]) == "number" and type(tuple[11]) == "number"
+		and tuple[4] ~= 76 and tuple[4] ~= 77 then
+		local _, length, layerCalls = frame_animation_layer(animation, avatar)
+		calls = calls + layerCalls
+		if type(length) ~= "number" or length ~= length or length <= 0 or length > 1000 then
+			enabled = true
+		elseif length < 0.9 then
+			enabled = state.mode == true
 		end
 	end
-	local fastWrite = runtime.options.fastWrite ~= false and Compat._fastWrite == true
-	for index = #state.pieces, 1, -1 do
-		local piece = state.pieces[index]
-		if not Compat.unit_alive(S, piece.unit) then
-			-- 换甲 / 销毁：下一帧重扫。
-			table.remove(state.pieces, index)
-			state.rescanAt = frame + 1
-		else
-			local failed
-			for _, b in ipairs(piece.bones) do
-				if rotations[b] ~= nil and pcall(S.Unit.set_local_rotation, piece.unit, piece.nodes[b], rotations[b]) then
-					written = written + 1
-				elseif targets then
-					failed = failed or {}
-					failed[b] = true
-				end
-				calls = calls + 1
-			end
-			local updated = pcall(S.World.update_unit, world, piece.unit)
-			calls = calls + 1
-			if updated and targets then
-				local ikWrites = 0
-				for _, a in ipairs(piece.arms) do
-					local arm, target = state.arms[a], targets[a]
-					if target and (not failed or not (failed[arm.sh] or failed[arm.el] or failed[arm.ha])) then
-						local count, cost = Compat.apply_independent_ik(S, piece.unit, piece.nodes[arm.sh],
-							piece.nodes[arm.el], piece.nodes[arm.ha], target, fastWrite)
-						ikWrites, calls = ikWrites + count, calls + cost
+	state.mode = enabled
+	local blend = arm_pose_options(runtime).armBlendTime
+	local step = blend > 0 and (runtime.dt or 1/60) / blend or 1
+	local alpha = state.alpha
+	if alpha == nil then alpha = enabled and 1 or 0 end
+	state.alpha = math.max(0, math.min(1, alpha + (enabled and step or -step)))
+	return state.alpha, calls
+end
+
+local function independent_visibility(piece, show)
+	local ok, result = pcall(S.Unit.set_unit_visibility, piece.unit, show)
+	if ok and result ~= false then piece.hidden = not show end
+	return 1
+end
+
+local function independent_release(runtime, state)
+	if not state or state.world ~= runtime.world or refresh_live_units(runtime, S) ~= "ok" then return end
+	for _, piece in ipairs(state.pieces) do
+		if (piece.hidden or next(piece.stretched) ~= nil) and session_unit_live(runtime, piece.unit)
+			and Compat.unit_alive(S, piece.unit) then
+			for a in pairs(piece.stretched) do
+				local arm = state.arms[a]
+				for _, b in ipairs({ arm.el, arm.ha }) do
+					if safe_node(S, piece.unit, state.list[b][1]) == piece.nodes[b] then
+						Compat.write_independent_position(S, piece.unit, piece.nodes[b], state.rest[b][4], 1)
 					end
 				end
-				if ikWrites > 0 then
-					pcall(S.World.update_unit, world, piece.unit)
-					written, calls = written + ikWrites, calls + 1
+			end
+			if next(piece.stretched) ~= nil then try(S.World.update_unit, state.world, piece.unit) end
+			if piece.hidden then independent_visibility(piece, true) end
+		end
+	end
+end
+
+local function independent_scan(runtime, state, avatar, world, list)
+	local options = runtime.options
+	local manifest, slots = options.independentPieces, options.independentPieceSlots or {}
+	local units = runtime.liveUnitsWorld == world and runtime.liveUnits or try(S.World.units, world)
+	if type(units) ~= "table" then return false end
+	local frame = runtime.frame or 0
+	local owners = findAvatars(S, world, units, #units, SUPPORT_MG_NAME, options.minNodes or 90, options, {}, runtime)
+	local nearby = {}
+	local function add_owner(unit)
+		if Compat.unit_alive(S, unit) then nearby[#nearby + 1] = { unit = unit, at = {} } end
+	end
+	add_owner(avatar)
+	for _, owner in ipairs(owners) do
+		if owner.unit ~= avatar then add_owner(owner.unit) end
+	end
+	if #nearby == 0 then return false end
+
+	-- 件上的 ias_ 肩骨和各 avatar 的**同名源肩骨**比（不是和根节点比：肩离脚底约 1.4 m，
+	-- 队友贴身站时他的根可能比自己的根更近，件会被误判给队友而不驱动）。每个 avatar 每根肩只读一次。
+	local function owner_point(owner, b)
+		local cached = owner.at[b]
+		if cached == nil then
+			cached = false
+			local node = safe_node(S, owner.unit, list[b][2])
+			if node ~= nil then
+				local x, y, z = readVector(S, try(S.Unit.world_position, owner.unit, node))
+				if x ~= nil then cached = { x, y, z } end
+			end
+			owner.at[b] = cached
+		end
+		return cached or nil
+	end
+
+	local function owned(unit)
+		-- 必须先用 has_node 命中肩骨，禁止读取任意小物件的世界位置。
+		local probe, probeBone
+		for _, b in ipairs(state.probes) do
+			probe = safe_node(S, unit, list[b][1])
+			if probe then probeBone = b break end
+		end
+		if not probe then return false end
+		local x, y, z = readVector(S, try(S.Unit.world_position, unit, probe))
+		local closest, distance = nil, math.huge
+		for _, owner in ipairs(nearby) do
+			local p = owner_point(owner, probeBone)
+			local d = p and vec_dist(x, y, z, p[1], p[2], p[3])
+			if d and d < distance then closest, distance = owner.unit, d end
+		end
+		return closest == avatar and distance <= 2
+	end
+
+	local present, seen, claimed = {}, {}, {}
+	for _, unit in ipairs(units) do present[unit] = true end
+	for i = #state.pieces, 1, -1 do
+		local piece = state.pieces[i]
+		local alive = present[piece.unit] and Compat.unit_alive(S, piece.unit)
+		local valid = alive
+		if valid then
+			for _, b in ipairs(piece.bones) do
+				if safe_node(S, piece.unit, list[b][1]) ~= piece.nodes[b] then valid = false break end
+			end
+		end
+		if valid then
+			seen[piece.unit], claimed[piece.slot] = true, true
+		else
+			if alive and piece.hidden then independent_visibility(piece, true) end
+			table.remove(state.pieces, i)
+		end
+	end
+	local expected = {}
+	for tag in pairs(manifest or {}) do
+		local slot = slots[tag] or tag
+		local alternatives = expected[slot] or {}
+		alternatives[#alternatives + 1] = tag
+		expected[slot] = alternatives
+	end
+	local missing = {}
+	for slot in pairs(expected) do if not claimed[slot] then missing[slot] = true end end
+	if not manifest or next(missing) ~= nil then
+		for _, unit in ipairs(units) do
+			if not manifest and #state.pieces >= 16 then break end
+			if unit ~= avatar and not seen[unit] and Compat.unit_alive(S, unit) and owned(unit) then
+				local tag = unit_tag(S, unit)
+				local slot = slots[tag] or tag
+				local names = manifest and manifest[tag]
+				if not manifest or (names and missing[slot]) then
+					local nodes, bones, selected = {}, {}, {}
+					for _, name in ipairs(names or {}) do selected[name] = true end
+					local complete = true
+					for b, bone in ipairs(list) do
+						if not manifest or selected[bone[1]] then
+							local node = safe_node(S, unit, bone[1])
+							if node then
+								nodes[b], bones[#bones + 1] = node, b
+							elseif manifest then
+								complete = false
+							end
+						end
+					end
+					if complete and #bones > 0 then
+						local piece = { unit = unit, nodes = nodes, bones = bones, arms = {}, wrists = {}, parents = {},
+							tag = tag, slot = slot, previous = {}, stretched = {} }
+						for a, arm in ipairs(state.arms) do
+							if nodes[arm.sh] and nodes[arm.el] and nodes[arm.ha] then
+								piece.arms[#piece.arms + 1] = a
+							end
+						end
+						for _, b in ipairs(bones) do
+							local source = list[b][2]
+							if source == "l_hand" or source == "r_hand" then piece.wrists[#piece.wrists + 1] = b end
+							local parent = state.parents[b]
+							if parent and (not parent.bone or not nodes[parent.bone]) then
+								piece.parents[b] = safe_node(S, unit, parent.name)
+							end
+						end
+						state.pieces[#state.pieces + 1] = piece
+						missing[slot] = nil
+					end
 				end
 			end
 		end
 	end
 
+	-- 有源骨暂时读不到时，保留件缓存，待下一次扫描重新解析源节点。
+	local sourceMissing = false
+	for b, bone in ipairs(list) do
+		state.sources[b] = safe_node(S, avatar, bone[2])
+		if state.sources[b] == nil then sourceMissing = true end
+	end
+	if #state.pieces > 0 and options.fastWrite ~= false then Compat.probe_fast_write(S, runtime.logger) end
+
+	local tags, absent, total = {}, {}, 0
+	for _, piece in ipairs(state.pieces) do tags[#tags + 1] = piece.tag end
+	for slot, alternatives in pairs(expected) do
+		total = total + 1
+		if missing[slot] then
+			table.sort(alternatives)
+			absent[#absent + 1] = table.concat(alternatives, "/")
+		end
+	end
+	table.sort(absent)
+	local detail = #absent > 0 and table.concat(absent, "、") or "无"
+	runtime.logger("[physbone][独立骨] 清单 %d 件 / 找到 %d 件 / 缺 %s ｜ %s",
+		total, #tags, detail, table.concat(tags, "、"))
+	local now = runtime.lastTime or os.time()
+	if #absent > 0 then
+		state.missingSince = state.missingSince or now
+		if not state.missingLogged and now - state.missingSince > 2 then
+			state.missingLogged = true
+			runtime.logger("[physbone][独立骨][警告] 缺件超过 2 秒：%s", detail)
+		end
+	else
+		state.missingSince, state.missingLogged = nil, nil
+	end
+	state.rescanAt = frame + ((#absent > 0 or sourceMissing) and 30 or (#tags == 0 and 300 or INDEPENDENT_RESCAN_FRAMES))
+	return true
+end
+
+local function independent_state(runtime, avatar, world, list)
+	local rest = runtime.options.independentRest
+	local state = { avatar = avatar, world = world, rest = rest, list = list, pieces = {}, sources = {}, parents = {},
+		arms = {}, probes = {}, offsets = {}, frames = 0, normals = {}, rescanAt = 0 }
+	local sources = {}
+	for b, bone in ipairs(list) do sources[bone[2]] = b end
+	for b, data in ipairs(rest or {}) do
+		state.parents[b] = { name = data[1], bone = sources[data[1]] }
+		local q, identity = Compat.independent_rest_offset(data[2], data[3])
+		state.offsets[b] = { q = q, identity = identity }
+	end
+	for _, side in ipairs({ "l", "r" }) do
+		local sh, el, ha = sources[side .. "_shoulder"], sources[side .. "_elbow"], sources[side .. "_hand"]
+		if sh then state.probes[#state.probes + 1] = sh end
+		if sh and el and ha then
+			state.arms[#state.arms + 1] = { sh = sh, el = el, ha = ha }
+			if not rest then
+				state.parents[sh] = { name = side .. "_clavicle" }
+				state.parents[el] = { name = side .. "_shoulder", bone = sh }
+				state.parents[ha] = { name = side .. "_elbow", bone = el }
+			end
+		end
+	end
+	return state
+end
+
+local function independent_frame(runtime, avatar, world, list)
+	if world == nil then return 0, 0 end
+	local options = runtime.options
+	local state = runtime.independent
+	local frame = runtime.frame or 0
+	if not state or state.avatar ~= avatar or state.world ~= world then
+		independent_release(runtime, state)
+		state = independent_state(runtime, avatar, world, list)
+		runtime.independent = state
+	end
+	if frame >= state.rescanAt and not independent_scan(runtime, state, avatar, world, list) then
+		state.rescanAt = frame + 30
+	end
+	if #state.pieces == 0 then return 0, 0 end
+
+	local calls, written = 0, 0
+	local rest = options.independentRest
+	local tune = tune_values(runtime)
+	local mode = (tune.text and tune.text.independentRetarget) or options.independentRetarget
+	local worldDelta = rest ~= nil and mode ~= "localCopy"
+	local fastWrite = options.fastWrite ~= false and Compat._fastWrite == true
+	local alpha = 0
+	if options.independentIk ~= false and #state.arms > 0 then alpha, calls = independent_action(runtime, state, avatar) end
+
+	local localCache, worldCache, targets, used = {}, {}, {}, {}
+	local function read_rotation(unit, node, read)
+		if not node then return nil end
+		local raw = try(read, unit, node)
+		calls = calls + 1
+		if raw == nil then return nil end
+		calls = calls + 1
+		local ok, x, y, z, w = pcall(S.Quaternion.to_elements, raw)
+		if ok then return Compat.independent_quaternion(x, y, z, w), raw end
+	end
+	local function source_rotation(cache, node, read)
+		if not node then return nil end
+		local result = cache[node]
+		if result == nil then
+			local q, raw = read_rotation(avatar, node, read)
+			result = q and { q = q, raw = raw } or false
+			cache[node] = result
+		end
+		return result or nil
+	end
+	local function set_rotation(piece, b, q, raw)
+		local stable = Compat.independent_hemisphere(q, piece.previous[b])
+		if raw and stable == q then
+			local ok, result = pcall(S.Unit.set_local_rotation, piece.unit, piece.nodes[b], raw)
+			calls = calls + 1
+			return ok and result ~= false, stable
+		end
+		local ok, cost = Compat.write_independent_rotation(S, piece.unit, piece.nodes[b], stable, fastWrite)
+		calls = calls + cost
+		return ok, stable
+	end
+	local function update(piece)
+		local ok, result = pcall(S.World.update_unit, world, piece.unit)
+		calls = calls + 1
+		return ok and result ~= false
+	end
+	-- 一轮只在同一帧抽一件。大件分几帧查缩放，最后一帧同时回读手腕。
+	if not state.sampleRound or (not state.samplePiece and state.frames >= state.sampleRound + 30) then
+		local bones = 0
+		for _, piece in ipairs(state.pieces) do bones = bones + #piece.bones end
+		state.sampleChunk = math.max(6, math.ceil(bones / math.max(1, 30 - #state.pieces)))
+		state.sampleRound, state.samplePiece, state.sampleBone = state.frames, 1, 1
+	end
+	local routinePiece = state.pieces[state.samplePiece or 0]
+	local sampledPiece
+	if not routinePiece or state.frames % 2 == 0 then
+		for _, piece in ipairs(state.pieces) do
+			if piece.recheck and session_unit_live(runtime, piece.unit)
+				and (not sampledPiece or piece.lastSample < sampledPiece.lastSample) then
+				sampledPiece = piece
+			end
+		end
+	end
+	local retry = sampledPiece ~= nil
+	sampledPiece = sampledPiece or routinePiece
+	local sampleFirst, sampleLast, sampleWrist
+	if retry then
+		sampleFirst = sampledPiece.scaleFault
+		sampleLast, sampleWrist = sampleFirst, true
+	elseif routinePiece then
+		sampleFirst = state.sampleBone
+		sampleLast = math.min(sampleFirst + state.sampleChunk - 1, #routinePiece.bones)
+		sampleWrist = sampleLast == #routinePiece.bones
+		if sampleWrist then
+			state.samplePiece, state.sampleBone = state.samplePiece + 1, 1
+		else
+			state.sampleBone = sampleLast + 1
+		end
+	end
+	if not state.pieces[state.samplePiece or 0] then state.samplePiece = nil end
+
+	local function pose_piece(piece, copyOnly, allowIk, sampled)
+		local healthy, count = true, 0
+		local rotations, rawRotations, expected = {}, {}, {}
+		local parentRotations, parentPoses, poseRoots = {}, {}, {}
+		local useWorld = worldDelta and not copyOnly
+		local useFkIk = rest ~= nil
+		for _, a in ipairs(piece.arms) do
+			local arm = state.arms[a]
+			if not rest or state.parents[arm.el].bone ~= arm.sh or state.parents[arm.ha].bone ~= arm.el then
+				useFkIk = false
+			end
+		end
+		local solveIk = allowIk and alpha > 0
+		local function require_root_pose(b)
+			for _ = 1, #piece.bones do
+				local parent = state.parents[b]
+				if not (parent and parent.bone and piece.nodes[parent.bone]) then
+					local node = piece.parents[b]
+					if node then poseRoots[node] = true end
+					return
+				end
+				b = parent.bone
+			end
+		end
+		if solveIk and useFkIk then
+			for _, a in ipairs(piece.arms) do require_root_pose(state.arms[a].sh) end
+		end
+		if sampled then
+			for _, b in ipairs(piece.wrists) do require_root_pose(b) end
+		end
+		local function model_parent_pose(node)
+			if node and parentPoses[node] == nil then
+				local cost
+				parentPoses[node], cost = Compat.independent_world_pose(S, piece.unit, node)
+				calls = calls + cost
+				parentPoses[node] = parentPoses[node] or false
+			end
+			return node and parentPoses[node] or nil
+		end
+		local function target_for(a)
+			local target = targets[a]
+			if target == nil then
+				local arm, cost = state.arms[a]
+				target, cost = Compat.independent_ik_target(S, avatar, state.sources[arm.sh],
+					state.sources[arm.el], state.sources[arm.ha], state.normals[a])
+				calls = calls + cost
+				if target then state.normals[a] = target.normal end
+				targets[a] = target or false
+			end
+			return target
+		end
+		local function model_parent_rotation(node)
+			if not node then return nil end
+			if parentRotations[node] == nil then
+				if poseRoots[node] then
+					local pose = model_parent_pose(node)
+					parentRotations[node] = pose and pose.q or false
+				else
+					parentRotations[node] = read_rotation(piece.unit, node, S.Unit.world_rotation) or false
+				end
+			end
+			return parentRotations[node] or nil
+		end
+
+		for _, b in ipairs(piece.bones) do
+			used[b] = true
+			local q, raw
+			local parent = state.parents[b]
+			if useWorld then
+				local offset = state.offsets[b]
+				if parent.bone and piece.nodes[parent.bone] then
+					-- Wtarget = Wsource * offset. 父骨的源世界旋转在求局部量时约掉，
+					-- 所以内部节点只需 inv(offsetParent) * sourceLocal * offset。
+					local source = source_rotation(localCache, state.sources[b], S.Unit.local_rotation)
+					local parentOffset = state.offsets[parent.bone]
+					if source and parentOffset.q and offset.q then
+						if offset.identity and parentOffset.identity then
+							q, raw = source.q, source.raw
+						else
+							q = Compat.independent_world_delta(source.q, offset.q, parentOffset.q)
+						end
+					end
+				else
+					local source = source_rotation(worldCache, state.sources[b], S.Unit.world_rotation)
+					local parentQ = model_parent_rotation(piece.parents[b])
+					if source and parentQ and offset.q then q = Compat.independent_world_delta(source.q, offset.q, parentQ) end
+				end
+			else
+				local source = source_rotation(localCache, state.sources[b], S.Unit.local_rotation)
+				if source then q, raw = source.q, source.raw end
+			end
+			if not q then healthy = false end
+			rotations[b], rawRotations[b] = q, raw
+		end
+
+		local factors, lengths, fk = {}, {}, {}
+		local function bone_pose(b)
+			if fk[b] ~= nil then return fk[b] or nil end
+			fk[b] = false
+			local parent, q = state.parents[b], rotations[b]
+			if not parent or not q then return nil end
+			local parentPose
+			if parent.bone and piece.nodes[parent.bone] then
+				parentPose = bone_pose(parent.bone)
+			else
+				parentPose = model_parent_pose(piece.parents[b])
+			end
+			if not parentPose then return nil end
+			local position = rest and rest[b][4]
+			if not position then
+				local x, y, z = readVector(S, try(S.Unit.local_position, piece.unit, piece.nodes[b]))
+				calls = calls + (x ~= nil and 2 or 1)
+				if x ~= nil then position = { x, y, z } end
+			end
+			if not position then return nil end
+			local factor = lengths[b]
+			if factor then position = { position[1]*factor, position[2]*factor, position[3]*factor } end
+			fk[b] = Compat.independent_fk(parentPose, q, position)
+			return fk[b]
+		end
+
+		if healthy and solveIk and useFkIk then
+			for _, a in ipairs(piece.arms) do
+				local arm, target = state.arms[a], target_for(a)
+				if target then
+					local sh, el, ha = arm.sh, arm.el, arm.ha
+					local shPose, elPose, haPose = bone_pose(sh), bone_pose(el), bone_pose(ha)
+					if shPose and elPose and haPose then
+						local rot, factor = Compat.solve_independent_fk_ik(shPose, elPose, haPose, target, alpha,
+							{ rotations[sh], rotations[el], rotations[ha] },
+							{ piece.previous[sh], piece.previous[el], piece.previous[ha] })
+						if rot then
+							rotations[sh], rotations[el], rotations[ha] = rot[1], rot[2], rot[3]
+							rawRotations[sh], rawRotations[el], rawRotations[ha] = nil, nil, nil
+							factors[a], lengths[el], lengths[ha] = factor, factor, factor
+							fk = {}
+						end
+					else
+						healthy = false
+					end
+				end
+			end
+		end
+
+		-- 求解只使用绑定长度。拉伸倍率没变时，沿用已经写入的平移。
+		for _, a in ipairs(piece.arms) do
+			local arm = state.arms[a]
+			local factor, previous = factors[a] or 1, piece.stretched[a] or 1
+			if factor ~= previous then
+				piece.stretched[a] = true -- 部分写入失败也必须在兜底时恢复两段。
+				local updated = true
+				for _, b in ipairs({ arm.el, arm.ha }) do
+					local ok, cost = Compat.write_independent_position(S, piece.unit, piece.nodes[b], rest[b][4], factor)
+					calls = calls + cost
+					updated = updated and ok
+				end
+				if updated then piece.stretched[a] = factor > 1 and factor or nil else healthy = false end
+			end
+		end
+		for _, b in ipairs(piece.bones) do
+			local q = rotations[b]
+			if q then
+				local ok, stable = set_rotation(piece, b, q, rawRotations[b])
+				if ok then rotations[b], count = stable, count + 1 else healthy = false end
+			end
+		end
+		if not update(piece) then healthy = false end
+		if healthy and solveIk and not useFkIk then
+			local changed = false
+			for _, a in ipairs(piece.arms) do
+				local arm = state.arms[a]
+				local target = target_for(a)
+				if target then
+					local sh, el, ha = arm.sh, arm.el, arm.ha
+					local nodes = { piece.nodes[sh], piece.nodes[el], piece.nodes[ha] }
+					local positions = rest and { rest[sh][4], rest[el][4], rest[ha][4] }
+					local writes, cost, rot, stretched, hand = Compat.apply_independent_ik(S, piece.unit, nodes,
+						target, fastWrite, alpha, { rotations[sh], rotations[el], rotations[ha] },
+						{ piece.previous[sh], piece.previous[el], piece.previous[ha] }, positions, sampled)
+					calls = calls + cost
+					if stretched then piece.stretched[a] = true end
+					if writes < 0 then
+						healthy = false
+						break
+					elseif writes > 0 then
+						changed, count = true, count + writes
+						rotations[sh], rotations[el], rotations[ha] = rot[1], rot[2], rot[3]
+						expected[ha] = hand
+					end
+				end
+			end
+			if changed and not update(piece) then healthy = false end
+		end
+		if sampled and healthy then
+			for _, b in ipairs(piece.wrists) do
+				if not expected[b] then
+					local pose = bone_pose(b)
+					if pose then expected[b] = pose.p elseif rest then healthy = false end
+				end
+			end
+			for b, position in pairs(expected) do
+				local x, y, z = readVector(S, try(S.Unit.world_position, piece.unit, piece.nodes[b]))
+				calls = calls + (x ~= nil and 2 or 1)
+				local d = vec_dist(x, y, z, position[1], position[2], position[3])
+				if not (d and d <= 0.02) then healthy = false end
+			end
+		end
+		if healthy then piece.previous = rotations end
+		return healthy, count
+	end
+
+	local function check_scale(piece, first, last)
+		for index = first, last do
+			local b = piece.bones[index]
+			local sx, sy, sz = readVector(S, try(S.Unit.local_scale, piece.unit, piece.nodes[b]))
+			calls = calls + (sx ~= nil and 2 or 1)
+			if sx == nil or not (math.abs(sx-1) <= 0.0001 and math.abs(sy-1) <= 0.0001
+				and math.abs(sz-1) <= 0.0001) then return index end
+		end
+	end
+
+	for index = #state.pieces, 1, -1 do
+		local piece = state.pieces[index]
+		if not session_unit_live(runtime, piece.unit) or not Compat.unit_alive(S, piece.unit) then
+			table.remove(state.pieces, index)
+			state.samplePiece, state.sampleRound = nil, nil
+			state.rescanAt = frame + 1
+		else
+			local sampled = piece == sampledPiece
+			if sampled then
+				if sampleFirst then
+					local fault = check_scale(piece, sampleFirst, sampleLast)
+					if fault or (piece.scaleFault and piece.scaleFault >= sampleFirst and piece.scaleFault <= sampleLast) then
+						piece.scaleFault = fault
+					end
+				end
+				piece.lastSample = state.frames
+			end
+			local scaleOk = piece.scaleFault == nil
+			local healthy, count = pose_piece(piece, false,
+				scaleOk and not piece.isolated and ((sampled and sampleWrist) or not piece.recheck),
+				sampled and sampleWrist and scaleOk)
+			if not healthy and scaleOk then
+				piece.scaleFault = check_scale(piece, 1, #piece.bones)
+				scaleOk = piece.scaleFault == nil
+			end
+			healthy = healthy and scaleOk
+			local checked = sampled and (sampleWrist or not scaleOk)
+			if checked or not scaleOk then
+				piece.recheck = not healthy or piece.isolated
+				piece.lastSample = piece.lastSample or state.frames
+			end
+			written = written + count
+			if healthy and (checked or not piece.recheck) then
+				piece.failures = 0
+				piece.successes = (piece.successes or 0) + 1
+				if piece.isolated and piece.successes >= 3 then
+					piece.isolated = false
+					piece.recheck = nil
+					runtime.logger("[physbone][独立骨] 恢复 %s", piece.tag)
+				end
+			elseif not healthy and (scaleOk or checked) then
+				piece.successes = 0
+				piece.failures = (piece.failures or 0) + 1
+				if not piece.isolated and piece.failures >= 3 then
+					piece.isolated = true
+					runtime.logger("[physbone][独立骨][警告] 隔离 %s", piece.tag)
+				end
+			end
+			if piece.isolated or not healthy or (piece.recheck and not checked) then
+				local fallback = healthy
+				if worldDelta or not healthy then
+					local fallbackCount
+					fallback, fallbackCount = pose_piece(piece, true, false, sampled and sampleWrist and scaleOk)
+					written = written + fallbackCount
+				end
+				fallback = fallback and scaleOk
+				if piece.isolated and not fallback and not piece.hidden then calls = calls + independent_visibility(piece, false) end
+			end
+			if not piece.isolated and healthy and piece.hidden then calls = calls + independent_visibility(piece, true) end
+		end
+	end
+
+	local sourceBones = {}
+	for b in ipairs(list) do if used[b] then sourceBones[#sourceBones + 1] = b end end
+	state.sourceBones = sourceBones
 	state.frames = state.frames + 1
 	if INDEPENDENT_LOG_FRAMES[state.frames] == true and #state.pieces > 0 then
 		-- 肩和手在模型上和 avatar 上各差多少（左右各报一次；没有就跳过）。
@@ -3923,14 +4419,95 @@ local function independent_frame(runtime, avatar, world, list)
 	return written, calls
 end
 
+local function sample_action_state(runtime, avatar)
+	local tune = tune_values(runtime)
+	local enabled = tune.stateLog
+	local cache = runtime.actionStateLog
+	if enabled == nil and tune.text ~= nil then
+		if tune.text.stateLog == "false" then enabled = 0 end
+		if tune.text.stateLog == "true" then enabled = 1 end
+	end
+	if enabled == 0 or (enabled == nil and (runtime.options or {}).stateLog ~= true) then
+		if cache ~= nil then
+			cache.avatar, cache.world, cache.previous = nil, nil, nil
+		end
+		return
+	end
+
+	local log = runtime.logger
+	local second = os.time()
+	if cache == nil then
+		cache = { second = second, lines = 0, skipped = 0, starts = {} }
+		runtime.actionStateLog = cache
+	elseif cache.second ~= second then
+		if cache.skipped > 0 then log("[physbone][动作状态] 省略 %d 次变化", cache.skipped) end
+		cache.second, cache.lines, cache.skipped = second, 0, 0
+	end
+
+	local unit = S.Unit
+	if avatar == nil or try(unit.alive, avatar) ~= true then avatar = nil end
+	local world = runtime.world
+	if cache.avatar ~= avatar or cache.world ~= world then
+		cache.avatar, cache.world, cache.previous = avatar, world, nil
+		if avatar ~= nil then cache.starts[#cache.starts + 1] = tostring(avatar) end
+	end
+	-- 每个自然秒留一行给上一秒的省略汇总；换人通知也占本秒额度。
+	while cache.lines < 19 and #cache.starts > 0 do
+		log("[physbone][动作状态] 开始采集 avatar=%s", table.remove(cache.starts, 1))
+		cache.lines = cache.lines + 1
+	end
+
+	-- 缺少状态机时两个动画读取接口都不能进；pcall 无法拦住原生崩溃。
+	if avatar == nil then return end
+	local animation = frame_animation_machine(runtime, avatar)
+	if not animation.active then return end
+	local current = frame_animation_state(animation, avatar)
+	if current == nil then return end
+	local previous = cache.previous
+	local changed = previous == nil or previous.n ~= current.n
+	if not changed then
+		for index = 1, current.n do
+			if previous[index] ~= current[index] then changed = true; break end
+		end
+	end
+	cache.previous = current
+	if not changed then return end
+	if cache.lines >= 19 then
+		cache.skipped = cache.skipped + 1
+		return
+	end
+
+	local layers, values = {}, {}
+	if previous ~= nil then
+		for index = 1, math.max(previous.n, current.n) do
+			if previous[index] ~= current[index] or (index <= previous.n) ~= (index <= current.n) then
+				layers[#layers + 1] = string.format("%d:%s→%s", index - 1,
+					tostring(previous[index]), tostring(current[index]))
+			end
+		end
+	end
+	for index = 1, current.n do values[index] = tostring(current[index]) end
+	local time, length = frame_animation_layer(animation, avatar)
+	local clip = "?"
+	if type(time) == "number" and time >= 0 and time < math.huge
+		and type(length) == "number" and length > 0 and length < math.huge then
+		clip = string.format("%.3fs/t=%.2fs", length, time)
+	end
+	log("[physbone][动作状态] n=%d 变化层=%s L11片段=%s 全部=[%s]", current.n,
+		previous == nil and "初始" or table.concat(layers, ","), clip, table.concat(values, ","))
+	cache.lines = cache.lines + 1
+end
+
 local function apply_arm_pose_frame(runtime)
 	if type(Compat.apply_arm_pose) ~= "function" then return 0, 0 end
 	local unit = runtime.avatar
 	if unit == nil then
 		unit = resolve_local_avatar_for_arm(runtime)
 	end
+	sample_action_state(runtime, unit)
 	if unit == nil then
 		runtime.armState = nil
+		if runtime.independent then runtime.independent.alpha, runtime.independent.mode = nil, nil end
 		runtime.armCalls = 0
 		-- 一次性：开着却一直找不到玩家角色（实机排查"到底跑没跑"用）。
 		runtime.armMissFrames = (runtime.armMissFrames or 0) + 1
@@ -3945,6 +4522,10 @@ local function apply_arm_pose_frame(runtime)
 		runtime.avatarTag = nil
 		runtime.avatars = nil
 		runtime.armState = nil
+		runtime.armScanAt = nil
+		if runtime.independent then
+			runtime.independent.alpha, runtime.independent.mode, runtime.independent.normals = nil, nil, {}
+		end
 		runtime.armCalls = 0
 		return 0, 0
 	end
@@ -4035,7 +4616,8 @@ local function drive(runtime)
 			runtime.avatars = nil
 			runtime.avatar = nil
 			runtime.armState = nil
-			runtime.liveUnits = nil
+			runtime.independent, runtime.actionStateLog, runtime.armScanAt = nil, nil, nil
+			runtime.liveUnits, runtime.physicsOwnerRoots = nil, nil
 			runtime.reArm = 1
 			runtime.rearmAt = frame + 1
 		elseif live == "ok" and runtime.avatars ~= nil and #runtime.avatars > 0 then
@@ -4069,6 +4651,7 @@ local function drive(runtime)
 			runtime.avatar = nil
 			runtime.avatarTag = nil
 			runtime.armState = nil
+			runtime.armScanAt = nil
 		end
 	end
 
@@ -4142,6 +4725,7 @@ local function drive(runtime)
 	-- 因为只有那时该 unit 是覆盖出来的自定义件；单独开任意一个都不崩）。
 	-- 所以这里**不逐条判定**，整组丢掉、按"场景已变"重挂。宁可闪一下，也不去碰可能已死的句柄。
 	local gap = runtime.rawDelta
+	local resetPhysics = gap ~= nil and gap > 0.25
 	if gap ~= nil and gap > (options.loadGapSeconds or 0.5)
 		and runtime.sessions ~= nil and #runtime.sessions > 0 then
 		logger("[physbone][LIFECYCLE] 检测到加载空档 %.2f s ⇒ 不查存活，直接整组重挂（%d 个会话）",
@@ -4370,6 +4954,9 @@ local function drive(runtime)
 	local written, skippedSame, engineCalls, staticChains = 0, 0, 0, 0
 	local attempted = 0
 	local dt = runtime.dt or (1 / 60)
+	local ownerStates = {}
+	local ownerRoots = runtime.physicsOwnerRoots or {}
+	runtime.physicsOwnerRoots = {}
 	phase(runtime, "写骨 前（" .. tostring(#runtime.sessions) .. " 个会话）")
 	for index = 1, #runtime.sessions do
 		local session = runtime.sessions[index]
@@ -4381,6 +4968,24 @@ local function drive(runtime)
 		local pending = (session.pendingDt or 0) + dt
 		local order = session.ownerOrder or 99
 		local due = true
+		local owner = session.owner
+		local ownerState = owner and ownerStates[owner]
+		if owner ~= nil and ownerState == nil and session_unit_live(runtime, owner) then
+			local active = Compat.unit_alive(S, owner) and frame_animation_machine(runtime, owner).active
+			ownerState = { active = active }
+			ownerStates[owner] = ownerState
+			if active then
+				local x, y, z = readVector(S, try(S.Unit.world_position, owner, 1))
+				if x ~= nil then
+					local previous = ownerRoots[owner]
+					ownerState.teleport = previous ~= nil and vec_dist(x, y, z, previous[1], previous[2], previous[3]) > 2
+					runtime.physicsOwnerRoots[owner] = { x, y, z }
+				end
+			end
+		end
+		local frozen = owner ~= nil and (ownerState == nil or not ownerState.active)
+		if frozen then due, pending, session.resetPhysics = false, 0, true end
+		if resetPhysics or (ownerState and ownerState.teleport) then session.resetPhysics = true end
 		if order > 1 then
 			local stride = owner_distance_sq(runtime, session) <= nearLimit2 and nearStride or farStride
 			-- 用**会话下标**错峰，而不是玩家序号：同一个玩家的若干护甲件如果同帧，
@@ -4414,7 +5019,9 @@ local function drive(runtime)
 		else
 			session.pendingDt = 0
 			attempted = attempted + 1
-			local ok, out = pcall(Compat.update, session, pending)
+			local operation = session.resetPhysics and Compat.reset_physics or Compat.update
+			local ok, out = pcall(operation, session, pending)
+			session.resetPhysics = nil
 			if ok then
 				if type(out) == "number" then written = written + out end
 			elseif not session.updateErrorLogged then
@@ -4653,6 +5260,7 @@ function M.install(stingray, options)
 		if driver.installed then
 			driver.frame = driver.frame + 1
 			local ok, err = pcall(drive, driver)
+			driver.frameAnimation = nil
 			if not ok and not driver.driveErrorLogged then
 				driver.driveErrorLogged = true
 				driver.logger("[physbone][错误] 驱动失败：%s", tostring(err))
@@ -4683,6 +5291,7 @@ function M.uninstall()
 	local runtime = state
 	if runtime == nil then return false end
 	runtime.installed = false
+	independent_release(runtime, runtime.independent)
 	for _, session in ipairs(runtime.sessions or {}) do
 		pcall(Compat.release, session)
 	end
