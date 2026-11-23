@@ -134,7 +134,20 @@
 - 有保护期的组调 `finish_guard`（R:5811）。没有下落模拟时，等到 until_time 才收尾：能用活体 settled 姿势的就用（`c.up` 加 `|axis.z| < .7` 判定"真的躺平了"），否则用 `fallen_rotation` 当刚体倒下。
 - 每个副本：校验副本和原件都在，且 hash 相同。通过的话，`set(root, fixed_core)` + `W.update_unit`，副本可见、原件隐藏；不通过就隐藏副本、恢复原件。
 - `skip[original] = not guard or guard.motion ~= nil`：原件从护甲名单里剔除。
-- 正常流程里**没有** `destroy_unit`（只在回滚时用）。副本最终怎么销毁、切世界时怎么清理，不在这一段（不确定，要看 R:6000 以后、R:6456、R:7162 的 `native_handoff_clean`）。
+- 正常流程里**没有** `destroy_unit`（只在回滚时用，R:5939）。
+- **已查实（第二轮侦察）：IAS 正常情况下从不销毁尸体副本**，也从不清 `clones[...]`。切世界时，`F.filter` 只处理 `r.world == wid` 的副本（R:5965、5973），其他世界的副本只是跳过，不销毁。复活也没有专门处理，owner 找不到时副本只会被跳过或隐藏（R:5993–5994）。副本数量靠 `created < 256` 封顶（R:5663），生成失败也计数。
+  - `ias-runtime-lifecycle-map-20261123.md` 写的"清理时 destroy_unit 副本（5936–5940）"指的是**失败回滚**路径，不是正常清理，那份文档写错了。
+- `native_handoff_clean`（R:5538–5544）只检查 frozen / clones / pending 是否为空，或是否和 scope 相关；`reseed`（R:6454–6456）要求它返回 true。R:7160–7162 是 `finish` 的 scope 判定。
+
+### 6.8 原生部分（查不到实现）
+- `freeze_corpse_physics(profile_id, instance_id, avatar_id)` 的绑定在 R:643，唯一调用点 R:5923，可用性检查在 R:5463。
+- 已有反编译材料里**没有它的实现**。查过的有：`tmp/ias-lab/decomp/` 的 report-*.md、`native_bridge/_strings.txt`、`_functions.txt`、bin 符号；e10 的 Ghidra 导出；e5/e8/e9/e11/e12 的产物。工作区里也没有 `HD2NativeHandoffFull_w64_release.dll`。
+- 唯一线索是 `decomp/native_bridge/_strings.txt:1887` 的字符串 "Scene corpse freeze"，附近还有 "Scene corpse witness/network"、"Scene retirement state"、"Scene physics"。
+- 从调用位置推测，它的作用是**让这具尸体那套件的物理停止演算或写回**，免得原件的物理覆盖副本的姿势，同时省开销。这只是推测，没有代码证据。
+- `corpse_freeze_context(frame, state)`：`F.begin` 传 (tick, 0)（R:5547），`control_context` 传 (tick, 1|2)（R:5580）。判据（R:5555–5586）：只有一个 World；场景里同时有 democracy-officer（15678e360612b805）和 ship-display（5b390845a8e3fc29）；Avatar World 里有存活的 ship avatar。不满足时返回 2（锁定）。
+- `shared_next_incarnation / forget_shared_avatar / set_avatar_incarnation`（R:630–632，R:6974）：只能看到 Lua 侧怎么用，原生做了什么不知道。
+- 白名单（`C:\Users\q1243\Downloads\hd2pbx_api.txt`）：spawn_unit、unlink_unit、update_unit、destroy_unit、name_hash、scene_graph_link/parent、set_local_*、set_unit_visibility、world_pose、has_animation_state_machine 都在里面；`Unit.num_actors` 不在（IAS 本来就把它当可选项，R:5672）。死亡时钟用到的 Network/GameSession 不在白名单，但用户已经同意 IAS 用的 API 可以照用，身份判定也已经在用了。
+- 物理类别（`set_avatar_physics_class`，0/1/2/3/4）在原生求解器里改变什么，没有任何文档。我们目前对所有类别一视同仁。
 
 ### 6.6 同一个 avatar 的多条命（R:5190–5246）
 - `M.observe(avatars, api, evidence)`：对每个 instance_slot 取 `{epoch, world, network, kind}`，其中任一项变了，就调 `api.forget_shared_avatar(id, old.token)`；新出现的用 `api.shared_next_incarnation()` 分配 token。
