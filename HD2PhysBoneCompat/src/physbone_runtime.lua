@@ -2583,6 +2583,10 @@ Roster.known, Roster.session, Roster.epoch = {}, nil, 0
 Roster.nextPoll, Roster.ownedCursor, Roster.cursor = 0, 0, 0
 Roster.extendedCursor, Roster.nearCursor, Roster.observedHigh = 4096, 0, 4095
 Roster.remoteCursors, Roster.poll = {}, 0
+-- E12f-C2：尸体副本（CorpseFreeze，定义在 physics_rig 之前的独立段）。这里只放两个表字段，
+-- 让 Roster 在自己的段里就能调到它，而不必在文件顶部再加局部变量。
+Roster.freeze = {}
+Roster.corpsePins = {}   -- IAS `__hd2ir_corpse_slots`（R:5436）：副本 / 原件 / 世界 / 主人的实例槽，槽位表清理时不删
 
 --- IAS profile 表：一件转换后的护甲 = 一个 profile，哈希 = 16 位十六进制资源 id（IAS 行 757–844，启动时装载一次）。
 --- 转换器写出 `profileHashes`（独立骨件与物理件都在内）；retarget 与物理共用这一份名单。
@@ -2612,7 +2616,8 @@ function Roster.instanceSlot(unit, frame)
 	if frame % 120 == 0 and Roster.slotPruned ~= frame then
 		Roster.slotPruned = frame
 		for key, last in pairs(Roster.slotSeen) do
-			if frame - last > 2 then Roster.slots[key], Roster.slotSeen[key] = nil, nil end
+			-- IAS R:930：尸体副本相关的槽位（Roster.corpsePins）不清，否则副本的身份会被"换发"。
+			if frame - last > 2 and not Roster.corpsePins[Roster.slots[key]] then Roster.slots[key], Roster.slotSeen[key] = nil, nil end
 		end
 	end
 	local slot = Roster.slots[unit]
@@ -3066,11 +3071,53 @@ function Roster.dead(unit)
 	return state ~= nil and state.dead == true
 end
 
+--- IAS `dead_age`（R:5182-5185）：死亡角色（role 3）且记过 dead_since 才有；返回距今秒数。
+function Roster.deadAge(unit)
+	local state = Roster.states[unit]
+	if state and state.role == 3 and state.deadSince then return math.max(0, os.clock() - state.deadSince) end
+end
+
+--- IAS `shared_life`（R:5097-5119）：本人 / 队友"当前这一条命"的证据；证据不全就什么都不返回。
+--- 每次调用都重查网络（IAS 同样每回调重查），所以只在尸体副本开启时才被调用。
+function Roster.sharedLife(unit, world, frame)
+	local state = Roster.states[unit]
+	local Net, GS = S.Network, S.GameSession
+	if not state or (state.role ~= 1 and state.role ~= 2) or state.dead or not state.network or not Roster.session
+		or (world ~= nil and state.world ~= world) or try(S.Unit.alive, unit) ~= true then return end
+	if state.role == 2 and (state.friendly ~= true or try(S.Unit.has_animation_state_machine, unit) ~= true) then return end
+	if try(Net.game_session) ~= Roster.session or try(GS.in_session, Roster.session) ~= true
+		or try(GS.game_object_exists, Roster.session, state.network) ~= true then return end
+	local health = try(GS.game_object_field, Roster.session, state.network, "health")
+	if type(health) ~= "number" or health ~= health or health <= 0 or health >= 1e9 then return end
+	return { epoch = Roster.epoch, network = state.network, world = Roster.instanceSlot(world, frame or 0),
+		kind = state.role == 2 and "friendly" or nil }
+end
+
+--- IAS `dead_life`（R:5121-5135）：死者自己的一条命（网络 id 被复用 / 单位复活都不继承）。
+--- IAS 的 Lua 侧没有任何调用者（只导出，给原生侧用）；这里照样保留并有测试，但运行时不调用。
+function Roster.deadLife(unit, world, frame)
+	local state = Roster.states[unit]
+	local Net, GS = S.Network, S.GameSession
+	if not state or state.role ~= 3 or not state.dead or not state.deadSince or state.owner ~= false or state.friendly ~= true
+		or not state.network or not Roster.session or state.world ~= world or not state.instance
+		or Roster.instanceSlot(unit, frame or 0) ~= state.instance or try(S.Unit.alive, unit) ~= true
+		or try(Net.game_session) ~= Roster.session or try(GS.in_session, Roster.session) ~= true then return end
+	local exists = try(GS.game_object_exists, Roster.session, state.network)
+	local health = exists == true and try(GS.game_object_field, Roster.session, state.network, "health")
+	local stillDead = type(health) == "number" and health == health and health <= 0 and math.abs(health) < 1e9
+	if not stillDead and try(S.Unit.has_animation_state_machine, unit) ~= false then return end
+	return { epoch = Roster.epoch, network = state.network, world = Roster.instanceSlot(world, frame or 0),
+		kind = "friendly", instance = state.instance }
+end
+
 --- 每帧：枚举 avatar、装甲件，求当帧归属。结果只保留到下一帧。
 function Roster.update(runtime)
 	local worlds = try(S.Application.worlds)
 	if type(worlds) ~= "table" then runtime.roster = nil return end
 	local frame = runtime.frame or 0
+	-- E12f-C2：IAS `__hd2ir_corpse_freeze.begin`（R:6502），每帧一次，先于任何枚举结果的使用。
+	local freeze = Roster.freeze
+	if freeze.begin then freeze.begin(runtime) end
 	local resource = (runtime.options or {}).avatarResource or DEFAULT_AVATAR_RESOURCE
 	local roster = { frame = frame, byWorld = {}, live = {}, localAvatar = nil,
 		identity = type(S.Network) == "table" and type(S.GameSession) == "table" }
@@ -3101,6 +3148,8 @@ function Roster.update(runtime)
 		runtime.identityErrorLogged = true
 		runtime.logger('[physbone][错误] 身份判定失败：%s', tostring(identityError))
 	end
+	-- E12f-C2：共享身体"化身号"簿记（IAS R:6917）。只在尸体副本开启时跑；它在我们的运行时里没有消费者。
+	if freeze.enabled and freeze.lifecycleObserve then pcall(freeze.lifecycleObserve, runtime, allAvatars) end
 	for _, world in ipairs(worlds) do
 		local avatars = perWorld[world]
 		local slots, gameplay = {}, false
@@ -3116,10 +3165,13 @@ function Roster.update(runtime)
 		-- （IAS 另有 scene_sources / 第一人称图两个条件，本运行时没有对应数据）。
 		local active = #avatars > 0 and not (type(count) == "number" and count <= 0)
 		local armour = active and roster_discover(runtime, world, frame, count, table.concat(slots, ":"), gameplay) or {}
+		-- E12f-C2：IAS R:6681-6682，枚举之后、归属之前过滤：副本不进名单；已被副本替换的原件也不进名单。
+		if freeze.active then armour = freeze.filter(world, avatars, armour) end
 		local owner = {}
 		for _, row in ipairs(armour) do
 			roster.live[row.unit] = true
 			local nodes = try(S.Unit.num_scene_graph_items, row.unit)
+			row.nodes = nodes   -- 尸体副本用（IAS 的 armour.node_count）
 			if type(nodes) == "number" and nodes > 1 then
 				-- IAS 行 6702–6725：每个探针 {1,0} 都算，每个 avatar 取各探针里的最小距离，再比 avatar。
 				local distance = {}
@@ -3152,6 +3204,7 @@ function Roster.update(runtime)
 end
 
 function Roster.reset()
+	if Roster.freeze.reset then Roster.freeze.reset() end
 	Roster.worlds = {}
 	Roster.states = setmetatable({}, { __mode = "k" })
 	Roster.known, Roster.session = {}, nil
@@ -5139,6 +5192,859 @@ local function apply_arm_pose_frame(runtime)
 end
 
 -- ---------------------------------------------------------------------------
+-- E12f-C2：尸体副本（CorpseFreeze）。逐段复刻 IAS 1.6.4 的 `__hd2ir_corpse_freeze`（R:5432-6002）与
+-- `__hd2ir_shared_body_lifecycle`（R:5190-5246）；代码自己写，行为与常数照 IAS，每段标注 IAS 行号（R:n）。
+--
+-- 和 IAS 唯一"不是逐字"的映射（用户允许的）：
+--   · 原生 `freeze_corpse_physics(profile, instance, avatar)`（R:5923）没有可用实现。我们的物理求解器是 Lua，
+--     所以它的等价物 = 停止模拟 / 停止写这具尸体的护甲件（被隐藏的原件）：丢掉原件的物理会话，并让 physics_sync 之后不再给它挂会话。
+-- 没有 IAS 对应物、也没有在这里即兴补的东西，见 docs/agent 的交接文档（"未复刻"一节）。
+--
+-- 铰接下落由 CorpseMotion 段提供（IAS `__hd2ir_corpse_motion`，R:5248-5429）；这里只调用它导出的同名函数：
+--   names / new(anchors, velocity) / advance(state, elapsed) / frames(state) / deform(frames, owner, pose) / owner(name)
+--   以及状态里的 points.hips.p、steps（R:5748、R:5760）。
+-- ---------------------------------------------------------------------------
+local CorpseFreeze = Roster.freeze
+CorpseFreeze.enabled, CorpseFreeze.active = false, false
+local cf = {
+	frozen = {}, clones = {}, liveCache = {}, livePending = {}, logged = {}, failed = {}, errors = {},
+	pending = {}, cores = {}, tornCache = {}, jointCache = {}, stopped = {},
+	tick = 0, now = 0, created = 0, runtime = nil,
+}
+CorpseFreeze.state = cf   -- 仅测试读取
+
+local unpack = unpack or table.unpack
+
+-- 数学（IAS R:177-240；四元数 {x,y,z,w}，主动旋转、列向量约定）
+local CZ = {}
+function CZ.finite(n) return type(n) == "number" and n == n and math.abs(n) < math.huge end
+function CZ.qnormalize(q)
+	local n = math.sqrt(q[1] * q[1] + q[2] * q[2] + q[3] * q[3] + q[4] * q[4])
+	if not CZ.finite(n) or n < 1.0e-8 then return nil end
+	return { q[1] / n, q[2] / n, q[3] / n, q[4] / n }
+end
+function CZ.qconjugate(q) return { -q[1], -q[2], -q[3], q[4] } end
+function CZ.qmul(a, b)
+	local x = a[4] * b[1] + a[1] * b[4] + a[2] * b[3] - a[3] * b[2]
+	local y = a[4] * b[2] - a[1] * b[3] + a[2] * b[4] + a[3] * b[1]
+	local z = a[4] * b[3] + a[1] * b[2] - a[2] * b[1] + a[3] * b[4]
+	local w = a[4] * b[4] - a[1] * b[1] - a[2] * b[2] - a[3] * b[3]
+	local n = math.sqrt(x * x + y * y + z * z + w * w)
+	if not CZ.finite(n) or n < 1.0e-8 then return nil end
+	return { x / n, y / n, z / n, w / n }
+end
+function CZ.qrotate(q, p)
+	local x, y, z, w = q[1], q[2], q[3], q[4]
+	local tx = 2.0 * (y * p[3] - z * p[2])
+	local ty = 2.0 * (z * p[1] - x * p[3])
+	local tz = 2.0 * (x * p[2] - y * p[1])
+	return { p[1] + w * tx + (y * tz - z * ty), p[2] + w * ty + (z * tx - x * tz), p[3] + w * tz + (x * ty - y * tx) }
+end
+function CZ.qerror_degrees(a, b)
+	local ax, ay, az, aw = -a[1], -a[2], -a[3], a[4]
+	local x = aw * b[1] + ax * b[4] + ay * b[3] - az * b[2]
+	local y = aw * b[2] - ax * b[3] + ay * b[4] + az * b[1]
+	local z = aw * b[3] + ax * b[2] - ay * b[1] + az * b[4]
+	local w = aw * b[4] - ax * b[1] - ay * b[2] - az * b[3]
+	local n = math.sqrt(x * x + y * y + z * z + w * w)
+	if not CZ.finite(n) or n < 1.0e-8 then return math.huge end
+	w = math.abs(w / n)
+	if w > 1.0 then w = 1.0 end
+	return 2.0 * math.acos(w) * 180.0 / math.pi
+end
+function CZ.perror(a, b)
+	local x, y, z = a[1] - b[1], a[2] - b[2], a[3] - b[3]
+	return math.sqrt(x * x + y * y + z * z)
+end
+function CZ.compose_pose(aq, ap, bq, bp)
+	local q = CZ.qmul(aq, bq)
+	local rp = CZ.qrotate(aq, bp)
+	if q == nil or rp == nil then return nil, nil end
+	return q, { ap[1] + rp[1], ap[2] + rp[2], ap[3] + rp[3] }
+end
+function CZ.relative_pose(pq, pp, cq, cp)
+	local inverse = CZ.qconjugate(pq)
+	local q = CZ.qmul(inverse, cq)
+	local p = CZ.qrotate(inverse, { cp[1] - pp[1], cp[2] - pp[2], cp[3] - pp[3] })
+	return q, p
+end
+function CZ.close(aq, ap, bq, bp)   -- IAS R:5476-5478
+	return aq and ap and bq and bp and CZ.qerror_degrees(aq, bq) < .1 and CZ.perror(ap, bp) < .001
+end
+
+-- 引擎读写（IAS world_pose / engine_vector / engine_quaternion，R:313-352、R:430）。
+-- 世界姿态走仓库已有的 Unit.world_pose（1 次调用 + 1 次 to_elements）；写入走已有的 write_independent_*。
+local function cz_world_pose(unit, node)
+	local pose = Compat.independent_world_pose(S, unit, node)
+	if pose then return pose.q, pose.p end
+end
+local function cz_vector(p)
+	local ok, value = pcall(S.Vector3, p[1], p[2], p[3])
+	if ok then return value end
+end
+local function cz_quaternion(q)
+	local value = Compat.independent_rotation_object(S, q, true)
+	return value
+end
+local function cz_set(unit, node, pose)   -- IAS `set`（R:5658-5661）
+	assert(Compat.write_independent_rotation(S, unit, node, pose.q, true), 'rotation write failed')
+	assert(Compat.write_independent_position(S, unit, node, pose.p, 1), 'position write failed')
+end
+local function cz_slot(unit) return Roster.instanceSlot(unit, cf.tick) end   -- IAS R:5438
+local function cz_log(text)
+	local runtime = cf.runtime
+	if runtime and runtime.logger then runtime.logger('[physbone][尸体副本] %s', text) end
+end
+local function cz_note(key, message)   -- IAS R:5439-5441：同一个 key 只记一次
+	if not cf.logged[key] then cf.logged[key] = true; cz_log('corpse-copy-v4 ' .. message) end
+end
+function CorpseFreeze.report(kind, err)   -- IAS R:5442-5449：同类错误 5 s 记一次
+	local r = cf.errors[kind] or { next = 0, count = 0 }
+	cf.errors[kind] = r
+	r.count = r.count + 1
+	if cf.now >= r.next then
+		cz_log('corpse-copy-v4 ' .. kind .. ' rejected count=' .. r.count .. ' error=' .. tostring(err))
+		r.next = cf.now + 5
+	end
+end
+
+--- IAS `eligible`（R:5451-5457）要求 profile 声明了性别 / authored / active / 非 observe_only。
+--- 我们的 profile 表就是转换器写出的 profileHashes，没有这些标志位 ⇒ 名单内的件一律合格（见交接文档）。
+local function cz_eligible(b) return type(b) == "table" and type(b.hash) == "string" and #b.hash > 0 end
+
+local function cz_available()   -- IAS R:5461-5470（去掉原生 ABI 一项）
+	for _, name in ipairs({ 'spawn_unit', 'destroy_unit', 'unlink_unit', 'update_unit' }) do
+		if type(S.World and S.World[name]) ~= 'function' then return false, 'World.' .. name end
+	end
+	for _, name in ipairs({ 'name_hash', 'set_unit_visibility', 'scene_graph_link', 'scene_graph_parent', 'has_node', 'node', 'alive' }) do
+		if type(S.Unit and S.Unit[name]) ~= 'function' then return false, 'Unit.' .. name end
+	end
+	return true
+end
+
+--- IAS `core`（R:5471-5493）：死者的 hips 世界姿态 + 头相对 hips 的轴；每帧每个 avatar 只算一次。
+local function cz_core(avatar)
+	local U = S.Unit
+	local key = cz_slot(avatar.unit)
+	if cf.cores[key] then return cf.cores[key] end
+	if U.alive(avatar.unit) ~= true or U.has_node(avatar.unit, 'hips') ~= true then return nil end
+	local n = U.node(avatar.unit, 'hips')
+	local count = U.num_scene_graph_items(avatar.unit)
+	if type(n) ~= 'number' or n ~= math.floor(n) or n < 0 or n > count or count > 256 then return nil end
+	local q, p = cz_world_pose(avatar.unit, n)
+	if not q or not p then return nil end
+	local c = { node = n, q = q, p = p, owner = key }
+	if U.has_node(avatar.unit, 'head') == true then
+		local head = U.node(avatar.unit, 'head')
+		if type(head) == 'number' and head >= 0 and head <= count then
+			local _, hp = cz_world_pose(avatar.unit, head)
+			local d = hp and CZ.perror(hp, p)
+			if d and d > .1 and d < 2 then
+				c.up = CZ.qrotate(CZ.qconjugate(q), { (hp[1] - p[1]) / d, (hp[2] - p[2]) / d, (hp[3] - p[3]) / d })
+			end
+		end
+	end
+	cf.cores[key] = c
+	return c
+end
+
+local CZ_LIMB_EDGES = { { 'neck', 'head' }, { 'chest', 'neck' },
+	{ 'l_clavicle', 'l_shoulder' }, { 'l_shoulder', 'l_elbow' }, { 'l_elbow', 'l_hand' },
+	{ 'r_clavicle', 'r_shoulder' }, { 'r_shoulder', 'r_elbow' }, { 'r_elbow', 'r_hand' },
+	{ 'hips', 'l_thigh' }, { 'l_thigh', 'l_knee' }, { 'l_knee', 'l_foot' },
+	{ 'hips', 'r_thigh' }, { 'r_thigh', 'r_knee' }, { 'r_knee', 'r_foot' } }
+
+--- IAS `detached`（R:5511-5527）：身体各段飞散（离 hips > 3.5 m，或肢段长度超过静止长度 + max(.12, 40%)）。
+local function cz_detached(native, c, cached)
+	for name, pose in pairs(native or {}) do
+		if type(pose) ~= 'table' or not pose.p then return true end
+		if name ~= 'boss' and name ~= 'root' and name ~= 'StingrayEntityRoot' and
+			name ~= 'FbxAxisSystem_ConvertNode' and CZ.perror(pose.p, c.p) > 3.5 then return true end
+	end
+	for _, edge in ipairs(CZ_LIMB_EDGES) do
+		local a, b = native and native[edge[1]], native and native[edge[2]]
+		local ca, cb = cached and cached[edge[1]], cached and cached[edge[2]]
+		if a and b and ca and cb then
+			local rest = CZ.perror(ca.p, cb.p)
+			if CZ.perror(a.p, b.p) > rest + math.max(.12, rest * .4) then return true end
+		end
+	end
+	return false
+end
+
+--- IAS `capture`（R:5528-5544）：整件每个节点相对 hips 的姿态。
+local function cz_capture(unit, count, offset, c, explicit)
+	local rows = {}
+	for n = offset, count - 1 + offset do
+		local chosen = explicit and explicit[n + 1]
+		local q, p
+		if chosen then q, p = chosen.q, chosen.p else q, p = cz_world_pose(unit, n) end
+		if not q or not p then return nil end
+		q, p = CZ.relative_pose(c.q, c.p, q, p)
+		if not q or not p then return nil end
+		rows[n] = { q = { q[1], q[2], q[3], q[4] }, p = { p[1], p[2], p[3] } }
+	end
+	return rows
+end
+
+--- StingrayEntityRoot 节点号（IAS 的 node_offset，只可能是 0 或 1，R:5638-5639）。
+local function cz_root_offset(unit)
+	local U = S.Unit
+	if U.has_node(unit, 'StingrayEntityRoot') ~= true then return nil end
+	local n = U.node(unit, 'StingrayEntityRoot')
+	if n == 0 or n == 1 then return n end
+end
+
+--- 关节映射：节点号 → 源骨名（IAS R:5617-5622：profile.target_flags 的 1024 位 + target_sources）。
+--- 我们没有 target_flags；等价数据是转换器的 independentPieces（该件上的目标骨名）与 independentBones（目标骨 → 源骨名）。
+--- 只有独立骨件有关节；纯物理件没有（⇒ 没有铰接下落，走 IAS 的"刚性倒下 / 活体定格"回退）。
+--- 节点号按 (实例槽, hash) 缓存：同一个 unit 的节点表不会变，所以稳态零引擎调用。
+local function cz_unit_joints(b)
+	local runtime = cf.runtime
+	local options = runtime and runtime.options or {}
+	local key = cz_slot(b.unit)
+	local cached = cf.jointCache[key]
+	if cached and cached.hash == b.hash then return cached.map end
+	local map = {}
+	local names = options.independentPieces and options.independentPieces['#ID[' .. b.hash .. ']']
+	local source = {}
+	for _, bone in ipairs(options.independentBones or {}) do source[bone[1]] = bone[2] end
+	for _, name in ipairs(names or {}) do
+		local joint = source[name]
+		if joint then
+			local node = safe_node(S, b.unit, name)
+			if node then map[node] = joint end
+		end
+	end
+	cf.jointCache[key] = { hash = b.hash, map = map }
+	return map
+end
+
+--- 关节的世界位置表（IAS 的 native：name -> {p}），由 capture 出来的 shape 算出（零引擎调用）。
+local function cz_native_from_shape(shape, joints, c)
+	local native = {}
+	for n, name in pairs(joints) do
+		local row = shape[n]
+		if row then
+			local r = CZ.qrotate(c.q, row.p)
+			native[name] = { p = { c.p[1] + r[1], c.p[2] + r[2], c.p[3] + r[3] } }
+		end
+	end
+	return native
+end
+
+--- IAS `observe` 对死者的 torn（R:5600-5603）用的是原生每帧给的关节位置，我们没有这份数据：
+--- 改成每 0.25 s 读一次这件的关节节点（独立骨件才有）。这是相对 IAS 唯一多出来的引擎读取，见交接文档。
+local function cz_torn_estimate(b, key, bucket)
+	local cached = cf.tornCache[key]
+	if cached and cached.bucket == bucket then return cached.early end
+	local early = false
+	local joints = cz_unit_joints(b)
+	if next(joints) ~= nil then
+		local c = cz_core(b.avatar)
+		if c then
+			local native = {}
+			for n, name in pairs(joints) do
+				local _, p = cz_world_pose(b.unit, n)
+				if p then native[name] = { p = p } end
+			end
+			local last = cf.liveCache[key]
+			early = cz_detached(native, c, last and last.native)
+		end
+	end
+	cf.tornCache[key] = { bucket = bucket, early = early, time = cf.now }
+	return early
+end
+
+--- 开关：IAS 的原生 `corpse_freeze_enabled()`（R:5549）读 IAS 自己的设置。我们没有那个设置页；
+--- 先用调参文件 `corpseFreeze = 0/1` 与安装选项 `corpseFreeze`，调参文件优先，默认关。
+local function cz_enabled(runtime)
+	local ok, values = pcall(tune_values, runtime)
+	local value = ok and values and values.corpseFreeze
+	if value ~= nil then return value ~= 0 end
+	return runtime.options ~= nil and runtime.options.corpseFreeze == true
+end
+
+-- 共享身体的"化身号"簿记（IAS `__hd2ir_shared_body_lifecycle`，R:5190-5246）。
+-- 原生那一侧（shared_next_incarnation / forget_shared_avatar / set_avatar_incarnation）我们没有；Lua 簿记照 IAS：
+-- 每个实例槽一个化身号，epoch / world / network / kind 任何一项变了就忘掉旧的、之后给新的。
+-- 在我们的运行时里这个号没有消费者（物理是 Lua 求解器，不需要原生去配对），所以它什么也不门控。
+local lifecycle = { live = {}, counter = 0, forgotten = 0 }
+CorpseFreeze.lifecycle = lifecycle
+local function lifecycle_valid(n) return type(n) == 'number' and n == math.floor(n) and n >= 0 and n <= 9007199254740991 end
+function lifecycle.observe(avatars, evidence)
+	local accepted = {}
+	local ok = pcall(function()
+		assert(type(avatars) == 'table' and #avatars <= 32)
+		local seen = {}
+		for _, item in ipairs(avatars) do
+			local id = item.instance_slot
+			assert(lifecycle_valid(id) and id > 0 and not seen[id]); seen[id] = true
+			local e = evidence(item)
+			if e ~= nil then
+				assert(lifecycle_valid(e.epoch) and lifecycle_valid(e.world) and lifecycle_valid(e.network))
+				accepted[id] = e
+			end
+		end
+	end)
+	if not ok then accepted = {} end   -- 证据不全 / 含糊就退役，不猜（R:5207）
+	for id, old in pairs(lifecycle.live) do
+		local e = accepted[id]
+		if not e or old.epoch ~= e.epoch or old.world ~= e.world or old.network ~= e.network or old.kind ~= e.kind then
+			lifecycle.forgotten = lifecycle.forgotten + 1
+			lifecycle.live[id] = nil
+		end
+	end
+	for id, e in pairs(accepted) do
+		if not lifecycle.live[id] then
+			lifecycle.counter = lifecycle.counter + 1
+			lifecycle.live[id] = { epoch = e.epoch, world = e.world, network = e.network, kind = e.kind, token = lifecycle.counter }
+		end
+	end
+end
+function lifecycle.token(id) local value = lifecycle.live[id]; return value and value.token end
+
+--- IAS R:6917：每帧对在场 avatar 观察一次（evidence = shared_life）。只在尸体副本开启时才跑（共享身份证据每个存活角色每帧约 5 次引擎查询）。
+function CorpseFreeze.lifecycleObserve(runtime, avatars)
+	local frame = runtime.frame or 0
+	local rows = {}
+	for _, a in ipairs(avatars) do rows[#rows + 1] = { unit = a.unit, world = a.world, instance_slot = Roster.instanceSlot(a.unit, frame) } end
+	lifecycle.observe(rows, function(item) return Roster.sharedLife(item.unit, item.world, frame) end)
+end
+
+function CorpseFreeze.reset()
+	cf.frozen, cf.clones, cf.liveCache, cf.livePending, cf.logged, cf.failed, cf.errors = {}, {}, {}, {}, {}, {}, {}
+	cf.pending, cf.cores, cf.tornCache, cf.jointCache, cf.stopped = {}, {}, {}, {}, {}
+	cf.created, cf.runtime = 0, nil
+	lifecycle.live, lifecycle.counter, lifecycle.forgotten = {}, 0, 0
+	for key in pairs(Roster.corpsePins) do Roster.corpsePins[key] = nil end
+	CorpseFreeze.enabled, CorpseFreeze.active = false, false
+end
+
+--- IAS `begin`（R:5546-5553）。
+function CorpseFreeze.begin(runtime)
+	cf.runtime, cf.tick, cf.now = runtime, runtime.frame or 0, os.clock()
+	cf.pending, cf.cores, cf.livePending = {}, {}, {}
+	local was = CorpseFreeze.enabled
+	CorpseFreeze.enabled = cz_enabled(runtime)
+	if was ~= CorpseFreeze.enabled then
+		cz_log('corpse-copy-v4 enabled=' .. tostring(CorpseFreeze.enabled))
+		if not CorpseFreeze.enabled then lifecycle.observe({}, function() return nil end) end
+	end
+	CorpseFreeze.active = CorpseFreeze.enabled or next(cf.clones) ~= nil
+	for key, r in pairs(cf.liveCache) do if cf.now - r.time > 30 then cf.liveCache[key] = nil end end   -- R:5552
+	for key, r in pairs(cf.tornCache) do if cf.now - r.time > 30 then cf.tornCache[key] = nil end end
+end
+
+--- IAS `queue_input`（R:5590-5601）：死者 + 有 30 s 内的活体缓存 ⇒ 排一个"只用缓存"的待复制项。
+--- IAS 在 retarget 读到原生快照之前调它（原生会拒绝撕裂的输入）；我们没有原生快照，early 恒为 false，
+--- 紧接着同一帧的 observe 会覆盖它（R:4705 同样跟在后面），所以这里等价于只是排个占位。core 延到 flush 再取。
+function CorpseFreeze.queue_input(b, snapshot)
+	if not CorpseFreeze.enabled or not cz_eligible(b) or not b.instance_id or Roster.role(b.avatar.unit) ~= 3 then return end
+	local key = cz_slot(b.unit)
+	if (cf.frozen[key] and not cf.frozen[key].guard) or cf.clones[key] then return end
+	local cached = cf.liveCache[key]
+	if not cached or cached.world ~= cz_slot(b.world) or cached.owner ~= cz_slot(b.avatar.unit) or
+		cached.hash ~= b.hash or cached.count ~= b.node_count or cf.now - cached.time > 30 then return end
+	if snapshot then return end   -- 没有原生快照来源
+	cf.pending[key] = { world = b.world, binding = b, offset = cached.offset, cache_only = true, early = false }
+end
+
+--- IAS `observe`（R:5602-5634）：活体每 0.25 s 一个样本（≤256 个，30 s 过期）；死者排一个待复制项。
+function CorpseFreeze.observe(b, explicit)
+	if not CorpseFreeze.enabled or not cz_eligible(b) then return end
+	local key = cz_slot(b.unit)
+	if (cf.frozen[key] and not cf.frozen[key].guard) or cf.clones[key] then return end
+	local role = Roster.role(b.avatar.unit)
+	if role ~= 1 and role ~= 2 and role ~= 3 then return end
+	local bucket = math.floor(cf.now * 4)
+	if role == 3 then
+		cf.pending[key] = { world = b.world, binding = b, explicit = explicit, early = cz_torn_estimate(b, key, bucket) }
+		return
+	end
+	-- 以下与 IAS 顺序不同处：先看桶 / 上限（零引擎调用），再读动画机与 core，调用数只会比 IAS 少。
+	local old = cf.liveCache[key]
+	if old and old.bucket == bucket then return end
+	local count = 0
+	for _ in pairs(cf.liveCache) do count = count + 1 end
+	if not old and count >= 256 then return end
+	if S.Unit.has_animation_state_machine(b.avatar.unit) ~= true then return end
+	local c = cz_core(b.avatar)
+	if not c then return end
+	local offset = cz_root_offset(b.unit)
+	if not offset then return end
+	local shape = cz_capture(b.unit, b.node_count, offset, c, explicit)
+	if not shape then return end
+	local joints = cz_unit_joints(b)
+	local native = cz_native_from_shape(shape, joints, c)
+	if cz_detached(native, c, old and old.native) then return end   -- 撕裂的样本不进缓存
+	local named = {}
+	for n, name in pairs(joints) do named[n] = name end
+	cf.livePending[key] = { shape = shape, bucket = bucket, time = cf.now, world = cz_slot(b.world), native = native, up = c.up,
+		owner = c.owner, hash = b.hash, count = b.node_count, offset = offset, joints = named,
+		core = { q = { unpack(c.q) }, p = { unpack(c.p) } } }
+end
+
+--- IAS `prepare`（R:5635-5661）：复制前的布局核对。profile.nodes 的核对（R:5642-5644）无对应数据，略。
+local function cz_prepare(item, use_cache)
+	local U = S.Unit
+	local b = item.binding
+	local c = item.core or cz_core(b.avatar)
+	assert(c, 'core unavailable')
+	local unit, count = b.unit, b.node_count
+	local offset = item.offset or cz_root_offset(unit)
+	assert(cz_eligible(b) and (offset == 0 or offset == 1), 'undeclared gender or invalid offset')
+	assert(U.alive(unit) == true and U.num_scene_graph_items(unit) == count and count >= 2 and count <= 256 and
+		U.has_node(unit, 'StingrayEntityRoot') == true and U.node(unit, 'StingrayEntityRoot') == offset, 'unsupported Unit root/layout')
+	local resource = U.name_hash(unit)
+	assert(type(resource) == 'string' and #resource > 0, 'spawn resource unavailable')
+	local shape = not use_cache and cz_capture(unit, count, offset, c, item.explicit) or nil
+	assert(shape or use_cache, 'corrected shape capture failed')
+	local parents = {}
+	if use_cache then
+		for n = offset + 1, count - 1 + offset do parents[n] = U.scene_graph_parent(unit, n) end
+	end
+	return { unit = unit, world = item.world, shape = shape, count = count, offset = offset, core = c, resource = resource,
+		parents = parents, key = cz_slot(unit), hash = b.hash, world_slot = cz_slot(item.world), owner = c.owner,
+		avatar_unit = b.avatar.unit }
+end
+
+--- IAS `apply`（R:5662-5686）。
+local function cz_apply(r)
+	local U, W = S.Unit, S.World
+	assert(cf.created < 256, 'copy lifetime limit')
+	cf.created = cf.created + 1   -- 失败的 spawn 也计数；一个会话内有上限（R:5663-5664）
+	local u = assert(W.spawn_unit(r.world, r.resource, assert(cz_vector(r.core.p)), assert(cz_quaternion(r.core.q))), 'spawn failed')
+	assert(u ~= r.unit, 'spawn returned original Unit')
+	r.clone = u
+	U.set_unit_visibility(u, false)
+	assert(U.alive(u) == true and U.name_hash(u) == r.resource and U.num_scene_graph_items(u) == r.count and
+		U.has_node(u, 'StingrayEntityRoot') == true and U.node(u, 'StingrayEntityRoot') == r.offset, 'copy identity/layout mismatch')
+	assert(U.has_animation_state_machine(u) ~= true, 'copy has active animation controller')
+	if type(U.num_actors) == 'function' then assert(U.num_actors(u) == 0, 'copy has native actors') end
+	W.unlink_unit(r.world, u)
+	U.scene_graph_link(u, r.offset, nil)
+	for n = r.offset + 1, r.count - 1 + r.offset do U.scene_graph_link(u, n, r.offset) end
+	cz_set(u, r.offset, r.core)
+	for n = r.offset + 1, r.count - 1 + r.offset do cz_set(u, n, r.shape[n]) end
+	W.update_unit(r.world, u)
+	for n = r.offset, r.count - 1 + r.offset do
+		local q, p = cz_world_pose(u, n)
+		local eq, ep = r.core.q, r.core.p
+		if n ~= r.offset then eq, ep = CZ.compose_pose(eq, ep, r.shape[n].q, r.shape[n].p) end
+		assert(CZ.close(q, p, eq, ep), 'copy world shape readback failed')
+		if n ~= r.offset then assert(U.scene_graph_parent(u, n) == r.offset, 'copy parent readback failed') end
+	end
+end
+
+--- IAS `register_clone`（R:5687-5696）。副本 / 原件 / 世界 / 主人的槽位进 corpsePins（槽位表清理时不删）。
+local function cz_register_clone(r)
+	local key = cz_slot(r.clone)
+	local record = { world = r.world_slot, owner = r.owner, hash = r.hash, count = r.count, root = r.offset, original = r.key, clone = key,
+		guard = r.guard, shape = r.guard and r.shape or nil, motion_shape = r.motion_shape, motion_owners = r.motion_owners,
+		fixed_core = r.motion_shape and r.core or nil }
+	cf.clones[key] = record
+	local pins = Roster.corpsePins
+	pins[key], pins[r.key], pins[r.world_slot], pins[r.owner] = true, true, true, true
+	return record
+end
+
+--- 替代原生 `freeze_corpse_physics`（R:5923）：停掉这件原件的 Lua 物理。
+--- 之后 physics_sync 不再给它挂会话（CorpseFreeze.physicsStopped）；已有会话立刻丢掉（与"unit 不在枚举里"一样不碰句柄）。
+local function cz_freeze_physics(r)
+	cf.stopped[r.key] = true
+	local runtime = cf.runtime
+	if runtime and runtime.sessionByUnit then runtime.sessionByUnit[r.unit] = nil end
+	return true
+end
+function CorpseFreeze.physicsStopped(unit, frame)
+	if next(cf.stopped) == nil then return false end
+	return cf.stopped[Roster.instanceSlot(unit, frame or cf.tick)] == true
+end
+
+--- IAS `fallen_rotation`（R:5697-5712）。
+local function cz_fallen_rotation(c, up)
+	assert(up, 'no intact body axis for fallen fallback')
+	local a = CZ.qrotate(c.q, up)
+	local d = math.sqrt(a[1] * a[1] + a[2] * a[2])
+	local b
+	if d > .01 then b = { a[1] / d, a[2] / d, 0 }
+	else
+		local side = CZ.qrotate(c.q, { 1, 0, 0 }); d = math.sqrt(side[1] * side[1] + side[2] * side[2])
+		b = d > .01 and { side[1] / d, side[2] / d, 0 } or { 1, 0, 0 }
+	end
+	local q = assert(CZ.qnormalize({ a[2] * b[3] - a[3] * b[2], a[3] * b[1] - a[1] * b[3],
+		a[1] * b[2] - a[2] * b[1], 1 + a[1] * b[1] + a[2] * b[2] + a[3] * b[3] }))
+	return CZ.qmul(CZ.qmul(CZ.qconjugate(c.q), q), c.q)
+end
+
+--- IAS `rewrite_copy`（R:5713-5722）。
+local function cz_rewrite_copy(world, u, r, shape, c)
+	cz_set(u, r.root, c)
+	for n = r.root + 1, r.root + r.count - 1 do cz_set(u, n, shape[n]) end
+	S.World.update_unit(world, u)
+	for n = r.root + 1, r.root + r.count - 1 do
+		local q, p = cz_world_pose(u, n)
+		local eq, ep = CZ.compose_pose(c.q, c.p, shape[n].q, shape[n].p)
+		assert(CZ.close(q, p, eq, ep), 'guard final shape readback failed')
+	end
+end
+
+--- IAS `start_motion`（R:5723-5774）。CorpseMotion 的导出名与 IAS 一致。
+local function cz_start_motion(prepared, g, age)
+	local m = CorpseMotion
+	assert(m and type(m.new) == 'function' and type(m.advance) == 'function' and type(m.frames) == 'function' and
+		type(m.deform) == 'function' and type(m.owner) == 'function' and type(m.names) == 'table', 'articulated module unavailable')
+	local ranked = {}
+	for _, r in ipairs(prepared) do ranked[#ranked + 1] = r end
+	local required = {}
+	for _, name in ipairs(m.names) do required[name] = true end
+	local function score(r)
+		local n = 0
+		for _, name in pairs(r.cached.joints or {}) do if required[name] then n = n + 1 end end
+		return n
+	end
+	table.sort(ranked, function(a, b) local x, y = score(a), score(b); if x ~= y then return x > y end; return a.hash < b.hash end)
+	local anchors = {}
+	local initial = assert(ranked[1].cached.core, 'missing complete living frame')
+	for _, r in ipairs(ranked) do
+		assert(cf.now - r.cached.time <= .8, 'living articulated sample too old')
+		for n, name in pairs(r.cached.joints or {}) do
+			if required[name] and not anchors[name] then
+				local q, p = CZ.compose_pose(initial.q, initial.p, r.shape[n].q, r.shape[n].p)
+				anchors[name] = { q = q, p = p }
+			end
+		end
+	end
+	local sampleAge = math.max(.016, cf.now - ranked[1].cached.time)
+	local current = prepared[1].core.p
+	local velocity = { (current[1] - initial.p[1]) / sampleAge, (current[2] - initial.p[2]) / sampleAge, (current[3] - initial.p[3]) / sampleAge }
+	local state = m.new(anchors, velocity)   -- 先完整校验，再改任何副本
+	local plans = {}
+	for _, r in ipairs(prepared) do
+		local owners, shape = {}, {}
+		for n, name in pairs(r.cached.joints or {}) do owners[n] = m.owner(name) end
+		for n = r.offset + 1, r.count - 1 + r.offset do
+			local q, p = CZ.compose_pose(initial.q, initial.p, r.shape[n].q, r.shape[n].p)
+			shape[n] = { q = q, p = p }
+			if not owners[n] then
+				local parent = r.parents[n]
+				local visited = {}
+				for _ = 1, r.count do
+					if type(parent) ~= 'number' or parent <= r.offset or parent >= r.offset + r.count or visited[parent] then break end
+					visited[parent] = true
+					if owners[parent] then owners[n] = owners[parent]; break end
+					parent = r.parents[parent]
+				end
+			end
+			if not owners[n] then
+				local best = math.huge
+				for _, name in ipairs(m.names) do
+					local d = CZ.perror(p, anchors[name].p)
+					if d < best then best = d; owners[n] = name end
+				end
+			end
+		end
+		plans[#plans + 1] = { r = r, shape = shape, owners = owners }
+	end
+	g.motion, g.motion_started = state, cf.now - math.min(age, 4)
+	for _, plan in ipairs(plans) do
+		plan.r.motion_shape, plan.r.motion_owners = plan.shape, plan.owners
+		plan.r.core = initial
+	end
+end
+
+--- IAS `update_motion`（R:5775-5810）。
+local function cz_update_motion(world, g, rows)
+	local m = CorpseMotion
+	local complete, c
+	local ok, err = pcall(function()
+		complete = m.advance(g.motion, math.max(0, cf.now - g.motion_started))
+		local frames = m.frames(g.motion)
+		c = { q = { 0, 0, 0, 1 }, p = { unpack(g.motion.points.hips.p) } }
+		for _, row in ipairs(rows) do
+			local r = row.r
+			row.target = {}
+			for n, pose in pairs(r.motion_shape) do
+				local out = m.deform(frames, r.motion_owners[n], pose)
+				local q, p = CZ.relative_pose(c.q, c.p, out.q, out.p)
+				assert(q and p, 'invalid motion output')
+				row.target[n] = { q = q, p = p }
+			end
+		end
+		for _, row in ipairs(rows) do cz_rewrite_copy(world, row.u, row.r, row.target, c) end
+	end)
+	if ok then
+		for _, row in ipairs(rows) do
+			row.r.fixed_core, row.r.shape = c, row.target
+			if complete then
+				row.r.guard, row.r.shape, row.r.motion_shape, row.r.motion_owners = nil, nil, nil, nil
+				cf.liveCache[row.r.original] = nil
+			end
+		end
+		if complete then
+			cz_note('settled-' .. g.owner, 'frozen owner=' .. g.owner .. ' units=' .. #rows .. ' pose=articulated-fall fixed_world=true support=last-live-feet-approx steps=' ..
+				tostring(g.motion.steps) .. ' original_graph_untouched=true')
+		end
+	else
+		for _, row in ipairs(rows) do
+			local r = row.r
+			if not pcall(cz_rewrite_copy, world, row.u, r, r.shape, r.fixed_core) then r.quarantine = true end
+			r.guard, r.shape, r.motion_shape, r.motion_owners = nil, nil, nil, nil
+			cf.liveCache[r.original] = nil
+		end
+		CorpseFreeze.report('motion-write', err)
+	end
+end
+
+--- IAS `finish_guard`（R:5811-5849）。
+local function cz_finish_guard(world, g, live, c)
+	local U = S.Unit
+	if not g.motion and cf.now < g.until_time then return end
+	local rows = {}
+	for _, key in ipairs(g.keys) do
+		local r = cf.frozen[key]
+		if not r or r.quarantine or not live[r.clone] or not live[key] then return end
+		local copy, original = live[r.clone], live[key]
+		if not cz_eligible(original) or original.hash ~= r.hash or copy.hash ~= r.hash or
+			U.alive(copy.unit) ~= true or U.alive(original.unit) ~= true or
+			U.num_scene_graph_items(copy.unit) ~= r.count or U.num_scene_graph_items(original.unit) ~= r.count then return end
+		rows[#rows + 1] = { r = r, u = copy.unit }
+	end
+	if g.motion then return cz_update_motion(world, g, rows) end
+	local ok, err = pcall(function()
+		local tilt = not g.settled and cz_fallen_rotation(c, g.up) or nil
+		for _, row in ipairs(rows) do
+			local r = row.r
+			if g.settled then row.target = g.settled[r.original]
+			else
+				row.target = {}
+				for n, p in pairs(r.shape) do row.target[n] = { q = CZ.qmul(tilt, p.q), p = CZ.qrotate(tilt, p.p) } end
+			end
+		end
+		for _, row in ipairs(rows) do cz_rewrite_copy(world, row.u, row.r, row.target, c) end
+	end)
+	if ok then
+		for _, row in ipairs(rows) do row.r.guard, row.r.shape = nil, nil; cf.liveCache[row.r.original] = nil end
+		cz_note('settled-' .. g.owner, 'frozen owner=' .. g.owner .. ' units=' .. #rows .. ' pose=' ..
+			(g.settled and 'intact-dead' or 'rigid-fallen-fallback') .. ' original_graph_untouched=true')
+	else
+		for _, row in ipairs(rows) do
+			if not pcall(cz_rewrite_copy, world, row.u, row.r, row.r.shape, c) then row.r.quarantine = true end
+			row.r.guard, row.r.shape = nil, nil
+			cf.liveCache[row.r.original] = nil
+		end
+		-- 最终写入失败：保留完整的显示，不每帧重试（R:5843-5847）
+		g.until_time = math.huge
+		CorpseFreeze.report('settle', err)
+	end
+end
+
+--- IAS `flush`（R:5850-5950）：本帧结尾，对每个主人（一具尸体 = 一组件）决定是否复制。
+function CorpseFreeze.flush(bindings)
+	local U, W = S.Unit, S.World
+	local ready = cf.pending
+	cf.pending = {}
+	if not CorpseFreeze.enabled then return end
+	local ok, missing = cz_available()
+	if not ok then cz_note('api', 'unavailable=' .. missing .. '; original display retained'); return end
+	local groups = {}
+	for _, b in ipairs(bindings) do
+		local r = cf.frozen[cz_slot(b.unit)]
+		if cz_eligible(b) and b.instance_id and not cf.failed[cz_slot(b.avatar.unit)] and (not r or r.guard) and not cf.clones[cz_slot(b.unit)] then
+			local owner = cz_slot(b.avatar.unit)
+			local g = groups[owner] or {}
+			groups[owner] = g
+			g[#g + 1] = cz_slot(b.unit)
+		end
+	end
+	for owner, keys in pairs(groups) do
+		-- 活体缓存按"同一帧的一整组"发布（R:5862-5868）：缺一件 / 新旧桶混用都不覆盖上一份完整组。
+		local completeLive = true
+		for _, key in ipairs(keys) do if not cf.livePending[key] then completeLive = false; break end end
+		if completeLive then for _, key in ipairs(keys) do cf.liveCache[key] = cf.livePending[key] end end
+		local guard = cf.frozen[keys[1]] and cf.frozen[keys[1]].guard
+		if guard then
+			local shapes, c = {}, nil
+			local complete = #keys == #guard.keys
+			for _, key in ipairs(guard.keys) do
+				local item = ready[key]
+				if not item or item.early or item.cache_only then complete = false; break end
+				c = item.core or cz_core(item.binding.avatar)
+				local okShape, shape = pcall(function()
+					return cz_capture(item.binding.unit, item.binding.node_count, cz_root_offset(item.binding.unit), c, item.explicit)
+				end)
+				if not okShape or not shape then complete = false; break end
+				shapes[key] = shape
+			end
+			-- 优先用一具真正躺下的完整尸体，不要第一帧还站着瞄准的姿态；否则最终用刚性倒下回退（R:5880-5886）
+			if complete and c and c.up and cf.now < guard.until_time then
+				local axis = CZ.qrotate(c.q, c.up)
+				if math.abs(axis[3]) < .7 then guard.settled = shapes end
+			end
+		else
+			local prepared, reason, age = {}, nil, nil
+			local early, useCache = false, false
+			for _, key in ipairs(keys) do
+				local item = ready[key]
+				if not item then reason = 'incomplete corrected group'; break end
+				age = Roster.deadAge(item.binding.avatar.unit)
+				if not age then reason = 'no confirmed death clock'; break end
+				early = early or item.early
+				useCache = useCache or item.early or item.cache_only or false
+			end
+			if not reason and (age >= 4 or useCache) then
+				if cf.created + #keys > 256 then reason = 'copy lifetime limit' end
+				if not reason then
+					for _, key in ipairs(keys) do
+						local success, r = pcall(cz_prepare, ready[key], useCache)
+						if not success then reason = tostring(r); break end
+						prepared[#prepared + 1] = r
+					end
+				end
+				local bucket
+				if not reason and useCache then
+					for _, r in ipairs(prepared) do
+						local cached = cf.liveCache[r.key]
+						if not cached or cached.owner ~= owner or cached.world ~= r.world_slot or cached.hash ~= r.hash or
+							cached.count ~= r.count or cached.offset ~= r.offset or cf.now - cached.time > 30 or
+							(bucket and cached.bucket ~= bucket) then reason = 'no complete intact group cache'; break end
+						if not cached.up then reason = 'no intact body axis'; break end
+						bucket = cached.bucket
+						r.shape, r.up, r.cached = cached.shape, cached.up, cached
+					end
+				end
+				if not reason then
+					local protection = useCache and { until_time = cf.now + math.max(0, 4 - age), up = prepared[1].up, owner = owner, keys = keys } or nil
+					if protection then
+						local okMotion, err = pcall(cz_start_motion, prepared, protection, age)
+						if not okMotion then cz_note('motion-unavailable-' .. owner, 'articulated unavailable owner=' .. owner .. ' reason=' .. tostring(err)) end
+					end
+					for _, r in ipairs(prepared) do r.guard = protection end
+					-- 提交顺序（R:5919-5927）：apply → 停物理 → 显示副本 → 隐藏原件
+					local committed, err = pcall(function()
+						for _, r in ipairs(prepared) do cz_apply(r) end
+						for _, r in ipairs(prepared) do assert(cz_freeze_physics(r) == true, 'corpse physics retirement rejected') end
+						for _, r in ipairs(prepared) do U.set_unit_visibility(r.clone, true) end
+						for _, r in ipairs(prepared) do r.hidden = true; U.set_unit_visibility(r.unit, false) end
+					end)
+					if committed then
+						for _, r in ipairs(prepared) do
+							cf.frozen[r.key] = cz_register_clone(r)
+							if not protection then cf.liveCache[r.key] = nil end
+						end
+						cz_note('frozen-' .. owner, (protection and 'protected' or 'frozen') .. ' owner=' .. owner .. ' units=' .. #prepared ..
+							' delay=' .. string.format('%.3f', age) .. ' intact_cache=' .. tostring(useCache) .. ' original_graph_untouched=true')
+					else
+						cf.failed[owner] = true   -- 一具尸体只试一次 spawn 事务，不是每帧一次（R:5935）
+						local restored = true
+						for _, r in ipairs(prepared) do
+							if r.hidden and not pcall(U.set_unit_visibility, r.unit, true) then restored = false end
+							if r.clone then
+								pcall(U.set_unit_visibility, r.clone, false)
+								if not pcall(W.destroy_unit, r.world, r.clone) then
+									-- 只有我们新建的副本才能隔离 / 删除；清理失败也不让它回到普通发现里
+									local record = cz_register_clone(r)
+									record.quarantine = true
+								end
+							end
+						end
+						cz_note('failed-' .. owner, 'copy group failed owner=' .. owner .. ' display_restored=' .. tostring(restored) .. ' error=' .. tostring(err))
+					end
+				end
+			end
+			if reason and age and age >= 4 then cz_note('skip-' .. owner .. '-' .. reason, 'skipped owner=' .. owner .. ' reason=' .. reason) end
+		end
+	end
+end
+
+--- IAS `F.filter`（R:5954-6000）：每个世界、每帧：副本不进名单；校验通过的原件也不进名单；
+--- 副本跟随死者的核心并保持可见、原件保持隐藏；校验不过的恢复原件、藏起副本。
+--- 绝不在这里销毁副本，也绝不清空 clones（IAS 同样；删除留作以后的实验）。
+function CorpseFreeze.filter(world, avatars, armour)
+	if next(cf.clones) == nil then return armour end
+	local U, W = S.Unit, S.World
+	local wid = cz_slot(world)
+	local owners, live, skip = {}, {}, {}
+	for _, a in ipairs(avatars) do owners[cz_slot(a.unit)] = a end
+	for _, item in ipairs(armour) do live[cz_slot(item.unit)] = item end
+	local finished = {}
+	for _, r in pairs(cf.clones) do
+		local g = r.guard
+		if r.world == wid and g and not finished[g] and owners[r.owner] then
+			finished[g] = true
+			local ok, err = pcall(function()
+				local c = cz_core(owners[r.owner])
+				if c then cz_finish_guard(world, g, live, c) end
+			end)
+			if not ok then CorpseFreeze.report('guard', err) end
+		end
+	end
+	for key, r in pairs(cf.clones) do
+		if r.world == wid then
+			local copyItem, original = live[key], live[r.original]
+			skip[key] = true
+			local valid = false
+			if not r.quarantine and copyItem and original and cz_eligible(original) and original.hash == r.hash and owners[r.owner] then
+				local ok, err = pcall(function()
+					local u = copyItem.unit
+					assert(U.alive(u) == true and U.num_scene_graph_items(u) == r.count, 'copy lifecycle changed')
+					local c = r.fixed_core or assert(cz_core(owners[r.owner]), 'core unavailable')
+					-- 每个显示 unit 两次写入；不再逐肢更新（R:5984-5986）
+					cz_set(u, r.root, c); W.update_unit(world, u)
+					local q, p = cz_world_pose(u, r.root)
+					assert(CZ.close(q, p, c.q, c.p), 'core following failed')
+					U.set_unit_visibility(u, true)
+					U.set_unit_visibility(original.unit, false)
+				end)
+				valid = ok
+				if not ok then cz_note('follow-' .. key, 'copy follow failed ' .. tostring(err)) end
+			end
+			if valid then skip[r.original] = not r.guard or r.guard.motion ~= nil
+			else
+				if copyItem then pcall(U.set_unit_visibility, copyItem.unit, false) end
+				if original then pcall(U.set_unit_visibility, original.unit, true) end
+			end
+		end
+	end
+	local result = {}
+	for _, item in ipairs(armour) do if not skip[cz_slot(item.unit)] then result[#result + 1] = item end end
+	return result
+end
+
+--- 逐帧入口（drive 在写骨之后调用；IAS 对应 R:4046 / R:4705 的 queue_input / observe 与 R:7018 的 flush）。
+--- bindings = 本帧过滤后的名单里有主人的件（IAS：armour_units 过滤之后建 binding）。
+function CorpseFreeze.frame(runtime)
+	if not CorpseFreeze.active then return end
+	local roster = runtime.roster
+	if roster == nil or roster.frame ~= cf.tick then return end
+	local bindings = {}
+	for world, row in pairs(roster.byWorld) do
+		local byUnit = {}
+		for _, a in ipairs(row.avatars) do byUnit[a.unit] = a end
+		for _, armour in ipairs(row.armour) do
+			local avatar = byUnit[row.owner[armour.unit]]
+			if avatar and type(armour.nodes) == 'number' and armour.nodes > 1 then
+				bindings[#bindings + 1] = { unit = armour.unit, world = world, avatar = avatar, node_count = armour.nodes,
+					hash = armour.hash, instance_id = cz_slot(armour.unit), profile = { hash = armour.hash } }
+			end
+		end
+	end
+	for _, b in ipairs(bindings) do
+		local ok, err = pcall(CorpseFreeze.queue_input, b, nil)
+		if not ok then CorpseFreeze.report('input', err) end
+		ok, err = pcall(CorpseFreeze.observe, b)
+		if not ok then CorpseFreeze.report('capture', err) end
+	end
+	local ok, err = pcall(CorpseFreeze.flush, bindings)
+	if not ok then CorpseFreeze.report('flush', err) end
+end
+
+local function corpse_frame(runtime)
+	if CorpseFreeze.active then CorpseFreeze.frame(runtime) end
+end
+
+-- ---------------------------------------------------------------------------
 -- E12e：物理会话生命周期（照 IAS：每帧按 Roster 结果以"实例槽位 + profile"绑定，不跨帧持有名单）。
 -- IAS 对应：runtime.lua 6860 一带 `C.bind_unit(profile.id, instance_id, avatar.id, root)` 每帧一次；
 -- 帧号/时间跳变、传送、布局变化由原生直接重置、不追赶。
@@ -5234,7 +6140,8 @@ local function physics_sync(runtime)
 	for world, row in pairs(roster.byWorld) do
 		for _, armour in ipairs(row.armour) do
 			local ownerUnit = row.owner[armour.unit]
-			if ownerUnit ~= nil and ownerOf[ownerUnit] ~= nil then
+			-- E12f-C2：已被尸体副本替换的原件不再绑定物理（替代 IAS 原生 freeze_corpse_physics，R:5923）。
+			if ownerUnit ~= nil and ownerOf[ownerUnit] ~= nil and not CorpseFreeze.physicsStopped(armour.unit, frame) then
 				desired[armour.unit] = { hash = armour.hash, owner = ownerOf[ownerUnit], world = world }
 				wanted[#wanted + 1] = armour.unit
 			end
@@ -5428,6 +6335,7 @@ local function drive(runtime)
 	physics_sync(runtime)
 	if runtime.sessions == nil or #runtime.sessions == 0 then
 		runtime.sessions = nil
+		corpse_frame(runtime)   -- E12f-C2：没有物理会话的帧（尸体的件已被停物理）也要跑尸体副本的采样 / flush
 		drive_arm_only_and_beat()
 		return
 	end
@@ -5742,6 +6650,10 @@ local function drive(runtime)
 	-- `zeroFrames` / `zeroLimit` 选项 / "[驱动失效]" 日志随之删除。
 	phase(runtime, "写骨 后")
 
+	-- E12f-C2：尸体副本的逐帧采样 / 复制（IAS：写骨之后的 observe R:4705，帧尾的 flush R:7018）。
+	-- 内部自带 pcall；未开启且没有副本时是一次布尔判断。
+	corpse_frame(runtime)
+
 	-- 姿态快照：外部按下热键 ⇒ 写请求文件 ⇒ 这里把骨架采下来。
 	-- 放在**物理写完、渲染之前**：采到的就是这一帧画到屏幕上的姿态。
 	snapshot_poll(S, runtime, options)
@@ -5935,6 +6847,11 @@ end
 M.install_ = M.install
 M.perf_ = Perf
 M.roster_ = Roster
+M.corpse_ = Roster.freeze
+-- 仅测试：把假 CorpseMotion 的函数拷进 CorpseMotion 表（C1 合入后它是那张局部表；单独在本分支上它是全局表）。
+M.set_corpse_motion_ = function(stub)
+	for key, value in pairs(stub) do CorpseMotion[key] = value end
+end
 M.set_engine_ = function(engine) S = engine end   -- 仅测试：不经 install 直接给 Roster 一个引擎
 
 -- 测试钩子：抬升探针的两块纯逻辑（读调参文件 / 给一个 unit 加偏移）。
