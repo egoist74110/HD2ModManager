@@ -886,6 +886,9 @@ do
 		rest[i] = { first.parents[source], identity, identity, first.locals[source].p }
 	end
 	_G.render = nil
+	-- corpseFreeze = false 的理由：下面逐条数 avatar 上 has_animation_state_machine / animation_get_state 的调用次数（验证动作采样复用
+	-- 帧内缓存），尸体定格开着时 IAS 自己也会对活体 avatar 另读一次 has_animation_state_machine（R:5613），与动作采样无关；
+	-- 开着时的整体成本由 perf-combat-test.lua / corpse-integration-test.lua 按 IAS 逐项对账。
 	local state = Runtime.install(S, { compat = Compat, armPose = true, corpseFreeze = false, carriers = {}, pollFrames = 1000, independentMissRescanFrames = 30,
 		independentPieces = { [first.tag] = expected, [late.tag] = expected }, independentBones = map, independentRest = rest,
 		independentTranslations = { [first.tag] = { ias_l_elbow = { avatar.locals.l_elbow.p, first.locals.l_elbow.p } } },

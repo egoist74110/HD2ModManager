@@ -81,6 +81,10 @@ local S = {
 }
 runtimeModule.set_engine_(S)
 
+-- corpseFreeze = false 的理由（逐项保留，不是为了藏成本）：本文件逐条断言"身份轮询自己"的存在性查询次数（R:4973-4983、R:4794-4846 的
+-- 捷径），而尸体定格开着时 IAS 每帧另外为化身号做 shared_life（R:5097-5119，game_object_exists 等，R:6917-6919），
+-- 会让这些计数多出一项与身份轮询无关的查询。开着时的整体成本由 perf-combat-test.lua（L/C/A/S 项）与
+-- corpse-integration-test.lua（逐阶段）按 IAS 逐项对账。
 local runtime = { frame = 0, options = { independentPieces = manifest, corpseFreeze = false }, logger = function() end }
 local function step()
 	runtime.frame = runtime.frame + 1

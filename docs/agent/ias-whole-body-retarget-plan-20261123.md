@@ -630,7 +630,7 @@ IAS 规则：unit 句柄只来自本回调的枚举、不跨帧（IAS `runtime.l
 ### 23.5 验证
 - Lua 回归合计 731 项全绿（含新增 3 项）；perf-combat 数字不变：战斗 111.78/帧（预算 126.40），非战斗 297.15/帧（预算 311.66）——该场景不挂护甲会话/独立骨件，删除的判活不在它的路径上；有会话时每会话每帧、每件/远端 avatar 每帧各少 1 次 `Unit.alive`（该场景未量化）。
 
-## 24. E12f：尸体定格（C1 CorpseMotion、C2 CorpseFreeze、C3 判活、D1 收尾；运行时 2.1.64，分支 `wip/ias-e12e-cmotion`）
+## 24. E12f：尸体定格（C1 CorpseMotion、C2 CorpseFreeze、C3 判活、D1 收尾；运行时 2.1.65，分支 `wip/ias-e12e-cmotion`）
 
 用户决定：尸体定格完全照 IAS 做，**包括 IAS 常态不销毁尸体副本（上限 256）**——原样照抄，删除留作以后的实验。
 
@@ -646,7 +646,7 @@ IAS 规则：unit 句柄只来自本回调的枚举、不跨帧（IAS `runtime.l
   2. 没有 `corpse_freeze_context`（原生侧的上下文通知）。
   3. 没有 profile 的 gender / authored 标志（`cz_eligible` 只要求有哈希字符串），`profile.nodes` 核对略。
   4. 关节表来自 `independentPieces` + `independentBones`（IAS 来自 profile 的 target_flags 位 10），样本零额外读取。
-  5. 死者的撕裂判断：IAS 用原生每帧给的关节位置（R:5600-5603）；我们没有，改成死后每 0.25 s 读一次该件的关节节点（`cz_torn_estimate`，仅独立骨件）——相对 IAS 唯一多出的引擎读取。
+  5. 死者的撕裂判断：IAS 用原生每帧给的关节位置（R:5604-5607，数据来自 retarget 常规开销 R:2724-2735）；我们没有，改成死后每 0.25 s 一个桶读该件的关节节点（`cz_torn_estimate`，仅独立骨件）——相对 IAS 唯一多出的引擎读取；2.1.65 起摊到连续几帧、每帧至多 10 次调用（见 24.5）。
   6. `freeze_corpse_physics`（原生）→ 停掉该原件的 Lua 物理会话（`physicsStopped`，physics_sync 不再给它建会话）。这是唯一允许的非字面映射。
   7. `dead_life` 照 IAS 保留并有测试，**运行时不调用**（IAS 的 Lua 侧同样没有调用者）。
 - 共享身体化身号簿记（R:5190-5246）照抄，但在我们的运行时里没有消费者。
@@ -659,6 +659,40 @@ IAS 规则：unit 句柄只来自本回调的枚举、不跨帧（IAS `runtime.l
 - 注意：**普通死亡（没撕裂）不走 CorpseMotion**——死后 4 s 直接按原件当时姿态定格；只有撕裂/提前复制才跑铰接下落。这是 IAS 的结构（R:5850-5950 的 `useCache` 才起 `start_motion`），不是我们的遗漏。
 - `Unit.scene_graph_link` 护栏：CorpseFreeze 只有 `cz_apply` 里 2 处调用（根节点 `scene_graph_link(copy, root, nil)` 与其余节点链到根），都在刚 spawn 的副本通过身份/布局断言（alive、name_hash、节点数、根节点、无动画控制器、无 actor）之后同帧执行；布局不符或 spawn 失败时一次都不调用。测试含 nil/无效 unit 审计与源码顺序断言。
 - **默认值改为开**，与 IAS 一致：IAS `native_bridge/preferences.py:20` 的 `optimization.load(dict(freeze=True,grip=True,refresh=2))`；1.6.4 面板没有该开关按钮（`companion/settings_bridge.lua:21、37` 对 `optimization.freeze` 直接拒绝，`panel_text.lua` 有"尸体冻结"文案但 `settings_panel.lua` 只放了 `optimization:recover` / `optimization:refresh`）；落盘文件是 `optimization.json`（`control_host.py:70`，与 `physics.json` 同目录）。`physics.json` 的 `corpses:false`（`ArmorBase/files/physics.json:6`）是另一回事：原生物理是否作用于尸体。
-- 开着的代价：`Roster.sharedLife`（IAS R:5190 的对应物）每帧给每个活 avatar 多查网络（game_object_exists / field）；perf-combat 的 IAS 预算模型不含它，该用例与 arm-pose、ias-roster 两处只数 IAS 名单开销的断言因此显式 `corpseFreeze=false`。
-- 运行时版本 2.1.64。
+- 开着的代价：`Roster.sharedLife`（IAS R:5097-5119 的对应物）每帧给每个活 avatar 多查网络（game_object_exists / field）。D1 当时为此在 perf-combat 里关了开关，**那是在藏成本**，D2 已撤销并按 IAS 逐项对账（见 24.5）。
+- 运行时版本 2.1.64（D2 起 2.1.65）。
 - 未验证：实机（真实 `world_pose` 抖动、真实 spawn_unit 的 unit 行为）。
+
+### 24.5 D2 尸体定格成本对账（运行时 2.1.65）
+用户规则：我们的引擎调用不得超过 IAS 同场景，且要按用户实际运行的配置（开）测。D2 撤销了 perf-combat 里的 `corpseFreeze=false`，把 IAS 为尸体定格付的调用逐项写进预算，并在整合测试里逐阶段对账。
+
+**保留 `corpseFreeze=false` 的两处（理由写在各自的注释里）**：`ias-roster-test.lua`（逐条断言身份轮询自己的存在性查询次数，shared_life 的 game_object_exists 与之无关）、`arm-pose-test.lua`（逐条数 avatar 上 has_animation_state_machine / animation_get_state 的次数，验证动作采样复用缓存，IAS 的 R:5613 另读一次与之无关）。perf-combat 不再关。
+
+**IAS 尸体项（行号指 `tmp/ias-lab/upstream/ias-1.6.4/Generator/runtime/lua/lua/runtime.lua`，只数 Lua 侧引擎 API；原生 ABI 不计）**：
+- L 化身号证据：R:6917-6919 每帧对在场 avatar 调 observe（R:5190-5246，本体零引擎调用）→ `shared_life`（R:5097-5119）：role 1 = 5 次（Unit.alive R:5099-5100、Network.game_session R:5108、GameSession.in_session R:5109、game_object_exists R:5110、game_object_field R:5111），role 2 = 6 次（另加 has_animation_state_machine R:5104-5105）；role 0 / 3 为 0。**不受 corpse_freeze 开关控制**（IAS 照付）。
+- C core(avatar)：R:5472-5493，每 avatar 每帧一次 = 10 次（alive、has_node/node(hips)、num_scene_graph_items、world_pose 2、has_node/node(head)、world_pose 2）；F.observe 在 role 1/2/3 时先于采样节流就调（R:5605-5607），queue_input 同样（R:5598）。
+- A F.observe 对活体每件每帧 has_animation_state_machine 1 次（R:5613，节流之前）。
+- S 采样：每 0.25 s 桶（R:5614-5618）每件 capture = node_count x 2 次 world_pose（R:5525-5544）。
+- 原子：world_pose = 2（R:430、R:376-386）；engine_vector = 1（R:313-317）；engine_quaternion = 3（R:327-351）；set = 6（R:5658-5661）。
+- 复制 prepare（R:5635-5657）、apply（R:5662-5686，C=12 时 134 次/件）、filter 跟随（R:5978-5990，13 次/件）、finish_guard + update_motion + rewrite_copy（R:5811-5849、R:5775-5810、R:5711-5719）。
+- IAS 另有而我们没有、**未计入**（只会让 IAS 更大）：F.control_context（R:5555-5588）舰上场景的 alive / has_asm 读取；retarget 常规开销里的 authored_scene_node_offset（R:2695-2700、R:4053）与 native 快照（R:2724-2735）。
+
+**对账表（`perf-combat-test.lua` 战斗世界 4 人、`corpse-integration-test.lua` 1 人 3 件 12 节点；单位：每帧尸体定格相关引擎调用，我们只统计尸体模块的 begin / 化身号簿记 / filter / 逐帧入口四个入口）**
+
+| 阶段 | 我们 均值 / 峰值 | IAS 均值 / 峰值 |
+|---|---|---|
+| 战斗世界活人阶段（4 人 x 1 件 x 110 节点，1200 帧 @120 Hz） | 53.8 / 947 | 97.1 / 947 |
+| 非战斗世界（role 0） | 0 / 0 | 0 / 0 |
+| A 活着（采样 + 化身号 + core） | 10.7 / 90 | 22.8 / 90 |
+| A 已死未满 4 s | 2.8 / 10 | 10 / 10 |
+| A 复制那一帧（三件） | 437 / 437 | 505 / 505 |
+| A 定格稳态 | 43 / 43 | 49 / 49 |
+| B 已死 0.5 s（未撕裂） | 3.7 / 10 | 10 / 10 |
+| B 撕裂复制那一帧（三件） | 398 / 398 | 466 / 466 |
+| B 铰接下落（CorpseMotion） | 268 / 268 | 346 / 346 |
+| B 倒地定格稳态 | 33 / 33 | 39 / 39 |
+
+**D2 为对齐 IAS 做的两处运行时改动**：
+1. `cz_root_offset` 按实例槽缓存（30 s 未读到即丢，`cz_prepare` 仍会重新断言根节点号）：IAS 的 offset 来自 retarget 本来就做的 authored_scene_node_offset，我们没有那一步，不缓存则采样帧每件多付 2 次，战斗峰值帧 955 > 947。缓存后峰值持平 947（首个采样帧会多 2 x 件数次一次性读取）。
+2. 死者撕裂估计（`cz_torn_estimate`）摊到连续几帧：先读一次 owner 的 core（≤10），再每帧至多 5 个关节（各 2 次），全读完才判 detached；之前一个桶内一帧 40 次，高于 IAS 此阶段每帧 10 次的 core。副作用：撕裂发现比以前晚约 4 帧（60 Hz 下约 67 ms）。这一项**没有 IAS 对应物**（IAS 的关节位置来自原生快照），属于非 IAS 的限额机制，请用户知悉。
+3. 更低的原因（不是缺陷）：我们的 set 只需 4 次引擎调用（Quaternion.from_elements + set_local_rotation + Vector3 + set_local_position），IAS 的 engine_quaternion 要 3 次；活人阶段我们在节流之前就返回，IAS 每帧都做 core 与 has_asm。

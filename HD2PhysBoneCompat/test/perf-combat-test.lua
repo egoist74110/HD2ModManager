@@ -11,6 +11,8 @@ local here = arg and arg[0] and arg[0]:gsub("[^/\\]*$", "") or ""
 package.path = here .. "../src/?.lua;" .. package.path
 
 local runtimeModule = dofile(here .. "../src/physbone_runtime.lua")
+-- 真求解器库：假求解器只替换"会话"那几个入口；尸体定格读 / 写节点用的是真库里的节点读写函数。
+local realCompat = dofile(here .. "../src/physbone_compat.lua")
 
 local failures, checks = 0, 0
 local function check(condition, message, detail)
@@ -90,6 +92,15 @@ function Fake:stingray(squad)
 		world_position = function(unit, _) return unit.position end,
 		-- 真引擎的名字里带资源 id（16 位十六进制）；非护甲 unit 没有。
 		debug_name = function(unit) return "#ID[" .. (unit.hash or tostring(unit.id)) .. "]" end,
+		-- 尸体定格（默认开）要读的节点：StingrayEntityRoot=1、hips=2、head=3；世界姿态 = 单位位置 + 0.3 m * 节点号（头与 hips 隔 0.3 m，
+		-- 满足 core 对"头相对 hips 的轴"的 0.1~2 m 条件），旋转恒为单位阵。
+		node = function(_, name) if name == "StingrayEntityRoot" then return 1 elseif name == "hips" then return 2 elseif name == "head" then return 3 end end,
+		world_pose = function(unit, node) return { unit = unit, node = node } end,
+		-- 以下只为让 CorpseFreeze 的 API 可用性检查（R:5461-5470）通过；战斗场景里没人死，不会被真正调用。
+		name_hash = function(unit) return unit.hash or tostring(unit.id) end,
+		set_unit_visibility = function() end,
+		scene_graph_link = function() end,
+		scene_graph_parent = function() end,
 	}
 	local World = {
 		units = function(_) return self_.units end,
@@ -112,6 +123,9 @@ function Fake:stingray(squad)
 		-- 相机固定在原点：于是 (0,0,0) 那个玩家就是"自己"（第一位）。
 		debug_camera_pose = function(_) return { pose = true } end,
 		update_unit = function() end,
+		spawn_unit = function() end,
+		destroy_unit = function() end,
+		unlink_unit = function() end,
 	}
 	local engine = {
 		Application = {
@@ -123,7 +137,13 @@ function Fake:stingray(squad)
 		Unit = Unit,
 		IdString64 = { from_hex = function(hex) return { hex = hex } end },
 		Vector3 = { to_elements = function(v) return v.x, v.y, v.z end },
-		Matrix4x4 = { translation = function(_) return vector(0, 0, 0) end },
+		Matrix4x4 = {
+			translation = function(_) return vector(0, 0, 0) end,
+			to_elements = function(m)
+				local p = m.unit.position
+				return 1, 0, 0, 0, 1, 0, 0, 0, 1, p.x, p.y, p.z + 0.3 * (m.node or 0)
+			end,
+		},
 	}
 	if squad ~= nil then
 		-- 战斗局身份：Network / GameSession（IAS physics_identity 的数据来源）。
@@ -168,6 +188,9 @@ end
 local function newCompat()
 	local compat = { attached = {}, released = {}, dtByUnit = {}, calls = {} }
 	compat.unit_alive = function(_, unit) return unit ~= nil and unit.alive == true end
+	for _, name in ipairs({ "independent_world_pose", "independent_rotation_object", "write_independent_rotation", "write_independent_position" }) do
+		compat[name] = realCompat[name]
+	end
 	compat.begin_frame = function() end
 	compat.filter_ias_groups = function(rig) return rig, 0 end
 	compat.select_rig = function(_, units, _)
@@ -223,7 +246,6 @@ local function freshRuntime(fake, compat, options)
 		validateFrames = 3,
 		heartbeatFrames = 1000000,
 		minNodes = 90,
-		corpseFreeze = false,   -- 预算对比的是 IAS 名单/归属开销；尸体副本开着时每帧多查网络（sharedLife），单独统计
 	}
 	for key, value in pairs(options or {}) do opts[key] = value end
 	runtimeModule.install(fake:stingray(), opts)
@@ -316,6 +338,76 @@ local function iasBudget(shape)
 	}
 end
 
+-- ---------------------------------------------------------------- IAS 1.6.4 尸体定格开着时的每帧开销（战斗世界、活人阶段）
+-- 用户规则：尸体定格按用户实际运行的默认（开）来测，成本不得超过 IAS 同场景。下面把 IAS 在这个场景里
+-- **为尸体定格付的**引擎调用逐项列出（只数 Lua 侧的 Unit/World/Network/GameSession/Matrix4x4 调用；
+-- 原生 ABI `api.corpse_freeze_context` / `corpse_freeze_enabled`、`shared_next_incarnation` 等不是 Lua 引擎 API，不计）。
+-- 行号同上，指 runtime.lua：
+--   L  共享身体化身号证据（每帧，不论 corpse_freeze 开关）：R:6917-6919 每个回调对在场 avatar 调
+--      `__hd2ir_shared_body_lifecycle.observe`（R:5190-5246，本体零引擎调用）→ evidence = `physics_identity.shared_life`
+--      （R:5097-5119）：role 1/2 且未死且有网络号才往下读：Unit.alive R:5099-5100；role 2 另加 has_animation_state_machine R:5104-5105；
+--      Network.game_session R:5108；GameSession.in_session R:5109；game_object_exists R:5110；game_object_field(health) R:5111。
+--      => role 1：5 次；role 2：6 次。role 0（非战斗世界）/ role 3（死者）在 R:5099 直接返回，0 次。
+--      （`identity().role` R:5180 只读 Lua 表，0 次；presentation_lives/worlds R:5139-5170 在单个世界 `#contexts<2` 时 R:5145-5146 直接返回。）
+--   C  `core(avatar)`（R:5472-5493）：F.observe（R:5602）在 role 1/2/3 时（R:5605-5606）、**先于任何采样节流**（R:5614 的 bucket 判断）就调（R:5607），
+--      每个 avatar 每帧一次（`cores` 每帧在 F.begin R:5546 清空、R:5474 命中缓存）：
+--      Unit.alive、has_node('hips')、node('hips')、num_scene_graph_items 各 1（R:5475-5477），world_pose 2
+--      （Unit.world_pose + Matrix4x4.to_elements，R:430、R:384-386；R:5479），has_node('head')、node('head') 各 1（R:5482-5483），
+--      world_pose(head) 2（R:5485）=> 10 次 / avatar / 帧。
+--   A  F.observe 对活体（role 1/2）每个 binding 每帧一次 Unit.has_animation_state_machine（R:5613，在 R:5614 节流之前）。
+--   S  采样：每 0.25 s 一个桶（R:5614 `bucket=floor(now*4)`、`old.bucket==bucket` 则跳过；首次 old==nil 立刻采），
+--      每个 binding 整件 capture（R:5525-5544）：每个节点 world_pose 2 次 => node_count*2 次 / binding / 桶。
+--   F.flush（R:5850）对活体全是纯 Lua（`ready[key]` 为空 => 'incomplete corrected group' R:5890-5893，不碰引擎）。
+-- 没有 IAS 对应物、本表不计的项（只会让 IAS 更大）：F.control_context（R:5555-5588，每帧：舰上场景的 alive/has_asm 读取）。
+local function iasCorpseBudget(shape)
+	local life, core, asm = 0, 0, 0
+	for _, role in ipairs(shape.roles) do
+		if role == 1 then life = life + 5 end
+		if role == 2 then life = life + 6 end
+		if role == 1 or role == 2 or role == 3 then core = core + 10 end
+		if role == 1 or role == 2 then asm = asm + shape.pieces end
+	end
+	local sample = 0
+	for _, role in ipairs(shape.roles) do
+		if role == 1 or role == 2 then sample = sample + shape.pieces * shape.nodes * 2 end
+	end
+	local seconds = shape.frames / shape.hz
+	local buckets = (life + core + asm) > 0 and (math.floor(seconds * 4) + 1) or 0   -- 次数取窗口内可能出现的最大次数
+	local aliveReads = 0
+	for _, role in ipairs(shape.roles) do
+		if role == 1 or role == 2 then aliveReads = aliveReads + 2 end   -- L 的 Unit.alive + C 的 Unit.alive
+	end
+	return {
+		life = life, core = core, asm = asm, sample = sample, buckets = buckets, aliveReads = aliveReads,
+		perFrame = life + core + asm,
+		total = shape.frames * (life + core + asm) + buckets * sample,
+		peak = life + core + asm + sample,
+	}
+end
+
+-- 尸体定格模块自己的引擎调用（只统计这四个入口里的调用：begin / 化身号簿记 / filter / 逐帧采样与 flush）。
+local function wrapCorpse(counter)
+	local freeze = runtimeModule.corpse_
+	local meter = { frame = 0, total = 0, peak = 0, raw = {} }
+	for _, name in ipairs({ "begin", "lifecycleObserve", "filter", "frame" }) do
+		local raw = freeze[name]
+		meter.raw[name] = raw
+		freeze[name] = function(...)
+			local before = counter.total
+			local a, b = raw(...)
+			meter.frame = meter.frame + (counter.total - before)
+			return a, b
+		end
+	end
+	function meter.endFrame()
+		meter.total = meter.total + meter.frame
+		meter.peak = math.max(meter.peak, meter.frame)
+		meter.frame = 0
+	end
+	function meter.restore() for name, raw in pairs(meter.raw) do freeze[name] = raw end end
+	return meter
+end
+
 local function combatScenario(label, gameplay)
 	io.stdout:write(string.format("\n[E12 %s] 世界 15000 个 unit + 4 名玩家\n", label))
 	local fake = newFake()
@@ -352,8 +444,7 @@ local function combatScenario(label, gameplay)
 	end
 	runtimeModule.install(S, { compat = compat, log = false, carriers = { { rig = { bones = { { name = "hair" } } }, path = "fake" } },
 		profileHashes = fake.hashes, settleFrames = 1, snapshot = false, tunePath = "nonexistent-hd2pbx-tune.txt", pollFrames = 1, validateFrames = 3,
-		heartbeatFrames = 1000000, minNodes = 90, perfWindow = 1000000,
-		corpseFreeze = false })   -- 预算对比的是名单/归属开销；尸体副本开着时每帧多查网络（sharedLife），不在这条预算里
+		heartbeatFrames = 1000000, minNodes = 90, perfWindow = 1000000 })   -- 尸体定格按用户实际运行的默认（开）测，不关
 	local runtime = rawget(_G, "__hd2physbone_runtime")
 	local function frame()
 		fake.clock = fake.clock + 1 / hz
@@ -371,14 +462,18 @@ local function combatScenario(label, gameplay)
 	end
 	counter.total, counter.by, rosterCalls = 0, {}, 0
 	local frames = 1200
+	local corpse = wrapCorpse(counter)
+	check(runtimeModule.corpse_.enabled == true, label .. "：尸体定格默认开着（按用户实际运行的配置测，不关开关）", runtimeModule.corpse_.enabled)
 	local c0 = realClock()
 	local peakRoster, peakTotal = 0, 0
 	for _ = 1, frames do
 		local beforeTotal, beforeRoster = counter.total, rosterCalls
 		frame()
+		corpse.endFrame()
 		peakTotal = math.max(peakTotal, counter.total - beforeTotal)
 		peakRoster = math.max(peakRoster, rosterCalls - beforeRoster)
 	end
+	corpse.restore()
 	local elapsed = realClock() - c0
 	local perFrame = counter.total / frames
 	local rosterPerFrame = rosterCalls / frames
@@ -390,6 +485,17 @@ local function combatScenario(label, gameplay)
 	for _, key in ipairs(keys) do io.stdout:write(string.format("    %-34s %.2f/帧\n", key, counter.by[key] / frames)) end
 	local units = #fake.units
 	local budget = iasBudget({ avatars = 4, profiles = #fake.hashes, armour = 4, units = units, frames = frames, hz = hz, gameplay = gameplay })
+	-- 尸体定格开着的 IAS 项（见 iasCorpseBudget 的逐项来源）。L 在 IAS 里不受开关控制，所以进总预算；C/A/S 受 corpse_freeze_enabled 控制，
+	-- 默认开（native_bridge/preferences.py:20 freeze=True），也进总预算。
+	local roleList = {}
+	for index in ipairs(players) do roleList[index] = roles[index] end
+	local cb = iasCorpseBudget({ roles = roleList, pieces = 1, nodes = 110, frames = frames, hz = hz })
+	budget.corpse = cb
+	budget.total = budget.total + cb.total
+	budget.peak = budget.peak + cb.peak
+	io.stdout:write(string.format("  [IAS 尸体项] L(化身号证据)=%d C(core)=%d A(has_asm)=%d => %d/帧；采样帧 +%d x %d 桶；合计 %d / %d 帧 = %.2f/帧；峰值帧 %d\n",
+		cb.life, cb.core, cb.asm, cb.perFrame, cb.sample, cb.buckets, cb.total, frames, cb.total / frames, cb.peak))
+	io.stdout:write(string.format("  [我们 尸体项] 尸体定格模块合计 %d / %d 帧 = %.2f/帧；峰值帧 %d\n", corpse.total, frames, corpse.total / frames, corpse.peak))
 	io.stdout:write(string.format("  [IAS 预算] 常规帧 %d + 身份 %d x %d 次 + 全量扫描 (1+%d) x %d 次 = %d 次 / %d 帧 = %.2f/帧；峰值帧 %d\n",
 		budget.ordinary, budget.identity, budget.polls, units, budget.scans, budget.total, frames, budget.total / frames, budget.peak))
 	local perf = runtimeModule.perf_
@@ -412,7 +518,15 @@ local function combatScenario(label, gameplay)
 	local solverSide = 1 + 4
 	check(peakTotal <= budget.peak + solverSide, label .. "：整帧峰值 <= IAS 峰值帧 + 求解侧无对应物 " .. solverSide,
 		string.format("%d <= %d + %d", peakTotal, budget.peak, solverSide))
-	check((counter.by["Unit.alive"] or 0) / frames < 1, label .. "：稳态不再逐 unit 调 Unit.alive", (counter.by["Unit.alive"] or 0) / frames)
+	-- Unit.alive 只剩逐 avatar 的判活（IAS 同样有：L 的 R:5099-5100 + C 的 R:5475，每个 avatar 每帧各 1 次）；不再逐 unit（15000 个）调。
+	check((counter.by["Unit.alive"] or 0) / frames <= cb.aliveReads + 0.5, label .. "：稳态 Unit.alive 只剩逐 avatar 判活（<= IAS 的 L+C 项 " .. cb.aliveReads .. "/帧），不逐 unit",
+		(counter.by["Unit.alive"] or 0) / frames)
+	-- 尸体定格自己的成本：均值与峰值都不得超过 IAS 同场景为它付的引擎调用（L/C/A/S 四项）。
+	check(corpse.total <= cb.total, label .. "：尸体定格模块调用数 <= IAS 尸体项（均值口径）", string.format("%d <= %d", corpse.total, cb.total))
+	check(corpse.peak <= cb.peak, label .. "：尸体定格模块峰值帧 <= IAS 尸体项峰值帧", string.format("%d <= %d", corpse.peak, cb.peak))
+	if not gameplay then
+		check(corpse.total == 0, label .. "：非战斗世界（role 0）尸体定格 0 次引擎调用（IAS R:5099 / R:5606 同样直接返回）", corpse.total)
+	end
 	-- 战斗世界里 World.units（全量）只能是 IAS 的 2.0 s 节奏；非战斗世界是 60 帧一次。
 	local fullScans = (counter.by["World.units"] or 0)
 	check(fullScans <= budget.scans, label .. "：全量 World.units 次数 <= IAS 节奏", string.format("%d <= %d", fullScans, budget.scans))

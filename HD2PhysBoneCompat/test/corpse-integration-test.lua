@@ -23,6 +23,21 @@ assert(Roster and Freeze and Freeze.state and Motion and type(Motion.new) == "fu
 local clock = 100.0
 os.clock = function() return clock end
 
+-- 尸体定格模块自己的引擎调用：包住它被 Roster.update / drive 调用的四个入口（begin / 化身号簿记 / filter / 逐帧采样与 flush），
+-- 按"总引擎调用计数器"的差值累计到 corpseMeter.frame。入口之间互不嵌套，所以不会重复计。
+-- 每次 scene() 换一个新的 E.engine（currentEngine），包装器只装一次。
+local currentEngine
+local corpseMeter = { frame = 0 }
+for _, name in ipairs({ "begin", "lifecycleObserve", "filter", "frame" }) do
+	local raw = Runtime.corpse_[name]
+	Runtime.corpse_[name] = function(...)
+		local before = currentEngine.total
+		local a, b = raw(...)
+		corpseMeter.frame = corpseMeter.frame + (currentEngine.total - before)
+		return a, b
+	end
+end
+
 local function qmul(a, b)
 	return { a[4] * b[1] + a[1] * b[4] + a[2] * b[3] - a[3] * b[2], a[4] * b[2] - a[1] * b[3] + a[2] * b[4] + a[3] * b[1],
 		a[4] * b[3] + a[1] * b[2] - a[2] * b[1] + a[3] * b[4], a[4] * b[4] - a[1] * b[1] - a[2] * b[2] - a[3] * b[3] }
@@ -221,6 +236,25 @@ local function scene(opts)
 		return r00, r10, r20, r01, r11, r21, r02, r12, r22, p[1], p[2], p[3]
 	end
 
+	-- 全部引擎调用的总数（每个命名空间的每个函数都包一层）；尸体定格模块自己的份额由下面 Freeze.* 的包装器按差值统计。
+	-- 注意：不并入 E.calls（那是按名字分项、给 freezeCalls 用的），这里只要一个总数。
+	E.engine = { total = 0 }
+	currentEngine = E.engine
+	for _, space in ipairs({ "Application", "World", "Unit", "Quaternion", "Matrix4x4", "Network", "GameSession", "IdString64" }) do
+		for key, fn in pairs(S[space]) do
+			if type(fn) == "function" then
+				S[space][key] = function(...) E.engine.total = E.engine.total + 1 return fn(...) end
+			end
+		end
+	end
+	do
+		local meta = getmetatable(S.Vector3)
+		local call = meta.__call
+		meta.__call = function(...) E.engine.total = E.engine.total + 1 return call(...) end
+		local toElements = S.Vector3.to_elements
+		S.Vector3.to_elements = function(...) E.engine.total = E.engine.total + 1 return toElements(...) end
+	end
+
 	local runtime = Runtime_.install(S, {
 		compat = Compat, perfCounters = false, log = false, tunePath = "nonexistent-hd2pbx-tune.txt",
 		identityPollSeconds = 0, rosterNegativeSeconds = 0,
@@ -270,15 +304,85 @@ end
 
 -- 统计每帧引擎调用总数（全部、尸体副本独有）
 local function totalCalls(E) local t = 0 for _, v in pairs(E.calls) do t = t + v end return t end
-local function profile(E, seconds, dt)
+-- model：该阶段 IAS 每帧为尸体定格付的引擎调用数（数字，或 function(i, now) 返回数字）；见下面"IAS 1.6.4 各阶段"。
+-- 第 4 个返回值是我们尸体定格模块的 { mean, peak }，第 5 个是 IAS 的 { mean, peak }。
+local function profile(E, seconds, dt, model)
 	local maxAll, maxFreeze, sumAll, n = 0, 0, 0, 0
-	for _ = 1, math.floor(seconds / (dt or 1 / 60) + 0.5) do
+	local oursSum, oursPeak, iasSum, iasPeak = 0, 0, 0, 0
+	for i = 1, math.floor(seconds / (dt or 1 / 60) + 0.5) do
 		E.reset_calls()
+		corpseMeter.frame = 0
 		E.step(dt)
 		local all, fz = totalCalls(E), E.freezeCalls()
 		maxAll, maxFreeze, sumAll, n = math.max(maxAll, all), math.max(maxFreeze, fz), sumAll + all, n + 1
+		oursSum, oursPeak = oursSum + corpseMeter.frame, math.max(oursPeak, corpseMeter.frame)
+		local ias = type(model) == "function" and model(i, clock) or model or 0
+		iasSum, iasPeak = iasSum + ias, math.max(iasPeak, ias)
 	end
-	return maxAll, maxFreeze, sumAll / math.max(n, 1)
+	n = math.max(n, 1)
+	return maxAll, maxFreeze, sumAll / n, { mean = oursSum / n, peak = oursPeak }, { mean = iasSum / n, peak = iasPeak }
+end
+
+-- ---------------------------------------------------------------- IAS 1.6.4 各阶段每帧引擎调用（尸体定格相关）
+-- 用户规则：我们的引擎调用不得超过 IAS 同场景。下面按 IAS 源码（行号指
+-- tmp/ias-lab/upstream/ias-1.6.4/Generator/runtime/lua/lua/runtime.lua）把"为尸体定格付的"调用逐阶段算出来，
+-- 与我们尸体定格模块的实测（四个入口的差值，见 corpseMeter）逐阶段比：均值与峰值都不得超过。
+-- 场景形状：1 个 avatar（活着 role 1，死后 role 3）、P=3 件、每件 C=12 个节点（根节点 offset=1）。
+-- 只数 Lua 侧引擎 API（Unit/World/Network/GameSession/Matrix4x4/Vector3/Quaternion）；原生 ABI（freeze_corpse_physics R:5923、
+-- corpse_freeze_context、shared_next_incarnation 等）不是 Lua 引擎 API，不计。
+-- 原子操作的 IAS 调用数：
+--   world_pose  = 2：Unit.world_pose + Matrix4x4.to_elements（R:430 -> R:376-386 pose_capture.matrix_read；稳态，前 128 次的
+--                 legacy 对拍读取 R:392-404 是启动期一次性的，不计）。
+--   engine_vector = 1（Vector3 构造 R:313-317）；engine_quaternion = 3（Vector3 构造 + Quaternion.axis_angle + Quaternion.is_valid，R:327-351）。
+--   set(unit,node,pose) = 6：set_local_rotation 1 + engine_quaternion 3 + set_local_position 1 + engine_vector 1（R:5658-5661）。
+--   core(avatar) = 10：Unit.alive、has_node('hips')、node('hips')、num_scene_graph_items 各 1（R:5475-5477）+ world_pose 2（R:5479）+ has_node('head')、
+--                 node('head') 各 1（R:5482-5483）+ world_pose 2（R:5485）；每个 avatar 每帧一次（`cores` 在 F.begin R:5546 清空、R:5474 命中）。
+--   shared_life(role 1) = 5：Unit.alive（R:5099-5100）、Network.game_session（R:5108）、GameSession.in_session（R:5109）、game_object_exists（R:5110）、
+--                 game_object_field（R:5111）。
+local P, C = #HASHES, COUNT
+local IAS_WP, IAS_SET, IAS_CORE, IAS_LIFE1 = 2, 6, 10, 5
+local IAS = {}
+-- 活人阶段每帧：L 化身号证据 5（R:6917-6919 observe -> R:5097-5119，role 1）+ C core 10（F.observe R:5602-5606，先于节流）
+-- + A has_animation_state_machine 每件 1（R:5613，在节流之前）+ S 采样帧（桶变了，R:5614-5618 `bucket=floor(now*4)`）每件 capture C*2（R:5525-5544）。
+function IAS.alive()
+	local last
+	return function(_, now)
+		local bucket = math.floor(now * 4)
+		local sample = last ~= bucket
+		last = bucket
+		return IAS_LIFE1 + IAS_CORE + P + (sample and P * C * IAS_WP or 0)
+	end
+end
+-- 已死未满 4 s（role 3，未撕裂）：shared_life 在 R:5099 因 s.dead 直接返回（0）；queue_input（R:5589-5601）与 observe（R:5602-5606）
+-- 都要 core（R:5598、R:5607），同帧缓存 => 10；flush（R:5850-5949）`age>=4 or use_cache` 不成立 => 0。
+IAS.dead = IAS_CORE
+-- prepare（R:5635-5657）：Unit.alive、num_scene_graph_items、has_node、node 各 1（R:5639-5640），name_hash 1（R:5646）；非缓存路径 capture C*2（R:5648），
+-- 缓存路径（撕裂）改读 parents：scene_graph_parent C-1 次（R:5650-5653）。
+function IAS.prepare(cache) return 4 + 1 + (cache and (C - 1) or C * IAS_WP) end
+-- apply（R:5662-5686）：spawn（engine_vector 1 + engine_quaternion 3 + spawn_unit 1 = 5，R:5665）、set_unit_visibility 1（R:5668）、
+-- 身份/布局断言 alive、name_hash、num_scene_graph_items、has_node、node 各 1（R:5669-5670）、has_animation_state_machine 1（R:5671）、
+-- num_actors 1（R:5672）、unlink_unit 1（R:5673）、scene_graph_link C（R:5674-5675）、set C 次（R:5676-5677）、update_unit 1（R:5678）、
+-- 回读 world_pose C 次 + scene_graph_parent C-1 次（R:5679-5685）。
+IAS.apply = 5 + 1 + 5 + 1 + 1 + 1 + C + C * IAS_SET + 1 + C * IAS_WP + (C - 1)
+-- 复制那一帧：observe 的 core 10 + 每件 prepare + 每件 apply + 显示副本 / 隐藏原件各 1 次 set_unit_visibility（R:5925-5926）。
+function IAS.copyFrame(cache) return IAS_CORE + P * IAS.prepare(cache) + P * IAS.apply + 2 * P end
+-- filter 对每个副本的跟随（R:5978-5990）：alive 1 + num_scene_graph_items 1 + set（根）6 + update_unit 1 + world_pose 2 + set_unit_visibility 2。
+IAS.follow = 1 + 1 + IAS_SET + 1 + IAS_WP + 2
+-- 定格稳态（没有 fixed_core，R:5981 每帧 core(owner) 一次）：core 10 + 每件 follow。
+IAS.frozen = IAS_CORE + P * IAS.follow
+-- 铰接下落的每一帧（R:5964-5970 filter 先对每组 guard 调 core(owner) 10 -> finish_guard R:5811-5849：每件 alive(副本) alive(原件)
+-- num_scene_graph_items(副本) num_scene_graph_items(原件) 共 4（R:5819-5820）-> update_motion R:5775-5810：每件 rewrite_copy（R:5711-5719）
+-- = set C 次 + update_unit 1 + 回读 (C-1)*2 -> 之后 fixed_core 已有，follow 不再 core）。
+IAS.fall = IAS_CORE + P * 4 + P * (C * IAS_SET + 1 + (C - 1) * IAS_WP) + P * IAS.follow
+-- 铰接下落结束后的稳态：fixed_core 已写（R:5791），没有 core => 只有每件 follow。
+IAS.settled = P * IAS.follow
+
+local costRows = {}
+local function costRow(phase, ours, ias)
+	costRows[#costRows + 1] = { phase = phase, ours = ours, ias = ias }
+	print(string.format("  COST %-30s 我们 均值 %7.1f / 峰值 %4d | IAS 均值 %7.1f / 峰值 %4d", phase, ours.mean, ours.peak, ias.mean, ias.peak))
+	check(ours.mean <= ias.mean + 1e-9, phase .. "：尸体定格每帧引擎调用均值 <= IAS", string.format("%.1f <= %.1f", ours.mean, ias.mean))
+	check(ours.peak <= ias.peak, phase .. "：尸体定格每帧引擎调用峰值 <= IAS", string.format("%d <= %d", ours.peak, ias.peak))
 end
 local function snapshot(E, copy)
 	local out = {}
@@ -320,19 +424,28 @@ do
 	local E = scene()
 	for _, u in ipairs(E.pieces) do E.runtime.sessionByUnit[u] = { fake = true } end
 	E.step()
-	local aliveMax, aliveFz, aliveAvg = profile(E, 2.0)
+	local aliveModel = IAS.alive()
+	aliveModel(0, clock)   -- 预热那一帧已经落在当前桶里：先记住桶号，窗口内只有桶变了的帧才算 IAS 的采样帧
+	local aliveMax, aliveFz, aliveAvg, aliveOurs, aliveIas = profile(E, 2.0, nil, aliveModel)
 	print(string.format("  INFO 阶段 活着：每帧总调用 最大 %d / 平均 %.1f，其中尸体副本独有 最大 %d", aliveMax, aliveAvg, aliveFz))
+	costRow("A 活着（采样+化身号+core）", aliveOurs, aliveIas)
 	E.die()
 	motionCalls.new, motionCalls.advance = 0, 0
-	local deadMax, deadAvg, deadFz = 0, 0, 0
-	deadMax, deadFz, deadAvg = profile(E, 3.8)
+	local deadMax, deadAvg, deadFz, deadOurs, deadIas = 0, 0, 0
+	deadMax, deadFz, deadAvg, deadOurs, deadIas = profile(E, 3.8, nil, IAS.dead)
 	print(string.format("  INFO 阶段 已死未满 4 s：每帧总调用 最大 %d / 平均 %.1f，其中尸体副本独有 最大 %d", deadMax, deadAvg, deadFz))
+	costRow("A 已死未满 4 s", deadOurs, deadIas)
 	check(#E.spawned == 0 and E.pieces[1].visible, "死后 < 4 s：不复制、原件可见", #E.spawned)
-	local spawnFrameCalls, spawnFrameFz
+	local spawnFrameCalls, spawnFrameFz, spawnOurs
 	for _ = 1, 40 do
 		E.reset_calls()
+		corpseMeter.frame = 0
 		E.step()
-		if (E.calls.spawn_unit or 0) > 0 then spawnFrameCalls, spawnFrameFz = totalCalls(E), E.freezeCalls() break end
+		if (E.calls.spawn_unit or 0) > 0 then spawnFrameCalls, spawnFrameFz, spawnOurs = totalCalls(E), E.freezeCalls(), corpseMeter.frame break end
+	end
+	if spawnOurs then
+		local ias = IAS.copyFrame(false)
+		costRow("A 复制那一帧（三件）", { mean = spawnOurs, peak = spawnOurs }, { mean = ias, peak = ias })
 	end
 	check(spawnFrameCalls ~= nil, "死后满 4 s 的那一帧：生成副本（spawn_unit 被调用）")
 	print(string.format("  INFO 阶段 复制那一帧（三件）：总调用 %d，其中尸体副本独有 %d", spawnFrameCalls or -1, spawnFrameFz or -1))
@@ -343,8 +456,9 @@ do
 	check(motionCalls.new == 0 and motionCalls.advance == 0, "普通死亡（没撕裂）不走 CorpseMotion，与 IAS 一致", motionCalls.advance)
 	linkAudit(E, "A")
 	local before = snapshot(E, c1)
-	local steadyMax, steadyFz, steadyAvg = profile(E, 1.0)
+	local steadyMax, steadyFz, steadyAvg, steadyOurs, steadyIas = profile(E, 1.0, nil, IAS.frozen)
 	print(string.format("  INFO 阶段 定格后稳态（3 个副本）：每帧总调用 最大 %d / 平均 %.1f，其中尸体副本独有 最大 %d", steadyMax, steadyAvg, steadyFz))
+	costRow("A 定格稳态", steadyOurs, steadyIas)
 	check(steadyFz <= 3 * 12 + 16, "定格后稳态每帧尸体副本引擎调用有界", steadyFz)
 	E.run(10)
 	check(maxDrift(before, snapshot(E, c1)) < 1e-6, "再过 10 s：副本一动不动（定格）")
@@ -367,7 +481,8 @@ do
 	for _, u in ipairs(E.pieces) do E.runtime.sessionByUnit[u] = { fake = true } end
 	E.run(1.5)
 	E.die()
-	E.run(0.5)
+	local _, _, _, tearDeadOurs, tearDeadIas = profile(E, 0.5, nil, IAS.dead)
+	costRow("B 已死 0.5 s（未撕裂）", tearDeadOurs, tearDeadIas)
 	check(#E.spawned == 0, "死后 0.5 s、没撕裂：不复制")
 	local headRef = E.jointNode.head
 	E.pieces[headRef[1]].nodes[headRef[2]] = { world = { q = IDENT, p = { 6, 0, 1.7 } } }   -- 头离 hips 6 m：撕裂
@@ -375,8 +490,13 @@ do
 	local spawnFrame
 	for i = 1, 60 do
 		E.reset_calls()
+		corpseMeter.frame = 0
 		E.step()
-		if (E.calls.spawn_unit or 0) > 0 then spawnFrame = { i = i, all = totalCalls(E), fz = E.freezeCalls() } break end
+		if (E.calls.spawn_unit or 0) > 0 then spawnFrame = { i = i, all = totalCalls(E), fz = E.freezeCalls(), ours = corpseMeter.frame } break end
+	end
+	if spawnFrame then
+		local ias = IAS.copyFrame(true)
+		costRow("B 撕裂复制那一帧（三件）", { mean = spawnFrame.ours, peak = spawnFrame.ours }, { mean = ias, peak = ias })
 	end
 	check(spawnFrame ~= nil and #E.spawned == 3, "撕裂：不等 4 s，提前复制三件", spawnFrame and spawnFrame.i)
 	print(string.format("  INFO 阶段 撕裂复制那一帧：总调用 %d，其中尸体副本独有 %d", spawnFrame and spawnFrame.all or -1, spawnFrame and spawnFrame.fz or -1))
@@ -387,7 +507,8 @@ do
 	local function headZ() return E.worldOf(E.copyOf(headR[1]), headR[2]).p[3] end
 	local z0, h0 = hipsZ(), headZ()
 	motionCalls.advance, motionCalls.frames, motionCalls.deform = 0, 0, 0
-	local motionMax, motionFz, motionAvg = profile(E, 1.0)
+	local motionMax, motionFz, motionAvg, motionOurs, motionIas = profile(E, 1.0, nil, IAS.fall)
+	costRow("B 铰接下落（CorpseMotion）", motionOurs, motionIas)
 	print(string.format("  INFO 阶段 倒地中（真 CorpseMotion）：每帧总调用 最大 %d / 平均 %.1f，其中尸体副本独有 最大 %d；1 s 内 advance=%d frames=%d deform=%d",
 		motionMax, motionAvg, motionFz, motionCalls.advance, motionCalls.frames, motionCalls.deform))
 	check(motionCalls.advance >= 55 and motionCalls.advance <= 65, "倒地期间每帧推进一次 CorpseMotion.advance", motionCalls.advance)
@@ -402,7 +523,8 @@ do
 	check(math.abs(h1 - z1) < 0.5, "身体放倒：头与 hips 高差小于站立时的 0.7", string.format("%.3f", h1 - z1))
 	local before = snapshot(E, c1)
 	motionCalls.advance = 0
-	local sMax, sFz, sAvg = profile(E, 1.0)
+	local sMax, sFz, sAvg, settledOurs, settledIas = profile(E, 1.0, nil, IAS.settled)
+	costRow("B 倒地定格稳态", settledOurs, settledIas)
 	print(string.format("  INFO 阶段 倒地定格后稳态：每帧总调用 最大 %d / 平均 %.1f，其中尸体副本独有 最大 %d", sMax, sAvg, sFz))
 	check(motionCalls.advance == 0 and sFz <= 3 * 12 + 16, "定格后不再推进 CorpseMotion，稳态引擎调用有界", string.format("advance=%d fz=%d", motionCalls.advance, sFz))
 	E.run(10)

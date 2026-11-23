@@ -105,7 +105,10 @@ local M = {}
 --        物理会话不再按"avatar 有无动画状态机"冻结 / 重置（IAS 没有这道闸，R:6975-6976、R:7004）。
 -- 2.1.63：E12e-B5。删 IAS 没有的残留判活与死条件：写骨前的逐会话 `Unit.alive`（改 `Roster.isLive`，零引擎调用）、
 --        piece / 远端 avatar 循环里紧跟 `Roster.isLive` 的 `Compat.unit_alive`、永远不会被置位的 `item.disabled`。
-M.VERSION = "2.1.64"
+-- 2.1.65：E12f-D2。尸体定格成本对账（按 IAS 逐项，见 perf-combat-test / corpse-integration-test）：StingrayEntityRoot 节点号按实例槽缓存
+--        （采样帧不再每件多付 2 次查询）；死者撕裂估计（IAS 由原生快照免费给）改为摊到连续几帧、每帧至多 10 次调用，
+--        已死未满 4 s 阶段的每帧峰值不再超过 IAS 的 core 开销。
+M.VERSION = "2.1.65"
 
 --- 安装标记用的全局键。只写这一个全局，且值就是模块本身（便于外部检查是否已装）。
 local INSTALL_KEY = "__hd2physbone_runtime"
@@ -5407,7 +5410,7 @@ local CorpseFreeze = Roster.freeze
 CorpseFreeze.enabled, CorpseFreeze.active = false, false
 local cf = {
 	frozen = {}, clones = {}, liveCache = {}, livePending = {}, logged = {}, failed = {}, errors = {},
-	pending = {}, cores = {}, tornCache = {}, jointCache = {}, stopped = {},
+	pending = {}, cores = {}, tornCache = {}, tornCore = {}, tornBudget = 0, jointCache = {}, offsetCache = {}, stopped = {},
 	tick = 0, now = 0, created = 0, runtime = nil,
 }
 CorpseFreeze.state = cf   -- 仅测试读取
@@ -5587,11 +5590,17 @@ local function cz_capture(unit, count, offset, c, explicit)
 end
 
 --- StingrayEntityRoot 节点号（IAS 的 node_offset，只可能是 0 或 1，R:5638-5639）。
+--- 按实例槽缓存（同一个 unit 的节点表不会变）：IAS 的 offset 来自它每帧本来就要做的 authored_scene_node_offset（R:4053，
+--- 属 retarget 的常规开销、不计入尸体项）；我们没有那一步，所以采样帧不能每次再付 2 次查询——否则尸体项会比 IAS 多。
+--- 缓存条目 30 s 没被读到就丢（begin 里清）；真正复制前 cz_prepare 仍会逐项重新断言根节点号（R:5640-5641），缓存过期不会放过错误布局。
 local function cz_root_offset(unit)
+	local key = cz_slot(unit)
+	local cached = cf.offsetCache[key]
+	if cached then cached.time = cf.now; return cached.offset end
 	local U = S.Unit
 	if U.has_node(unit, 'StingrayEntityRoot') ~= true then return nil end
 	local n = U.node(unit, 'StingrayEntityRoot')
-	if n == 0 or n == 1 then return n end
+	if n == 0 or n == 1 then cf.offsetCache[key] = { offset = n, time = cf.now }; return n end
 end
 
 --- 关节映射：节点号 → 源骨名（IAS R:5617-5622：profile.target_flags 的 1024 位 + target_sources）。
@@ -5632,27 +5641,53 @@ local function cz_native_from_shape(shape, joints, c)
 	return native
 end
 
---- IAS `observe` 对死者的 torn（R:5600-5603）用的是原生每帧给的关节位置，我们没有这份数据：
---- 改成每 0.25 s 读一次这件的关节节点（独立骨件才有）。这是相对 IAS 唯一多出来的引擎读取，见交接文档。
+--- IAS `observe` 对死者的 torn（R:5604-5607）用的是原生每帧给的关节位置（`native`，R:2724-2735 `__hd2ir_sample_native_links`
+--- 是 retarget 的常规开销），我们没有这份数据：改成每 0.25 s 一个桶读一次这件的关节节点（独立骨件才有）。
+--- 这是相对 IAS 唯一多出来的引擎读取（IAS 的对应读取属常规 retarget、不算尸体项，但我们仍然限额）：
+--- 为了让"已死未满 4 s"那几秒里尸体定格的每帧调用峰值不超过 IAS（IAS 此时每帧只付 core 的 10 次，R:5472-5493），
+--- 把一个桶的读取摊到连续几帧：每帧最多 CZ_TORN_BUDGET 次调用（= 10）——先读一次 owner 的 core（≤10，同帧已缓存则免费），
+--- 之后每帧最多 5 个关节（各 2 次）；全部读完才判 detached（用 core 那一帧的 hips 位置，几帧内位移远小于 3.5 m 的判据）。
+local CZ_TORN_BUDGET = 10
 local function cz_torn_estimate(b, key, bucket)
-	local cached = cf.tornCache[key]
-	if cached and cached.bucket == bucket then return cached.early end
-	local early = false
-	local joints = cz_unit_joints(b)
-	if next(joints) ~= nil then
-		local c = cz_core(b.avatar)
-		if c then
-			local native = {}
-			for n, name in pairs(joints) do
-				local _, p = cz_world_pose(b.unit, n)
-				if p then native[name] = { p = p } end
-			end
-			local last = cf.liveCache[key]
-			early = cz_detached(native, c, last and last.native)
-		end
+	local e = cf.tornCache[key]
+	if e and e.bucket == bucket and e.done then return e.early end
+	if not e or e.bucket ~= bucket then
+		e = { bucket = bucket, early = e ~= nil and e.early or false, time = cf.now, idx = 1, native = {} }
+		cf.tornCache[key] = e
 	end
-	cf.tornCache[key] = { bucket = bucket, early = early, time = cf.now }
-	return early
+	local joints = cz_unit_joints(b)
+	if next(joints) == nil then e.done, e.early = true, false; return false end
+	local owner = cz_slot(b.avatar.unit)
+	local scan = cf.tornCore[owner]
+	if not scan or scan.bucket ~= bucket then
+		local c = cf.cores[owner]
+		if not c then
+			if cf.tornBudget < CZ_TORN_BUDGET then return e.early end   -- core 最多 10 次调用：等一个预算整的帧
+			c = cz_core(b.avatar)
+			cf.tornBudget = 0
+		end
+		if not c then return e.early end
+		scan = { bucket = bucket, c = c, time = cf.now }
+		cf.tornCore[owner] = scan
+	end
+	if not e.order then
+		e.order = {}
+		for n in pairs(joints) do e.order[#e.order + 1] = n end
+		table.sort(e.order)
+	end
+	while e.idx <= #e.order and cf.tornBudget >= 2 do
+		local n = e.order[e.idx]
+		local _, p = cz_world_pose(b.unit, n)
+		cf.tornBudget = cf.tornBudget - 2
+		if p then e.native[joints[n]] = { p = p } end
+		e.idx = e.idx + 1
+	end
+	if e.idx > #e.order then
+		local last = cf.liveCache[key]
+		e.early = cz_detached(e.native, scan.c, last and last.native)
+		e.done = true
+	end
+	return e.early
 end
 
 --- 开关：IAS 的原生 `corpse_freeze_enabled()`（R:5549）读 IAS 自己的设置。我们没有那个设置页；
@@ -5714,7 +5749,7 @@ end
 
 function CorpseFreeze.reset()
 	cf.frozen, cf.clones, cf.liveCache, cf.livePending, cf.logged, cf.failed, cf.errors = {}, {}, {}, {}, {}, {}, {}
-	cf.pending, cf.cores, cf.tornCache, cf.jointCache, cf.stopped = {}, {}, {}, {}, {}
+	cf.pending, cf.cores, cf.tornCache, cf.tornCore, cf.jointCache, cf.offsetCache, cf.stopped = {}, {}, {}, {}, {}, {}, {}
 	cf.created, cf.runtime = 0, nil
 	lifecycle.live, lifecycle.counter, lifecycle.forgotten = {}, 0, 0
 	for key in pairs(Roster.corpsePins) do Roster.corpsePins[key] = nil end
@@ -5725,6 +5760,7 @@ end
 function CorpseFreeze.begin(runtime)
 	cf.runtime, cf.tick, cf.now = runtime, runtime.frame or 0, os.clock()
 	cf.pending, cf.cores, cf.livePending = {}, {}, {}
+	cf.tornBudget = CZ_TORN_BUDGET
 	local was = CorpseFreeze.enabled
 	CorpseFreeze.enabled = cz_enabled(runtime)
 	if was ~= CorpseFreeze.enabled then
@@ -5734,6 +5770,8 @@ function CorpseFreeze.begin(runtime)
 	CorpseFreeze.active = CorpseFreeze.enabled or next(cf.clones) ~= nil
 	for key, r in pairs(cf.liveCache) do if cf.now - r.time > 30 then cf.liveCache[key] = nil end end   -- R:5552
 	for key, r in pairs(cf.tornCache) do if cf.now - r.time > 30 then cf.tornCache[key] = nil end end
+	for key, r in pairs(cf.offsetCache) do if cf.now - r.time > 30 then cf.offsetCache[key] = nil end end
+	for key, r in pairs(cf.tornCore) do if cf.now - (r.time or cf.now) > 30 then cf.tornCore[key] = nil end end
 end
 
 --- IAS `queue_input`（R:5590-5601）：死者 + 有 30 s 内的活体缓存 ⇒ 排一个"只用缓存"的待复制项。
