@@ -704,15 +704,15 @@ do
 	calls, order = {}, {}
 	state.options.stateLog = false
 	_G.render()
-	check("动作日志：选项关闭时仅保留原有手臂 alive 调用",
-		calls.alive == 1 and calls.machine == nil and calls.state == nil and calls.layer == nil and #logs == 22,
+	check("动作日志：选项关闭时本人 avatar 不再调 Unit.alive（E12f-C3，IAS 无此调用）",
+		calls.alive == nil and calls.machine == nil and calls.state == nil and calls.layer == nil and #logs == 22,
 		"alive=" .. tostring(calls.alive))
 	state.options.stateLog = true
 	state.tune = { frame = state.frame, values = { stateLog = 0 } }
 	calls, order = {}, {}
 	_G.render()
 	check("动作日志：调参 stateLog=0 优先关闭且零额外引擎调用",
-		calls.alive == 1 and calls.machine == nil and calls.state == nil and calls.layer == nil and #logs == 22,
+		calls.alive == nil and calls.machine == nil and calls.state == nil and calls.layer == nil and #logs == 22,
 		"alive=" .. tostring(calls.alive))
 	state.tune = nil
 	for i = 1, 25 do
@@ -1488,15 +1488,36 @@ do
 	check("E11 拉枪：子件可刷新后清除还原记录", runtime.weaponShift == nil)
 	Link.weaponMembers[found.id] = nil
 	local tied = { world = world, pieces = { { unit = twin } } }
+	-- E12f-C3：第一人称判定的件句柄只认本帧枚举（Roster.isLive 查表），不调 Unit.alive。
+	local savedRoster, probeCalls = runtime.roster, { alive = 0, twinNodes = 0 }
+	local rawAlive, rawHasNode = S.Unit.alive, S.Unit.has_node
+	S.Unit.alive = function(...) probeCalls.alive = probeCalls.alive + 1; return rawAlive(...) end
+	S.Unit.has_node = function(unit, ...)
+		if unit == twin then probeCalls.twinNodes = probeCalls.twinNodes + 1 end
+		return rawHasNode(unit, ...)
+	end
+	runtime.roster = { frame = runtime.frame or 0, byWorld = {}, live = { [avatar] = true } }
+	check("E12f-C3 第一人称：件不在本帧枚举 ⇒ 0，且不对它发任何引擎调用",
+		Link.first_person_action(runtime, tied, function(n) return avatar.worldPoses[n] end) == 0
+		and probeCalls.twinNodes == 0 and probeCalls.alive == 0,
+		string.format("twinNodes=%d alive=%d", probeCalls.twinNodes, probeCalls.alive))
+	runtime.roster = { frame = (runtime.frame or 0) - 1, byWorld = {}, live = { [twin] = true, [avatar] = true } }
+	check("E12f-C3 第一人称：枚举不是本帧的（旧帧名单）同样不碰句柄",
+		Link.first_person_action(runtime, tied, function(n) return avatar.worldPoses[n] end) == 0
+		and probeCalls.twinNodes == 0)
+	runtime.roster = { frame = runtime.frame or 0, byWorld = {}, live = { [twin] = true, [avatar] = true } }
 	check("E11 第一人称：当前原生手臂唯一匹配才判 3",
-		Link.first_person_action(tied, function(n) return avatar.worldPoses[n] end) == 3)
+		Link.first_person_action(runtime, tied, function(n) return avatar.worldPoses[n] end) == 3)
 	tied.pieces[1].unit = avatar
 	check("E11 第一人称：第三人称匹配优先",
-		Link.first_person_action(tied, function(n) return avatar.worldPoses[n] end) == 0)
+		Link.first_person_action(runtime, tied, function(n) return avatar.worldPoses[n] end) == 0)
 	graphs = { fp, twin }
 	tied.pieces[1].unit = twin
 	check("E11 第一人称：重复匹配关闭求解",
-		Link.first_person_action(tied, function(n) return avatar.worldPoses[n] end) == 0)
+		Link.first_person_action(runtime, tied, function(n) return avatar.worldPoses[n] end) == 0)
+	check("E12f-C3 第一人称：在本帧枚举里的件正常判定，全程不调 Unit.alive（含 FP 图）",
+		probeCalls.alive == 0, "alive=" .. tostring(probeCalls.alive))
+	S.Unit.alive, S.Unit.has_node, runtime.roster = rawAlive, rawHasNode, savedRoster
 	check("E11 拉枪：卸载恢复原 update", Runtime.uninstall() and _G.update == update)
 	_G.update = oldUpdate
 end

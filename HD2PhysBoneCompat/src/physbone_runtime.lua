@@ -2300,10 +2300,13 @@ local function skirt_apply(S_, runtime)
 		-- 为什么裙摆这条路特别容易踩到（2026-11-12 军械库/债券页崩溃）：开页面时引擎会
 		-- **连续创建/销毁**一大堆展示用的护甲件，而裙摆是**每帧遍历所有会话**的、并且在
 		-- `drive` 的最末尾跑（pruneSessions 之后）——一帧之内被销毁的件就落在这条路上。
+		--
+		-- E12f-C3：判活改本帧枚举查表（`Roster.isLive`，零引擎调用）。会话的 unit 是本帧 physics_sync 从本帧 Roster 建出来的，
+		-- 句柄只来自本帧枚举、不跨帧（IAS R:894-896、R:1417-1422）；IAS 没有逐帧 `Unit.alive` 复查，也没有裙摆这一层（无对应物）。
+		-- 本帧枚举失败 / 没跑时 `Roster.isLive` 为假 ⇒ 本帧不碰这些句柄，比单点 `Unit.alive` 更严。
 		local alive = session.unit ~= nil
 			and session.dead == nil
-			and type(Compat.unit_alive) == "function"
-			and Compat.unit_alive(S_, session.unit) == true
+			and Roster.isLive(runtime, session.unit)
 		if alive then
 			-- 会话级准备：① 骨盆速度 → 运动斜坡；② "正后方"轴（世界坐标）。
 			local refs = skirt_refs(S_, session)
@@ -3170,7 +3173,9 @@ end
 --- IAS 的"本人"：role == 1。没有网络身份可用时没有本人（IAS 同样没有回退）。
 function Roster.localAvatar(runtime)
 	local roster = runtime.roster
-	if roster == nil then return nil end
+	-- 只认**本帧**枚举：枚举失败 / 没跑时 runtime.roster 可能还是上一帧的，里面的句柄不能再用
+	-- （IAS 句柄不跨帧、枚举不到就本帧没有这个人，R:894-896、R:1417-1422）。
+	if roster == nil or roster.frame ~= (runtime.frame or 0) then return nil end
 	return roster.localAvatar, roster.localWorld
 end
 
@@ -4007,11 +4012,12 @@ function IndependentLink.first_person(runtime, state)
 	return dx*dx + dy*dy < threshold*threshold
 end
 
-function IndependentLink.first_person_action(state, readPose)
+function IndependentLink.first_person_action(runtime, state, readPose)
 	local graphs = try(S.World.units_by_resource, state.world, "content/fac_helldivers/fp_cha_avatar/fp_cha_avatar")
 	if type(graphs) ~= "table" or #graphs == 0 then return 0 end
 	for _, piece in ipairs(state.pieces) do
-		if Compat.unit_alive(S, piece.unit) then
+		-- E12f-C3：件句柄只来自本帧枚举 ⇒ `Roster.isLive` 查表，不再 `Unit.alive`（R:894-896、R:1417-1422）。
+		if Roster.isLive(runtime, piece.unit) then
 			local native = {}
 			for _, side in ipairs({ "r_", "l_" }) do
 				local arm = {}
@@ -4034,7 +4040,8 @@ function IndependentLink.first_person_action(state, readPose)
 				if not matches(readPose) then
 					local count = 0
 					for _, unit in ipairs(graphs) do
-						if Compat.unit_alive(S, unit) and matches(function(name)
+						-- FP 图的句柄来自上面本帧的 units_by_resource：IAS 直接用、不再判活（R:441-445 fp_graphs）。
+						if matches(function(name)
 							local node = safe_node(S, unit, name)
 							return node and Compat.independent_world_pose(S, unit, node)
 						end) then count = count + 1 end
@@ -4666,7 +4673,7 @@ local function independent_frame(runtime, avatar, world, list, state, remote)
 		if not remote and not paused then
 			viewFirstPerson = IndependentLink.first_person(runtime, state)
 			if runtime.options.independentGrips and (due or viewFirstPerson) then
-				presentationAction = IndependentLink.first_person_action(state, readPose)
+				presentationAction = IndependentLink.first_person_action(runtime, state, readPose)
 			end
 			paused = viewFirstPerson or presentationAction == 3
 			if due then
@@ -5064,16 +5071,8 @@ local function apply_arm_pose_frame(runtime)
 		end
 		return 0, 0
 	end
-	if not Compat.unit_alive(S, unit) then
-		runtime.avatar = nil
-		runtime.avatarTag = nil
-		runtime.avatars = nil
-		runtime.armState = nil
-		runtime.armScanAt = nil
-		IndependentLink.release_all(runtime)
-		runtime.armCalls = 0
-		return 0, 0
-	end
+	-- E12f-C3：原来这里对本人 avatar 再调一次 `Compat.unit_alive`。IAS 没有：unit 只来自本帧枚举（R:894-896、R:1417-1422）。
+	-- 走到这里 `unit` 要么刚过 `Roster.isLive`（上面），要么来自 `Roster.localAvatar`（现在只认本帧枚举），所以必是本帧句柄。
 	local world = runtime.cache and runtime.cache.world or nil
 	local independent = runtime.options and runtime.options.independentBones
 	if type(independent) == "table" and #independent > 0 then
@@ -5153,7 +5152,7 @@ local function physics_rig(runtime, hash, unit, carriers)
 	local frame = runtime.frame or 0
 	if row ~= nil and frame < (row.retryAt or 0) then return nil end
 	-- profile 表：哈希 → 容器，每个哈希只匹配一次（IAS 的 profile 是启动时装载的静态数据）。
-	local best = Compat.select_rig(S, { unit }, carriers)
+	local best = Compat.select_rig(S, { unit }, carriers, runtime.isLiveFn)
 	local allowPartial = runtime.options.allowPartial == true
 	-- 与 2.1.60 一致：按件切骨的转换器产物只带容器的一部分骨，部分命中（score >= 1）是正常情形。
 	if best ~= nil and (best.full or allowPartial or (best.score or 0) >= 1) then
@@ -5169,6 +5168,9 @@ local function physics_sync(runtime)
 	local roster = runtime.roster
 	local frame = runtime.frame or 0
 	if roster == nil or roster.frame ~= frame then return end
+	if runtime.isLiveFn == nil then
+		runtime.isLiveFn = function(unit) return Roster.isLive(runtime, unit) end
+	end
 	local options = runtime.options
 	local carriers = runtime.carriers
 	if carriers == nil then
@@ -5252,6 +5254,8 @@ local function physics_sync(runtime)
 	local attachOptions = {
 		logger = runtime.logger, strictIdentity = options.strictIdentity == true,
 		fastWrite = options.fastWrite ~= false, solver = options.solver, bendBlend = options.bendBlend,
+		-- E12f-C3：会话 / attach 的判活都走本帧枚举查表（零引擎调用），不再逐会话 `Unit.alive`。
+		isLive = runtime.isLiveFn,
 	}
 	local attached = 0
 	for _, unit in ipairs(wanted) do

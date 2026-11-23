@@ -312,5 +312,16 @@ objs[7000001].x = 12
 local se6 = poll()
 check(se6 > 64, "队友对象与 avatar 位置偏差 > 1 m：捷径失效，恢复扫描", se6)
 
+-- E12f-C3：本人 avatar 只认本帧枚举（枚举失败 / 没跑时 runtime.roster 可能是上一帧的，句柄不跨帧）
+do
+	local mine = { name = "me" }
+	local rt = { frame = 10, roster = { frame = 10, live = { [mine] = true }, localAvatar = mine, localWorld = "w" } }
+	local u, w = Roster.localAvatar(rt)
+	check(u == mine and w == "w", "localAvatar：本帧枚举给出本人")
+	rt.frame = 11
+	check(Roster.localAvatar(rt) == nil, "localAvatar：枚举不是本帧的（旧帧名单）⇒ nil，不返回旧句柄")
+	check(Roster.isLive(rt, mine) == false, "isLive：旧帧名单同样判不在")
+end
+
 io.stdout:write(string.format("\n检查 %d 项，失败 %d\n", checks, failures))
 os.exit(failures == 0 and 0 or 1)

@@ -89,6 +89,9 @@ if apply ~= nil then
 	check("选中判据不再写死 hips", not only_hips,
 		only_hips and "skirt_apply 里还写着 find(\"hips\")" or "")
 	check("走 skirt_eligible", apply:find("skirt_eligible(", 1, true) ~= nil)
+	-- E12f-C3：判活只查本帧枚举（零引擎调用），不再逐会话 Unit.alive
+	check("skirt_apply 判活走 Roster.isLive（本帧枚举）", apply:find("Roster.isLive(runtime, session.unit)", 1, true) ~= nil)
+	check("skirt_apply 不再调 unit_alive", apply:find("unit_alive", 1, true) == nil)
 end
 
 -- ⑤ 身份探针里的 API 保持在探针内。E7 的两个已知签名仅允许用于挂接及原骨链恢复。

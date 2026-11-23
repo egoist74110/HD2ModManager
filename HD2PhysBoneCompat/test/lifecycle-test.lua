@@ -267,6 +267,44 @@ do
 	check("零违规引擎调用", calls.violation == nil, violationText(calls))
 end
 
+-- ---------------------------------------------------------------------------
+print("T10 E12f-C3：运行时托管的会话——判活只查本帧枚举（isLive），零 Unit.alive 调用")
+do
+	local live = true
+	local isLive = function() return live end
+	local S, unit, engineState, calls = make_engine(100)
+	local session = M.attach(S, unit, make_rig(), { logger = quiet(), world = {}, isLive = isLive })
+	check("attach 成功且全程 0 次 Unit.alive", #session.sessions >= 1 and calls.alive == 0, "alive=" .. calls.alive)
+
+	local written = M.update(session, 1 / 60)
+	check("在本帧枚举里 ⇒ 正常驱动，仍 0 次 Unit.alive", written > 0 and calls.alive == 0, string.format("写=%d alive=%d", written, calls.alive))
+
+	live = false
+	calls.violation = nil
+	local other = calls.other
+	local w = M.update(session, 1 / 60)
+	check("不在本帧枚举里 ⇒ 不写、不对句柄发引擎调用、仍 0 次 Unit.alive",
+		w == 0 and calls.other == other and calls.alive == 0, string.format("写=%d 新增调用=%d alive=%d", w, calls.other - other, calls.alive))
+	check("单帧缺席不永久判死（下一帧在枚举里就恢复）", session.dead == nil, tostring(session.dead))
+	live = true
+	check("下一帧在枚举里 ⇒ 恢复驱动", M.update(session, 1 / 60) > 0)
+
+	-- attach 入口 / 链间闸：句柄不在本帧枚举里 ⇒ 放弃，且 0 次引擎调用
+	local S2, unit2, _, calls2 = make_engine(100)
+	local dead = M.attach(S2, unit2, make_rig(), { logger = quiet(), isLive = function() return false end })
+	check("attach：不在本帧枚举 ⇒ 空会话 dead，零引擎调用（含 alive）",
+		#dead.sessions == 0 and dead.dead == "dead" and calls2.other == 0 and calls2.alive == 0)
+
+	-- select_rig 判活
+	local S3, unit3, _, calls3 = make_engine(100)
+	local cands = { { rig = make_rig(), path = "x" } }
+	M.select_rig(S3, { unit3 }, cands, function() return false end)
+	check("select_rig：不在本帧枚举 ⇒ 不对该 unit 做 has_node（零引擎调用）", calls3.other == 0 and calls3.alive == 0,
+		string.format("other=%d alive=%d", calls3.other, calls3.alive))
+	local best = M.select_rig(S3, { unit3 }, cands, function() return true end)
+	check("select_rig：在本帧枚举里 ⇒ 正常打分，零 Unit.alive", best ~= nil and calls3.alive == 0 and calls3.other > 0)
+end
+
 print("")
 if failures == 0 then
 	print("=== 全部通过 ===")
