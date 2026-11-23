@@ -6239,6 +6239,152 @@ local function apply_arm_pose_frame(runtime)
 	return written or 0, calls or 0
 end
 
+-- ---------------------------------------------------------------------------
+-- E12e：物理会话生命周期（照 IAS：每帧按 Roster 结果以"实例槽位 + profile"绑定，不跨帧持有名单）。
+-- IAS 对应：runtime.lua 6860 一带 `C.bind_unit(profile.id, instance_id, avatar.id, root)` 每帧一次；
+-- 帧号/时间跳变、传送、布局变化由原生直接重置、不追赶。
+-- 我们的 Lua 求解器必须自己持有链状态：状态按 unit 句柄（弱键）存，**只对本帧枚举里存在的 unit 有效**，
+-- 本帧枚举里没有它 → 状态直接丢弃（不碰句柄）；没有 discover/打分额度/负缓存/退避/整组重挂。
+-- ---------------------------------------------------------------------------
+local function physics_rig(runtime, hash, unit, carriers)
+	local rows = runtime.hashRig
+	if rows == nil then rows = {}; runtime.hashRig = rows end
+	local row = rows[hash]
+	if row ~= nil and row.rig ~= nil then return row end
+	local frame = runtime.frame or 0
+	if row ~= nil and frame < (row.retryAt or 0) then return nil end
+	-- profile 表：哈希 → 容器，每个哈希只匹配一次（IAS 的 profile 是启动时装载的静态数据）。
+	local best = Compat.select_rig(S, { unit }, carriers)
+	local allowPartial = runtime.options.allowPartial == true
+	if best ~= nil and (best.full or (allowPartial and best.score > 0)) then
+		row = { rig = best.rig, path = best.path }
+		rows[hash] = row
+		return row
+	end
+	rows[hash] = { retryAt = frame + Roster.INTERVAL }   -- 取 IAS 的 DISCOVERY_INTERVAL 节奏
+	return nil
+end
+
+local function physics_sync(runtime)
+	local roster = runtime.roster
+	local frame = runtime.frame or 0
+	if roster == nil or roster.frame ~= frame then return end
+	local options = runtime.options
+	local carriers = runtime.carriers
+	if carriers == nil then
+		local raw = options.carriers
+		if raw == nil or #raw == 0 then raw = loadCarriers(S, runtime.cache, options, runtime.logger) end
+		local removed
+		carriers, removed = filterCarriers(raw, runtime.iasPhysicsGroups)
+		if #raw > 0 then runtime.carriers = carriers end
+		if removed > 0 and not runtime.iasFilterLogged then
+			runtime.logger("[physbone] IAS 可选组掩码=%d，排除 %d 条骨记录", runtime.iasPhysicsGroups, removed)
+			runtime.iasFilterLogged = true
+		end
+	end
+	if carriers == nil or #carriers == 0 then return end
+
+	-- 玩家名单：本帧枚举，按到相机的距离排序（第一位 = 离相机最近 = 自己的调度优先级）。
+	local list, ownerOf = {}, {}
+	for world, row in pairs(roster.byWorld) do
+		local cx, cy, cz = cameraPosition(S, world, runtime.cache)
+		for _, item in ipairs(row.avatars) do
+			local entry = { unit = item.unit, world = world, x = item.p[1], y = item.p[2], z = item.p[3], positionFrame = frame }
+			if cx ~= nil then
+				local dx, dy, dz = item.p[1] - cx, item.p[2] - cy, item.p[3] - cz
+				entry.cameraDistance = dx * dx + dy * dy + dz * dz
+			end
+			list[#list + 1] = entry
+		end
+	end
+	table.sort(list, function(a, b)
+		local da, db = a.cameraDistance, b.cameraDistance
+		if da ~= nil and db ~= nil then return da < db end
+		if da ~= nil then return true end
+		if db ~= nil then return false end
+		return tostring(a.unit) < tostring(b.unit)
+	end)
+	local previousTags = {}
+	for _, old in ipairs(runtime.avatars or {}) do previousTags[old.unit] = old.tag end
+	for index, entry in ipairs(list) do
+		entry.order = index
+		entry.tag = previousTags[entry.unit]
+		ownerOf[entry.unit] = entry
+	end
+	runtime.avatars = #list > 0 and list or nil
+	if #list > 0 then
+		runtime.world = list[1].world
+		if not (roster.identity and arm_pose_enabled(runtime)) then runtime.avatar = list[1].unit end
+	end
+
+	local byUnit = runtime.sessionByUnit
+	if byUnit == nil then byUnit = setmetatable({}, { __mode = "k" }); runtime.sessionByUnit = byUnit end
+	local desired, wanted = {}, {}
+	for world, row in pairs(roster.byWorld) do
+		for _, armour in ipairs(row.armour) do
+			local ownerUnit = row.owner[armour.unit]
+			if ownerUnit ~= nil and ownerOf[ownerUnit] ~= nil then
+				desired[armour.unit] = { hash = armour.hash, owner = ownerOf[ownerUnit], world = world }
+				wanted[#wanted + 1] = armour.unit
+			end
+		end
+	end
+	-- 本帧枚举里没有（或不再归属任何 avatar）的 unit：丢掉状态，不碰句柄。
+	for unit in pairs(byUnit) do
+		if desired[unit] == nil then byUnit[unit] = nil end
+	end
+	table.sort(wanted, function(a, b)
+		local oa, ob = desired[a].owner.order, desired[b].owner.order
+		if oa ~= ob then return oa < ob end
+		return desired[a].hash < desired[b].hash
+	end)
+	local attachOptions = {
+		logger = runtime.logger, strictIdentity = options.strictIdentity == true,
+		fastWrite = options.fastWrite ~= false, solver = options.solver, bendBlend = options.bendBlend,
+	}
+	local attached = 0
+	for _, unit in ipairs(wanted) do
+		local want = desired[unit]
+		local session = byUnit[unit]
+		if session == nil then
+			local rig = physics_rig(runtime, want.hash, unit, carriers)
+			if rig ~= nil then
+				attachOptions.world = want.world
+				session = Compat.attach(S, unit, rig.rig, attachOptions)
+				session.rigSource, session.unitTag, session.attachFrame = rig.path, "#ID[" .. want.hash .. "]", frame
+				if #session.sessions > 0 then
+					byUnit[unit] = session
+					attached = attached + 1
+				else
+					runtime.emptyLogged = runtime.emptyLogged or setmetatable({}, { __mode = "k" })
+					if runtime.emptyLogged[unit] == nil then
+						runtime.emptyLogged[unit] = true
+						runtime.logger("[physbone][失败] unit=%s 挂载完成但产出 0 条链（容器 %s）", tostring(session.unitTag), tostring(rig.path))
+					end
+					session = nil
+				end
+			end
+		end
+		if session ~= nil then
+			session.owner, session.ownerOrder, session.ownerTag = want.owner.unit, want.owner.order, want.owner.tag
+		end
+	end
+	local sessions = {}
+	for _, unit in ipairs(wanted) do
+		if byUnit[unit] ~= nil then sessions[#sessions + 1] = byUnit[unit] end
+	end
+	if attached > 0 then
+		local chains = 0
+		for _, session in ipairs(sessions) do chains = chains + #session.sessions end
+		runtime.logger("[physbone] 已挂载 %d 个 unit / %d 条链（玩家 %d 个）；本帧新挂 %d", #sessions, chains, #list, attached)
+		if runtime.attachedFrame == nil then
+			runtime.attachedFrame, runtime.driveFrames, runtime.callsAccum = frame, 0, 0
+			runtime.peakAngle, runtime.repeatCalls, runtime.zeroFrames = 0, 0, 0
+		end
+	end
+	runtime.sessions = #sessions > 0 and sessions or nil
+end
+
 local function drive(runtime)
 	local frame = runtime.frame
 	local options = runtime.options
@@ -6268,79 +6414,20 @@ local function drive(runtime)
 	Compat.begin_frame(frame)
 	-- E12d：IAS 式每帧枚举（avatar / 装甲件 / 本人身份）。本帧用到的独立骨句柄都来自这一次枚举。
 	local rosterOk = false
-	if arm_pose_enabled(runtime) then
+	if arm_pose_enabled(runtime) or options.carriers == nil or #options.carriers > 0 then
 		local okRoster, rosterError = pcall(Roster.update, runtime)
 		rosterOk = okRoster and runtime.roster ~= nil
 		if not okRoster and not runtime.rosterErrorLogged then
 			runtime.rosterErrorLogged = true
 			logger("[physbone][错误] 每帧枚举失败：%s", tostring(rosterError))
 		end
-		if rosterOk and runtime.roster.identity then resolve_local_avatar_for_arm(runtime) end
-	else
-		runtime.roster = nil
+		if rosterOk and runtime.roster.identity and arm_pose_enabled(runtime) then resolve_local_avatar_for_arm(runtime) end
 	end
 	if runtime.independent and not arm_pose_enabled(runtime) then IndependentLink.release_all(runtime) end
 	local driveClock = os.clock()   -- 这一拍驱动块占用的 CPU 时间（心跳里报出来）
 
-	-- ---------- 生命周期：**先"不碰句柄"地判死** ----------
-	-- 必须在 `Compat.update` / `pruneSessions` / `refresh_avatar_distances` / 裙摆之前做：
-	-- 它们每一个都要 deref 手里的 unit 句柄。判据见 `refresh_live_units`（纯指针比较）。
-	--
-	-- 2026-11-12 抓到的真凶就在这里：`refresh_avatar_distances` 每帧对**每个 avatar 句柄**调
-	-- `Unit.world_position(avatar.unit, 1)`，而 `runtime.avatars` 是**上一帧**的名单 ——
-	-- 债券页快速切页时引擎会连续重建 avatar（展台上那个角色本身就是 avatar 资源），
-	-- 句柄一失效，这一行就是野读 → 原生 AV（0x3e564b / 参数 0x0 0x0），Lua 层完全看不出来。
-	-- 所以会话**和** avatar 两套句柄都要过同一道闸。
-	local haveSessions = runtime.sessions ~= nil and #runtime.sessions > 0
-	local haveAvatars = (runtime.avatars ~= nil and #runtime.avatars > 0) or runtime.avatar ~= nil
-	if haveSessions or (haveAvatars and not rosterOk) then
-		local live = refresh_live_units(runtime, S)
-		if live == "world-gone" then
-			-- 我们那个世界已经不在了：整组丢弃，一个句柄都不碰（下一帧重扫）。
-			logger("[physbone][LIFECYCLE] 世界已不在 ⇒ 整组丢弃 %d 个会话 / %d 个 avatar（不碰句柄）",
-				#(runtime.sessions or {}), #(runtime.avatars or {}))
-			runtime.sessions = nil
-			runtime.avatars = nil
-			runtime.avatar = nil
-			runtime.armState = nil
-			runtime.independent, runtime.independentRemotes, runtime.actionStateLog, runtime.armScanAt = nil, nil, nil, nil
-			runtime.liveUnits, runtime.physicsOwnerRoots = nil, nil
-			runtime.reArm = 1
-			runtime.rearmAt = frame + 1
-		elseif live == "ok" and runtime.avatars ~= nil and #runtime.avatars > 0 then
-			-- avatar 名单同样按指针过一遍：不在活体列表里的直接摘掉（不调任何 Unit API）。
-			local keptAvatars, droppedAvatars = {}, 0
-			for index = 1, #runtime.avatars do
-				local avatar = runtime.avatars[index]
-				if avatar.unit ~= nil and session_unit_live(runtime, avatar.unit) then
-					keptAvatars[#keptAvatars + 1] = avatar
-				else
-					droppedAvatars = droppedAvatars + 1
-				end
-			end
-			if droppedAvatars > 0 then
-				logger("[physbone][LIFECYCLE] %d 个 avatar 已不在活体列表里 ⇒ 从名单移除（指针判死，不碰句柄）%s",
-					droppedAvatars, #keptAvatars == 0 and "；名单空了" or "")
-				runtime.avatars = keptAvatars
-				if #keptAvatars == 0 then
-					runtime.avatar = nil
-					runtime.avatarTag = nil
-					-- 没有玩家了：会话也就没有主人，交给下面的"主人已不在"逻辑整体收掉。
-					runtime.reconcile = frame
-				else
-					-- `runtime.avatar` 是"排序第一的那个玩家"，它可能刚被摘掉；
-					-- 后面的 lift / 第一人称锁定都会拿它去发引擎调用，所以必须同步成还活着的那一个。
-					runtime.avatar = keptAvatars[1].unit
-					runtime.avatarTag = keptAvatars[1].tag
-				end
-			end
-		elseif live == "ok" and runtime.avatar ~= nil and not session_unit_live(runtime, runtime.avatar) then
-			runtime.avatar = nil
-			runtime.avatarTag = nil
-			runtime.armState = nil
-			runtime.armScanAt = nil
-		end
-	end
+	-- E12e：IAS 没有"先判死"这一步：本帧用到的句柄都来自本帧 Roster 的枚举（docs/agent/ias-runtime-lifecycle-map）。
+	-- 物理会话在下面的 physics_sync 里按"本帧枚举 + 实例槽位"建立/丢弃，不跨帧持有名单。
 
 	phase(runtime, "drive 开始")
 
@@ -6403,108 +6490,10 @@ local function drive(runtime)
 	end
 	if not advanced then return end
 
-	-- ---------- 加载空档：不查存活，直接整组重挂 ----------
-	-- 加载界面期间 `render`/`update` 根本不跑（实测：静默 4~15 秒是常态），而这一整段时间里
-	-- 引擎正在销毁上一场景的 unit。等我们再被调到，`runtime.sessions` 里那些句柄很可能
-	-- 已经指向被释放的对象 —— 而**逐条查存活本身就是一个引擎调用**（`Compat.session_health`
-	-- → `Unit.alive`）。在"unit 已经被覆盖/释放"的窗口里发这个调用，就是原生崩溃
-	-- （2026-11-11 实机：崩在 0x3e564b 读空指针，且**只在物理 + 软映射同时开**时发生 ——
-	-- 因为只有那时该 unit 是覆盖出来的自定义件；单独开任意一个都不崩）。
-	-- 所以这里**不逐条判定**，整组丢掉、按"场景已变"重挂。宁可闪一下，也不去碰可能已死的句柄。
+	-- 帧间隔过大（加载/切场景）只让物理重置；IAS：帧号/时间跳变原生直接重置、不追赶（行 6455 一带 lua-recovery）。
 	local gap = runtime.rawDelta
 	local resetPhysics = gap ~= nil and gap > 0.25
-	if gap ~= nil and gap > (options.loadGapSeconds or 0.5)
-		and runtime.sessions ~= nil and #runtime.sessions > 0 then
-		logger("[physbone][LIFECYCLE] 检测到加载空档 %.2f s ⇒ 不查存活，直接整组重挂（%d 个会话）",
-			gap, #runtime.sessions)
-		runtime.sessions = nil
-		runtime.reconcile = nil
-		runtime.reArm = 1
-		runtime.rearmAt = frame + (options.reArmFrames or 60)
-	end
 	runtime.rawDelta = nil
-
-	if runtime.sessions ~= nil and #runtime.sessions > 0 then
-		local dropped = pruneSessions(runtime)
-		-- **默认行为**：任何会话死亡 ⇒ 整组释放，一个句柄都不留。
-		--
-		-- 依据（2026-11-11 实机 + 用户对照实验 + 开关二分，已确认修复闪退）：
-		--   · `discoverOnly=1`（只扫描、**不持有句柄**）⇒ 不崩；
-		--   · `writeOff=1`（挂载但不写骨）⇒ 仍崩 ⇒ 与写骨无关；
-		--   · 两人**同时**切图才崩；多人局里自己一个人切图不崩；中途加入不崩。
-		-- 崩溃日志总是「掉了 N 个会话，**剩 M 个继续跑**」：那 M 个句柄被留着，
-		-- 紧接着是几十秒加载空档（render 不再回调、修剪跑不到），引擎在销毁它们
-		-- ⇒ 读空指针（转储 0x3e564b，异常参数 0x0 0x0）。
-		--
-		-- 代价：队友换甲/阵亡时全场会闪一下没物理（随后立刻重挂）。
-		-- 想退回旧行为（保留剩余会话）可在调参文件写 `dropAllOnDeath = 0`。
-		if dropped > 0 and (tune_values(runtime).dropAllOnDeath or 1) ~= 0 then
-			logger("[physbone][LIFECYCLE] dropAllOnDeath=1：掉了 %d 个会话 ⇒ 整组释放（不留任何句柄），随后重挂",
-				dropped)
-			runtime.sessions = nil
-			runtime.reconcile = nil
-			runtime.reArm = 1
-			runtime.rearmAt = frame + 1
-			-- 整组释放之后要**立刻**重扫：把重试门也清掉，否则上一次那批"0 命中"的
-			-- 结论会让新场景的头几拍空转（新的 unit 是不同实例，但门是按实例记的，
-			-- 不清也只是多等一轮；清掉是为了让补挂从第一拍就开始）。
-			runtime.scoreAttemptAt = nil
-			runtime.fillPending = nil
-			runtime.probeRejected = nil
-		elseif #runtime.sessions == 0 then
-			-- 全没了（换场景 / 全员阵亡）：退回等待，带退避（避免换甲期间每秒重挂一次）。
-			-- 存活时长决定退避：刚挂上就死 = 抖动（换甲中），要越等越久；
-			-- 稳定跑过 5 秒再死 = 正常换场景，下一次应当**立刻**重挂。
-			local survived = frame - (runtime.attachedFrame or frame)
-			runtime.sessions = nil
-			runtime.reconcile = nil
-			runtime.fillPending = nil
-			if survived >= (options.stableFrames or 600) then
-				runtime.reArm = 1
-			else
-				runtime.reArm = (runtime.reArm or 0) + 1
-			end
-			local delay = math.min(options.maxReArmFrames or 600, (options.reArmFrames or 60) * runtime.reArm)
-			runtime.rearmAt = frame + delay
-			logger("[physbone][LIFECYCLE] 场景已变（存活 %d 帧）⇒ 退避 %d 帧后重扫", survived, delay)
-		else
-			-- 只掉了一部分（某个队友换甲 / 退出 / 阵亡）：**留着活着的那些**，只补缺的。
-			-- 老版本在这一步是"丢掉全部会话再重扫"，多人局里那等于一个人换甲，全场人闪一下没物理。
-			if dropped > 0 then
-				logger("[physbone][LIFECYCLE] 掉了 %d 个会话，剩 %d 个继续跑，随后补挂缺的",
-					dropped, #runtime.sessions)
-				runtime.reconcile = frame
-			end
-			-- 会话全都还"健康"，但场上**玩家名单**可能变了（有人加入 / 有人退出 / 复活换了实体）。
-			-- 这里同样**不释放任何东西**：变的是名单，谁还在谁就继续跑。
-			local validateFrames = options.validateFrames == nil and 60 or options.validateFrames
-			if validateFrames > 0 and (frame % validateFrames) == 0 and avatarSetChanged(runtime) then
-				runtime.reconcile = frame
-			end
-		end
-	end
-
-	-- 名单变化后的补挂/收尾。走的是同一个 `tryAttach`（**增量**：只补没挂的、只收主人不在的），
-	-- 所以不需要先把自己人的会话丢掉 —— 那正是老版本多人局里"所有人闪一下没物理"的来源。
-	if runtime.reconcile ~= nil and runtime.sessions ~= nil and #runtime.sessions > 0 then
-		if frame >= runtime.reconcile then
-			local poll = options.reconcilePollFrames or (options.pollFrames or 20)
-			phase(runtime, "tryAttach 前")
-			if tryAttach(runtime) then
-				-- 装填还没完成（还有候选没轮到打分）时不能清掉 reconcile，否则"剩下的件"
-				-- 要等下一位玩家进场/有人阵亡才会被想起 —— 那正是老现象。
-				-- 另外：有"负结果待重试"时要把它排上，否则那批件永远没机会翻案。
-				runtime.reconcile = runtime.fillPending and (frame + poll) or runtime.negativeRetryAt
-				runtime.negativeRetryAt = nil
-				runtime.reconcileFails = 0
-			else
-				-- E12c：连续失败就退避（IAS 的资源发现是每 60 帧一次）：基准间隔 ×1、×2、×3 封顶。
-				-- 2.1.58 实机里"发现目标失败"每 20 帧重试，每次带全量扫描。
-				runtime.reconcileFails = (runtime.reconcileFails or 0) + 1
-				runtime.reconcile = frame + poll * math.min(3, runtime.reconcileFails)
-			end
-		end
-	end
 
 	local function drive_arm_only_and_beat()
 		if not arm_pose_enabled(runtime) then return end
@@ -6520,33 +6509,12 @@ local function drive(runtime)
 		end
 	end
 
-	if runtime.sessions == nil then
-		if runtime.rearmAt ~= nil and frame < runtime.rearmAt then
-			note_wait(runtime, "退避等待重扫")
-			drive_arm_only_and_beat()
-			return
-		end
-		-- 等待中的轮询会跑一趟完整的 `discover`（扫所有 unit + 给每个候选打分，几千次引擎调用），
-		-- 所以**必须**随等待时长放慢：刚掉线那 2 秒要快（复活/换甲很快结束），
-		-- 之后就按 3 倍间隔扫一次 —— 否则"一直等不到"会变成持续的顿卡。
-		runtime.waitSince = runtime.waitSince or frame
-		local waited = frame - runtime.waitSince
-		local poll = options.pollFrames or 20
-		-- 装填中（还有候选没轮到处理）**不减速**：减速会把"补挂"拉成十几秒，
-		-- 观感就是"进图后十几秒完全没物理"。这期间每拍只多花预筛的钱（≈0.04 ms/件），
-		-- 真打分仍受 `scoreUnitsPerFrame` 限制，所以不会突破预算。
-		if waited > (options.waitSlowAfter or 200) and not runtime.fillPending then poll = poll * 3 end
-		if (frame % poll) ~= 0 then
-			drive_arm_only_and_beat()
-			return
-		end
-		if not tryAttach(runtime) then
-			drive_arm_only_and_beat()
-			return
-		end
-		runtime.waitSince = nil
-	else
-		runtime.waitSince = nil
+	-- E12e：物理会话 = 本帧 Roster 枚举 ∩ 已有容器（IAS bind_unit：实例槽位 + profile，每帧）。
+	physics_sync(runtime)
+	if runtime.sessions == nil or #runtime.sessions == 0 then
+		runtime.sessions = nil
+		drive_arm_only_and_beat()
+		return
 	end
 
 	-- ---------- 调度（谁拿最高物理权） ----------
