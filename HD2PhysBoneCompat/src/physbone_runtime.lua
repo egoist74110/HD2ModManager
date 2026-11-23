@@ -100,7 +100,7 @@ local M = {}
 --        flags=0x35（yawCon + angleCon，没有 pitchCon）的长发链：pitch 区间留着初值 [0, 0]，
 --        而求解器在 axisLimits 打开时两个分量都夹 ⇒ 前后甩被锁在 0°，长发看着像一根焊丝。
 --        现在没约束的轴按"不限"处理，总偏角仍由锥兜住。
-M.VERSION = "2.1.57"
+M.VERSION = "2.1.58"
 
 --- 安装标记用的全局键。只写这一个全局，且值就是模块本身（便于外部检查是否已装）。
 local INSTALL_KEY = "__hd2physbone_runtime"
@@ -241,6 +241,89 @@ local function try(...)
 	local ok, a, b, c = pcall(...)
 	if ok then return a, b, c end
 	return nil, tostring(a)
+end
+
+-- ---------------------------------------------------------------------------
+-- 分项计数（E12，开销全清单 §5）：每项记"引擎调用数 + os.clock 相对耗时"，每 600 帧一行汇总。
+-- 调用数按**最内层**分项归属（排他），耗时同样排他（减去子分项）。os.clock 只能看相对量。
+-- 关掉：调参文件 `perfCounters = 0` 或 install 选项 `perfCounters = false`（关掉后不包装任何引擎函数）。
+-- ---------------------------------------------------------------------------
+local Perf = { on = false, cur = nil, n = {}, calls = {}, clock = {}, events = {}, frames = 0, totalCalls = 0, window = 600,
+	order = { "F1", "F2", "F3", "F4", "F5", "F6", "F7", "F8", "F9", "P1", "P2", "P3", "P4", "P5", "P6", "P7", "P8", "OTHER" } }
+
+function Perf.reset()
+	Perf.n, Perf.calls, Perf.clock, Perf.events, Perf.frames, Perf.totalCalls = {}, {}, {}, {}, 0, 0
+	Perf.firstAttachCalls = nil
+end
+Perf.reset()
+
+function Perf.count(name) -- 计一次"发生"（F2 的查找次数、P4/P5/P6 的日志事件）
+	if Perf.on then Perf.n[name] = (Perf.n[name] or 0) + 1 end
+end
+
+function Perf.event(name, amount)
+	Perf.events[name] = (Perf.events[name] or 0) + (amount or 1)
+end
+
+--- 包装一个函数：进入时压栈，退出时按排他口径记账。错误穿过去时栈会错位，drive 入口会重置。
+function Perf.wrap(name, fn)
+	if type(fn) ~= "function" then return fn end
+	local function leave(frame, ...)
+		local spent = os.clock() - frame.t0
+		Perf.n[name] = (Perf.n[name] or 0) + 1
+		Perf.clock[name] = (Perf.clock[name] or 0) + spent - frame.child
+		if frame.prev then frame.prev.child = frame.prev.child + spent end
+		Perf.cur = frame.prev
+		return ...
+	end
+	return function(...)
+		if not Perf.on then return fn(...) end
+		local frame = { name = name, t0 = os.clock(), child = 0, prev = Perf.cur }
+		Perf.cur = frame
+		return leave(frame, fn(...))
+	end
+end
+
+--- 给引擎命名空间里的函数套计数壳（原地替换；只替换一次）。
+function Perf.instrument(stingray)
+	for _, space in ipairs({ "Unit", "World", "Application", "Matrix4x4", "Quaternion", "Vector3", "Keyboard" }) do
+		local table_ = type(stingray) == "table" and stingray[space] or nil
+		if type(table_) == "table" and rawget(table_, "__perfWrapped") == nil then
+			local entries = {}
+			for key, value in pairs(table_) do
+				if type(value) == "function" then entries[key] = value end
+			end
+			for key, fn in pairs(entries) do
+				table_[key] = function(...)
+					if Perf.on then
+						local current = Perf.cur
+						local bucket = current and current.name or "OTHER"
+						Perf.calls[bucket] = (Perf.calls[bucket] or 0) + 1
+						Perf.totalCalls = Perf.totalCalls + 1
+					end
+					return fn(...)
+				end
+			end
+			rawset(table_, "__perfWrapped", true)
+		end
+	end
+end
+
+function Perf.summary(runtime, extra)
+	local frames = math.max(1, Perf.frames)
+	local parts = {}
+	for _, name in ipairs(Perf.order) do
+		local calls, spent, count = Perf.calls[name] or 0, Perf.clock[name] or 0, Perf.n[name] or 0
+		if calls > 0 or spent > 0 or count > 0 then
+			parts[#parts + 1] = string.format("%s=%.1f次/%.3fms(调%d)", name, calls / frames, spent * 1000 / frames, count)
+		end
+	end
+	local events = {}
+	for key, value in pairs(Perf.events) do events[#events + 1] = key .. "=" .. tostring(value) end
+	table.sort(events)
+	runtime.logger("[physbone][PERF] 窗口=%d帧 世界unit=%d 总引擎调用=%.1f/帧 ｜ %s ｜ 事件 %s",
+		Perf.frames, runtime.liveUnitCount or 0, Perf.totalCalls / frames, table.concat(parts, " "),
+		#events > 0 and table.concat(events, " ") or "无")
 end
 
 local function readVector(S_, vector)
@@ -1652,11 +1735,22 @@ local function refresh_live_units(runtime, S_)
 	local units = try(S_.World.units, runtime.world)
 	if type(units) ~= "table" then
 		runtime.liveUnits = nil
+		runtime.liveStamp = nil
 		return "unavailable"
 	end
 	runtime.liveUnits = units
 	runtime.liveUnitsWorld = runtime.world
 	runtime.liveUnitCount = #units
+	-- F2：判活由"每次线性比较整张表"改成"一次建索引、之后 O(1)"。
+	-- 索引用帧戳（不必每帧清表）：live[unit] == 本帧戳 才算活。每 600 帧整体重建一次，防止死句柄越积越多。
+	local stamp = (runtime.frame or 0) + 1
+	local live = runtime.liveIndex
+	if live == nil or (runtime.liveBuilt or 0) + 600 <= stamp then
+		live = {}
+		runtime.liveIndex, runtime.liveBuilt = live, stamp
+	end
+	for index = 1, #units do live[units[index]] = stamp end
+	runtime.liveStamp, runtime.liveIndexUnits = stamp, units
 	return "ok"
 end
 
@@ -1665,6 +1759,12 @@ end
 local function session_unit_live(runtime, unit)
 	local units = runtime.liveUnits
 	if units == nil then return true end
+	Perf.count("F2")
+	local live = runtime.liveIndex
+	if live ~= nil and runtime.liveIndexUnits == units then
+		return live[unit] == runtime.liveStamp
+	end
+	-- 外部直接塞了 liveUnits（测试 / 旧调用方）：没有索引，退回线性比较。
 	for index = 1, #units do
 		if units[index] == unit then return true end
 	end
@@ -4126,18 +4226,78 @@ function IndependentLink.weapon_graph(unit, spec, attachment)
 	if owned and signature == spec[3] then return spec[2]+base end
 end
 
-function IndependentLink.find_weapon(units, attachment, graphs)
-	local found
-	for _, unit in ipairs(units or {}) do
-		if Compat.unit_alive(S, unit) then
-			local tag = unit_tag(S, unit):match("^#ID%[([%da-fA-F]+)%]$")
-			local spec = tag and graphs[tag:lower()]
-			local root = spec and IndependentLink.weapon_graph(unit, spec, attachment)
-			if root then
-				if found then return end
-				found = { unit = unit, node = root, sidearm = spec[4], envelope = spec[5], spec = spec, id = tag:lower() }
+-- F3：找武器。改前：持枪时**每帧**遍历全世界 unit，对每个调 `Unit.alive` + `Unit.debug_name`（2×N 次引擎调用）。
+-- 改后（对应 IAS 只在身份/武器变化时才重新枚举的做法）：
+--   ① 判活不再调 `Unit.alive`：unit 在本帧 `World.units` 的索引里就是活的（`runtime.liveIndex`）；
+--   ② `debug_name` 结果按 unit 缓存（"不是武器"的缓存 180 帧过期，防指针复用）；
+--   ③ 找到过武器就先只验证缓存的那一件（索引里还在 + 武器图仍与右手挂点吻合），完整扫描 20 帧一次；
+--      没找到时 10 帧一次。
+-- `runtime` 缺省（老调用/测试）时退回原来的全量写法，行为不变。
+function IndependentLink.find_weapon(units, attachment, graphs, runtime)
+	local function inspect(unit, tag)
+		local spec = tag and graphs[tag:lower()]
+		local root = spec and IndependentLink.weapon_graph(unit, spec, attachment)
+		if root then
+			return { unit = unit, node = root, sidearm = spec[4], envelope = spec[5], spec = spec, id = tag:lower() }
+		end
+	end
+	if runtime == nil then
+		local found
+		for _, unit in ipairs(units or {}) do
+			if Compat.unit_alive(S, unit) then
+				local tag = unit_tag(S, unit):match("^#ID%[([%da-fA-F]+)%]$")
+				local hit = inspect(unit, tag)
+				if hit then
+					if found then return end
+					found = hit
+				end
 			end
 		end
+		return found
+	end
+	local frame = runtime.frame or 0
+	local cache = runtime.weaponCache
+	if cache == nil then cache = { tags = {}, tagsBuilt = frame }; runtime.weaponCache = cache end
+	local live, stamp = runtime.liveIndex, runtime.liveStamp
+	if runtime.liveIndexUnits ~= units then live = nil end
+	if cache.unit ~= nil then
+		if live ~= nil and live[cache.unit] == stamp then
+			local hit = inspect(cache.unit, cache.tag)
+			if hit and frame < (cache.nextScan or 0) then return hit end
+			if not hit then cache.unit, cache.nextScan = nil, 0 end
+		else
+			cache.unit, cache.nextScan = nil, 0
+		end
+	end
+	if cache.unit == nil and frame < (cache.nextScan or 0) then return nil end
+	if frame - cache.tagsBuilt >= 180 then cache.tags, cache.tagsBuilt = {}, frame end
+	local found, tags = nil, cache.tags
+	for index = 1, #(units or {}) do
+		local unit = units[index]
+		local tag = tags[unit]
+		if tag == nil then
+			if live ~= nil then
+				tag = unit_tag(S, unit):match("^#ID%[([%da-fA-F]+)%]$") or false
+			elseif Compat.unit_alive(S, unit) then
+				tag = unit_tag(S, unit):match("^#ID%[([%da-fA-F]+)%]$") or false
+			else
+				tag = false
+			end
+			tags[unit] = tag
+		end
+		if tag then
+			local hit = inspect(unit, tag)
+			if hit then
+				if found then cache.unit, cache.nextScan = nil, frame + 10; return end
+				found = hit
+				found.cacheTag = tag
+			end
+		end
+	end
+	if found then
+		cache.unit, cache.tag, cache.nextScan = found.unit, found.cacheTag, frame + 20
+	else
+		cache.unit, cache.nextScan = nil, frame + 10
 	end
 	return found
 end
@@ -4180,7 +4340,7 @@ function IndependentLink.held_weapon(runtime, state, readPose)
 	if not right or not root or not camera or not camera.z then return end
 	local V = Compat.contact_math
 	if V.length(V.sub(root.p, { camera.x, camera.y, camera.z })) <= 1 then return end
-	local weapon = IndependentLink.find_weapon(runtime.liveUnits, right, IndependentLink.weaponGraphs)
+	local weapon = IndependentLink.find_weapon(runtime.liveUnits, right, IndependentLink.weaponGraphs, runtime)
 	if not weapon then return end
 	local lnode = safe_node(S, weapon.unit, "IK_left")
 	local rnode = safe_node(S, weapon.unit, "IK_right")
@@ -5105,8 +5265,13 @@ local function independent_scan(runtime, state, avatar, world, list)
 	end
 	table.sort(absent)
 	local detail = #absent > 0 and table.concat(absent, "、") or "无"
-	runtime.logger("[physbone][独立骨] 清单 %d 件 / 找到 %d 件 / 缺 %s ｜ %s",
-		total, #tags, detail, table.concat(tags, "、"))
+	-- 只在结果变化时落盘（原来缺件时每次扫描都写一行，30 帧一次）。
+	local signature = total .. "|" .. #tags .. "|" .. detail
+	if state.lastScanSignature ~= signature then
+		state.lastScanSignature = signature
+		runtime.logger("[physbone][独立骨] 清单 %d 件 / 找到 %d 件 / 缺 %s ｜ %s",
+			total, #tags, detail, table.concat(tags, "、"))
+	end
 	local now = runtime.lastTime or os.time()
 	if #absent > 0 then
 		state.missingSince = state.missingSince or now
@@ -5117,7 +5282,20 @@ local function independent_scan(runtime, state, avatar, world, list)
 	else
 		state.missingSince, state.missingLogged = nil, nil
 	end
-	state.rescanAt = frame + ((#absent > 0 or sourceMissing) and 30 or (#tags == 0 and 300 or INDEPENDENT_RESCAN_FRAMES))
+	-- P3：缺件时的重扫间隔。IAS 的资源发现是每 60 帧一次（报告：资源发现每 60 帧扫一次）；
+	-- 原来这里 30 帧一次且永不放缓。现在：基准 60 帧，结果（缺哪些件）不变就翻倍退避，封顶 300 帧，
+	-- 结果一变（来了新件 / 件被拿走）立即回到 60。
+	if #absent > 0 or sourceMissing then
+		if state.missingSignature == signature then
+			state.missBackoff = math.min(300, (state.missBackoff or 30) * 2)
+		else
+			state.missingSignature, state.missBackoff = signature, math.floor(tonumber(runtime.options.independentMissRescanFrames) or 60)
+		end
+		state.rescanAt = frame + state.missBackoff
+	else
+		state.missingSignature, state.missBackoff = nil, nil
+		state.rescanAt = frame + (#tags == 0 and 300 or INDEPENDENT_RESCAN_FRAMES)
+	end
 	return true
 end
 
@@ -6364,6 +6542,29 @@ end
 ---@param stingray table 引擎命名空间
 ---@param options table { compat, logPath, debug, archiveId, ... }
 ---@return table runtime
+-- 分项计数的包装（见 Perf）。所有被包装的都是上面已经定义好的局部函数 / 表字段；
+-- 局部函数是按上值被别的函数引用的，所以在这里重新赋值，之前定义的调用方也会走包装。
+local perfWrapped = false
+local function perf_wrap_all()
+	if perfWrapped then return end
+	perfWrapped = true
+	refresh_live_units = Perf.wrap("F1", refresh_live_units)
+	refresh_avatar_distances = Perf.wrap("F8", refresh_avatar_distances)
+	identity_watch = Perf.wrap("F8", identity_watch)
+	fp_lock_watch = Perf.wrap("F8", fp_lock_watch)
+	scheduler_watch = Perf.wrap("F8", scheduler_watch)
+	sched_poll = Perf.wrap("F9", sched_poll)
+	independent_frame = Perf.wrap("F4", independent_frame)
+	apply_arm_pose_frame = Perf.wrap("F4", apply_arm_pose_frame)
+	sample_action_state = Perf.wrap("F5", sample_action_state)
+	frame_animation_machine = Perf.wrap("F5", frame_animation_machine)
+	independent_scan = Perf.wrap("P3", independent_scan)
+	tryAttach = Perf.wrap("P2", tryAttach)
+	IndependentLink.find_weapon = Perf.wrap("F3", IndependentLink.find_weapon)
+	IndependentLink.physics = Perf.wrap("F6", IndependentLink.physics)
+	M.independent_physics_ = IndependentLink.physics
+end
+
 function M.install(stingray, options)
 	local existing = rawget(_G, INSTALL_KEY)
 	if existing ~= nil then return existing end
@@ -6379,6 +6580,32 @@ function M.install(stingray, options)
 	Compat = compat
 
 	local logger, logContext = makeLogger(options)
+	-- 分项计数：默认开（用户下次实机要一次拿全分项）；`perfCounters = false` 关。
+	Perf.reset()
+	Perf.on = options.perfCounters ~= false
+	if Perf.on then
+		Perf.window = math.floor(tonumber(options.perfWindow) or 600)
+		Perf.instrument(S)
+		for _, name in ipairs({ "update", "attach", "session_health", "unit_alive" }) do
+			if type(Compat[name]) == "function" and not rawget(Compat, "__perf_" .. name) then
+				local bucket = (name == "update" and "F6") or (name == "attach" and "P7") or "F7"
+				Compat[name] = Perf.wrap(bucket, Compat[name])
+				rawset(Compat, "__perf_" .. name, true)
+			end
+		end
+		perf_wrap_all()
+		local rawLogger = logger
+		logger = function(format, ...)
+			if type(format) == "string" then
+				if format:find("有新玩家", 1, true) then Perf.event("P4") end
+				if format:find("跳过 %d 个离它所属玩家", 1, true) or format:find("跳过 %d", 1, true) and format:find("尸体", 1, true) then Perf.event("P5") end
+				if format:find("玩家动它不动", 1, true) or format:find("没有跟着动", 1, true) then Perf.event("P6") end
+				if format:find("[独立骨] 清单", 1, true) then Perf.event("P3log") end
+			end
+			return rawLogger(format, ...)
+		end
+	end
+
 	state = {
 		options = options,
 		iasPhysicsGroups = math.floor(tonumber(options.iasPhysicsGroups) or 0) % 16,
@@ -6417,7 +6644,22 @@ function M.install(stingray, options)
 		if originalRender ~= nil then result = originalRender(...) end
 		if driver.installed then
 			driver.frame = driver.frame + 1
+			local calls0 = Perf.totalCalls
+			Perf.cur = nil
 			local ok, err = pcall(drive, driver)
+			if Perf.on then
+				Perf.cur = nil
+				Perf.frames = Perf.frames + 1
+				local spent = Perf.totalCalls - calls0
+				if spent > (Perf.events.maxFrameCalls or 0) then Perf.events.maxFrameCalls = spent end
+				if Compat.perf_resync then Perf.events.P1 = Compat.perf_resync end
+				if Perf.frames >= Perf.window then
+					pcall(Perf.summary, driver)
+					local keepResync = Perf.events.P1
+					Perf.reset()
+					Perf.events.P1 = keepResync
+				end
+			end
 			driver.frameAnimation = nil
 			if not ok and driver.weaponShift then IndependentLink.restore_weapon(driver) end
 			if not ok and not driver.driveErrorLogged then

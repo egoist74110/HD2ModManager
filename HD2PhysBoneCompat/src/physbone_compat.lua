@@ -3256,6 +3256,7 @@ function M.update_tip(session, dt, maxWrite)
 					for index = 1, #tips do tips[index].ready = false end
 					item.lastWritten = nil   -- 跳变后必须整条重写（否则脏标记会让我们以为"没变"）
 					item.jumps = (item.jumps or 0) + 1
+					M.perf_resync = (M.perf_resync or 0) + 1
 					if item.jumps <= 3 then
 						logger("[physbone][RESYNC] 锚点跳变，%d 个尖端已对齐目标（第 %d 次）",
 							#tips, item.jumps)
