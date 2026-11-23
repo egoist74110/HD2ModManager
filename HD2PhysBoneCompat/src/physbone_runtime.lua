@@ -4016,6 +4016,87 @@ local function roster_instance_slot(value, frame)
 	return slot
 end
 
+--- IAS solo_discovery_allowed（行 4756–4789）：只跳过"猜测式"发现（低位扫描）；已知对象刷新照常。
+--- 独自一人且已验证：唯一 avatar 的网络对象仍存在、类型对、血量与位置吻合；两份成员名单（peers / other_peers）都只含自己。
+local function roster_solo_allowed(S, GS, Net, states, known, slots, avatars, session, peer, owned, complete)
+	if #avatars ~= 1 or not complete or type(peer) ~= "string" or #peer == 0 or #peer > 128 then return false end
+	local avatar = avatars[1]
+	if type(avatar) ~= "table" or not avatar.unit or not avatar.world then return false end
+	local state = states[avatar.unit]
+	if not state or state.owner ~= true or state.dead or not state.network or state.world ~= avatar.world
+		or not known[state.network] or not owned[state.network] or Roster.session ~= session then return false end
+	for _, name in ipairs({ "peers", "other_peers" }) do
+		if type(GS[name]) ~= "function" then return false end
+		local rows = try(GS[name], session)
+		if type(rows) ~= "table" then return false end
+		local count = 0
+		for _, member in pairs(rows) do
+			count = count + 1
+			if count > 32 or type(member) ~= "string" or #member == 0 or #member > 128 or member ~= peer then return false end
+		end
+	end
+	if try(Net.game_session) ~= session or try(Net.peer_id) ~= peer or try(GS.in_session, session) ~= true
+		or try(GS.game_object_exists, session, state.network) ~= true
+		or try(GS.game_object_is_type, session, state.network, "gl7xl2w") ~= true
+		or try(S.Unit.alive, avatar.unit) ~= true
+		or try(S.Unit.has_animation_state_machine, avatar.unit) ~= true then return false end
+	local health = try(GS.game_object_field, session, state.network, "health")
+	local x, y, z = readVector(S, try(GS.game_object_field, session, state.network, "position"))
+	return type(health) == "number" and health == health and health > 0 and health < 1e9
+		and x ~= nil and roster_distance(avatar.p, { x, y, z }) <= 1.0
+end
+
+--- IAS squad_discovery_allowed（行 4794–4846）：2–4 个 avatar 各有新鲜、唯一的网络 / owner 证明，
+--- 且两份成员名单一致、与可见 avatar 的 owner 集合完全吻合。只跳过猜测式 id 发现与远端枚举。
+local function roster_squad_allowed(S, GS, Net, states, known, slots, avatars, session, peer, owned, complete)
+	if #avatars < 2 or #avatars > 4 or not complete or type(peer) ~= "string" or #peer == 0 or #peer > 128
+		or type(GS.game_object_owner) ~= "function" then return false end
+	local members
+	for _, name in ipairs({ "peers", "other_peers" }) do
+		if type(GS[name]) ~= "function" then return false end
+		local list = try(GS[name], session)
+		if type(list) ~= "table" then return false end
+		local found, count = {}, 0
+		for _, owner in pairs(list) do
+			count = count + 1
+			if count > 4 or type(owner) ~= "string" or #owner == 0 or #owner > 128 then return false end
+			if owner ~= peer then
+				if found[owner] then return false end
+				found[owner] = true
+			end
+		end
+		if members then
+			for owner in pairs(found) do if not members[owner] then return false end end
+			for owner in pairs(members) do if not found[owner] then return false end end
+		else members = found end
+	end
+	local seen, networks, world, selfCount = {}, {}, nil, 0
+	for _, avatar in ipairs(avatars) do
+		local state = states[avatar.unit]
+		if not state or state.dead or not state.network or not known[state.network] or state.world ~= avatar.world
+			or state.instance ~= slots[avatar.unit] or networks[state.network] or (world and world ~= avatar.world)
+			or try(S.Unit.alive, avatar.unit) ~= true
+			or try(S.Unit.has_animation_state_machine, avatar.unit) ~= true then return false end
+		world = avatar.world; networks[state.network] = true
+		if try(GS.game_object_exists, session, state.network) ~= true
+			or try(GS.game_object_is_type, session, state.network, "gl7xl2w") ~= true then return false end
+		local owner = try(GS.game_object_owner, session, state.network)
+		if type(owner) ~= "string" or #owner == 0 or #owner > 128 or seen[owner] then return false end
+		seen[owner] = true
+		if owner == peer then
+			if state.owner ~= true or not owned[state.network] then return false end
+			selfCount = selfCount + 1
+		elseif not members[owner] or state.owner ~= false or state.friendly ~= true or owned[state.network] then return false end
+		local health = try(GS.game_object_field, session, state.network, "health")
+		local x, y, z = readVector(S, try(GS.game_object_field, session, state.network, "position"))
+		if type(health) ~= "number" or health ~= health or health <= 0 or health >= 1e9 or x == nil
+			or roster_distance(avatar.p, { x, y, z }) > 1.0 then return false end
+	end
+	for owner in pairs(members) do if not seen[owner] then return false end end
+	return selfCount == 1 and try(Net.game_session) == session and try(Net.peer_id) == peer
+		and try(GS.in_session, session) == true
+end
+
 local function roster_identity(runtime, avatars)
 	local Net, GS = S.Network, S.GameSession
 	if type(avatars) ~= "table" or #avatars > 32 then return end   -- IAS 行 4841
@@ -4074,15 +4155,20 @@ local function roster_identity(runtime, avatars)
 			known[id] = nil
 		end
 	end
-	for index = 1, math.min(16, #ownedIds) do consider(ownedIds[index]) end
-	for _ = 1, math.min(64, #ownedIds) do
-		Roster.ownedCursor = Roster.ownedCursor % #ownedIds + 1
-		consider(ownedIds[Roster.ownedCursor])
+	-- IAS 行 4879–4889：solo / squad 已验证时跳过本地低位扫描（只跳过发现，已知对象刷新照常）
+	local solo = roster_solo_allowed(S, GS, Net, states, known, slots, avatars, session, peer, owned, complete)
+	local squad = not solo and roster_squad_allowed(S, GS, Net, states, known, slots, avatars, session, peer, owned, complete)
+	if not solo and not squad then
+		for index = 1, math.min(16, #ownedIds) do consider(ownedIds[index]) end
+		for _ = 1, math.min(64, #ownedIds) do
+			Roster.ownedCursor = Roster.ownedCursor % #ownedIds + 1
+			consider(ownedIds[Roster.ownedCursor])
+		end
+		for _ = 1, 64 do consider(Roster.cursor); Roster.cursor = (Roster.cursor + 1) % 4096 end
 	end
-	for _ = 1, 64 do consider(Roster.cursor); Roster.cursor = (Roster.cursor + 1) % 4096 end
 	-- IAS 行 4909–4951：枚举真实的远端 owner（GS.peers 与 GS.other_peers 合并，各读至多 32 个，去掉自己），
 	-- 排序后取前 4 个，每个 owner 考察前 8 个 id + 16 个游标 id。
-	if #avatars > 1 and type(peer) == "string" then
+	if #avatars > 1 and not squad and type(peer) == "string" then
 		local members = {}
 		for _, name in ipairs({ "peers", "other_peers" }) do
 			local values = type(GS[name]) == "function" and try(GS[name], session)
