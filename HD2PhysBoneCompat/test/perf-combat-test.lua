@@ -201,7 +201,7 @@ end
 -- ================================================================ E12 战斗场景：世界里 2000 个 unit
 -- 目的：量"与世界 unit 数成正比"的几项（F1 活体列表、F2 判活、F3 找武器）每帧的引擎调用数。
 -- 这份用例在改动前后的运行时上都能跑：数字来自假引擎自己的计数器，不依赖运行时里的 Perf。
-io.stdout:write("\n[E12 战斗场景] 世界 2000 个 unit + 1 名玩家\n")
+io.stdout:write("\n[E12 战斗场景] 世界 15000 个 unit + 4 名玩家\n")
 
 local function counted(fake)
 	local S = fake:stingray()
@@ -223,9 +223,9 @@ end
 
 do
 	local fake = newFake()
-	for _ = 1, 1960 do fake:addUnit({ nodes = 10 }) end
+	for _ = 1, 14960 do fake:addUnit({ nodes = 10 }) end
 	local compat = newCompat()
-	fake:playerAt("p1", 0)
+	for index = 1, 4 do fake:playerAt("p" .. index, (index - 1) * 10) end
 	local S, counter = counted(fake)
 	rawset(_G, "__hd2physbone_runtime", nil)
 	rawset(_G, "render", function() end)
@@ -234,7 +234,7 @@ do
 		heartbeatFrames = 1000000, minNodes = 90, perfWindow = 1000000 })
 	local runtime = rawget(_G, "__hd2physbone_runtime")
 	fake:advance(60)
-	check(#(runtime.sessions or {}) == 1, "战斗场景下玩家护甲正常挂上", #(runtime.sessions or {}))
+	check(#(runtime.sessions or {}) == 4, "战斗场景下玩家护甲正常挂上", #(runtime.sessions or {}))
 	counter.total, counter.by = 0, {}
 	local c0 = os.clock()
 	fake:advance(300)
@@ -246,14 +246,28 @@ do
 	for key in pairs(counter.by) do keys[#keys + 1] = key end
 	table.sort(keys)
 	for _, key in ipairs(keys) do io.stdout:write(string.format("    %-28s %.2f/帧\n", key, counter.by[key] / 300)) end
-	check(perFrame < 30, "世界 2000 个 unit 时稳态每帧引擎调用 < 30", perFrame)
+	local perf = runtimeModule.perf_
+	if perf ~= nil then
+		local rows = {}
+		for name, calls in pairs(perf.calls) do rows[#rows + 1] = string.format("%s=%.1f", name, calls / math.max(1, perf.frames)) end
+		for _, bucket in ipairs({ "OTHER", "P2", "F8" }) do
+			local per, list = perf.api[bucket] or {}, {}
+			for name, calls in pairs(per) do list[#list + 1] = string.format("%s=%.1f", name, calls / math.max(1, perf.frames)) end
+			table.sort(list)
+			io.stdout:write("  [明细 " .. bucket .. "] " .. table.concat(list, " ") .. "\n")
+		end
+		table.sort(rows)
+		io.stdout:write("  [分项] " .. table.concat(rows, " ") .. "\n")
+		check((perf.calls.OTHER or 0) / math.max(1, perf.frames) < 1, "OTHER 接近 0（计数覆盖全部引擎调用）", (perf.calls.OTHER or 0) / math.max(1, perf.frames))
+	end
+	check(perFrame < 40, "世界 15000 个 unit、4 人时稳态每帧引擎调用 < 40", perFrame)
 	check((counter.by["Unit.alive"] or 0) / 300 < 1, "稳态不再逐 unit 调 Unit.alive", (counter.by["Unit.alive"] or 0) / 300)
 end
 
--- F3：找武器。2000 个 unit 里 1 件是武器，右手挂点命中它。
+-- F3：找武器。15000 个 unit 里 1 件是武器，右手挂点命中它。
 do
 	local fake = newFake()
-	for _ = 1, 1960 do fake:addUnit({ nodes = 10 }) end
+	for _ = 1, 14960 do fake:addUnit({ nodes = 10 }) end
 	local weapon = fake:addUnit({ nodes = 10 })
 	weapon.isWeapon = true
 	local S, counter = counted(fake)
@@ -295,7 +309,7 @@ do
 	io.stdout:write(string.format("  [数据] 找武器 120 帧：Unit.alive %.1f/帧、Unit.debug_name %.1f/帧；Lua 耗时 %.1f ms\n",
 		alive / 120, names / 120, elapsed * 1000))
 	check(hits == 120, "每帧都找到那件武器", hits)
-	check((alive + names) / 120 < 50, "找武器稳态每帧引擎调用 < 50（改前为 2×2000）", (alive + names) / 120)
+	check((alive + names) / 120 < 150, "找武器稳态每帧引擎调用 < 150（改前为 15000×2；15000 个 unit 的 debug_name 缓存 180 帧才重建一次）", (alive + names) / 120)
 	Link.weapon_graph = original
 end
 

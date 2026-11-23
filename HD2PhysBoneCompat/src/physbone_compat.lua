@@ -2484,6 +2484,7 @@ function M.attach(S, unit, rig, options)
 		-- 上限 20 留了余量，但远小于位置跳变能产生的量级。
 		maxAccel = options.maxAccel or 10,   -- 走路 3~8 m/s²；留一点余量
 		positionSmoothing = options.positionSmoothing or 0.2,
+		teleportThreshold = options.teleportThreshold or 2.0,
 		jumpThreshold = options.jumpThreshold or 0.25,   -- 米；一帧移动 25cm 只可能是跳变
 		jumpCooldown = options.jumpCooldown or 30,        -- 跳变后静默帧数
 		chainBudget = options.chainBudget or 0.55,        -- 整条链的累计偏角上限（rad，约 31°）
@@ -3169,6 +3170,8 @@ function M.update_tip(session, dt, maxWrite)
 	local staticLimit = session.staticSkipLimit or 120
 	local jumpThreshold = session.jumpThreshold or 0.25
 	local jumpEps2 = jumpThreshold * jumpThreshold
+	local teleportThreshold = session.teleportThreshold or 2.0   -- 米；超过它才当真正的传送去重置
+	local sqrt = math.sqrt
 	local writeEpsilonNeg = -epsilon
 	-- 局部化热点引用：PUC Lua 5.1 不会自动消掉重复的 table 链式查找。
 	local stepTip, localRotations = M.step_tip, M.local_rotations
@@ -3245,11 +3248,33 @@ function M.update_tip(session, dt, maxWrite)
 				lastQ[4], lastQ[5], lastQ[6], lastQ[7] = qx, qy, qz, qw
 				-- 位置跳变（换装 / 切 LOD / 瞬移）：让尖端直接对齐目标，比"静默 N 帧"恢复得快
 				local jumped = false
+				local carried = false
 				if item.lastAnchor ~= nil then
 					local dx = apx - item.lastAnchor[1]
 					local dy = apy - item.lastAnchor[2]
 					local dz = apz - item.lastAnchor[3]
-					jumped = (dx * dx + dy * dy + dz * dz) > jumpEps2
+					local d2 = dx * dx + dy * dy + dz * dz
+					jumped = d2 > jumpEps2
+					if jumped then
+						local distance = sqrt(d2)
+						if distance > (M.perf_jump_max or 0) then M.perf_jump_max = distance end
+						-- E12c：锚点位移在 [jumpThreshold, teleportThreshold) 之间时**不重置**，
+						-- 把整条链的尖端状态随锚点一起平移（位置、上一帧位置都搬，速度不变）。
+						-- IAS 的状态存在驱动骨本地系里，锚点平移根本不会触发重置；只有帧/时间/传送间隙才重置。
+						-- 实机 2.1.58：4 人局里队友链每帧都因"远程玩家按网络 tick 阶跃"被判跳变（累计 13.8 万次），
+						-- 每次都把尖端对齐回目标 ⇒ 物理等于每帧被清零。
+						if distance < teleportThreshold and item.lastWritten ~= nil then
+							local itips = tip.tips
+							for index = 1, #itips do
+								local t = itips[index]
+								if t.ready then
+									t.px, t.py, t.pz = t.px + dx, t.py + dy, t.pz + dz
+								end
+							end
+							carried, jumped = true, false
+							M.perf_carry = (M.perf_carry or 0) + 1
+						end
+					end
 				end
 				local tips = tip.tips
 				if jumped then

@@ -100,7 +100,7 @@ local M = {}
 --        flags=0x35（yawCon + angleCon，没有 pitchCon）的长发链：pitch 区间留着初值 [0, 0]，
 --        而求解器在 axisLimits 打开时两个分量都夹 ⇒ 前后甩被锁在 0°，长发看着像一根焊丝。
 --        现在没约束的轴按"不限"处理，总偏角仍由锥兜住。
-M.VERSION = "2.1.58"
+M.VERSION = "2.1.59"
 
 --- 安装标记用的全局键。只写这一个全局，且值就是模块本身（便于外部检查是否已装）。
 local INSTALL_KEY = "__hd2physbone_runtime"
@@ -248,11 +248,11 @@ end
 -- 调用数按**最内层**分项归属（排他），耗时同样排他（减去子分项）。os.clock 只能看相对量。
 -- 关掉：调参文件 `perfCounters = 0` 或 install 选项 `perfCounters = false`（关掉后不包装任何引擎函数）。
 -- ---------------------------------------------------------------------------
-local Perf = { on = false, cur = nil, n = {}, calls = {}, clock = {}, events = {}, frames = 0, totalCalls = 0, window = 600,
-	order = { "F1", "F2", "F3", "F4", "F5", "F6", "F7", "F8", "F9", "P1", "P2", "P3", "P4", "P5", "P6", "P7", "P8", "OTHER" } }
+local Perf = { on = false, active = false, api = {}, cur = nil, n = {}, calls = {}, clock = {}, events = {}, frames = 0, totalCalls = 0, window = 600,
+	order = { "F1", "F2", "F3", "F4", "F4p", "F4a", "F5", "F6", "F7", "F8", "F9", "P1", "P2", "P3", "P4", "P5", "P6", "P7", "P8", "OTHER" } }
 
 function Perf.reset()
-	Perf.n, Perf.calls, Perf.clock, Perf.events, Perf.frames, Perf.totalCalls = {}, {}, {}, {}, 0, 0
+	Perf.n, Perf.calls, Perf.clock, Perf.events, Perf.frames, Perf.totalCalls, Perf.api = {}, {}, {}, {}, 0, 0, {}
 	Perf.firstAttachCalls = nil
 end
 Perf.reset()
@@ -295,11 +295,17 @@ function Perf.instrument(stingray)
 			end
 			for key, fn in pairs(entries) do
 				table_[key] = function(...)
-					if Perf.on then
+					-- 只数**我们自己的回调**里发出的调用（Perf.active）：引擎命名空间是全局共享的，
+					-- 其他 mod 的调用也会经过这里。2.1.58 没有这个门，OTHER≈1750 次/帧其实是别人的调用。
+					if Perf.on and Perf.active then
 						local current = Perf.cur
 						local bucket = current and current.name or "OTHER"
 						Perf.calls[bucket] = (Perf.calls[bucket] or 0) + 1
 						Perf.totalCalls = Perf.totalCalls + 1
+						local per = Perf.api[bucket]
+						if per == nil then per = {}; Perf.api[bucket] = per end
+						local name = space .. "." .. key
+						per[name] = (per[name] or 0) + 1
 					end
 					return fn(...)
 				end
@@ -321,6 +327,17 @@ function Perf.summary(runtime, extra)
 	local events = {}
 	for key, value in pairs(Perf.events) do events[#events + 1] = key .. "=" .. tostring(value) end
 	table.sort(events)
+	for _, bucket in ipairs({ "F4", "F6", "F7", "P2", "OTHER" }) do
+		local per = Perf.api[bucket]
+		if per ~= nil then
+			local rows = {}
+			for name, count in pairs(per) do rows[#rows + 1] = { name, count } end
+			table.sort(rows, function(a, b) return a[2] > b[2] end)
+			local text = {}
+			for index = 1, math.min(5, #rows) do text[#text + 1] = string.format("%s=%.1f", rows[index][1], rows[index][2] / frames) end
+			parts[#parts + 1] = bucket .. "明细[" .. table.concat(text, " ") .. "]"
+		end
+	end
 	runtime.logger("[physbone][PERF] 窗口=%d帧 世界unit=%d 总引擎调用=%.1f/帧 ｜ %s ｜ 事件 %s",
 		Perf.frames, runtime.liveUnitCount or 0, Perf.totalCalls / frames, table.concat(parts, " "),
 		#events > 0 and table.concat(events, " ") or "无")
@@ -511,8 +528,13 @@ local function discover(S_, cache, options, logger, runtime)
 	local previous = cache.lastUnitCount
 	cache.lastUnitCount = count
 	-- 场景还在加载/切换（unit 总数在变）⇒ 不做全量扫描，下一拍再来。
+	-- E12c：战斗里弹体/碎片每帧增减几十到几百个，原来"总数必须完全相同"在战斗中永远过不了，
+	-- 于是"发现目标失败"每 20 帧重试一次永不放弃。现在只有总数变化超过 25%（且 > 500）才算换场景。
 	if previous ~= count then
-		return nil, "unit 总数在变（加载/切场景中）"
+		local delta = previous ~= nil and math.abs(count - previous) or math.huge
+		if previous == nil or (delta > 500 and delta > 0.25 * math.max(previous, 1)) or count < 2000 and delta > 0 then
+			return nil, "unit 总数在变（加载/切场景中）"
+		end
 	end
 
 	-- 挂点按**名字**问（`IdString32` 会失效，见 compat 里 `rig_bone_names` 的说明）。
@@ -581,10 +603,28 @@ local function discover(S_, cache, options, logger, runtime)
 	for index = 1, #avatars do avatarUnits[avatars[index].unit] = avatars[index] end
 
 	local withMg, withoutMg = {}, {}
+	-- E12c：逐个 unit 问节点数是实机里 11.7 万次/帧尖峰的来源（15 000 个 unit × 多次调用）。
+	--   ① 判活改用本帧 `World.units` 索引（在表里就是活的），不再每个 unit 调 `Unit.alive`；
+	--   ② "节点数不够 = 不是护甲"的结论按 unit 缓存 600 帧（只缓存否定结论，防指针复用误伤）；
+	--   ③ 一次最多新探 `discoverProbeBudget`（默认 3000）个 unit，超出就分片到下一拍继续，缓存保留。
+	local frameNow = runtime and runtime.frame or 0
+	local negative = cache.nodeNegative
+	if negative == nil or (cache.nodeNegativeBuilt or 0) + 600 <= frameNow then
+		negative = {}
+		cache.nodeNegative, cache.nodeNegativeBuilt = negative, frameNow
+	end
+	local live = runtime and runtime.liveIndexUnits == units and runtime.liveIndex or nil
+	local stamp = runtime and runtime.liveStamp
+	local budget = options.discoverProbeBudget or 3000
+	local probed, sliced = 0, false
 	for index = 1, count do
 		local unit = units[index]
-		if avatarUnits[unit] == nil and Compat.unit_alive(S_, unit) then
+		if avatarUnits[unit] == nil and negative[unit] == nil
+			and (live ~= nil and live[unit] == stamp or live == nil and Compat.unit_alive(S_, unit)) then
+			if probed >= budget then sliced = true break end
+			probed = probed + 1
 			local nodes = try(S_.Unit.num_scene_graph_items, unit)
+			if type(nodes) == "number" and nodes < minNodes then negative[unit] = true end
 			if type(nodes) == "number" and nodes >= minNodes then
 				if try(S_.Unit.has_node, unit, supportMg) == true then
 					if #withMg < maxUnits then
@@ -595,6 +635,9 @@ local function discover(S_, cache, options, logger, runtime)
 				end
 			end
 		end
+	end
+	if sliced then
+		return nil, string.format("扫描分片中（本拍新探 %d 个 unit，缓存否定 %d 个）", probed, 0)
 	end
 	local armorList = withMg
 	for _, candidate in ipairs(withoutMg) do
@@ -4546,6 +4589,18 @@ function IndependentLink.shift_weapon(runtime, world, weapon, delta, graphs)
 	return ok
 end
 
+--- 缩放判定（E12c）。
+--- 引擎会主动把某些骨（头盔/头，第一人称、死亡、空投期间）缩成 0 来"隐藏"它；那不是姿势异常。
+--- 旧写法一律要求缩放 == 1：挂接断言失败 → 件被隔离并整件隐藏 ⇒ 实机截图里"角色整个透明，只剩武器挂件"。
+--- 现在：全部分量 ≈ 1 → 正常；全部分量 ≈ 0（< 0.01）→ 引擎有意隐藏，放行（不隔离、不隐藏整件）；
+--- 其余（非均匀 / 拉伸）才算异常。
+function IndependentLink.scale_state(x, y, z)
+	if x == nil then return "missing" end
+	if math.abs(x-1) <= 1e-6 and math.abs(y-1) <= 1e-6 and math.abs(z-1) <= 1e-6 then return "one" end
+	if math.abs(x) < 0.01 and math.abs(y) < 0.01 and math.abs(z) < 0.01 then return "hidden" end
+	return "fault"
+end
+
 function IndependentLink.restore(state, piece, layoutChanged)
 	local link = piece.link
 	if not link then return true end
@@ -4581,6 +4636,13 @@ function IndependentLink.fail(runtime, state, piece, reason)
 			restored and "" or "，待恢复原骨链")
 	end
 	piece.linkFailed = true
+	-- 瞬时原因（缩放异常 / 件或 avatar 刚消失 / 原父节点还在）不应让件永远停在 E6 回退路径：
+	-- 60 帧后清掉标记重试挂接（重试期间件仍可见、仍按旋转复制跟随）。
+	local text = tostring(reason)
+	if text:find("缩放", 1, true) or text:find("消失", 1, true) or text:find("原父节点", 1, true)
+		or text:find("缺少节点", 1, true) then
+		piece.linkRetryAt = (runtime.frame or 0) + 60
+	end
 	return restored
 end
 
@@ -4597,8 +4659,8 @@ function IndependentLink.attach(runtime, state, piece)
 			local node, source = piece.nodes[b], state.sources[b]
 			assert(node and source and state.rest[b], "缺少节点 " .. state.list[b][1])
 			local x, y, z = readVector(S, U.local_scale(unit, node))
-			assert(x and math.abs(x-1) <= 1e-6 and math.abs(y-1) <= 1e-6 and math.abs(z-1) <= 1e-6,
-				"缩放 " .. state.list[b][1])
+			local scaleState = IndependentLink.scale_state(x, y, z)
+			assert(scaleState == "one" or scaleState == "hidden", "缩放 " .. state.list[b][1])
 			local px, py, pz = readVector(S, U.local_position(unit, node))
 			local q = Compat.independent_quaternion(S.Quaternion.to_elements(U.local_rotation(unit, node)))
 			local parent = U.scene_graph_parent(unit, node)
@@ -5172,6 +5234,7 @@ local function independent_scan(runtime, state, avatar, world, list)
 	end
 
 	local present, seen, claimed = {}, {}, {}
+	local dropReasons = { gone = 0, dead = 0, nodes = 0 }
 	for _, unit in ipairs(units) do present[unit] = true end
 	for i = #state.pieces, 1, -1 do
 		local piece = state.pieces[i]
@@ -5185,11 +5248,19 @@ local function independent_scan(runtime, state, avatar, world, list)
 		if valid then
 			seen[piece.unit], claimed[piece.slot] = true, true
 		else
+			if not present[piece.unit] then dropReasons.gone = dropReasons.gone + 1
+			elseif not alive then dropReasons.dead = dropReasons.dead + 1
+			else dropReasons.nodes = dropReasons.nodes + 1 end
 			if alive and piece.link then IndependentLink.restore(state, piece, true) end
 			if alive then IndependentLink.restore_clothing(state, piece) end
 			if alive and piece.hidden then independent_visibility(piece, true) end
 			table.remove(state.pieces, i)
 		end
+	end
+	-- E12c 诊断：实机 19:43:43 八件同时"找不到"，日志里看不出是句柄没了、判死还是节点 id 变了。
+	if dropReasons.gone + dropReasons.dead + dropReasons.nodes > 0 then
+		runtime.logger("[physbone][独立骨] 摘掉 %d 件（不在世界列表 %d / 判死 %d / 节点 id 变了 %d）；世界 unit %d",
+			dropReasons.gone + dropReasons.dead + dropReasons.nodes, dropReasons.gone, dropReasons.dead, dropReasons.nodes, #units)
 	end
 	local expected = {}
 	for tag in pairs(manifest or {}) do
@@ -5286,10 +5357,15 @@ local function independent_scan(runtime, state, avatar, world, list)
 	-- 原来这里 30 帧一次且永不放缓。现在：基准 60 帧，结果（缺哪些件）不变就翻倍退避，封顶 300 帧，
 	-- 结果一变（来了新件 / 件被拿走）立即回到 60。
 	if #absent > 0 or sourceMissing then
-		if state.missingSignature == signature then
-			state.missBackoff = math.min(300, (state.missBackoff or 30) * 2)
-		else
-			state.missingSignature, state.missBackoff = signature, math.floor(tonumber(runtime.options.independentMissRescanFrames) or 60)
+		-- E12c：死亡/空投重生后新件是一件件冒出来的，2.1.58 把间隔拉到 60 帧起、最长 300 帧，
+		-- 实机里件迟迟挂不上（"找到 0 件/2 件"来回，约 18 秒）。现在：结果一变就进入 15 帧间隔的"快扫窗口"
+		-- （900 帧），窗口内每次扫描结果不变也只在 60 帧后才开始退避。
+		local fast = math.floor(tonumber(runtime.options.independentMissRescanFrames) or 15)
+		if #tags == 0 then fast = math.min(fast, 5) end
+		if state.missingSignature ~= signature then
+			state.missingSignature, state.missBackoff, state.missFastUntil = signature, fast, frame + 900
+		elseif frame >= (state.missFastUntil or 0) then
+			state.missBackoff = math.min(300, math.max(60, (state.missBackoff or 30) * 2))
 		end
 		state.rescanAt = frame + state.missBackoff
 	else
@@ -5446,6 +5522,11 @@ local function independent_frame(runtime, avatar, world, list, state, remote)
 			if eligible then
 				weapon = IndependentLink.held_weapon(runtime, state, readPose)
 				state.singleHand = weapon ~= nil and (weapon.sidearm or not weapon.support)
+				-- E12c：空主动作 + 武器姿势树但**找不到手里的武器**（没拿枪 / 武器未识别 / 复活后还没生成）：
+				-- 不能把双手拉去握点（那里没有枪）：双手改跟原生手轨迹（与 action=2 的接触同口径），手臂照抄动画。
+				if weapon == nil then
+					state.contacts, state.singleHand = IndependentLink.contacts(2, readPose), false
+				end
 			end
 		end
 	end
@@ -5521,8 +5602,10 @@ local function independent_frame(runtime, avatar, world, list, state, remote)
 			local b = piece.bones[index]
 			local x, y, z = readVector(S, try(S.Unit.local_scale, piece.unit, piece.nodes[b]))
 			calls = calls + (x ~= nil and 2 or 1)
-			if x == nil or not (math.abs(x-1) <= 0.0001 and math.abs(y-1) <= 0.0001
-				and math.abs(z-1) <= 0.0001) then return index end
+			if x == nil then return index end
+			if not (math.abs(x-1) <= 0.0001 and math.abs(y-1) <= 0.0001 and math.abs(z-1) <= 0.0001) then
+				if IndependentLink.scale_state(x, y, z) ~= "hidden" then return index end
+			end
 		end
 	end
 
@@ -5661,6 +5744,9 @@ local function independent_frame(runtime, avatar, world, list, state, remote)
 			state.samplePiece, state.sampleRound = nil, nil
 			state.rescanAt = frame + 1
 		else
+			if piece.linkFailed and not piece.link and piece.linkRetryAt and frame >= piece.linkRetryAt then
+				piece.linkFailed, piece.linkRetryAt = nil, nil
+			end
 			local linked = piece.link and not piece.linkFailed
 			local pieceDue = due or not piece.link
 			if piece.link and (not linkEnabled or piece.linkFailed) then
@@ -6125,8 +6211,12 @@ local function drive(runtime)
 				-- 另外：有"负结果待重试"时要把它排上，否则那批件永远没机会翻案。
 				runtime.reconcile = runtime.fillPending and (frame + poll) or runtime.negativeRetryAt
 				runtime.negativeRetryAt = nil
+				runtime.reconcileFails = 0
 			else
-				runtime.reconcile = frame + poll     -- 场景还没稳，下一拍再来
+				-- E12c：连续失败就退避（IAS 的资源发现是每 60 帧一次）：基准间隔 ×1、×2、×3 封顶。
+				-- 2.1.58 实机里"发现目标失败"每 20 帧重试，每次带全量扫描。
+				runtime.reconcileFails = (runtime.reconcileFails or 0) + 1
+				runtime.reconcile = frame + poll * math.min(3, runtime.reconcileFails)
 			end
 		end
 	end
@@ -6553,6 +6643,9 @@ local function perf_wrap_all()
 	identity_watch = Perf.wrap("F8", identity_watch)
 	fp_lock_watch = Perf.wrap("F8", fp_lock_watch)
 	scheduler_watch = Perf.wrap("F8", scheduler_watch)
+	avatarSetChanged = Perf.wrap("F8", avatarSetChanged)
+	pruneSessions = Perf.wrap("F7", pruneSessions)
+	drive = Perf.wrap("F9", drive)   -- drive 本体剩余部分（时钟、生命周期、门控）：未归入子项的调用都记在这里
 	sched_poll = Perf.wrap("F9", sched_poll)
 	independent_frame = Perf.wrap("F4", independent_frame)
 	apply_arm_pose_frame = Perf.wrap("F4", apply_arm_pose_frame)
@@ -6562,6 +6655,10 @@ local function perf_wrap_all()
 	tryAttach = Perf.wrap("P2", tryAttach)
 	IndependentLink.find_weapon = Perf.wrap("F3", IndependentLink.find_weapon)
 	IndependentLink.physics = Perf.wrap("F6", IndependentLink.physics)
+	IndependentLink.present = Perf.wrap("F4p", IndependentLink.present)
+	IndependentLink.attach = Perf.wrap("F4a", IndependentLink.attach)
+	IndependentLink.held_weapon = Perf.wrap("F3", IndependentLink.held_weapon)
+	IndependentLink.action = Perf.wrap("F5", IndependentLink.action)
 	M.independent_physics_ = IndependentLink.physics
 end
 
@@ -6640,13 +6737,15 @@ function M.install(stingray, options)
 		-- 先让原来的 render 跑完（别的 mod 可能也在包装），再写我们的姿态：
 		-- 这样引擎已经算完动画、还没画，我们写进去的 local pose 会直接用于本帧蒙皮。
 		local result
-		if driver.weaponShift then IndependentLink.restore_weapon(driver) end
+		if driver.weaponShift then Perf.active = Perf.on; IndependentLink.restore_weapon(driver); Perf.active = false end
 		if originalRender ~= nil then result = originalRender(...) end
 		if driver.installed then
 			driver.frame = driver.frame + 1
 			local calls0 = Perf.totalCalls
 			Perf.cur = nil
+			Perf.active = Perf.on
 			local ok, err = pcall(drive, driver)
+			Perf.active = false
 			if Perf.on then
 				Perf.cur = nil
 				Perf.frames = Perf.frames + 1
@@ -6715,6 +6814,7 @@ function M.setOptions(patch)
 end
 
 M.install_ = M.install
+M.perf_ = Perf
 
 -- 测试钩子：抬升探针的两块纯逻辑（读调参文件 / 给一个 unit 加偏移）。
 -- 单独暴露出来，是因为"不累加、引擎重设后能重写、关掉时能还原"这三条

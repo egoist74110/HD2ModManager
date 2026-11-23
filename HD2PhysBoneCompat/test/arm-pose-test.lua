@@ -1419,5 +1419,260 @@ do
 	_G.update = oldUpdate
 end
 
+-- 12a) E12c: head bone scaled to 0 by the engine: link allowed, piece stays visible.
+do
+	local avatar, nextAvatar = make_rig("unarmed"), make_rig("unarmed")
+	local armor, failed = make_rig("unarmed"), make_rig("unarmed")
+	armor.tag, failed.tag = "#ID[e700000000000001]", "#ID[e700000000000002]"
+	local expected = { "ias_hips", "ias_l_thigh", "ias_l_knee" }
+	local map, rest = {}, {}
+	for index, name in ipairs(expected) do
+		local source = name:sub(5)
+		map[index] = { name, source }
+		rest[index] = { armor.parents[source], avatar.locals[source].q, armor.locals[source].q, armor.locals[source].p }
+		for _, piece in ipairs({ armor, failed }) do piece.names[name] = piece.names[source] end
+	end
+	armor.locals.l_thigh.p = { -0.20, 0, 0 }
+	armor.update_world()
+	local S, world = make_env(avatar)
+	local units, owners = { avatar, armor, failed }, { avatar }
+	local replacement, peerPiece
+	S.World.units = function() return units end
+	S.World.units_by_resource = function() return owners end
+	local links, unlinks, poseWrites, refreshes = 0, 0, 0, 0
+	local setPosition, update = S.Unit.set_local_position, S.World.update_unit
+	S.Unit.set_local_position = function(unit, node, p)
+		poseWrites = poseWrites + 1
+		return setPosition(unit, node, p)
+	end
+	S.World.update_unit = function(w, unit)
+		if unit == armor then refreshes = refreshes + 1 end
+		return update(w, unit)
+	end
+	S.Unit.scene_graph_parent = function(unit, node)
+		return unit.names[unit.parents[unit.names[node]]]
+	end
+	S.Unit.scene_graph_link = function(unit, node, parent)
+		unit.parents[unit.names[node]] = unit.names[parent]
+	end
+	S.World.link_unit = function(_, unit, node, owner, source)
+		assert(unit.alive and owner.alive)
+		links = links + 1
+		local name = unit.names[node]
+		if unit == failed and name == "l_thigh" then return false end
+		unit.links = unit.links or {}
+		unit.links[name] = { owner = owner, source = owner.names[source] }
+		unit.parents[name] = nil
+		unit.locals[name].q = { 0, 0, 0, 1 }
+	end
+	S.World.unlink_unit = function(_, unit)
+		assert(unit.alive and (unit == armor or unit == failed or unit == replacement or unit == peerPiece))
+		unlinks = unlinks + 1
+		unit.links = {}
+	end
+	local camera = { 0, -4, 2 }
+	S.World.debug_camera_pose = function() return camera end
+	S.Matrix4x4.translation = function(p) return p end
+	local opts = { compat = Compat, armPose = true, carriers = {}, log = false, poseHz = 30,
+		independentPieces = { [armor.tag] = expected, [failed.tag] = expected },
+		independentBones = map, independentRest = rest }
+	local savedIo = _G.io
+	armor.scale = { 0, 0, 0 }
+	_G.io = nil
+	local state = Runtime.install(S, opts)
+	state.avatar, state.world, state.cache.world = avatar, world, world
+	state.avatars = { { unit = avatar } }
+	local logs = {}
+	state.logger = function(fmt, ...) logs[#logs + 1] = string.format(fmt, ...) end
+	local function tick(time)
+		state.frame, state.lastTime, state.dt = state.frame + 1, time, 0.01
+		state.frameAnimation, state.liveUnits, state.liveUnitsWorld = nil, units, world
+		for _, unit in ipairs(owners) do unit.update_world() end
+		for _, unit in ipairs(units) do unit.update_world() end
+		Runtime.apply_arm_pose_frame_(state)
+	end
+	tick(0)
+	check("E12c: head scale 0 still links natively", armor.links ~= nil and armor.links.hips ~= nil
+		and armor.links.hips.owner == avatar and armor.visible ~= false)
+	for i = 1, 20 do tick(0.01 * i) end
+	check("E12c: piece stays visible and not isolated while scale is 0", armor.visible ~= false and not state.independent.pieces[1].isolated)
+	Runtime.uninstall()
+end
+
+
+-- 12b) E12c: stretched scale -> link fallback keeps piece visible, relinks within 90 frames after recovery, follows new avatar.
+do
+	local avatar, nextAvatar = make_rig("unarmed"), make_rig("unarmed")
+	local armor, failed = make_rig("unarmed"), make_rig("unarmed")
+	armor.tag, failed.tag = "#ID[e700000000000001]", "#ID[e700000000000002]"
+	local expected = { "ias_hips", "ias_l_thigh", "ias_l_knee" }
+	local map, rest = {}, {}
+	for index, name in ipairs(expected) do
+		local source = name:sub(5)
+		map[index] = { name, source }
+		rest[index] = { armor.parents[source], avatar.locals[source].q, armor.locals[source].q, armor.locals[source].p }
+		for _, piece in ipairs({ armor, failed }) do piece.names[name] = piece.names[source] end
+	end
+	armor.locals.l_thigh.p = { -0.20, 0, 0 }
+	armor.update_world()
+	local S, world = make_env(avatar)
+	local units, owners = { avatar, armor, failed }, { avatar }
+	local replacement, peerPiece
+	S.World.units = function() return units end
+	S.World.units_by_resource = function() return owners end
+	local links, unlinks, poseWrites, refreshes = 0, 0, 0, 0
+	local setPosition, update = S.Unit.set_local_position, S.World.update_unit
+	S.Unit.set_local_position = function(unit, node, p)
+		poseWrites = poseWrites + 1
+		return setPosition(unit, node, p)
+	end
+	S.World.update_unit = function(w, unit)
+		if unit == armor then refreshes = refreshes + 1 end
+		return update(w, unit)
+	end
+	S.Unit.scene_graph_parent = function(unit, node)
+		return unit.names[unit.parents[unit.names[node]]]
+	end
+	S.Unit.scene_graph_link = function(unit, node, parent)
+		unit.parents[unit.names[node]] = unit.names[parent]
+	end
+	S.World.link_unit = function(_, unit, node, owner, source)
+		assert(unit.alive and owner.alive)
+		links = links + 1
+		local name = unit.names[node]
+		if unit == failed and name == "l_thigh" then return false end
+		unit.links = unit.links or {}
+		unit.links[name] = { owner = owner, source = owner.names[source] }
+		unit.parents[name] = nil
+		unit.locals[name].q = { 0, 0, 0, 1 }
+	end
+	S.World.unlink_unit = function(_, unit)
+		assert(unit.alive and (unit == armor or unit == failed or unit == replacement or unit == peerPiece))
+		unlinks = unlinks + 1
+		unit.links = {}
+	end
+	local camera = { 0, -4, 2 }
+	S.World.debug_camera_pose = function() return camera end
+	S.Matrix4x4.translation = function(p) return p end
+	local opts = { compat = Compat, armPose = true, carriers = {}, log = false, poseHz = 30,
+		independentPieces = { [armor.tag] = expected, [failed.tag] = expected },
+		independentBones = map, independentRest = rest }
+	local savedIo = _G.io
+	armor.scale = { 1, 1, 2 }
+	_G.io = nil
+	local state = Runtime.install(S, opts)
+	state.avatar, state.world, state.cache.world = avatar, world, world
+	state.avatars = { { unit = avatar } }
+	local logs = {}
+	state.logger = function(fmt, ...) logs[#logs + 1] = string.format(fmt, ...) end
+	local function tick(time)
+		state.frame, state.lastTime, state.dt = state.frame + 1, time, 0.01
+		state.frameAnimation, state.liveUnits, state.liveUnitsWorld = nil, units, world
+		for _, unit in ipairs(owners) do unit.update_world() end
+		for _, unit in ipairs(units) do unit.update_world() end
+		Runtime.apply_arm_pose_frame_(state)
+	end
+	tick(0)
+	check("E12c: stretched scale falls back with original chain and visible piece", (armor.links == nil or next(armor.links) == nil)
+		and armor.parents.l_thigh == "hips" and armor.visible ~= false)
+	armor.scale = nil
+	local relinked
+	for i = 1, 90 do
+		tick(0.01 * i)
+		if armor.links and armor.links.hips and armor.links.hips.owner == avatar then relinked = i break end
+	end
+	check("E12c: relinks automatically after scale recovers", relinked ~= nil, relinked)
+	check("E12c: visible after relink", armor.visible ~= false)
+	state.avatar, state.avatars = nextAvatar, { { unit = nextAvatar } }
+	units, owners = { nextAvatar, armor }, { nextAvatar }
+	avatar.alive = false
+	tick(1.0)
+	check("E12c: relinks to the new avatar and stays visible", armor.links.hips.owner == nextAvatar and armor.visible ~= false)
+	Runtime.uninstall()
+end
+
+
+-- 12c) E12c: half-failed link falls back, piece visible and keeps following avatar rotation.
+do
+	local avatar, nextAvatar = make_rig("unarmed"), make_rig("unarmed")
+	local armor, failed = make_rig("unarmed"), make_rig("unarmed")
+	armor.tag, failed.tag = "#ID[e700000000000001]", "#ID[e700000000000002]"
+	local expected = { "ias_hips", "ias_l_thigh", "ias_l_knee" }
+	local map, rest = {}, {}
+	for index, name in ipairs(expected) do
+		local source = name:sub(5)
+		map[index] = { name, source }
+		rest[index] = { armor.parents[source], avatar.locals[source].q, armor.locals[source].q, armor.locals[source].p }
+		for _, piece in ipairs({ armor, failed }) do piece.names[name] = piece.names[source] end
+	end
+	armor.locals.l_thigh.p = { -0.20, 0, 0 }
+	armor.update_world()
+	local S, world = make_env(avatar)
+	local units, owners = { avatar, armor, failed }, { avatar }
+	local replacement, peerPiece
+	S.World.units = function() return units end
+	S.World.units_by_resource = function() return owners end
+	local links, unlinks, poseWrites, refreshes = 0, 0, 0, 0
+	local setPosition, update = S.Unit.set_local_position, S.World.update_unit
+	S.Unit.set_local_position = function(unit, node, p)
+		poseWrites = poseWrites + 1
+		return setPosition(unit, node, p)
+	end
+	S.World.update_unit = function(w, unit)
+		if unit == armor then refreshes = refreshes + 1 end
+		return update(w, unit)
+	end
+	S.Unit.scene_graph_parent = function(unit, node)
+		return unit.names[unit.parents[unit.names[node]]]
+	end
+	S.Unit.scene_graph_link = function(unit, node, parent)
+		unit.parents[unit.names[node]] = unit.names[parent]
+	end
+	S.World.link_unit = function(_, unit, node, owner, source)
+		assert(unit.alive and owner.alive)
+		links = links + 1
+		local name = unit.names[node]
+		if unit == failed and name == "l_thigh" then return false end
+		unit.links = unit.links or {}
+		unit.links[name] = { owner = owner, source = owner.names[source] }
+		unit.parents[name] = nil
+		unit.locals[name].q = { 0, 0, 0, 1 }
+	end
+	S.World.unlink_unit = function(_, unit)
+		assert(unit.alive and (unit == armor or unit == failed or unit == replacement or unit == peerPiece))
+		unlinks = unlinks + 1
+		unit.links = {}
+	end
+	local camera = { 0, -4, 2 }
+	S.World.debug_camera_pose = function() return camera end
+	S.Matrix4x4.translation = function(p) return p end
+	local opts = { compat = Compat, armPose = true, carriers = {}, log = false, poseHz = 30,
+		independentPieces = { [armor.tag] = expected, [failed.tag] = expected },
+		independentBones = map, independentRest = rest }
+	local savedIo = _G.io
+
+	_G.io = nil
+	local state = Runtime.install(S, opts)
+	state.avatar, state.world, state.cache.world = avatar, world, world
+	state.avatars = { { unit = avatar } }
+	local logs = {}
+	state.logger = function(fmt, ...) logs[#logs + 1] = string.format(fmt, ...) end
+	local function tick(time)
+		state.frame, state.lastTime, state.dt = state.frame + 1, time, 0.01
+		state.frameAnimation, state.liveUnits, state.liveUnitsWorld = nil, units, world
+		for _, unit in ipairs(owners) do unit.update_world() end
+		for _, unit in ipairs(units) do unit.update_world() end
+		Runtime.apply_arm_pose_frame_(state)
+	end
+	tick(0)
+	check("E12c: failed piece stays visible", failed.visible ~= false)
+	avatar.locals.hips.q = { 0, 0, 0.6, 0.8 }
+	tick(0.01)
+	tick(0.02)
+	check("E12c: fallback piece keeps following avatar rotation", qangle(failed.locals.hips.q, avatar.locals.hips.q) < 1e-6 and failed.visible ~= false)
+	Runtime.uninstall()
+end
+
+
 print(string.format("\n失败 %d 项", failures))
 os.exit(failures == 0 and 0 or 1)

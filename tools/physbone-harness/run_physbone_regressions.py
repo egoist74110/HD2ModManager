@@ -142,7 +142,7 @@ def main() -> int:
         rows.append((test.name, status, passed, failed, result.returncode))
         if args.verbose or status == "FAIL":
             print(f"--- {test.name} ({status}) ---")
-            print(out.strip()[-3000:])
+            print(out.strip()[-30000:])
 
     width = max(len(row[0]) for row in rows)
     for name, status, passed, failed, code in rows:
