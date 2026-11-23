@@ -1,6 +1,44 @@
 # IAS 对齐：中断恢复记录（2026-11-23）
 
-GPT 的 5 小时额度剩下约 34%，任务随时可能中途停下。本文写给接手的任何模型或会话：从这里能知道现在做到哪、半成品怎么判断、怎么接着做。
+本文写给接手的任何模型或会话：从这里能知道现在做到哪、半成品怎么判断、怎么接着做。
+
+## 0. 最新状态（2026-11-23 23:05，Claude 额度用完，交给 GPT 接手）——先读这一节
+
+### 0.1 代码在哪
+- **集成分支 `wip/ias-e12e` = `f9bb2ac`，运行时 2.1.66**。工作树是 `D:\gitCode\HD2ModManager-e12e-cmotion`（分支 `wip/ias-e12e-cmotion`，和集成分支同一个提交）。接着开发就在这里做。
+- **测试工作树** `D:\gitCode\HD2ModManager-ias-to-patch`（`exp/ias-to-patch`）现在停在 `09ae7cf`（2.1.65）。用户的 dev 快捷方式指向它。**只有用户同意后**才能把它快进到集成分支：`git -C D:\gitCode\HD2ModManager-ias-to-patch merge --ff-only wip/ias-e12e`。开发时不要在里面改文件或构建，它的 watch 会自动重编。
+- 可以删的旧工作树：`D:\gitCode\HD2ModManager-e12e-roster`、`D:\gitCode\HD2ModManager-e12e-live`（都已合并完）。删之前要问用户。
+- 测试用 Mod 已经用新转换器转好：`D:\gitCode\HD2ModManager-e12e-cmotion\tmp\ias-to-patch\e12f-out\IAS-DP8-runtime2.1.65.zip`。joint-pose 里带 `profileHashes`。用户已经导入管理器了。
+- **IAS 的做法统一查** `docs/agent/ias-reference-roster-physics-corpse-identity-20261123.md`，内容包括护甲名单、发现开销、归属、物理绑定、身份、尸体定格和原生部分。每批的结果写在规划 `ias-whole-body-retarget-plan-20261123.md` 的 §21–§25。
+- 回归命令：`$env:PYTHONIOENCODING='utf-8'; python tools/physbone-harness/run_physbone_regressions.py`，当前 916 项全过。C# 用 `dotnet build -c Debug -nodeReuse:false -m:1 -p:NuGetAudit=false`（要求 0 警告）和 `dotnet test -c Debug --no-build -nodeReuse:false`，跑完执行 `dotnet build-server shutdown`。
+
+### 0.2 实机结果（2.1.65，2026-11-23 22:30，用户实测）
+- 先遇到一次"全身摆大字"：原因是管理器设置里「物理模式」是「关闭」，运行时没有部署。用户改成「外置加载器兼容」后正常。**物理模式关着时，IAS 转换的 Mod 一定会摆大字。**
+- **打起来只有 20 多帧，卡成 PPT，用户很不满意**（"这是人类能玩的？"）。日志 `%LOCALAPPDATA%\hd2physbone.log` 的 PERF 行（4 人、任务中、约 30 fps）：
+  - F9 约 2880 次/帧、7 ms，F4p 约 1100 次、5.5 ms，F6 约 1170 次、3.2 ms，F3 约 430 次。
+- 落地后摆大字约 20 秒才恢复正常。
+- 两者在 2.1.66 的处理见 0.3。**2.1.66 还没有上过实机。**
+
+### 0.3 2.1.66 做了什么（P1 批，规划 §25）
+- **F9 暴涨的根因是尸体定格的活体采样。** 角色为 1/2 时，每 0.25 s 对每个主人的每件护甲逐节点调用 `world_pose + to_elements`：4 人 × 14 件 × 约 180 节点 × 2 ≈ 2 万次，全挤在一帧。
+  - 现在每帧只采一个主人的一整组，峰值从 20279 降到 5087，但**平均仍约 2700 次/帧（约 5 ms）**。
+  - IAS 同样每 0.25 s 采一次，但它读的是 retarget 已算好的显式世界姿态（R:4705），几乎不花钱。
+- **摆大字的根因：独立骨原来只给身份判定为 role 1 的本人做**，要等身份解出来；队友默认根本不做。
+  - IAS 不等身份，每帧对每个绑定的 avatar 都做 retarget（R:6860–7010）。现在改成不等身份，队友默认开。
+  - 队友路径保留旧的限频：20 Hz，6 m 外每 4 帧一次。这和 IAS 的每帧不一致，**用户还没表态**。
+- PERF 行拆了子项：F9d 发现、F9i 身份、F9c 尸体、F9s 物理同步。F3、F4p、F9 也会打印 API 明细。
+
+### 0.4 下一步（按顺序；每一步先查 IAS 怎么做，照做）
+1. **尸体采样改用 retarget 的结果**（照 IAS R:4705 explicit）：IndependentLink 本来就在算这些骨的姿势，让它把节点世界姿态交给 CorpseFreeze，不要再去问引擎。纯物理件（没有独立骨的）怎么采，先查 IAS；查不到就报告用户。
+2. **写骨照 IAS 省调用**：没变的骨不写（IAS R:2387 用阈值判断 `unchanged`，R:2648 起只写变化的节点）；每个 Unit 每帧只调一次 `World.update_unit`（R:4566）。F4p（IndependentLink.present）和 F6（物理写骨）都要做。
+3. 测试必须用**实机场景**的数量来量（4 人、每人 14 件、约 180 节点、1.9 万个 unit、30 fps，见 `perf-combat-test.lua` 里的"P1 任务场景"），和 IAS 同场景的预算比。**写骨这部分以前从来没和 IAS 比过，之前说"开销不超过 IAS"只覆盖了发现和身份**，这次要补上。
+4. 做完问用户能不能快进测试工作树；让用户测之前，提醒他物理模式必须开。想单独看尸体定格的开销，可以在 `%LOCALAPPDATA%\hd2pbx_tune.txt` 里加 `corpseFreeze = 0` 对比。这个文件是用户自己的：Claude 新建在 %LOCALAPPDATA% 的文件游戏看不到，所以要让用户手动加。那里的 `identLog = 1` 会多写日志，测帧数时建议改成 0。
+
+### 0.5 待用户决定的事
+- 队友 retarget 用 20 Hz 限频，还是照 IAS 每帧都做。
+- 尸体副本不删（照 IAS，上限 256）：等对齐完成后再做"能不能删"的实验。
+- 设置页要不要加尸体定格开关（IAS 面板没有这个开关，默认开）。
+- 不是 IAS 做法、而是我们自己补的地方：死者撕裂估计（IAS 用原生快照），采样分帧（IAS 用的是免费数据，不需要分帧）。
 
 ## 1. 总目标和原则（用户定的）
 
