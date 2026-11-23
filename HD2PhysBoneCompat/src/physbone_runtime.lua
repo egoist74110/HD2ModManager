@@ -113,6 +113,7 @@ local INSTALL_KEY = "__hd2physbone_runtime"
 local tune_values     -- 调参文件读数（定义在后面，tryAttach 也要用 ⇒ 必须先声明）
 local Compat          -- physbone_compat 模块（require 或注入）
 local Roster = {}     -- IAS 式每帧枚举（见 Roster 段）
+local CorpseMotion = {} -- E12f-C1：尸体关节倒地纯数值模块（见 CorpseMotion 段）
 local S               -- stingray 命名空间
 local state = nil     -- 运行状态；nil = 未安装
 local originalRender  -- 挂载前的 render（链式调用，不吞掉别人）
@@ -3174,6 +3175,205 @@ function Roster.localAvatar(runtime)
 	return roster.localAvatar, roster.localWorld
 end
 
+-- ---------------------------------------------------------------------------
+-- E12f-C1：CorpseMotion（尸体四秒关节倒地的纯数值模块）。
+-- 镜像 IAS `__hd2ir_corpse_motion`（R:5248-5429）：公开函数名 / 参数 / 返回值同 IAS
+-- （new / advance / frames / deform / owner / names），常数逐个照抄。
+-- 纯数学：不调任何引擎 API（IAS 的该模块同样不碰引擎）。支撑面是"最后一次完整活体双脚"的近似，
+-- 不是地形查询（R:5250-5252）。前向声明 `local CorpseMotion = {}` 在文件顶部 Roster 之后。
+do
+	local M = CorpseMotion
+	local unpack_ = unpack or table.unpack
+	-- R:5255-5257：15 个节点，顺序即迭代顺序
+	local names = { 'hips', 'chest', 'head', 'l_shoulder', 'r_shoulder', 'l_elbow', 'r_elbow',
+		'l_hand', 'r_hand', 'l_thigh', 'r_thigh', 'l_knee', 'r_knee', 'l_foot', 'r_foot' }
+	M.names = names -- R:5257
+
+	local function finite(v) return type(v) == 'number' and v == v and math.abs(v) < 1e7 end -- R:5258
+	local function vec(v, n) -- R:5259-5262
+		assert(type(v) == 'table', 'numeric vector required')
+		for i = 1, n do assert(finite(v[i]), 'nonfinite vector') end
+	end
+	local function add(a, b) return { a[1] + b[1], a[2] + b[2], a[3] + b[3] } end -- R:5263
+	local function sub(a, b) return { a[1] - b[1], a[2] - b[2], a[3] - b[3] } end -- R:5264
+	local function scale(a, k) return { a[1] * k, a[2] * k, a[3] * k } end -- R:5265
+	local function dot(a, b) return a[1] * b[1] + a[2] * b[2] + a[3] * b[3] end -- R:5266
+	local function cross(a, b) -- R:5267
+		return { a[2] * b[3] - a[3] * b[2], a[3] * b[1] - a[1] * b[3], a[1] * b[2] - a[2] * b[1] }
+	end
+	local function length(a) return math.sqrt(dot(a, a)) end -- R:5268
+	local function unit(a) -- R:5269
+		local d = length(a); assert(d > 1e-8, 'degenerate direction'); return scale(a, 1 / d)
+	end
+	local function qm(a, b) -- R:5270-5275：四元数乘法 (x,y,z,w)
+		return { a[4] * b[1] + a[1] * b[4] + a[2] * b[3] - a[3] * b[2],
+			a[4] * b[2] - a[1] * b[3] + a[2] * b[4] + a[3] * b[1],
+			a[4] * b[3] + a[1] * b[2] - a[2] * b[1] + a[3] * b[4],
+			a[4] * b[4] - a[1] * b[1] - a[2] * b[2] - a[3] * b[3] }
+	end
+	local function qr(q, v) -- R:5276-5279：四元数旋转向量
+		local t = scale(cross(q, v), 2)
+		return add(v, add(scale(t, q[4]), cross(q, t)))
+	end
+	local function between(a, b) -- R:5280-5289：a 到 b 的最短弧四元数
+		a, b = unit(a), unit(b)
+		local d = math.max(-1, math.min(1, dot(a, b)))
+		if d < -.999999 then
+			local side = math.abs(a[1]) < .8 and { 1, 0, 0 } or { 0, 1, 0 }
+			local axis = unit(cross(a, side)); return { axis[1], axis[2], axis[3], 0 }
+		end
+		local v = cross(a, b); local w = 1 + d; local n = math.sqrt(dot(v, v) + w * w)
+		return { v[1] / n, v[2] / n, v[3] / n, w / n }
+	end
+	-- R:5290-5299：12 条躯干/交叉支撑 + 8 条肢段，共 20 条定长边（任务摘要说 15 条，以 IAS 为准）
+	local edges = { { 'hips', 'chest' }, { 'chest', 'head' },
+		{ 'chest', 'l_shoulder' }, { 'chest', 'r_shoulder' },
+		{ 'hips', 'l_thigh' }, { 'hips', 'r_thigh' },
+		{ 'l_shoulder', 'r_shoulder' }, { 'l_thigh', 'r_thigh' },
+		{ 'hips', 'l_shoulder' }, { 'hips', 'r_shoulder' },
+		{ 'chest', 'l_thigh' }, { 'chest', 'r_thigh' },
+		{ 'l_shoulder', 'l_elbow' }, { 'l_elbow', 'l_hand' },
+		{ 'r_shoulder', 'r_elbow' }, { 'r_elbow', 'r_hand' },
+		{ 'l_thigh', 'l_knee' }, { 'l_knee', 'l_foot' },
+		{ 'r_thigh', 'r_knee' }, { 'r_knee', 'r_foot' } }
+	-- R:5300-5303
+	local child = { hips = 'chest', chest = 'head', head = 'chest',
+		l_shoulder = 'l_elbow', r_shoulder = 'r_elbow', l_elbow = 'l_hand', r_elbow = 'r_hand',
+		l_thigh = 'l_knee', r_thigh = 'r_knee', l_knee = 'l_foot', r_knee = 'r_foot' }
+	local terminal = { l_hand = 'l_elbow', r_hand = 'r_elbow', l_foot = 'l_knee', r_foot = 'r_knee' }
+
+	--- R:5304-5346。anchors[name] = {p={x,y,z}, q={x,y,z,w}}；velocity 可空（核心位移速度，上限 4 m/s）。
+	function M.new(anchors, velocity)
+		local s = { points = {}, links = {}, steps = 0, initial = {} }
+		for _, name in ipairs(names) do
+			local row = assert(anchors[name], 'missing articulated anchor ' .. name)
+			vec(row.p, 3); vec(row.q, 4)
+			local norm = math.sqrt(row.q[1] ^ 2 + row.q[2] ^ 2 + row.q[3] ^ 2 + row.q[4] ^ 2)
+			assert(math.abs(norm - 1) < .001, 'invalid anchor quaternion')
+			s.initial[name] = { p = { unpack_(row.p) }, q = { unpack_(row.q) } }
+		end
+		local height = length(sub(anchors.head.p, anchors.hips.p)) +
+			.5 * (length(sub(anchors.l_foot.p, anchors.hips.p)) + length(sub(anchors.r_foot.p, anchors.hips.p))) -- R:5313-5314
+		assert(height > .35 and height < 3.5, 'unsupported articulated size')
+		s.floor = math.min(anchors.l_foot.p[3], anchors.r_foot.p[3]) - .025 * height -- R:5316
+		local v = velocity or { 0, 0, 0 }; vec(v, 3)
+		if length(v) > 4 then v = scale(unit(v), 4) end -- R:5318
+		-- R:5319-5320：确定性的小倾倒冲量，避免对称站姿保持平衡
+		local right = unit(sub(anchors.r_shoulder.p, anchors.l_shoulder.p))
+		local up = unit(sub(anchors.chest.p, anchors.hips.p))
+		local forward = unit(cross(right, up))
+		s.forward = forward
+		for _, name in ipairs(names) do
+			local p = s.initial[name].p
+			local radius = (name == 'hips' or name == 'chest') and .065 or name == 'head' and .047 or .019 -- R:5327
+			local angular = scale(cross(right, sub(p, anchors.hips.p)), 1.6) -- R:5328
+			local speed = add(v, add(angular, scale(forward, .3))) -- R:5329
+			local mass = (name == 'hips' or name == 'chest') and 4 or name == 'head' and 2 or 1 -- R:5330
+			s.points[name] = { p = { unpack_(p) }, previous = sub(p, scale(speed, 1 / 120)),
+				radius = radius * height, weight = 1 / mass } -- R:5331
+		end
+		for _, edge in ipairs(edges) do -- R:5333-5337
+			local d = length(sub(anchors[edge[1]].p, anchors[edge[2]].p))
+			assert(d > .005 and d < height * 1.2, 'degenerate body constraint')
+			s.links[#s.links + 1] = { a = edge[1], b = edge[2], min = d, max = d }
+		end
+		-- R:5338-5344：四肢首末端弦长界，防止完全折叠又不锁死初始弯曲
+		for _, chain in ipairs({ { 'l_shoulder', 'l_elbow', 'l_hand' }, { 'r_shoulder', 'r_elbow', 'r_hand' },
+			{ 'l_thigh', 'l_knee', 'l_foot' }, { 'r_thigh', 'r_knee', 'r_foot' } }) do
+			local a = length(sub(anchors[chain[1]].p, anchors[chain[2]].p))
+			local b = length(sub(anchors[chain[2]].p, anchors[chain[3]].p))
+			s.links[#s.links + 1] = { a = chain[1], b = chain[3], min = math.max(math.abs(a - b), .24 * (a + b)), max = a + b }
+		end
+		return s
+	end
+
+	-- R:5347-5381：一个固定步（1/120 s）
+	local function step(s)
+		local dt = 1 / 120
+		for _, name in ipairs(names) do -- Verlet，阻尼 .992，重力 9.82 沿 -z（R:5349-5354）
+			local r = s.points[name]; local p, b = r.p, r.previous
+			local x, y, z = p[1], p[2], p[3]
+			p[1] = x + (x - b[1]) * .992; p[2] = y + (y - b[2]) * .992; p[3] = z + (z - b[3]) * .992 - 9.82 * dt * dt
+			b[1], b[2], b[3] = x, y, z
+		end
+		for _ = 1, 16 do -- 16 次约束迭代（R:5355）
+			for _, link in ipairs(s.links) do
+				local a, b = s.points[link.a], s.points[link.b]
+				local ap, bp = a.p, b.p
+				local x, y, z = bp[1] - ap[1], bp[2] - ap[2], bp[3] - ap[3]
+				local d = math.sqrt(x * x + y * y + z * z)
+				assert(d > 1e-9, 'collapsed constraint')
+				local target = math.max(link.min, math.min(link.max, d))
+				local k = (d - target) / d / (a.weight + b.weight)
+				local ka, kb = k * a.weight, k * b.weight
+				ap[1] = ap[1] + x * ka; ap[2] = ap[2] + y * ka; ap[3] = ap[3] + z * ka
+				bp[1] = bp[1] - x * kb; bp[2] = bp[2] - y * kb; bp[3] = bp[3] - z * kb
+			end
+			for _, name in ipairs(names) do -- 地面接触（R:5368-5377）
+				local r = s.points[name]; local level = s.floor + r.radius
+				if r.p[3] < level then
+					r.p[3] = level
+					-- 仅在接触近似平面时做切向阻尼 .12
+					r.previous[1] = r.previous[1] + (r.p[1] - r.previous[1]) * .12
+					r.previous[2] = r.previous[2] + (r.p[2] - r.previous[2]) * .12
+					r.previous[3] = math.max(r.previous[3], level)
+				end
+			end
+		end
+		for _, name in ipairs(names) do vec(s.points[name].p, 3) end -- R:5379
+		s.steps = s.steps + 1
+	end
+
+	--- R:5382-5389。elapsed 秒；返回是否已走满 480 步。单次追赶最多 32 步（R:5387）。
+	function M.advance(s, elapsed)
+		assert(finite(elapsed) and elapsed >= 0, 'invalid elapsed time')
+		local wanted = math.min(480, math.floor(elapsed * 120 + 1e-6))
+		for _ = 1, math.min(32, math.max(0, wanted - s.steps)) do step(s) end
+		return s.steps == 480
+	end
+
+	--- R:5390-5409。返回 out[name] = {q, p, origin}；躯干扭转由肩线修正（R:5397-5404）。
+	function M.frames(s)
+		local out = {}
+		for name, next_name in pairs(child) do
+			local initial = sub(s.initial[next_name].p, s.initial[name].p)
+			local current = sub(s.points[next_name].p, s.points[name].p)
+			out[name] = { q = between(initial, current), p = s.points[name].p, origin = s.initial[name].p }
+		end
+		local a = sub(s.initial.r_shoulder.p, s.initial.l_shoulder.p)
+		local b = sub(s.points.r_shoulder.p, s.points.l_shoulder.p)
+		local q = out.hips.q
+		local up = unit(sub(s.points.chest.p, s.points.hips.p))
+		a = qr(q, a); a = sub(a, scale(up, dot(a, up))); b = sub(b, scale(up, dot(b, up)))
+		local twist = between(a, b); out.hips.q = qm(twist, q)
+		out.chest.q = out.hips.q
+		for name, parent in pairs(terminal) do
+			out[name] = { q = out[parent].q, p = s.points[name].p, origin = s.initial[name].p }
+		end
+		return out
+	end
+
+	--- R:5410-5413。frames[owner] 把原姿态 pose={q,p} 变形到倒地姿态。
+	function M.deform(frames, owner, pose)
+		local f = assert(frames[owner], 'unknown articulated owner')
+		return { q = qm(f.q, pose.q), p = add(f.p, qr(f.q, sub(pose.p, f.origin))) }
+	end
+
+	--- R:5414-5425：骨名 → 所属关节节点；无归属返回 nil。
+	function M.owner(name)
+		if child[name] or terminal[name] then return name end
+		if name == 'neck' then return 'head' end
+		if name == 'spine1' or name == 'spine2' or name == 'l_clavicle' or name == 'r_clavicle' then return 'chest' end
+		for _, side in ipairs({ 'l_', 'r_' }) do
+			if name == side .. 'shoulder_twist' then return side .. 'shoulder' end
+			if name == side .. 'hand_twist' then return side .. 'elbow' end
+			if name:sub(1, 2) == side and name:find('finger', 3, true) then return side .. 'hand' end
+			if name == side .. 'ball' or name == side .. 'toe' then return side .. 'foot' end
+		end
+		if name == 'hips' or name == 'boss' or name == 'root' then return 'hips' end
+	end
+end
+
 local INDEPENDENT_LOG_FRAMES = { [1] = true, [600] = true }
 
 local function safe_node(S_, unit, name)
@@ -5935,6 +6135,7 @@ end
 M.install_ = M.install
 M.perf_ = Perf
 M.roster_ = Roster
+M.corpseMotion_ = CorpseMotion
 M.set_engine_ = function(engine) S = engine end   -- 仅测试：不经 install 直接给 Roster 一个引擎
 
 -- 测试钩子：抬升探针的两块纯逻辑（读调参文件 / 给一个 unit 加偏移）。
