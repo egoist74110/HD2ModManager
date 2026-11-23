@@ -115,9 +115,13 @@ local wholeStripped = strip_comments(source)
 local function link_body(name)
 	return assert(wholeStripped:match("function IndependentLink%." .. name .. "%(.-\nend"))
 end
+-- E12f-C2：尸体副本（CorpseFreeze）照 IAS 用 scene_graph_parent / scene_graph_link 压平副本的节点树（IAS R:5662-5686）。
+-- 只作用于**我们自己 spawn 出来的副本**，从不碰原件；整段默认关（corpseFreeze 开关，默认 0）。
+local freezeBody = wholeStripped:match("local CorpseFreeze = Roster%.freeze.-local function corpse_frame") or ""
+check("找得到尸体副本段（危险 API 的另一处合法容身处）", #freezeBody > 1000)
 local linkBodies = {
-	["%.scene_graph_parent%("] = link_body("attach") .. link_body("restore"),
-	["%.scene_graph_link%("] = link_body("restore"),
+	["%.scene_graph_parent%("] = link_body("attach") .. link_body("restore") .. freezeBody,
+	["%.scene_graph_link%("] = link_body("restore") .. freezeBody,
 }
 for _, api in ipairs(PROBE_APIS) do
 	local _, total = wholeStripped:gsub(api, "")

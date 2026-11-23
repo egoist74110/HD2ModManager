@@ -33,7 +33,7 @@ KNOWN_EXTERNAL = {"conform-stub-test.lua"}
 # 多人局场景（它自己 os.exit），以前被错列在这里，于是那 24 项检查从来没跑过。
 LIBRARY_FILES: set[str] = set()
 # 这几个是驱动 runtime 而不是 compat 的。
-RUNTIME_TESTS = {"ias-roster-test.lua", "runtime-harness-test.lua", "log-budget-test.lua", "lift-probe-test.lua", "mp_harness.lua", "snapshot-test.lua",
+RUNTIME_TESTS = {"corpse-freeze-test.lua", "ias-roster-test.lua", "runtime-harness-test.lua", "log-budget-test.lua", "lift-probe-test.lua", "mp_harness.lua", "snapshot-test.lua",
                  # 读的是**源码文本**的静态护栏，必须给它 runtime 路径（给 compat 会直接判失败）
                  "skirt-guard-test.lua",
                  # 调度器：驱动的是 runtime 的 redistribute/schedule_budget 钩子
