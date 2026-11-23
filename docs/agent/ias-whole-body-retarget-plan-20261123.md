@@ -629,3 +629,36 @@ IAS 规则：unit 句柄只来自本回调的枚举、不跨帧（IAS `runtime.l
 
 ### 23.5 验证
 - Lua 回归合计 731 项全绿（含新增 3 项）；perf-combat 数字不变：战斗 111.78/帧（预算 126.40），非战斗 297.15/帧（预算 311.66）——该场景不挂护甲会话/独立骨件，删除的判活不在它的路径上；有会话时每会话每帧、每件/远端 avatar 每帧各少 1 次 `Unit.alive`（该场景未量化）。
+
+## 24. E12f：尸体定格（C1 CorpseMotion、C2 CorpseFreeze、C3 判活、D1 收尾；运行时 2.1.64，分支 `wip/ias-e12e-cmotion`）
+
+用户决定：尸体定格完全照 IAS 做，**包括 IAS 常态不销毁尸体副本（上限 256）**——原样照抄，删除留作以后的实验。
+
+### 24.1 C1 CorpseMotion（提交 0793997，R:5248-5429）
+纯数值的关节倒地模块，导出名与 IAS 一致：`names`（15 个关节，顺序同 IAS）、`new(anchors, velocity)`、`advance(state, elapsed)`、`frames(state)`、`deform(frames, owner, pose)`、`owner(name)`。常数照抄（半径、质量、定长边 20 条 + 肢弦界 4 条、floor = min(足 z) - .025*height）。不碰引擎，不做地形查询。测试 `corpse-motion-test.lua`。
+
+### 24.2 C2 CorpseFreeze（提交 f904d86，R:5190-6002）
+- 活体每 0.25 s 一桶采样（≤256 个、30 s 过期）；死后 `dead_age >= 4 s` 复制；撕裂（关节离 hips > 3.5 m 或肢段拉长）则用活体缓存提前复制并走受保护的铰接下落（CorpseMotion）。
+- 提交顺序：spawn 并先隐藏 → 身份/布局断言 → 停原件物理 → 显示副本 → 隐藏原件；任一步失败回滚（恢复原件、销毁副本、一具尸体只试一次、失败的 spawn 也计数）。
+- filter：副本不进名单，原件消失则藏副本、回来则恢复；**不销毁副本、不清空 clones**（世界切换、复活都留着）。
+- **非 IAS 字面的几处（均为我们没有对应机制而作的最小映射，请用户知悉）**：
+  1. 开关：IAS 的 `corpse_freeze_enabled()` 是原生函数，读 IAS 设置。我们用调参文件 `corpseFreeze = 0/1`（优先）与安装选项 `corpseFreeze`（见 24.4 默认值）。**没有设置页入口。**
+  2. 没有 `corpse_freeze_context`（原生侧的上下文通知）。
+  3. 没有 profile 的 gender / authored 标志（`cz_eligible` 只要求有哈希字符串），`profile.nodes` 核对略。
+  4. 关节表来自 `independentPieces` + `independentBones`（IAS 来自 profile 的 target_flags 位 10），样本零额外读取。
+  5. 死者的撕裂判断：IAS 用原生每帧给的关节位置（R:5600-5603）；我们没有，改成死后每 0.25 s 读一次该件的关节节点（`cz_torn_estimate`，仅独立骨件）——相对 IAS 唯一多出的引擎读取。
+  6. `freeze_corpse_physics`（原生）→ 停掉该原件的 Lua 物理会话（`physicsStopped`，physics_sync 不再给它建会话）。这是唯一允许的非字面映射。
+  7. `dead_life` 照 IAS 保留并有测试，**运行时不调用**（IAS 的 Lua 侧同样没有调用者）。
+- 共享身体化身号簿记（R:5190-5246）照抄，但在我们的运行时里没有消费者。
+
+### 24.3 C3 判活（提交 2dd3816）
+裙摆 / 第一人称 / 本人 avatar / 会话健康 / attach / 选 rig 的剩余判活改本帧 Roster 枚举。
+
+### 24.4 D1 收尾（本批）
+- 新增 `HD2PhysBoneCompat/test/corpse-integration-test.lua`（27 项）：**真 CorpseMotion + 真 CorpseFreeze** 在带 Network/GameSession 的假引擎里端到端——活着采样 → health 0 → 死后 4 s 复制/显示/隐藏原件/停物理 → 定格不动；撕裂路径用真 CorpseMotion 约 4 s 倒地（hips z 1.0 → 0.116，头 z 0.086）并定格；世界切换 + 复活后副本仍在、全程 0 次销毁；每阶段统计每帧引擎调用。
+- 注意：**普通死亡（没撕裂）不走 CorpseMotion**——死后 4 s 直接按原件当时姿态定格；只有撕裂/提前复制才跑铰接下落。这是 IAS 的结构（R:5850-5950 的 `useCache` 才起 `start_motion`），不是我们的遗漏。
+- `Unit.scene_graph_link` 护栏：CorpseFreeze 只有 `cz_apply` 里 2 处调用（根节点 `scene_graph_link(copy, root, nil)` 与其余节点链到根），都在刚 spawn 的副本通过身份/布局断言（alive、name_hash、节点数、根节点、无动画控制器、无 actor）之后同帧执行；布局不符或 spawn 失败时一次都不调用。测试含 nil/无效 unit 审计与源码顺序断言。
+- **默认值改为开**，与 IAS 一致：IAS `native_bridge/preferences.py:20` 的 `optimization.load(dict(freeze=True,grip=True,refresh=2))`；1.6.4 面板没有该开关按钮（`companion/settings_bridge.lua:21、37` 对 `optimization.freeze` 直接拒绝，`panel_text.lua` 有"尸体冻结"文案但 `settings_panel.lua` 只放了 `optimization:recover` / `optimization:refresh`）；落盘文件是 `optimization.json`（`control_host.py:70`，与 `physics.json` 同目录）。`physics.json` 的 `corpses:false`（`ArmorBase/files/physics.json:6`）是另一回事：原生物理是否作用于尸体。
+- 开着的代价：`Roster.sharedLife`（IAS R:5190 的对应物）每帧给每个活 avatar 多查网络（game_object_exists / field）；perf-combat 的 IAS 预算模型不含它，该用例与 arm-pose、ias-roster 两处只数 IAS 名单开销的断言因此显式 `corpseFreeze=false`。
+- 运行时版本 2.1.64。
+- 未验证：实机（真实 `world_pose` 抖动、真实 spawn_unit 的 unit 行为）。

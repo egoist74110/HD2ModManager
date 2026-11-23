@@ -223,6 +223,7 @@ local function freshRuntime(fake, compat, options)
 		validateFrames = 3,
 		heartbeatFrames = 1000000,
 		minNodes = 90,
+		corpseFreeze = false,   -- 预算对比的是 IAS 名单/归属开销；尸体副本开着时每帧多查网络（sharedLife），单独统计
 	}
 	for key, value in pairs(options or {}) do opts[key] = value end
 	runtimeModule.install(fake:stingray(), opts)
@@ -351,7 +352,8 @@ local function combatScenario(label, gameplay)
 	end
 	runtimeModule.install(S, { compat = compat, log = false, carriers = { { rig = { bones = { { name = "hair" } } }, path = "fake" } },
 		profileHashes = fake.hashes, settleFrames = 1, snapshot = false, tunePath = "nonexistent-hd2pbx-tune.txt", pollFrames = 1, validateFrames = 3,
-		heartbeatFrames = 1000000, minNodes = 90, perfWindow = 1000000 })
+		heartbeatFrames = 1000000, minNodes = 90, perfWindow = 1000000,
+		corpseFreeze = false })   -- 预算对比的是名单/归属开销；尸体副本开着时每帧多查网络（sharedLife），不在这条预算里
 	local runtime = rawget(_G, "__hd2physbone_runtime")
 	local function frame()
 		fake.clock = fake.clock + 1 / hz

@@ -105,7 +105,7 @@ local M = {}
 --        物理会话不再按"avatar 有无动画状态机"冻结 / 重置（IAS 没有这道闸，R:6975-6976、R:7004）。
 -- 2.1.63：E12e-B5。删 IAS 没有的残留判活与死条件：写骨前的逐会话 `Unit.alive`（改 `Roster.isLive`，零引擎调用）、
 --        piece / 远端 avatar 循环里紧跟 `Roster.isLive` 的 `Compat.unit_alive`、永远不会被置位的 `item.disabled`。
-M.VERSION = "2.1.63"
+M.VERSION = "2.1.64"
 
 --- 安装标记用的全局键。只写这一个全局，且值就是模块本身（便于外部检查是否已装）。
 local INSTALL_KEY = "__hd2physbone_runtime"
@@ -5656,12 +5656,13 @@ local function cz_torn_estimate(b, key, bucket)
 end
 
 --- 开关：IAS 的原生 `corpse_freeze_enabled()`（R:5549）读 IAS 自己的设置。我们没有那个设置页；
---- 先用调参文件 `corpseFreeze = 0/1` 与安装选项 `corpseFreeze`，调参文件优先，默认关。
+--- 用调参文件 `corpseFreeze = 0/1` 与安装选项 `corpseFreeze`，调参文件优先；默认开，与 IAS 默认一致
+--- （IAS native_bridge/preferences.py:20 `optimization.load(dict(freeze=True,...))`，1.6.4 面板里没有这个开关的按钮）。
 local function cz_enabled(runtime)
 	local ok, values = pcall(tune_values, runtime)
 	local value = ok and values and values.corpseFreeze
 	if value ~= nil then return value ~= 0 end
-	return runtime.options ~= nil and runtime.options.corpseFreeze == true
+	return not (runtime.options ~= nil and runtime.options.corpseFreeze == false)
 end
 
 -- 共享身体的"化身号"簿记（IAS `__hd2ir_shared_body_lifecycle`，R:5190-5246）。

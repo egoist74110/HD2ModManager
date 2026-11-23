@@ -81,7 +81,7 @@ local S = {
 }
 runtimeModule.set_engine_(S)
 
-local runtime = { frame = 0, options = { independentPieces = manifest }, logger = function() end }
+local runtime = { frame = 0, options = { independentPieces = manifest, corpseFreeze = false }, logger = function() end }
 local function step()
 	runtime.frame = runtime.frame + 1
 	return Roster.update(runtime)

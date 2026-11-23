@@ -19,10 +19,19 @@ GPT 的 5 小时额度剩下约 34%，任务随时可能中途停下。本文写
 | E10 | 重定向 + 衣物规则对齐（2.1.56），A 档误差千分之几 mm | 完成，Claude 已复验，未提交 | `e10/mod`、`e10/compare_a.py`，规划 §16 |
 | E11 | 握枪和动作分支对齐（2.1.57），B 档误差千分之一 mm | 完成，Claude 已复验（Lua 694 过），未提交 | `e11/compare_b.py`、`e11/blender/`，规划 §17；Mod 沿用 `e10/mod` |
 | **E12e** | 物理会话生命周期改 IAS 模型（运行时 2.1.63，分支 `wip/ias-e12e-roster`） | B1/B2/B2b/B3/B4/B5 完成（B4：持枪找武器、删看门狗、物理归属闸；B5：删残留判活与 item.disabled），Lua 回归全绿（2 条尸体定格 pending），未实机验证 | 规划 §21、§22、§23；待做：尸体定格、家族过滤/authored/租约/marker/第一人称门控/对端抑制、物理求解器移植 |
+| **E12f** | 尸体定格全 IAS 化（运行时 2.1.64，分支 `wip/ias-e12e-cmotion`） | C1 CorpseMotion / C2 CorpseFreeze / C3 判活 / D1 整合测试+默认开 完成，Lua 回归 883 项全绿；未实机验证 | 规划 §24；用户待决：设置页入口（IAS 1.6.4 面板也没有）、IAS 式不销毁副本的删除实验 |
 | E12（其余） | 物理算法对齐（C 档） | 未开始 | 任务说明待写 |
 | 之后 | 实机测试，消耗对标 IAS，降级开关 | 未开始 | |
 
 E6–E11 已提交为一个检查点（见 `git log`，提交信息以"E6–E11 检查点"开头）。注意：`tmp/` 不进 git，所以 E9 真值工具（`tmp/ias-to-patch/e9/`）、各批的对照脚本和产物都只存在本机，不能删。
+
+### 2.1.0 E12f 已知问题 / 待决
+- 尸体副本默认开；开关只有调参文件 `corpseFreeze = 0/1` 与安装选项，没有设置页（IAS 1.6.4 面板同样没有；落盘在 `optimization.json` 的 `freeze`，默认 true）。
+- 副本不销毁（IAS 常态，上限 256/会话），长局会累积；删除是以后的实验。
+- 原生 `freeze_corpse_physics` 以"停原件 Lua 物理会话"代替；`corpse_freeze_context`、profile gender/authored 标志没有。
+- 开着时每帧多查网络（`sharedLife`），perf-combat 预算不含；三处只测名单开销的用例显式关了它。
+- `runtime-harness-test.lua` 的 2 条尸体用例仍为 pending（该 harness 没有网络身份造不出 role 3），已由 `corpse-integration-test.lua` 覆盖。
+- 实机未验证。
 
 ### 2.1 E12e-B1：Roster 枚举全部转换件（分支 `wip/ias-e12e-roster`）
 

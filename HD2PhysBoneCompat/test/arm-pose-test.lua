@@ -886,7 +886,7 @@ do
 		rest[i] = { first.parents[source], identity, identity, first.locals[source].p }
 	end
 	_G.render = nil
-	local state = Runtime.install(S, { compat = Compat, armPose = true, carriers = {}, pollFrames = 1000, independentMissRescanFrames = 30,
+	local state = Runtime.install(S, { compat = Compat, armPose = true, corpseFreeze = false, carriers = {}, pollFrames = 1000, independentMissRescanFrames = 30,
 		independentPieces = { [first.tag] = expected, [late.tag] = expected }, independentBones = map, independentRest = rest,
 		independentTranslations = { [first.tag] = { ias_l_elbow = { avatar.locals.l_elbow.p, first.locals.l_elbow.p } } },
 		log = false, tunePath = "nonexistent-hd2pbx-tune.txt" })

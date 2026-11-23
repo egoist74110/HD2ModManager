@@ -467,8 +467,8 @@ do
 	engine.hidden[avatarA] = nil
 	engine.extraAvatars = nil
 
-	pending("T7 死后 4 s 生成尸体副本、隐藏原件、原件移出名单（R:5190-6002）", "E12f-C2 已在 corpse-freeze-test.lua 里用带 Network/GameSession 死亡与可写节点树的假引擎实测（本 harness 的假引擎没有网络身份，造不出 role 3）")
-	pending("T7 副本 4 s 铰接下落并定格（R:5248-5429）", "需要真实 CorpseMotion（C1），corpse-freeze-test.lua 里只用了同名函数的假实现")
+	pending("T7 死后 4 s 生成尸体副本、隐藏原件、原件移出名单（R:5190-6002）", "E12f-C2/D1 已在 corpse-freeze-test.lua 与 corpse-integration-test.lua 里用带 Network/GameSession 死亡与可写节点树的假引擎实测（本 harness 的假引擎没有网络身份，造不出 role 3）")
+	pending("T7 副本 4 s 铰接下落并定格（R:5248-5429）", "E12f-D1 已在 corpse-integration-test.lua 用真实 CorpseMotion + CorpseFreeze 端到端实测（本 harness 造不出 role 3）")
 
 	Runtime.uninstall()
 end
