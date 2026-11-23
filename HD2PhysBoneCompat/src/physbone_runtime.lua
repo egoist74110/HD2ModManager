@@ -3875,6 +3875,8 @@ Roster.states = setmetatable({}, { __mode = "k" })
 Roster.known, Roster.session, Roster.epoch = {}, nil, 0
 Roster.nextPoll, Roster.ownedCursor, Roster.cursor = 0, 0, 0
 Roster.extendedCursor, Roster.nearCursor, Roster.observedHigh = 4096, 0, 4095
+Roster.remoteCursors, Roster.poll = {}, 0
+Roster.instanceSlots, Roster.instanceSeen, Roster.nextInstanceSlot, Roster.instancePruned = {}, {}, 1, -1
 
 local function roster_hashes(runtime)
 	local cached = runtime.rosterHashes
@@ -3994,9 +3996,33 @@ local function roster_discover(runtime, world, frame, unitCount, signature, game
 end
 
 --- IAS physics_identity.update：本人 / 队友 / 死亡（Network + GameSession，4 Hz）。
+--- IAS __hd2ir_unit_instance_slot：同一个 unit 值映射到单调递增的槽号；超过 2 帧没出现的键每 120 帧清一次。
+--- 只做表查询，不调引擎；必须每帧对在场 avatar 调用，否则 4 Hz 的判定轮询会把键清掉造成假“换实例”。
+local function roster_instance_slot(value, frame)
+	if value == nil then return 0 end
+	if frame % 120 == 0 and Roster.instancePruned ~= frame then
+		Roster.instancePruned = frame
+		for key, last in pairs(Roster.instanceSeen) do
+			if frame - last > 2 then Roster.instanceSlots[key], Roster.instanceSeen[key] = nil, nil end
+		end
+	end
+	local slot = Roster.instanceSlots[value]
+	if slot == nil then
+		slot = Roster.nextInstanceSlot
+		Roster.nextInstanceSlot = slot + 1
+		Roster.instanceSlots[value] = slot
+	end
+	Roster.instanceSeen[value] = frame
+	return slot
+end
+
 local function roster_identity(runtime, avatars)
 	local Net, GS = S.Network, S.GameSession
+	if type(avatars) ~= "table" or #avatars > 32 then return end   -- IAS 行 4841
 	local states = Roster.states
+	local frame = runtime.frame or 0
+	local slots = {}
+	for _, avatar in ipairs(avatars) do slots[avatar.unit] = roster_instance_slot(avatar.unit, frame) end
 	local present = {}
 	for _, avatar in ipairs(avatars) do present[avatar.unit] = avatar.world end
 	-- 先作废缺席再节流：拒绝快速指针复用（IAS 行 4745–4747）
@@ -4009,14 +4035,16 @@ local function roster_identity(runtime, avatars)
 	local session = try(Net.game_session)
 	if not session or try(GS.in_session, session) ~= true then
 		Roster.known, Roster.session = {}, nil
-		Roster.extendedCursor, Roster.nearCursor, Roster.observedHigh = 4096, 0, 4095
+		Roster.extendedCursor, Roster.nearCursor, Roster.observedHigh, Roster.poll = 4096, 0, 4095, 0
+		Roster.remoteCursors = {}
 		Roster.states = setmetatable({}, { __mode = "k" })
 		return
 	end
 	if Roster.session ~= session then
 		Roster.epoch = Roster.epoch + 1
 		Roster.known, Roster.session = {}, session
-		Roster.extendedCursor, Roster.nearCursor, Roster.observedHigh = 4096, 0, 4095
+		Roster.extendedCursor, Roster.nearCursor, Roster.observedHigh, Roster.poll = 4096, 0, 4095, 0
+		Roster.remoteCursors = {}
 		Roster.states = setmetatable({}, { __mode = "k" })
 		states = Roster.states
 	end
@@ -4052,6 +4080,50 @@ local function roster_identity(runtime, avatars)
 		consider(ownedIds[Roster.ownedCursor])
 	end
 	for _ = 1, 64 do consider(Roster.cursor); Roster.cursor = (Roster.cursor + 1) % 4096 end
+	-- IAS 行 4909–4951：枚举真实的远端 owner（GS.peers 与 GS.other_peers 合并，各读至多 32 个，去掉自己），
+	-- 排序后取前 4 个，每个 owner 考察前 8 个 id + 16 个游标 id。
+	if #avatars > 1 and type(peer) == "string" then
+		local members = {}
+		for _, name in ipairs({ "peers", "other_peers" }) do
+			local values = type(GS[name]) == "function" and try(GS[name], session)
+			if type(values) == "table" then
+				local count = 0
+				for _, member in pairs(values) do
+					count = count + 1
+					if count > 32 then break end
+					if type(member) == "string" and #member > 0 and #member <= 128 and member ~= peer then members[member] = true end
+				end
+			end
+		end
+		local order = {}
+		for member in pairs(members) do order[#order + 1] = member end
+		table.sort(order)
+		local active = {}
+		for index = 1, math.min(4, #order) do
+			local remote = order[index]
+			active[remote] = true
+			local values = try(GS.objects_owned_by, session, remote)
+			if type(values) == "table" then
+				local set, found, count = {}, {}, 0
+				for _, id in pairs(values) do
+					count = count + 1
+					if count > 8192 then break end
+					if type(id) == "number" and id >= 0 and id <= 4294967295 and id == math.floor(id) and not set[id] then
+						set[id] = true; found[#found + 1] = id
+					end
+				end
+				table.sort(found, function(a, b) return a > b end)
+				for j = 1, math.min(8, #found) do consider(found[j]) end
+				local cursor = Roster.remoteCursors[remote] or 0
+				for _ = 1, math.min(16, #found) do
+					cursor = cursor % #found + 1
+					consider(found[cursor])
+				end
+				Roster.remoteCursors[remote] = cursor
+			end
+		end
+		for member in pairs(Roster.remoteCursors) do if not active[member] then Roster.remoteCursors[member] = nil end end
+	end
 	local unresolved = false
 	for _, avatar in ipairs(avatars) do
 		local state = states[avatar.unit]
@@ -4085,7 +4157,8 @@ local function roster_identity(runtime, avatars)
 	for _, avatar in ipairs(avatars) do
 		if try(S.Unit.alive, avatar.unit) == true then
 			local state = states[avatar.unit]
-			if not state or state.world ~= avatar.world then state = { role = 0 } end
+			local instance = slots[avatar.unit]
+			if not state or state.world ~= avatar.world or state.instance ~= instance then state = { role = 0, instance = instance } end
 			states[avatar.unit] = state
 			state.world = avatar.world
 			local machine = try(S.Unit.has_animation_state_machine, avatar.unit)
@@ -4120,6 +4193,43 @@ local function roster_identity(runtime, avatars)
 		if state.owner == true and not state.dead and item.machine == true then
 			localCount[state.world] = (localCount[state.world] or 0) + 1
 		end
+	end
+	-- IAS 行 5029–5060：稳定互斥回退。只给还没连上网络对象的远端 avatar；
+	-- 需连续 4 次轮询都是同一个对象、误差 <= 0.5 m、次近 - 最近 > 0.5 m、其他活体 avatar 的间隔 > 0.5 m。
+	Roster.poll = Roster.poll + 1
+	local poll = Roster.poll
+	local claimed = {}
+	for _, item in ipairs(live) do if item.s.network then claimed[item.s.network] = true end end
+	for _, item in ipairs(live) do
+		local state = item.s
+		if not state.network and not state.dead and item.machine == true and complete and localCount[state.world] == 1 then
+			local bestId, best, second = nil, math.huge, math.huge
+			for id, o in pairs(objects) do
+				if o.health > 0 then
+					local d = roster_distance(item.a.p, o.p)
+					if d < best then second, best, bestId = best, d, id elseif d < second then second = d end
+				end
+			end
+			local o = bestId and objects[bestId]
+			local margin = math.huge
+			if o then
+				for _, other in ipairs(live) do
+					if other ~= item and not other.s.dead and other.machine == true then
+						margin = math.min(margin, roster_distance(other.a.p, o.p) - best)
+					end
+				end
+			end
+			if o and not o.owned and not claimed[bestId] and best <= 0.5 and second - best > 0.5 and margin > 0.5 then
+				if state.fallbackId == bestId and state.fallbackPoll == poll - 1 and now - state.fallbackAt <= 0.75 then
+					state.fallbackHits = state.fallbackHits + 1
+				else state.fallbackHits = 1 end
+				state.fallbackId, state.fallbackPoll, state.fallbackAt = bestId, poll, now
+				if state.fallbackHits >= 4 then
+					state.network, state.owner, state.matchMethod = bestId, false, "stable-mutual"
+					claimed[bestId] = true
+				end
+			else state.fallbackHits = 0; state.fallbackId = nil end
+		else state.fallbackHits = 0; state.fallbackId = nil end
 	end
 	for _, item in ipairs(live) do
 		local state = item.s
@@ -4225,6 +4335,8 @@ function Roster.reset()
 	Roster.known, Roster.session = {}, nil
 	Roster.nextPoll, Roster.ownedCursor, Roster.cursor = 0, 0, 0
 	Roster.extendedCursor, Roster.nearCursor, Roster.observedHigh = 4096, 0, 4095
+	Roster.remoteCursors, Roster.poll = {}, 0
+	Roster.instanceSlots, Roster.instanceSeen, Roster.nextInstanceSlot, Roster.instancePruned = {}, {}, 1, -1
 end
 
 --- 本回调枚举里存在的 unit（含 avatar 与装甲件）。

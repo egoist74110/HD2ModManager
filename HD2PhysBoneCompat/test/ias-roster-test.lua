@@ -142,5 +142,105 @@ local before = calls.units
 for _ = 1, 30 do step() end
 check(calls.units - before <= 1, "稳定后 30 帧内全量 World.units 至多 1 次（IAS 兜底节奏）", calls.units - before)
 
+-- ===================================================================== E12e-B2 身份（IAS 1.6.4 对照）
+-- 新场景：清空世界，用表驱动的多对象 / 多 owner 假引擎。
+io.stdout:write("\n[E12e 身份] >32 提前返回 / 实例槽 / 远端 peer 枚举 / 稳定互斥回退\n")
+for index = #units, 1, -1 do units[index] = nil end
+local objs = {}          -- id -> { x, y, z, health }
+local ownership = { me = {} }
+local peersList, otherPeersList = nil, nil
+local sessionCalls = 0
+S.Network.game_session = function() sessionCalls = sessionCalls + 1; return 1 end
+local GSm = S.GameSession
+GSm.objects_owned_by = function(_, peer)
+	local out = {}
+	for _, id in ipairs(ownership[peer] or {}) do out[#out + 1] = id end
+	return out
+end
+GSm.game_object_exists = function(_, id) return objs[id] ~= nil end
+GSm.game_object_field = function(_, id, field)
+	local o = objs[id]
+	if field == "health" then return o.health end
+	return { o.x, o.y, o.z }
+end
+GSm.peers = function() return peersList end
+GSm.other_peers = function() return otherPeersList end
+local function hardReset()
+	Roster.reset(); runtime.roster = nil
+	for index = #units, 1, -1 do units[index] = nil end
+end
+
+-- (1) #avatars > 32：直接返回，什么都不碰（IAS 行 4841）
+hardReset()
+local crowd = {}
+for i = 1, 33 do crowd[i] = newUnit("crowd" .. i, i * 10, "avatar") end
+local before32 = sessionCalls
+step()
+check(sessionCalls == before32, "33 个 avatar：身份判定提前返回，不读网络会话", sessionCalls - before32)
+for i = 1, 33 do destroy(crowd[i]) end
+
+-- (2) 实例槽变化 -> 新建 state，复活不再继承 dead（IAS 行 4989-4990；没有 dead 清零）
+hardReset()
+objs = { [5000] = { x = 0, y = 0, z = 0, health = 100 } }
+ownership = { me = { 5000 } }
+local me = newUnit("me", 0, "avatar")
+step()
+check(Roster.role(me) == 1, "本人角色 1", Roster.role(me))
+objs[5000].health = 0
+step()
+check(Roster.dead(me) and Roster.role(me) == 3, "health<=0 -> dead，角色 3")
+step()
+check(Roster.dead(me), "同一实例下 dead 不会被清回（IAS 没有 dead->alive 重置）")
+Roster.instanceSlots[me] = 987654   -- 模拟实例槽被换发（同一个 unit 值、新的渲染实例）
+objs[5000] = { x = 0, y = 0, z = 0, health = 100 }
+step()
+check(not Roster.dead(me) and Roster.role(me) == 1, "实例槽变了：state 重建，复活后不再是 dead", Roster.role(me))
+check(Roster.states[me].instance == 987654, "state 记录了实例槽")
+
+-- (3) 远端 peer 只能经 peers 枚举找到（id 远在低位扫描和近邻窗口之外）
+hardReset()
+objs = { [5000] = { x = 0, y = 0, z = 0, health = 100 }, [7000000] = { x = 10, y = 0, z = 0, health = 100 } }
+ownership = { me = { 5000 }, peer2 = { 7000000 } }
+peersList, otherPeersList = nil, nil
+local a = newUnit("a", 0, "avatar")
+local b = newUnit("b", 10, "avatar")
+for _ = 1, 4 do step() end
+check(Roster.role(a) == 1, "本人仍是角色 1", Roster.role(a))
+check(Roster.role(b) == 0, "没有 peers 名单时，远端 id 7000000 找不到，队友未识别", Roster.role(b))
+peersList = { "me", "peer2" }
+for _ = 1, 4 do step() end
+check(Roster.role(b) == 2, "GS.peers 里有 peer2：枚举其对象，队友被识别为角色 2", Roster.role(b))
+check(Roster.states[b].network == 7000000 and Roster.states[b].owner == false, "队友绑定到 peer2 的对象，owner=false")
+peersList, otherPeersList = nil, { "peer2", "me" }
+Roster.reset()
+for _ = 1, 4 do step() end
+check(Roster.role(b) == 2, "只有 other_peers 提供名单时同样有效（两个来源合并，去掉自己）", Roster.role(b))
+
+-- (4) 稳定互斥回退：连续 4 次轮询才认定，中途断掉就清零
+hardReset()
+objs = { [5000] = { x = 0, y = 0, z = 0, health = 100 }, [7000001] = { x = 30.3, y = 0, z = 0, health = 100 } }
+ownership = { me = { 5000 }, peer2 = { 7000001 } }   -- 7000001 差 0.3 m：达不到 0.05 m 的直接绑定
+peersList, otherPeersList = { "me", "peer2" }, nil
+local host = newUnit("host", 0, "avatar")
+local mate = newUnit("mate", 30, "avatar")
+for _ = 1, 3 do step() end
+check(Roster.states[mate].network == nil and Roster.states[mate].fallbackHits == 3, "3 次轮询：还没认定", Roster.states[mate].fallbackHits)
+step()
+check(Roster.states[mate].network == 7000001 and Roster.states[mate].matchMethod == "stable-mutual"
+	and Roster.states[mate].owner == false, "第 4 次轮询：认定 stable-mutual")
+local mate2 = newUnit("mate2", 60, "avatar")
+ownership.peer2 = { 7000001, 7000002 }
+objs[7000002] = { x = 60.3, y = 0, z = 0, health = 100 }
+for _ = 1, 3 do step() end
+check(Roster.states[mate2].fallbackHits == 3 and Roster.states[mate2].network == nil, "mate2 连续 3 次命中", Roster.states[mate2].fallbackHits)
+objs[7000002].x = 60.8
+step()
+check(Roster.states[mate2].fallbackHits == 0 and Roster.states[mate2].fallbackId == nil, "目标超出 0.5 m：计数清零")
+objs[7000002].x = 60.3
+for _ = 1, 3 do step() end
+check(Roster.states[mate2].network == nil and Roster.states[mate2].fallbackHits == 3, "清零后重新数：3 次仍不认定", Roster.states[mate2].fallbackHits)
+step()
+check(Roster.states[mate2].network == 7000002 and Roster.states[mate2].matchMethod == "stable-mutual", "清零后连续第 4 次才认定")
+
 io.stdout:write(string.format("\n检查 %d 项，失败 %d\n", checks, failures))
 os.exit(failures == 0 and 0 or 1)
