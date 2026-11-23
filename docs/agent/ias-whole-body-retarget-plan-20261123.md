@@ -606,3 +606,26 @@ IAS 预算 = 常规帧 49（含相机 3、IAS 独有的场景源/第一人称图
 - Lua 回归 728 项全绿（含新增：武器只经 units_by_resource 找到、歧义 nil、无武器同帧 nil、换对象后用新对象、持枪主路径、零处理 200 帧不丢会话、无状态机 avatar 物理继续写且不重置也不读状态机；新增的三类用例在旧代码上均失败）。
 - 性能（假引擎 15008 unit、1200 帧）：战斗整帧 116.58 → 111.78/帧（IAS 预算 126.40），非战斗 301.95 → 297.15/帧（预算 311.66）；找武器每帧 1 次 `units_by_resource`/目录项（真实目录 97 项，与 IAS 同量），0 次 `World.units` / `debug_name` / `Unit.alive`。
 - 仍保留、无 IAS 对应物（待用户决定）：写骨前对每个会话的 `Unit.alive` 复查；件/远端 avatar 循环里与 `Roster.isLive` 并列的 `Compat.unit_alive`；`Application.time_since_launch`。
+
+## 23. E12e-B5：删 IAS 没有的残留判活与死条件（运行时 2.1.63）
+
+IAS 规则：unit 句柄只来自本回调的枚举、不跨帧（IAS `runtime.lua` R:894-896、R:1417-1422）；我们的对应物是 `Roster.isLive`（本帧枚举）。22.5 末条列的"仍保留"项逐条处理如下。
+
+### 23.1 写骨前的逐会话 `Unit.alive`（physbone_runtime.lua，drive 写骨循环）
+- 验证：`runtime.sessions` 的 unit 全部由 `physics_sync` 从本帧 `Roster.byWorld[*].armour` 建出，`session.owner` 也来自本帧 avatar 名单。
+- 但不是"一定本帧"：`Application.worlds` 取不到时 `Roster.update` 把 `runtime.roster` 置空，`physics_sync` 提前返回，`runtime.sessions` 仍是上一帧的。所以不是单纯删除，而是把引擎调用 `Unit.alive` 换成 `Roster.isLive(runtime, session.unit)`（纯表查找，0 次引擎调用）：不在本帧枚举里本帧不写。这正是 IAS 的口径。
+- 新增用例 mp_harness 场景 5b2（枚举失败 30 帧一次都不写骨、恢复后继续）；去掉这行 `isLive` 判断该用例失败。
+
+### 23.2 件 / 远端 avatar 循环里与 `Roster.isLive` 并列的 `Compat.unit_alive`
+- 删除 3 处：`independent_release`、独立骨 piece 清理循环、远端 avatar 循环。`isLive` 为真即该句柄在本帧枚举里。
+- 保留：`apply_arm_pose_frame` 里对"本人 avatar"的单次 `Compat.unit_alive`（本帧枚举失败时 `runtime.roster` 可能是旧帧，`Roster.localAvatar` 会给出旧句柄；该处不是循环、每帧 1 次）；裙摆 `skirt_apply`、`first_person_action`、`probe_carriers`/`attach`/`release` 内的判活，以及 IAS 同做法的 `units_by_resource` 候选 `Unit.alive`（R:3739-3743）和身份判定里对枚举候选的 `Unit.alive`。它们不在本批范围，未改。
+
+### 23.3 `item.disabled`
+- 全仓 grep（src 与 test）：没有任何赋值为真的地方；只有测试自己手写 `disabled = true/false`。删除 `physbone_compat.lua` 的 5 处读取（2528、2683、2732、2743、3193 行）；删除 `p1-regression-test.lua` 与 `mp_harness.lua` 里对该字段的手写赋值/断言。
+
+### 23.4 `Application.time_since_launch`：保留
+- 它是 drive 唯一的帧时钟：算 dt（物理求解 + 子步）、判"同一时间步内的重复调用"（`advanced`）、判加载空档（`rawDelta > 0.25` ⇒ 重置物理）。没有另一处同帧读同一时钟。
+- IAS 的 Lua 侧只取 `os.clock()`（R:1505、R:4853、R:5546）和帧号 `tick`，不算物理 dt，因为 IAS 的求解在原生里。我们的求解器在 Lua，必须有 dt，所以这一次读取没有 IAS 对应物但有用途，不删。
+
+### 23.5 验证
+- Lua 回归合计 731 项全绿（含新增 3 项）；perf-combat 数字不变：战斗 111.78/帧（预算 126.40），非战斗 297.15/帧（预算 311.66）——该场景不挂护甲会话/独立骨件，删除的判活不在它的路径上；有会话时每会话每帧、每件/远端 avatar 每帧各少 1 次 `Unit.alive`（该场景未量化）。

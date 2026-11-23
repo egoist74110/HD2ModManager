@@ -128,14 +128,13 @@ for i = 1, #logs do
 	if logs[i]:find("护栏", 1, true) then tripped, tripLine = true, logs[i] end
 end
 check("漂移 2 m 时护栏触发", tripped, tripLine or "护栏一次都没执行（旧版就是这样）")
-check("触发后该链下帧可恢复", not session.sessions[1].disabled and session.sessions[1].previousPosition == nil)
+check("触发后该链下帧可恢复", session.sessions[1].previousPosition == nil)
 
 -- ---------------------------------------------------------------------------
 -- R2：release 只用数字重建，不碰任何句柄
 -- ---------------------------------------------------------------------------
 print("R2 release 数字重建")
 written = 0
-session.sessions[1].disabled = false
 collectgarbage("collect")
 local restored = M.release(session)
 check("release 写回 3 根骨", restored == 3, "restored=" .. tostring(restored))

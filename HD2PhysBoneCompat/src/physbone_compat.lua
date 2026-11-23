@@ -2525,7 +2525,7 @@ function M.reset_physics(session)
 	if session == nil or M.session_health(session, M.frame) ~= "ok" then return 0 end
 	local restored = 0
 	for _, item in ipairs(session.sessions) do
-		if not item.disabled and not (session.skipOptionalIas and item.optionalIas) then
+		if not (session.skipOptionalIas and item.optionalIas) then
 			restored = restored + restore_chain(session, item)
 		end
 	end
@@ -2680,7 +2680,7 @@ function M.update(session, dt, maxWrite)
 			-- 不再逐级衰减：源模型每节的参数完全相同，累加弯曲来自层级，而不是靠衰减。
 
 			local base = item.basePoses[index]
-			if base ~= nil and not item.disabled then
+			if base ~= nil then
 				-- 每一步失败都带一句原因返回。为什么：整条链有 6 个引擎调用，
 				-- 任何一环坏掉都只表现为"什么都没写"，光看结果永远分不清是
 				-- API 失效、姿态非法、还是句柄过期（2026-10-31 实测：写了 8 秒后突然开始 0 写入）。
@@ -2729,7 +2729,7 @@ function M.update(session, dt, maxWrite)
 				end
 			else
 				session.skippedWrites = (session.skippedWrites or 0) + 1
-				if item.disabled ~= true and session.firstFailReason == nil then
+				if session.firstFailReason == nil then
 					session.firstFailReason = string.format("node#%d base=nil", index)
 					logger("[physbone][失败] basePose 为空：%s", session.firstFailReason)
 				end
@@ -2740,7 +2740,7 @@ function M.update(session, dt, maxWrite)
 		-- 为什么必须有这一层：`is_valid` 与行列式检查都在"写出之前"，一旦哪一帧漏过去，
 		-- 网格会被拉成一根针，而且**肉眼看见时已经发生**（2026-10-31 用户实拍）。
 		-- 这里用"末节离 bind 位置多远"当最终判据，代价是每链每帧一次 world_position。
-		if item.bindTip ~= nil and item.bindAnchor ~= nil and not item.disabled and not reset and written > writtenBefore then
+		if item.bindTip ~= nil and item.bindAnchor ~= nil and not reset and written > writtenBefore then
 			local okTip, tipPos = pcall(function() return S.Unit.world_position(unit, item.nodes[#item.nodes]) end)
 			local okDep, depPos = pcall(function() return S.Unit.world_position(unit, item.anchorNode) end)
 			if okTip and tipPos ~= nil and okDep and depPos ~= nil then
@@ -3190,7 +3190,7 @@ function M.update_tip(session, dt, maxWrite)
 	for si = 1, itemCount do
 		local item = items[si]
 		local tip = item.tip
-		if not item.disabled and tip ~= nil and not (session.skipOptionalIas and item.optionalIas) then
+		if tip ~= nil and not (session.skipOptionalIas and item.optionalIas) then
 			local anchorNode = item.anchorNode
 			local cached = anchors[anchorNode]
 			if cached == nil then

@@ -115,7 +115,7 @@ function Fake:stingray()
 	}
 	return {
 		Application = {
-			worlds = function() return { 1 } end,
+			worlds = function() if self_.noWorlds then return nil end return { 1 } end,
 			string_to_id32 = id32,
 			time_since_launch = function() return self_.clock end,
 		},
@@ -397,7 +397,7 @@ do
 	local runtime = freshRuntime(fake, compat, {})
 	fake:advance(80)
 	local attachCount = #compat.attached
-	-- 此后求解器一条骨都不处理（written=0、skippedSame=0），而且某条链带着 disabled 标记：
+	-- 此后求解器一条骨都不处理（written=0、skippedSame=0）：
 	-- 以前连续 45 帧就会 `runtime.sessions = nil` 并重挂；现在什么都不该发生。
 	compat.update = function(session, dt, _)
 		compat.dtByUnit[#compat.dtByUnit + 1] = { unit = session.unit.name, dt = dt }
@@ -405,12 +405,36 @@ do
 		return 0
 	end
 	local session = runtime.sessions and runtime.sessions[1]
-	if session and session.sessions[1] then session.sessions[1].disabled = true end
 	compat.dtByUnit = {}
 	fake:advance(200)
 	check(#compat.attached == attachCount, "200 帧零处理：没有重挂", #compat.attached - attachCount)
 	check(runtime.sessions ~= nil and #runtime.sessions == 1 and runtime.sessions[1] == session, "会话原封不动还在")
 	check(#compat.dtByUnit == 200, "每帧仍在驱动", #compat.dtByUnit)
+end
+
+-- ================================================================ 场景 5b2：本帧枚举失败不碰上一帧的句柄（E12e-B5）
+io.stdout:write("\n[场景 5b2] 本帧枚举失败：会话还是上一帧的，不写骨（IAS 句柄只来自本回调枚举、不跨帧，R:894-896、R:1417-1422）\n")
+do
+	local fake = newFake()
+	local compat = newCompat()
+	fake:playerAt("p1", 0, 6)
+	local runtime = freshRuntime(fake, compat, {})
+	fake:advance(80)
+	local driven = 0
+	local update = compat.update
+	compat.update = function(session, dt, ...)
+		driven = driven + 1
+		return update(session, dt, ...)
+	end
+	fake:advance(5)
+	check(driven > 0, "枚举正常时照常驱动", driven)
+	fake.noWorlds = true
+	driven = 0
+	fake:advance(30)
+	check(driven == 0, "Application.worlds 取不到 ⇒ 30 帧一次都不写骨", driven)
+	fake.noWorlds = nil
+	fake:advance(5)
+	check(driven > 0, "枚举恢复后继续驱动", driven)
 end
 
 -- ================================================================ 场景 5c：没有动画状态机的 avatar 照常跑物理（E12e-B4）

@@ -103,7 +103,9 @@ local M = {}
 -- 2.1.62：E12e-B4。持枪找武器/跟随件改成 IAS 的逐资源 `units_by_resource`（修好 2.1.61 里"liveUnits 无人赋值 ⇒ 持枪路径静默失效"）；
 --        删除"驱动失效"看门狗与 `zeroLimit`；删除 `refresh_live_units` / `session_unit_live` 全世界活体表（判活改用本帧 `Roster.isLive`）；
 --        物理会话不再按"avatar 有无动画状态机"冻结 / 重置（IAS 没有这道闸，R:6975-6976、R:7004）。
-M.VERSION = "2.1.62"
+-- 2.1.63：E12e-B5。删 IAS 没有的残留判活与死条件：写骨前的逐会话 `Unit.alive`（改 `Roster.isLive`，零引擎调用）、
+--        piece / 远端 avatar 循环里紧跟 `Roster.isLive` 的 `Compat.unit_alive`、永远不会被置位的 `item.disabled`。
+M.VERSION = "2.1.63"
 
 --- 安装标记用的全局键。只写这一个全局，且值就是模块本身（便于外部检查是否已装）。
 local INSTALL_KEY = "__hd2physbone_runtime"
@@ -4408,8 +4410,7 @@ local function independent_release(runtime, state)
 	end
 	if runtime.roster == nil or runtime.roster.byWorld[state.world] == nil then return end
 	for _, piece in ipairs(state.pieces) do
-		if (piece.link or piece.hidden or piece.positionDirty or piece.clothingRest) and Roster.isLive(runtime, piece.unit)
-			and Compat.unit_alive(S, piece.unit) then
+		if (piece.link or piece.hidden or piece.positionDirty or piece.clothingRest) and Roster.isLive(runtime, piece.unit) then
 			local restored = IndependentLink.restore(state, piece)
 			IndependentLink.restore_clothing(state, piece)
 			if restored and piece.positionDirty then
@@ -4904,7 +4905,7 @@ local function independent_frame(runtime, avatar, world, list, state, remote)
 	state.correction = { due = due, now = now, nextAt = state.nextCorrection, blend = blend, paused = paused }
 	for index = #state.pieces, 1, -1 do
 		local piece = state.pieces[index]
-		if not Roster.isLive(runtime, piece.unit) or not Compat.unit_alive(S, piece.unit) then
+		if not Roster.isLive(runtime, piece.unit) then
 			table.remove(state.pieces, index)
 			state.samplePiece, state.sampleRound = nil, nil
 			state.rescanAt = frame + 1
@@ -5090,7 +5091,7 @@ local function apply_arm_pose_frame(runtime)
 			local metres = sched_settings(runtime).metres
 			local frame = runtime.frame or 0
 			for index, owner in ipairs(runtime.avatars or state.owners or {}) do
-				if owner.unit ~= unit and Roster.isLive(runtime, owner.unit) and Compat.unit_alive(S, owner.unit) then
+				if owner.unit ~= unit and Roster.isLive(runtime, owner.unit) then
 					local distance = owner.cameraDistance or math.huge
 					local stride = distance <= metres * metres and 1 or 4
 					local remote = remoteStates[owner.unit]
@@ -5582,13 +5583,10 @@ local function drive(runtime)
 			end
 			due = false
 		end
-		-- 写骨前再复查一次存活：pruneSessions 只在**帧首**判过，
-		-- 而场景拆解会在本帧中途继续释放 unit —— 那一小段窗口正是"写进野对象"的来源。
-		-- unit_alive 是便宜的引擎调用，比赌一次野指针便宜得多。
-		if due and session.unit ~= nil and type(Compat.unit_alive) == "function" then
-			local okAlive, alive = pcall(Compat.unit_alive, S, session.unit)
-			if okAlive and alive == false then due = false end
-		end
+		-- E12e-B5：原来这里写骨前再调一次 `Unit.alive`。IAS 没有：unit 句柄只来自本回调的枚举、不跨帧（R:894-896、R:1417-1422）。
+		-- 会话 unit 本来就是本帧 physics_sync 从本帧 Roster 里建出来的；唯一可能跨帧的是本帧枚举失败/没跑
+		-- （physics_sync 提前返回、runtime.sessions 还是上一帧的）——这时 `Roster.isLive` 为假，本帧不碰这些句柄。零引擎调用。
+		if due and not Roster.isLive(runtime, session.unit) then due = false end
 		if due or session.independentPresentation and Roster.isLive(runtime, session.unit)
 			and (tune_values(runtime).writeOff or 0) == 0 then
 			local operation = due and (session.resetPhysics and Compat.reset_physics or Compat.update) or nil
