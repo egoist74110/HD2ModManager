@@ -380,12 +380,73 @@ do
 	local fake = newFake()
 	local compat = newCompat()
 	for index = 1, 4 do fake:playerAt("p" .. index, (index - 1) * 10, 60) end
-	local runtime = freshRuntime(fake, compat, { maxChainsPerFrame = 160, otherPlayerStride = 2, zeroLimit = 5 })
+	local runtime = freshRuntime(fake, compat, { maxChainsPerFrame = 160, otherPlayerStride = 2 })
 	fake:advance(80)
 	local attachCount = #compat.attached
 	fake:advance(60)
 	check(#compat.attached == attachCount, "分帧跑了 60 帧，一次都没有重挂", #compat.attached - attachCount)
 	check(runtime.sessions ~= nil and #runtime.sessions == 4, "四个会话仍在", runtime.sessions ~= nil and #runtime.sessions or 0)
+end
+
+-- ================================================================ 场景 5b：没有看门狗（E12e-B4）
+io.stdout:write("\n[场景 5b] 零处理帧不丢会话：IAS 没有按帧计数的看门狗（只有已锁存的试验开关 R:3914/3967/4007，从不丢会话）\n")
+do
+	local fake = newFake()
+	local compat = newCompat()
+	fake:playerAt("p1", 0, 6)
+	local runtime = freshRuntime(fake, compat, {})
+	fake:advance(80)
+	local attachCount = #compat.attached
+	-- 此后求解器一条骨都不处理（written=0、skippedSame=0），而且某条链带着 disabled 标记：
+	-- 以前连续 45 帧就会 `runtime.sessions = nil` 并重挂；现在什么都不该发生。
+	compat.update = function(session, dt, _)
+		compat.dtByUnit[#compat.dtByUnit + 1] = { unit = session.unit.name, dt = dt }
+		session.engineCalls, session.skippedSame = 0, 0
+		return 0
+	end
+	local session = runtime.sessions and runtime.sessions[1]
+	if session and session.sessions[1] then session.sessions[1].disabled = true end
+	compat.dtByUnit = {}
+	fake:advance(200)
+	check(#compat.attached == attachCount, "200 帧零处理：没有重挂", #compat.attached - attachCount)
+	check(runtime.sessions ~= nil and #runtime.sessions == 1 and runtime.sessions[1] == session, "会话原封不动还在")
+	check(#compat.dtByUnit == 200, "每帧仍在驱动", #compat.dtByUnit)
+end
+
+-- ================================================================ 场景 5c：没有动画状态机的 avatar 照常跑物理（E12e-B4）
+io.stdout:write("\n[场景 5c] avatar 没有动画状态机：物理继续写、不重置（IAS 角色类 0 照常 bind_unit，R:6975/R:7004）\n")
+do
+	local fake = newFake()
+	local compat = newCompat()
+	local avatar = fake:playerAt("p1", 0, 6)
+	avatar.anim = false
+	local resets = 0
+	compat.reset_physics = function(session, dt, ...)
+		resets = resets + 1
+		return compat.update(session, dt, ...)
+	end
+	local machineReads = 0
+	local makeStingray = fake.stingray
+	fake.stingray = function(self_, ...)
+		local stingray = makeStingray(self_, ...)
+		local readMachine = stingray.Unit.has_animation_state_machine
+		stingray.Unit.has_animation_state_machine = function(unit)
+			machineReads = machineReads + 1
+			return readMachine(unit)
+		end
+		return stingray
+	end
+	local runtime = freshRuntime(fake, compat, {})
+	fake:advance(80)
+	compat.dtByUnit = {}
+	machineReads, resets = 0, 0
+	fake:advance(60)
+	local own = 0
+	for _, entry in ipairs(compat.dtByUnit) do if entry.unit == "p1-armor" then own = own + 1 end end
+	check(own == 60, "没有状态机的本人：60 帧每帧都写", own)
+	check(resets == 0, "没有状态机：不触发重置", resets)
+	check(machineReads == 0, "物理闸不再每帧读 has_animation_state_machine", machineReads)
+	check(runtime.sessions ~= nil and #runtime.sessions == 1, "会话仍在")
 end
 
 -- ================================================================ 场景 6：没有 units_by_resource

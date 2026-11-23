@@ -438,35 +438,29 @@ do
 	Link.weapon_graph = function(unit, spec) if unit.isWeapon then return 2 end end
 	-- 武器用的标识：假引擎的 debug_name 是 #ID[<id>]
 	local weaponId = tostring(weapon.id)
+	weapon.hash = weaponId:lower()   -- 假引擎的 units_by_resource 按 unit.hash 匹配 Id64 键
 	local graphs = { [weaponId:lower()] = { 2, 1, 258, true } }
-	-- 帧驱动：每帧先刷新活体列表（真实运行时在 drive 里做；这里用假引擎同样的入口）
+	-- E12e-B4：IAS 每帧对目录里每个武器 hash 各问一次 units_by_resource（R:3669-3670），不扫全世界、不读 debug_name、
+	-- 不调 Unit.alive。没有"活体列表"可刷新，也没有跨帧缓存。
 	runtime.world = 1
-	local function refresh()
-		runtime.frame = (runtime.frame or 0) + 1
-		runtime.liveUnits = S.World.units(1)
-		runtime.liveUnitCount = #runtime.liveUnits
-		-- 与运行时同款的索引：在没有改动的版本里没有这几个字段，find_weapon 也不会用它
-		local live = runtime.liveIndex or {}
-		runtime.liveIndex = live
-		runtime.liveStamp = runtime.frame
-		runtime.liveIndexUnits = runtime.liveUnits
-		for i = 1, #runtime.liveUnits do live[runtime.liveUnits[i]] = runtime.frame end
-	end
-	refresh()
 	counter.total, counter.by = 0, {}
 	local c0 = os.clock()
 	local hits = 0
 	for _ = 1, 120 do
-		refresh()
-		if Link.find_weapon(runtime.liveUnits, { p = { 0, 0, 0 }, q = { 0, 0, 0, 1 } }, graphs, runtime) then hits = hits + 1 end
+		runtime.frame = (runtime.frame or 0) + 1
+		if Link.find_weapon(1, { p = { 0, 0, 0 }, q = { 0, 0, 0, 1 } }, graphs) then hits = hits + 1 end
 	end
 	local elapsed = os.clock() - c0
-	counter.total = counter.total - 0
 	local alive, names = counter.by["Unit.alive"] or 0, counter.by["Unit.debug_name"] or 0
-	io.stdout:write(string.format("  [数据] 找武器 120 帧：Unit.alive %.1f/帧、Unit.debug_name %.1f/帧；Lua 耗时 %.1f ms\n",
-		alive / 120, names / 120, elapsed * 1000))
-	check(hits == 120, "每帧都找到那件武器", hits)
-	check((alive + names) / 120 < 150, "找武器稳态每帧引擎调用 < 150（改前为 15000×2；15000 个 unit 的 debug_name 缓存 180 帧才重建一次）", (alive + names) / 120)
+	local byResource, fullScan = counter.by["World.units_by_resource"] or 0, counter.by["World.units"] or 0
+	io.stdout:write(string.format("  [数据] 找武器 120 帧（15000 个无关 unit）：units_by_resource %.1f/帧、World.units %.1f/帧、Unit.alive %.1f/帧、Unit.debug_name %.1f/帧；Lua 耗时 %.1f ms\n",
+		byResource / 120, fullScan / 120, alive / 120, names / 120, elapsed * 1000))
+	check(hits == 120, "每帧都找到那件武器（只经 units_by_resource）", hits)
+	check(alive == 0 and names == 0 and fullScan == 0, "找武器：不调 Unit.alive / debug_name / World.units（IAS R:3669-3671）",
+		string.format("alive=%d names=%d units=%d", alive, names, fullScan))
+	local catalog = 0
+	for _ in pairs(Link.weaponGraphs) do catalog = catalog + 1 end
+	check(byResource / 120 == 1, "找武器：每个目录 hash 每帧恰好 1 次 units_by_resource（与 IAS 同量；真实目录 " .. catalog .. " 项）", byResource / 120)
 	Link.weapon_graph = original
 end
 

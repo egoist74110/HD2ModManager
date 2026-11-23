@@ -153,7 +153,6 @@ def replay(frames, *, link, blend, physics):
     })
     state = runtime.install(env, opts)
     state.avatar, state.world, state.cache.world = handles[0], world, world
-    state.liveUnits, state.liveUnitsWorld = table(handles), world
     state.avatars = lua.table(lua.table(unit=handles[0], cameraDistance=0))
     log = []
     state.logger = wrap(lambda fmt, *args: log.append(fmt % args if args else fmt))

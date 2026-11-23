@@ -100,7 +100,10 @@ local M = {}
 --        flags=0x35（yawCon + angleCon，没有 pitchCon）的长发链：pitch 区间留着初值 [0, 0]，
 --        而求解器在 axisLimits 打开时两个分量都夹 ⇒ 前后甩被锁在 0°，长发看着像一根焊丝。
 --        现在没约束的轴按"不限"处理，总偏角仍由锥兜住。
-M.VERSION = "2.1.61"
+-- 2.1.62：E12e-B4。持枪找武器/跟随件改成 IAS 的逐资源 `units_by_resource`（修好 2.1.61 里"liveUnits 无人赋值 ⇒ 持枪路径静默失效"）；
+--        删除"驱动失效"看门狗与 `zeroLimit`；删除 `refresh_live_units` / `session_unit_live` 全世界活体表（判活改用本帧 `Roster.isLive`）；
+--        物理会话不再按"avatar 有无动画状态机"冻结 / 重置（IAS 没有这道闸，R:6975-6976、R:7004）。
+M.VERSION = "2.1.62"
 
 --- 安装标记用的全局键。只写这一个全局，且值就是模块本身（便于外部检查是否已装）。
 local INSTALL_KEY = "__hd2physbone_runtime"
@@ -137,7 +140,7 @@ local DEFAULT_LOG_ROTATE_BYTES = 512 * 1024
 --- 只留这几类，是因为它们本身就是"出事了"的证据；心跳、等待、预算、逐链明细
 --- 这类常规行才是吃字节的大头，也是最没必要的长期留存。
 --- </para>
-local ALWAYS_LOG_TAGS = { "[错误]", "[失败]", "[警告]", "[驱动失效]", "[快照]", "[裙摆]" }
+local ALWAYS_LOG_TAGS = { "[错误]", "[失败]", "[警告]", "[快照]", "[裙摆]" }
 
 --- 造一个 logger。返回 `log, context`。
 --- <para>
@@ -339,8 +342,8 @@ function Perf.summary(runtime, extra)
 			parts[#parts + 1] = bucket .. "明细[" .. table.concat(text, " ") .. "]"
 		end
 	end
-	runtime.logger("[physbone][PERF] 窗口=%d帧 世界unit=%d 总引擎调用=%.1f/帧 ｜ %s ｜ 事件 %s",
-		Perf.frames, runtime.liveUnitCount or 0, Perf.totalCalls / frames, table.concat(parts, " "),
+	runtime.logger("[physbone][PERF] 窗口=%d帧 总引擎调用=%.1f/帧 ｜ %s ｜ 事件 %s",
+		Perf.frames, Perf.totalCalls / frames, table.concat(parts, " "),
 		#events > 0 and table.concat(events, " ") or "无")
 end
 
@@ -634,66 +637,11 @@ local function phase(runtime, name)
 	runtime.logger("[physbone][相位] %s", name)
 end
 
---- 用**指针相等**判断"会话的 unit 还在不在"，全程**不 deref 句柄**。
----
---- 为什么必须这样（2026-11-12 债券页快切必崩，转储 `0x3e564b` / 参数 `0x0 0x0`）：
---- 句柄被销毁之后，**任何**引擎调用都会 deref 那块已经还回去的内存 —— `Unit.alive` 也一样，
---- 而 `pcall` 拦不住原生 AV。过去的写法是"每帧对每个会话问一次 `Unit.alive`"，
---- 于是"引擎刚刚销毁这批 unit"的那一帧就是必死：慢速切页还能被"加载空档"那道闸（整组丢弃、
---- 一条都不查）救下来，快速切页没有空档，直接踩中。
----
---- 这里的判据换了方向：**问引擎要"当前活体列表"，然后在 Lua 里按指针比**。
---- `World.units(world)` 返回的是引擎自己现存的对象，拿它做**相等比较**不 deref 任何东西。
----@return string "ok"（拿到可信列表，`runtime.liveUnits` 有效）| "world-gone"（我们那个世界没了）
----          | "unavailable"（引擎没这两个 API ⇒ 不据此判死，退回旧行为）
-local function refresh_live_units(runtime, S_)
-	local worlds = try(S_.Application.worlds)
-	if type(worlds) ~= "table" then return "unavailable" end
-	local found = false
-	for index = 1, #worlds do
-		if worlds[index] == runtime.world then found = true break end
-	end
-	if not found then return "world-gone" end
-	local units = try(S_.World.units, runtime.world)
-	if type(units) ~= "table" then
-		runtime.liveUnits = nil
-		runtime.liveStamp = nil
-		return "unavailable"
-	end
-	runtime.liveUnits = units
-	runtime.liveUnitsWorld = runtime.world
-	runtime.liveUnitCount = #units
-	-- F2：判活由"每次线性比较整张表"改成"一次建索引、之后 O(1)"。
-	-- 索引用帧戳（不必每帧清表）：live[unit] == 本帧戳 才算活。每 600 帧整体重建一次，防止死句柄越积越多。
-	local stamp = (runtime.frame or 0) + 1
-	local live = runtime.liveIndex
-	if live == nil or (runtime.liveBuilt or 0) + 600 <= stamp then
-		live = {}
-		runtime.liveIndex, runtime.liveBuilt = live, stamp
-	end
-	for index = 1, #units do live[units[index]] = stamp end
-	runtime.liveStamp, runtime.liveIndexUnits = stamp, units
-	return "ok"
-end
-
---- 会话的 unit 是否仍在活体列表里（**只做指针比较**）。
---- `runtime.liveUnits == nil` 表示"没有可信列表"⇒ 不据此判死（保持旧行为）。
-local function session_unit_live(runtime, unit)
-	if Roster.isLive(runtime, unit) then return true end
-	local units = runtime.liveUnits
-	if units == nil then return true end
-	Perf.count("F2")
-	local live = runtime.liveIndex
-	if live ~= nil and runtime.liveIndexUnits == units then
-		return live[unit] == runtime.liveStamp
-	end
-	-- 外部直接塞了 liveUnits（测试 / 旧调用方）：没有索引，退回线性比较。
-	for index = 1, #units do
-		if units[index] == unit then return true end
-	end
-	return false
-end
-
+-- E12e-B4：这里原来有 `refresh_live_units` / `session_unit_live`（每帧或释放时问引擎要 `World.units` 全表，
+-- 在 Lua 里按指针建索引判活）。IAS 没有"全世界活体表"：判活只用本回调的枚举结果，句柄不跨帧
+-- （R:894-896、R:1417-1428）。对应物是 `Roster.isLive(runtime, unit)`（本帧 `units_by_resource` 枚举），
+-- 所有判活处都改用它；`runtime.liveUnits / liveIndex / liveStamp / liveBuilt / liveIndexUnits / liveUnitsWorld /
+-- liveUnitCount` 全部删除。
 
 -- ---------------------------------------------------------------------------
 -- 抬升诊断（默认关闭，靠一个外部文本文件打开）
@@ -1317,7 +1265,7 @@ local function refresh_avatar_distances(S_, runtime)
 	for index = 1, #avatars do
 		local avatar = avatars[index]
 		-- 防御：名单可能被别处复用；这里再按指针确认一次。
-		if avatar.unit ~= nil and session_unit_live(runtime, avatar.unit) then
+		if avatar.unit ~= nil and Roster.isLive(runtime, avatar.unit) then
 			local ax, ay, az = readVector(S_, try(S_.Unit.world_position, avatar.unit, 1))
 			if ax ~= nil then
 				avatar.x, avatar.y, avatar.z, avatar.positionFrame = ax, ay, az, runtime.frame
@@ -3605,78 +3553,29 @@ function IndependentLink.weapon_graph(unit, spec, attachment)
 	if owned and signature == spec[3] then return spec[2]+base end
 end
 
--- F3：找武器。改前：持枪时**每帧**遍历全世界 unit，对每个调 `Unit.alive` + `Unit.debug_name`（2×N 次引擎调用）。
--- 改后（对应 IAS 只在身份/武器变化时才重新枚举的做法）：
---   ① 判活不再调 `Unit.alive`：unit 在本帧 `World.units` 的索引里就是活的（`runtime.liveIndex`）；
---   ② `debug_name` 结果按 unit 缓存（"不是武器"的缓存 180 帧过期，防指针复用）；
---   ③ 找到过武器就先只验证缓存的那一件（索引里还在 + 武器图仍与右手挂点吻合），完整扫描 20 帧一次；
---      没找到时 10 帧一次。
--- `runtime` 缺省（老调用/测试）时退回原来的全量写法，行为不变。
-function IndependentLink.find_weapon(units, attachment, graphs, runtime)
-	local function inspect(unit, tag)
-		local spec = tag and graphs[tag:lower()]
-		local root = spec and IndependentLink.weapon_graph(unit, spec, attachment)
-		if root then
-			return { unit = unit, node = root, sidearm = spec[4], envelope = spec[5], spec = spec, id = tag:lower() }
-		end
-	end
-	if runtime == nil then
-		local found
-		for _, unit in ipairs(units or {}) do
-			if Compat.unit_alive(S, unit) then
-				local tag = unit_tag(S, unit):match("^#ID%[([%da-fA-F]+)%]$")
-				local hit = inspect(unit, tag)
-				if hit then
-					if found then return end
-					found = hit
+-- E12e-B4：找手里的武器，照 IAS `trial.find_owned`（R:3649-3700）：
+--   · 对武器目录里的每个资源 hash，各问一次 `World.units_by_resource(world, Id64.from_hex(hash))`（R:3669-3670），
+--     不枚举全世界 unit、不读 debug_name、不调 `Unit.alive`（R:3671 起只对候选本身验图）；
+--   · 一个资源的实例多于 16 个就整项跳过（R:3671）；
+--   · 与当前原生右手挂点（2 mm / 0.15°）吻合的候选算"拥有者"，多于一个 ⇒ 歧义，返回 nil（R:3684）；
+--   · 没有候选就立刻 nil，没有"过 N 帧再扫"的间隔；句柄只活在本次调用里，不跨帧缓存（R:894-896、R:1417-1422）。
+-- IAS 的 `find_owned` 另按 epoch 缓存同一 avatar 本帧的结果（R:3649-3652）；本运行时每帧每 avatar 只调一次，缓存无用，不做。
+-- 与 IAS 的唯一差别：IAS 的每个武器 spec 可带 `path`（R:3669），我们的目录只有 hash，所以恒用 hash。
+function IndependentLink.find_weapon(world, attachment, graphs)
+	local found
+	for hash, spec in pairs(graphs) do
+		local key = roster_key(hash)
+		local units = key ~= nil and try(S.World.units_by_resource, world, key) or nil
+		if type(units) == "table" and #units <= 16 then
+			for index = 1, #units do
+				local unit = units[index]
+				local root = IndependentLink.weapon_graph(unit, spec, attachment)
+				if root then
+					if found then return nil end
+					found = { unit = unit, node = root, sidearm = spec[4], envelope = spec[5], spec = spec, id = hash:lower() }
 				end
 			end
 		end
-		return found
-	end
-	local frame = runtime.frame or 0
-	local cache = runtime.weaponCache
-	if cache == nil then cache = { tags = {}, tagsBuilt = frame }; runtime.weaponCache = cache end
-	local live, stamp = runtime.liveIndex, runtime.liveStamp
-	if runtime.liveIndexUnits ~= units then live = nil end
-	if cache.unit ~= nil then
-		if live ~= nil and live[cache.unit] == stamp then
-			local hit = inspect(cache.unit, cache.tag)
-			if hit and frame < (cache.nextScan or 0) then return hit end
-			if not hit then cache.unit, cache.nextScan = nil, 0 end
-		else
-			cache.unit, cache.nextScan = nil, 0
-		end
-	end
-	if cache.unit == nil and frame < (cache.nextScan or 0) then return nil end
-	if frame - cache.tagsBuilt >= 180 then cache.tags, cache.tagsBuilt = {}, frame end
-	local found, tags = nil, cache.tags
-	for index = 1, #(units or {}) do
-		local unit = units[index]
-		local tag = tags[unit]
-		if tag == nil then
-			if live ~= nil then
-				tag = unit_tag(S, unit):match("^#ID%[([%da-fA-F]+)%]$") or false
-			elseif Compat.unit_alive(S, unit) then
-				tag = unit_tag(S, unit):match("^#ID%[([%da-fA-F]+)%]$") or false
-			else
-				tag = false
-			end
-			tags[unit] = tag
-		end
-		if tag then
-			local hit = inspect(unit, tag)
-			if hit then
-				if found then cache.unit, cache.nextScan = nil, frame + 10; return end
-				found = hit
-				found.cacheTag = tag
-			end
-		end
-	end
-	if found then
-		cache.unit, cache.tag, cache.nextScan = found.unit, found.cacheTag, frame + 20
-	else
-		cache.unit, cache.nextScan = nil, frame + 10
 	end
 	return found
 end
@@ -3719,7 +3618,7 @@ function IndependentLink.held_weapon(runtime, state, readPose)
 	if not right or not root or not camera or not camera.z then return end
 	local V = Compat.contact_math
 	if V.length(V.sub(root.p, { camera.x, camera.y, camera.z })) <= 1 then return end
-	local weapon = IndependentLink.find_weapon(runtime.liveUnits, right, IndependentLink.weaponGraphs, runtime)
+	local weapon = IndependentLink.find_weapon(state.world, right, IndependentLink.weaponGraphs)
 	if not weapon then return end
 	local lnode = safe_node(S, weapon.unit, "IK_left")
 	local rnode = safe_node(S, weapon.unit, "IK_right")
@@ -3766,28 +3665,37 @@ function IndependentLink.mark_weapon_descendants(graph, roots)
 	end
 end
 
-function IndependentLink.weapon_followers(units, weapon)
+-- E12e-B4：跟随件照 IAS `trial.discover_followers`（R:3721-3766）：候选资源 = 本武器成员 + 配件目录，同一 hash 数量冲突就放弃
+-- （R:3724-3726）；每个资源各问一次 `World.units_by_resource`（R:3729-3731），查不到表 ⇒ 放弃，实例 > 16 ⇒ 放弃（R:3735-3738）；
+-- 逐个候选要求 `Unit.alive` 且 debug_name（小写）含该 hash（R:3739-3743，debug_name 只在这里读）；图不合法 ⇒ 放弃；
+-- 全场候选 > 48 ⇒ 放弃（R:3746-3749）。不再遍历全世界 unit。
+function IndependentLink.weapon_followers(world, weapon)
 	local members = IndependentLink.weaponMembers[weapon.id]
-	local wanted = {}
+	local wanted, candidates = {}, {}
 	for id, count in ((members or "") .. " " .. IndependentLink.weaponAccessories):gmatch("(%x+):(%d+)") do
 		count = tonumber(count)
 		if wanted[id] and wanted[id] ~= count then return end
+		if wanted[id] == nil then candidates[#candidates+1] = id end
 		wanted[id] = count
 	end
 	local root = IndependentLink.weapon_snapshot(weapon.unit, weapon.spec[1])
 	if not root or not root.nodes[weapon.node] then return end
 	IndependentLink.mark_weapon_descendants(root, { [weapon.node] = true })
-	local pending, ordered, groups = {}, { root }, {}
-	for _, unit in ipairs(units) do
-		if unit ~= weapon.unit and Compat.unit_alive(S, unit) then
-			local id = unit_tag(S, unit):match("^#ID%[(%x+)%]$")
-			id = id and id:lower()
-			if id and wanted[id] then
-				groups[id] = (groups[id] or 0)+1
-				if groups[id] > 16 or #pending >= 48 then return end
-				local graph = IndependentLink.weapon_snapshot(unit, wanted[id])
-				if not graph then return end
-				pending[#pending+1] = graph
+	local pending, ordered = {}, { root }
+	for _, id in ipairs(candidates) do
+		local key = roster_key(id)
+		local units = key ~= nil and try(S.World.units_by_resource, world, key) or nil
+		if type(units) ~= "table" or #units > 16 then return end
+		for index = 1, #units do
+			local unit = units[index]
+			if unit ~= weapon.unit and Compat.unit_alive(S, unit) then
+				local name = unit_tag(S, unit)
+				if type(name) == "string" and name:lower():find(id, 1, true) then
+					local graph = IndependentLink.weapon_snapshot(unit, wanted[id])
+					if not graph then return end
+					pending[#pending+1] = graph
+					if #pending > 48 then return end
+				end
 			end
 		end
 	end
@@ -3989,7 +3897,7 @@ function IndependentLink.attach(runtime, state, piece)
 	local ok, reason = pcall(function()
 		assert(type(W.link_unit) == "function" and type(W.unlink_unit) == "function"
 			and type(U.scene_graph_parent) == "function" and type(U.scene_graph_link) == "function", "挂接 API")
-		assert(session_unit_live(runtime, unit) and session_unit_live(runtime, avatar)
+		assert(Roster.isLive(runtime, unit) and Roster.isLive(runtime, avatar)
 			and U.alive(unit) == true and U.alive(avatar) == true, "件或 avatar 已消失")
 		for _, b in ipairs(piece.bones) do
 			local node, source = piece.nodes[b], state.sources[b]
@@ -4325,7 +4233,7 @@ function IndependentLink.weapon_trial(runtime, state, weapon, sample, vectors, r
 		end
 	end
 	if not shared or runtime.weaponTrialDisabled then return end
-	local graphs = runtime.liveUnits and IndependentLink.weapon_followers(runtime.liveUnits, weapon)
+	local graphs = IndependentLink.weapon_followers(state.world, weapon)
 	if not graphs then return end
 	if V.length(shared) > 1e-6 and not IndependentLink.shift_weapon(runtime, state.world, weapon, shared, graphs) then return end
 	local right, left = state.contacts.r, state.contacts.l
@@ -4492,9 +4400,15 @@ function IndependentLink.restore_clothing(state, piece)
 end
 
 local function independent_release(runtime, state)
-	if not state or state.world ~= runtime.world or refresh_live_units(runtime, S) ~= "ok" then return end
+	if not state or state.world ~= runtime.world then return end
+	-- E12e-B4：原来先 `refresh_live_units`（World.units 全表）确认"世界还在、表可信"。IAS 口径是本回调枚举（R:1417-1428）：
+	-- 本帧还没枚举过就枚举一次（释放是低频事件），世界不在枚举里 ⇒ 这些句柄不再碰。
+	if runtime.roster == nil or runtime.roster.frame ~= (runtime.frame or 0) then
+		if not pcall(Roster.update, runtime) then return end
+	end
+	if runtime.roster == nil or runtime.roster.byWorld[state.world] == nil then return end
 	for _, piece in ipairs(state.pieces) do
-		if (piece.link or piece.hidden or piece.positionDirty or piece.clothingRest) and session_unit_live(runtime, piece.unit)
+		if (piece.link or piece.hidden or piece.positionDirty or piece.clothingRest) and Roster.isLive(runtime, piece.unit)
 			and Compat.unit_alive(S, piece.unit) then
 			local restored = IndependentLink.restore(state, piece)
 			IndependentLink.restore_clothing(state, piece)
@@ -4990,7 +4904,7 @@ local function independent_frame(runtime, avatar, world, list, state, remote)
 	state.correction = { due = due, now = now, nextAt = state.nextCorrection, blend = blend, paused = paused }
 	for index = #state.pieces, 1, -1 do
 		local piece = state.pieces[index]
-		if not session_unit_live(runtime, piece.unit) or not Compat.unit_alive(S, piece.unit) then
+		if not Roster.isLive(runtime, piece.unit) or not Compat.unit_alive(S, piece.unit) then
 			table.remove(state.pieces, index)
 			state.samplePiece, state.sampleRound = nil, nil
 			state.rescanAt = frame + 1
@@ -5130,7 +5044,7 @@ local function apply_arm_pose_frame(runtime)
 		if okRoster and runtime.roster ~= nil and runtime.roster.identity then resolve_local_avatar_for_arm(runtime) end
 	end
 	local unit = runtime.avatar
-	if unit ~= nil and not session_unit_live(runtime, unit) then
+	if unit ~= nil and not Roster.isLive(runtime, unit) then
 		runtime.avatar, unit = nil, nil
 	end
 	if unit == nil then
@@ -5176,7 +5090,7 @@ local function apply_arm_pose_frame(runtime)
 			local metres = sched_settings(runtime).metres
 			local frame = runtime.frame or 0
 			for index, owner in ipairs(runtime.avatars or state.owners or {}) do
-				if owner.unit ~= unit and session_unit_live(runtime, owner.unit) and Compat.unit_alive(S, owner.unit) then
+				if owner.unit ~= unit and Roster.isLive(runtime, owner.unit) and Compat.unit_alive(S, owner.unit) then
 					local distance = owner.cameraDistance or math.huge
 					local stride = distance <= metres * metres and 1 or 4
 					local remote = remoteStates[owner.unit]
@@ -5379,7 +5293,7 @@ local function physics_sync(runtime)
 			#counts > 1 and ("；每件链数 " .. table.concat(counts, ",")) or "")
 		if runtime.attachedFrame == nil then
 			runtime.attachedFrame, runtime.driveFrames, runtime.callsAccum = frame, 0, 0
-			runtime.peakAngle, runtime.repeatCalls, runtime.zeroFrames = 0, 0, 0
+			runtime.peakAngle, runtime.repeatCalls = 0, 0
 		end
 	end
 	runtime.sessions = #sessions > 0 and sessions or nil
@@ -5625,27 +5539,28 @@ local function drive(runtime)
 		if schedule and schedule.paused then
 			pending, session.resetPhysics, session.independentHistory = 0, true, nil
 		end
+		-- E12e-B4：原来这里按"avatar 有没有动画状态机 / 是否 Unit.alive"冻结物理（due=false、pending=0、重置），
+		-- 并且为此每个 avatar 每帧读一次 has_animation_state_machine。IAS 没有这道闸：没有状态机且未死亡的 avatar
+		-- 角色类是 0 但照常绑定（`bind_unit` R:7004，每帧对 bindings 里每一项；类只经 `set_avatar_physics_class`
+		-- R:6975-6976 推给原生）。原生只在帧号/时间跳变、传送、布局变化时重置（report-physics.md:20）。
+		-- 所以这里只保留"传送 ⇒ 重置"（IAS 原生同样会重置），其余不暂停、不重置。
+		-- 在不在本帧枚举里 = `Roster.isLive`（IAS 的判活口径，R:1417-1428）。
 		local ownerState = owner and ownerStates[owner]
-		if owner ~= nil and ownerState == nil and session_unit_live(runtime, owner) then
-			local active = Compat.unit_alive(S, owner) and frame_animation_machine(runtime, owner).active
-			ownerState = { active = active }
+		if owner ~= nil and ownerState == nil and Roster.isLive(runtime, owner) then
+			ownerState = {}
 			ownerStates[owner] = ownerState
-			if active then
-				-- Roster 本帧已读过 avatar 根位置（physics_sync 写进 runtime.avatars）：直接取，不再读引擎。
-				local x, y, z
-				for _, entry in ipairs(runtime.avatars or {}) do
-					if entry.unit == owner and entry.positionFrame == frame then x, y, z = entry.x, entry.y, entry.z break end
-				end
-				if x == nil then x, y, z = readVector(S, try(S.Unit.world_position, owner, 1)) end
-				if x ~= nil then
-					local previous = ownerRoots[owner]
-					ownerState.teleport = previous ~= nil and vec_dist(x, y, z, previous[1], previous[2], previous[3]) > 2
-					runtime.physicsOwnerRoots[owner] = { x, y, z }
-				end
+			-- Roster 本帧已读过 avatar 根位置（physics_sync 写进 runtime.avatars）：直接取，不再读引擎。
+			local x, y, z
+			for _, entry in ipairs(runtime.avatars or {}) do
+				if entry.unit == owner and entry.positionFrame == frame then x, y, z = entry.x, entry.y, entry.z break end
+			end
+			if x == nil then x, y, z = readVector(S, try(S.Unit.world_position, owner, 1)) end
+			if x ~= nil then
+				local previous = ownerRoots[owner]
+				ownerState.teleport = previous ~= nil and vec_dist(x, y, z, previous[1], previous[2], previous[3]) > 2
+				runtime.physicsOwnerRoots[owner] = { x, y, z }
 			end
 		end
-		local frozen = owner ~= nil and (ownerState == nil or not ownerState.active)
-		if frozen then due, pending, session.resetPhysics = false, 0, true end
 		if resetPhysics or (ownerState and ownerState.teleport) then session.resetPhysics = true end
 		if order > 1 then
 			local stride = owner_distance_sq(runtime, session) <= nearLimit2 and nearStride or farStride
@@ -5674,7 +5589,7 @@ local function drive(runtime)
 			local okAlive, alive = pcall(Compat.unit_alive, S, session.unit)
 			if okAlive and alive == false then due = false end
 		end
-		if due or session.independentPresentation and session_unit_live(runtime, session.unit)
+		if due or session.independentPresentation and Roster.isLive(runtime, session.unit)
 			and (tune_values(runtime).writeOff or 0) == 0 then
 			local operation = due and (session.resetPhysics and Compat.reset_physics or Compat.update) or nil
 			local ok, out, solved = pcall(IndependentLink.physics, runtime, session, schedule, operation, pending)
@@ -5722,9 +5637,6 @@ local function drive(runtime)
 	runtime.staticChains = staticChains
 	runtime.lastChainTotal = primaryChains + nearChains + farChains
 	runtime.lastAttempted = attempted
-	-- 这一帧一条都没驱动（stride 分帧的正常现象）时不能让"零帧看门狗"累加，
-	-- 否则分帧本身会被误判成"驱动失效"→ 重挂 → 分帧 → 再判失效，无限循环。
-	local attemptedAny = attempted > 0
 
 	-- 峰值：**偏离绑定方向**的最大角，也就是"离模型原本的形状有多远"。
 	--
@@ -5826,33 +5738,11 @@ local function drive(runtime)
 		logger("[physbone][debug] 逐件峰值（全体 %.1f°）%s", peak, table.concat(pieces, " "))
 	end
 
-	-- ⚠️ 判"驱动失效"不能用"这一帧写了几个骨"：加了"姿态没变就跳过"之后，
-	-- 站着不动时 written 天然就是 0，用它判失效会让静止的角色每 45 帧重挂一次（踩过）。
-	-- 真正的判据是"求解器有没有在处理链"：写了 + 因没变而跳过 = 处理过的骨数。
-	--
-	-- 多人分帧之后还要再排除一种假信号：**这一帧按 stride 谁都不该被驱动**。
-	-- 那种帧一条骨都不会被处理，但这不是故障——它是节流本身。判据要挂"有没有尝试过"。
+	-- E12e-B4：这里原来有"驱动失效"看门狗（连续 N 帧一条骨都没处理 / 任一链 disabled ⇒ 丢掉全部会话等重挂）。
+	-- IAS 没有按帧计数的看门狗：它只有已锁存的试验开关（R:3914、R:3967、R:4007），那些开关
+	-- 只停自己的那个试验，从不丢会话。`item.disabled` 在整个运行时里没有任何地方会被置位，也一并删除。
+	-- `zeroFrames` / `zeroLimit` 选项 / "[驱动失效]" 日志随之删除。
 	phase(runtime, "写骨 后")
-	local handled = written + skippedSame
-	if not attemptedAny then
-		-- 分帧跳过的帧：不算数，也不清零（清零会让"卡住"永远攒不到上限）
-	elseif handled == 0 then
-		runtime.zeroFrames = (runtime.zeroFrames or 0) + 1
-	else
-		runtime.zeroFrames = 0
-	end
-	local tripped = false
-	for _, session in ipairs(runtime.sessions) do
-		for _, item in ipairs(session.sessions) do
-			if item.disabled == true then tripped = true end
-		end
-	end
-	if runtime.zeroFrames >= (options.zeroLimit or 45) or tripped then
-		logger("[physbone][驱动失效] 连续 %d 帧一条骨都没处理（护栏=%s）⇒ 退回等待重挂",
-			runtime.zeroFrames, tostring(tripped))
-		runtime.sessions = nil
-		runtime.zeroFrames = 0
-	end
 
 	-- 姿态快照：外部按下热键 ⇒ 写请求文件 ⇒ 这里把骨架采下来。
 	-- 放在**物理写完、渲染之前**：采到的就是这一帧画到屏幕上的姿态。
@@ -5875,7 +5765,6 @@ local perfWrapped = false
 local function perf_wrap_all()
 	if perfWrapped then return end
 	perfWrapped = true
-	refresh_live_units = Perf.wrap("F1", refresh_live_units)
 	refresh_avatar_distances = Perf.wrap("F8", refresh_avatar_distances)
 	fp_lock_watch = Perf.wrap("F8", fp_lock_watch)
 	scheduler_watch = Perf.wrap("F8", scheduler_watch)
@@ -5957,7 +5846,6 @@ function M.install(stingray, options)
 		driveFrames = 0,
 		beatFrames = 0,
 		callsAccum = 0,
-		zeroFrames = 0,
 		waitReason = nil,
 		waitRepeat = 0,
 		installed = true,

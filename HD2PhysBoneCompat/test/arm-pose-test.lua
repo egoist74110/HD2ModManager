@@ -617,6 +617,8 @@ do
 	S.Network, S.GameSession = nil, nil   -- 这组用例逐次数 Unit.alive / 状态机读取，不带 IAS 身份轮询
 	local teammate = make_rig("rifle")
 	S.World.units = function() return { avatar, teammate } end
+	-- E12e-B4：判活只认本帧枚举（Roster.isLive，IAS R:1417-1428）；换 avatar 时枚举也要跟着换。
+	S.World.units_by_resource = function() return { avatar } end
 	local calls, order, logs = {}, {}, {}
 	local otherCalls = 0
 	local hasMachine, layerAvailable = false, true
@@ -1202,7 +1204,7 @@ do
 	state.logger = function(fmt, ...) logs[#logs + 1] = string.format(fmt, ...) end
 	local function tick(time)
 		state.frame, state.lastTime, state.dt = state.frame + 1, time, 0.01
-		state.frameAnimation, state.liveUnits, state.liveUnitsWorld = nil, units, world
+		state.frameAnimation = nil
 		for _, unit in ipairs(owners) do unit.update_world() end
 		for _, unit in ipairs(units) do unit.update_world() end
 		Runtime.apply_arm_pose_frame_(state)
@@ -1413,17 +1415,51 @@ do
 	_G.update = update
 	local runtime = Runtime.install(S, { compat = Compat, log = false })
 	local spec = { 2, 1, 258, true }
-	local found = Link.find_weapon(units, pose(0, 0, 0), { ["1111111111111111"] = spec })
+	-- E12e-B4：武器只经 World.units_by_resource(world, Id64.from_hex(hash)) 找（IAS R:3669-3670）；
+	-- 假引擎里 units_by_resource 按 hash 过滤当前 `units`，没有任何"活体列表"字段可读。
+	local found = Link.find_weapon(world, pose(0, 0, 0), { ["1111111111111111"] = spec })
 	check("E11 武器归属：核对资源、拓扑和原生右手父框", found and found.node == 2 and found.sidearm)
-	check("E11 武器归属：远离或重复匹配时不使用",
-		not Link.find_weapon(units, pose(0.003, 0, 0), { ["1111111111111111"] = spec })
-		and not Link.find_weapon({ weapon, weapon }, pose(0, 0, 0), { ["1111111111111111"] = spec }))
+	local single = units
+	units = { avatar, weapon, weapon, magazine }
+	local twice = Link.find_weapon(world, pose(0, 0, 0), { ["1111111111111111"] = spec })
+	units = single
+	check("E11 武器归属：远离或重复匹配时不使用（重复 ⇒ 歧义 nil，IAS R:3684）",
+		not Link.find_weapon(world, pose(0.003, 0, 0), { ["1111111111111111"] = spec }) and not twice)
+	units = { avatar, magazine }
+	check("E11 武器归属：没有武器实例 ⇒ 同帧立刻 nil，不缓存",
+		not Link.find_weapon(world, pose(0, 0, 0), { ["1111111111111111"] = spec }))
+	units = single
+	check("E11 武器归属：每次调用都重新取（不跨帧留句柄）",
+		Link.find_weapon(world, pose(0, 0, 0), { ["1111111111111111"] = spec }).unit == weapon)
+	local replacement = make_rig("unarmed")
+	replacement.tag, replacement.nodeCount, replacement.names.StingrayEntityRoot = weapon.tag, 2, 1
+	replacement.update_world()
+	units = { avatar, replacement, magazine }
+	local swapped = Link.find_weapon(world, pose(0, 0, 0), { ["1111111111111111"] = spec })
+	check("E11 武器归属：下一帧换了新对象就用新的（旧句柄不留）", swapped and swapped.unit == replacement)
+	units = single
+	-- 持枪主路径（held_weapon）：武器只能经 units_by_resource 到达；这里没有任何 liveUnits 之类的字段。
+	Link.weaponGraphs["1111111111111111"] = spec
+	runtime.poseCamera = { frame = runtime.frame, x = 0, y = -5, z = 2 }
+	local heldState = { world = world, contacts = { r = pose(0, 0, 0) } }
+	local function heldPose(name)
+		if name == "root" then return pose(0, 0, 0) end
+		if name == "attach_hand_r" then return pose(0, 0, 0) end
+	end
+	local held = Link.held_weapon(runtime, heldState, heldPose)
+	check("E11 持枪：held_weapon 经 units_by_resource 找到武器（无活体列表字段）", held and held.unit == weapon and held.sidearm)
+	units = { avatar, magazine }
+	check("E11 持枪：武器消失 ⇒ 同帧 held_weapon 立刻 nil", Link.held_weapon(runtime, heldState, heldPose) == nil)
+	units = single
+	Link.weaponGraphs["1111111111111111"] = nil
 	local accessoryPos = magazine.worldPoses.root.p
 	Link.weaponMembers[found.id] = "2222222222222222:2"
-	local followers = Link.weapon_followers(units, found)
-	check("E11 拉枪：独立弹匣按原生父框随武器根走",
-		followers and #followers == 2 and followers[2].unit == magazine
-		and Link.weapon_followers({ weapon }, found) == nil)
+	local followers = Link.weapon_followers(world, found)
+	units = { avatar, weapon }
+	local noChild = Link.weapon_followers(world, found)
+	units = single
+	check("E11 拉枪：独立弹匣按原生父框随武器根走（跟随件只经 units_by_resource 找，IAS R:3729-3731）",
+		followers and #followers == 2 and followers[2].unit == magazine and noChild == nil)
 	local shifted = Link.shift_weapon(runtime, world, found, { 0.18, 0, 0 }, followers)
 	check("E11 拉枪：武器根以原生父框换算世界偏移",
 		shifted and dist(weapon.locals.hips.p, V.add(original, { 0.18, 0, 0 })) < 1e-9
@@ -1443,7 +1479,7 @@ do
 		if unit == magazine then return false end
 		return updateUnit(w, unit)
 	end
-	followers = Link.weapon_followers(units, found)
+	followers = Link.weapon_followers(world, found)
 	check("E11 拉枪：子件更新失败撤回根位移并禁用试验",
 		not Link.shift_weapon(runtime, world, found, { 0.1, 0, 0 }, followers)
 		and runtime.weaponTrialDisabled and dist(weapon.locals.hips.p, original) < 1e-9)
@@ -1532,7 +1568,7 @@ do
 	state.logger = function(fmt, ...) logs[#logs + 1] = string.format(fmt, ...) end
 	local function tick(time)
 		state.frame, state.lastTime, state.dt = state.frame + 1, time, 0.01
-		state.frameAnimation, state.liveUnits, state.liveUnitsWorld = nil, units, world
+		state.frameAnimation = nil
 		for _, unit in ipairs(owners) do unit.update_world() end
 		for _, unit in ipairs(units) do unit.update_world() end
 		Runtime.apply_arm_pose_frame_(state)
@@ -1613,7 +1649,7 @@ do
 	state.logger = function(fmt, ...) logs[#logs + 1] = string.format(fmt, ...) end
 	local function tick(time)
 		state.frame, state.lastTime, state.dt = state.frame + 1, time, 0.01
-		state.frameAnimation, state.liveUnits, state.liveUnitsWorld = nil, units, world
+		state.frameAnimation = nil
 		for _, unit in ipairs(owners) do unit.update_world() end
 		for _, unit in ipairs(units) do unit.update_world() end
 		Runtime.apply_arm_pose_frame_(state)
@@ -1706,7 +1742,7 @@ do
 	state.logger = function(fmt, ...) logs[#logs + 1] = string.format(fmt, ...) end
 	local function tick(time)
 		state.frame, state.lastTime, state.dt = state.frame + 1, time, 0.01
-		state.frameAnimation, state.liveUnits, state.liveUnitsWorld = nil, units, world
+		state.frameAnimation = nil
 		for _, unit in ipairs(owners) do unit.update_world() end
 		for _, unit in ipairs(units) do unit.update_world() end
 		Runtime.apply_arm_pose_frame_(state)

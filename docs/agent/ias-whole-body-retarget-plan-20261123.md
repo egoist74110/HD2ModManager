@@ -575,3 +575,34 @@ IAS 预算 = 常规帧 49（含相机 3、IAS 独有的场景源/第一人称图
   1. `runtime.liveUnits` 在 E12e WIP 之后没有任何地方赋值（`refresh_live_units` 不再被调用），而 `IndependentLink.held_weapon → find_weapon` 仍读它：握枪的找武器路径在真运行时里拿不到列表。
   2. "驱动失效看门狗"（连续 45 帧零处理）只置 `runtime.sessions = nil`，不清 `sessionByUnit`，下一帧 `physics_sync` 会原样重建，等于没生效。
   3. 物理会话里的 `frozen`（主人没有动画状态机就停物理并重置）是我们自己的做法，IAS 的原生状态机怎么处理没有 Lua 侧证据；它同时是上面"求解侧逐帧读取"的来源。
+
+## 22. E12e-B4：持枪找武器改 IAS 做法、删看门狗、物理归属闸改 IAS 做法（运行时 2.1.62）
+
+### 22.1 持枪找武器（修复 21.5 残留问题 1）
+
+- 症状：`runtime.liveUnits` 只由 `refresh_live_units` 赋值，而后者 E12e 之后只在 `independent_release` 里调；持枪路径 `find_weapon(runtime.liveUnits, ...)` 遍历空表，`weapon_followers` 被 `runtime.liveUnits and ...` 跳过 ⇒ 没有武器、没有跟随件、也不报错。
+- 现在照 IAS `trial.find_owned`（R:3649-3700）：对武器目录每个 hash 各问一次 `World.units_by_resource(world, Id64.from_hex(hash))`（R:3669-3670），实例 > 16 整项跳过（R:3671）；候选逐个验图，右手挂点 2 mm / 0.15° 吻合算拥有者；多于一个 ⇒ nil（R:3684）；没有候选立即 nil。不读 `World.units`、`debug_name`、`Unit.alive`；句柄不跨帧。去掉了原来的 20 帧 / 10 帧重扫间隔、`runtime.weaponCache`、debug_name 缓存，以及那段错误的注释。
+- 跟随件照 `discover_followers`（R:3721-3766）：成员 + 配件目录各自 `units_by_resource`，> 16 放弃、查不到表放弃、候选 `Unit.alive` + debug_name 含 hash、全场 > 48 放弃。
+- `find_weapon(world, attachment, graphs)`、`weapon_followers(world, weapon)` 签名不再带 unit 表。
+- 与 IAS 的差别：IAS 的武器 spec 可带 `path`（R:3669），我们的目录只有 hash，恒用 hash；IAS 的 per-epoch 结果缓存（R:3649-3652）没做，因为我们每帧每 avatar 只调一次。
+
+### 22.2 删"驱动失效"看门狗（21.5 残留问题 2）
+
+- IAS 没有按帧计数的看门狗，只有已锁存的试验开关（R:3914、R:3967、R:4007），从不丢会话。删除连续 N 帧零处理判据、`item.disabled` 判据、`zeroFrames`、`zeroLimit` 选项、"[驱动失效]" 日志和日志白名单里的同名标签。`item.disabled` 在运行时里没有任何地方被置位。
+- `physbone_compat.lua` 里还有 5 处读 `item.disabled` 的条件（2528、2683、2732、2743、3193 行附近），因为从不为真，是死条件，本批没动。
+
+### 22.3 物理归属闸（21.5 残留问题 3）
+
+- 删除"avatar 没有动画状态机 / `Unit.alive` 为假 ⇒ `due=false, pending=0, resetPhysics=true`"以及为它每个 avatar 每帧读一次 `has_animation_state_machine`。IAS：无状态机且未死亡的 avatar 角色类为 0 但照常 `bind_unit`（R:7004），类经 `set_avatar_physics_class` 推给原生（R:6975-6976）；原生只在帧号/时间跳变、传送、布局变化时重置（report-physics.md:20）。
+- 只保留"主人传送 > 2 m ⇒ 重置"（对应原生的 teleport reset）。判活 = 本帧 `Roster.isLive`。
+- **角色类 0/1/2/3/4 在原生求解器里的效果没有任何文档**（Lua 里只是推送；`report-physics.md` 没覆盖求解器本体，`decomp/native_bridge` 的字符串里也没有这个名字），所以我们的求解器对所有类行为一致。死亡（3）的尸体定格仍属尸体定格批次，未实现。
+
+### 22.4 删除的活体表机制
+
+`refresh_live_units`、`session_unit_live`、`runtime.liveUnits / liveIndex / liveStamp / liveBuilt / liveIndexUnits / liveUnitsWorld / liveUnitCount`、Perf 分项 `F1` 的包装、PERF 日志里的"世界unit"。原来调用 `session_unit_live` 的 8 处全部改 `Roster.isLive`；`independent_release` 先确保本帧有枚举（没有就 `Roster.update` 一次），枚举里没有这个世界就不碰那批句柄。
+
+### 22.5 验证
+
+- Lua 回归 728 项全绿（含新增：武器只经 units_by_resource 找到、歧义 nil、无武器同帧 nil、换对象后用新对象、持枪主路径、零处理 200 帧不丢会话、无状态机 avatar 物理继续写且不重置也不读状态机；新增的三类用例在旧代码上均失败）。
+- 性能（假引擎 15008 unit、1200 帧）：战斗整帧 116.58 → 111.78/帧（IAS 预算 126.40），非战斗 301.95 → 297.15/帧（预算 311.66）；找武器每帧 1 次 `units_by_resource`/目录项（真实目录 97 项，与 IAS 同量），0 次 `World.units` / `debug_name` / `Unit.alive`。
+- 仍保留、无 IAS 对应物（待用户决定）：写骨前对每个会话的 `Unit.alive` 复查；件/远端 avatar 循环里与 `Roster.isLive` 并列的 `Compat.unit_alive`；`Application.time_since_launch`。
