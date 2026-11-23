@@ -532,3 +532,46 @@ F4 585–904 次/帧不是膨胀：单人 1 人时 321–372，4 人局低帧率
 ### 20.5 验收
 
 Lua 回归 715 通过 / 0 失败；C# Debug 构建 0 警告 0 错误，全量测试 6 个程序集全绿；无 MSBuild/dotnet 残留。以上都是假引擎结果，**没有实机验证**。
+
+## 21. E12e 小结：物理会话生命周期改 IAS 模型（运行时 2.1.61，分支 `wip/ias-e12e-roster`）
+
+### 21.1 四批各自做了什么
+
+- **B1 名单/物理绑定**：转换器写 `profileHashes`（独立骨件 + 物理件，相当于 IAS 的 profile 表），运行时 `Roster` 只按这份表枚举全部转换件；物理按"发现的件 → 哈希 → 容器"绑定，不再自己 discover。归属取 `{1,0}` 全部探针的最小距离；signature 用实例槽位（IAS 行 925–945）；600 帧没扫的世界记录清掉；只扫 active 世界。
+- **B2 / B2b 身份**：`roster_identity` 对齐 IAS 4718–5100：`#avatars > 32` 提前返回、实例槽位建 state、远端 peer 枚举、稳定互斥回退、会话重置补全、solo / squad 发现捷径（验证后跳过低位扫描与远端枚举）。
+- **B3 旧用例改写 + 性能门槛换算**（本节）：
+  - `runtime-harness-test.lua` 15 个失败用例逐条改成 IAS 行为（每条断言在注释里写 IAS 行号），依赖"尸体定格"的部分列为 pending（用例里印 `SKIP ... 等尸体定格批次`）。
+  - `perf-combat-test.lua` 改成真正的战斗场景（模拟 Network/GameSession：本人角色 1，3 名队友角色 2；第二个场景是无网络身份的非战斗世界），门槛从"每帧 < 40"换成"按 IAS 规则算出的同场景预算"（公式和行号写在测试文件顶部）。
+  - 删掉只服务于已删机制、IAS 也没有对应物的运行时代码（见 21.4）。
+
+### 21.2 现在和 IAS 一致的行为
+
+- 尸体仍是 avatar（资源枚举还会列出它），它那套件继续归它、每帧绑定；新玩家那套归新玩家；尸体消失后这套件 3 m 内无 avatar 即不再绑定。没有"主人不算玩家就整组释放 / 交还基准姿态"。
+- 归属只看距离：最近 avatar `d2 < 9.0`、次近余量 0.20；3 m 内的件全部绑定，没有"静止的是人台"启发式。
+- 没有停写窗口、没有"指针判死"：句柄只来自本帧枚举，不在枚举里的 unit 本帧碰不到，其余的 unit 照常处理。
+- 发现节奏：战斗世界全量 `World.units` 每 2.0 s 一次，非战斗世界 60 帧一次；空结果只缓存 0.25 s；身份 4 Hz。
+
+### 21.3 性能（假引擎 15008 个 unit、4 名玩家、120 Hz、1200 帧窗口）
+
+| 场景 | 我们每帧（枚举/归属/身份侧 / 整帧） | IAS 预算每帧 | 峰值帧（我们 / IAS） |
+|---|---|---|---|
+| 战斗（角色 1/2，squad 捷径） | 107.78 / 116.58 | 126.40 | 15060 / 15127（+ 求解侧 5） |
+| 非战斗世界 | 293.15 / 301.95 | 311.66 | 15060 / 15058（+ 求解侧 5） |
+
+IAS 预算 = 常规帧 49（含相机 3、IAS 独有的场景源/第一人称图枚举 3）+ 身份轮询 69 次/轮 × 4 Hz + 全量扫描 (1+U) 次 × 每 2.0 s（非战斗：每 60 帧），逐项行号见 `perf-combat-test.lua`。为达到不超过 IAS，B3 里改了三处重复读取（`refresh_avatar_distances`、`fp_lock_watch`、`scheduler_watch` 复用 `physics_sync` 本帧已读的相机和 avatar 位置；会话里"主人传送检测"复用 Roster 的 avatar 位置），整帧调用从 328.95 降到 301.95（非战斗）/ 116.58（战斗）。
+
+没有 IAS 对应物的求解侧调用（整帧峰值门槛里单列 5 次）：`Application.time_since_launch` 每帧 1 次（Lua 求解器要自己的 dt，IAS 的求解在原生 DLL）；物理会话的"主人是否仍有动画状态机"闸每个 avatar 每帧 1 次（IAS 用 4 Hz 的身份 role/dead，没有逐帧读）。
+
+### 21.4 本批删掉的运行时代码（IAS 无对应物，且已确认没有别的地方用）
+
+`identity_watch` / `motion_sample` / `motion_follows`（"玩家动它不动就放掉"）；`tryAttach`、`discover`、`findAvatars`、`pickWorld`、`pruneSessions`、`scanAvatars`、`avatarSetChanged`（旧发现/挂载/判死流程，早已不被调用）；`dump_census`、`ident_log_positions`、`ident_node_pos`、`probe_identity_api`（只挂在 tryAttach 上的诊断）；`driveHoldUntil` / `deathGraceFrames`（会话死亡停写窗口）；`discoverOnly` 开关；`reconcile`、`rearmAt`、`reArm`、`scoreAttemptAt`、`negativeRetryAt`、`staleOwners` 等状态；`note_wait`、`SUPPORT_MG_NAME`；选项 `maxArmorDistance`、`maxMatchedPerOwner`、`attachMaxDistance`、`scoreUnitsPerFrame`、`identityWatch`、`identityPollFrames`。
+
+### 21.5 仍未做（待后续批次或需要用户决定）
+
+- **尸体定格**（IAS R:5190–6002）：需要原生 `freeze_corpse_physics`，两条 pending 用例在 `runtime-harness-test.lua` T7。
+- 家族过滤、authored 归属证明、租约、marker、第一人称门控、对端抑制（handoff）。
+- 物理求解器移植（IAS 的求解在原生 DLL 里）。
+- 发现的几个残留问题（未改，留给用户决定）：
+  1. `runtime.liveUnits` 在 E12e WIP 之后没有任何地方赋值（`refresh_live_units` 不再被调用），而 `IndependentLink.held_weapon → find_weapon` 仍读它：握枪的找武器路径在真运行时里拿不到列表。
+  2. "驱动失效看门狗"（连续 45 帧零处理）只置 `runtime.sessions = nil`，不清 `sessionByUnit`，下一帧 `physics_sync` 会原样重建，等于没生效。
+  3. 物理会话里的 `frozen`（主人没有动画状态机就停物理并重置）是我们自己的做法，IAS 的原生状态机怎么处理没有 Lua 侧证据；它同时是上面"求解侧逐帧读取"的来源。

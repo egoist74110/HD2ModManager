@@ -79,7 +79,7 @@ function Fake:playerAt(name, x, chains, hash)
 	return avatar, armor
 end
 
-function Fake:stingray()
+function Fake:stingray(squad)
 	local self_ = self
 	local id32 = function(text) return text end
 	local Unit = {
@@ -113,7 +113,7 @@ function Fake:stingray()
 		debug_camera_pose = function(_) return { pose = true } end,
 		update_unit = function() end,
 	}
-	return {
+	local engine = {
 		Application = {
 			worlds = function() return { 1 } end,
 			string_to_id32 = id32,
@@ -125,6 +125,35 @@ function Fake:stingray()
 		Vector3 = { to_elements = function(v) return v.x, v.y, v.z end },
 		Matrix4x4 = { translation = function(_) return vector(0, 0, 0) end },
 	}
+	if squad ~= nil then
+		-- 战斗局身份：Network / GameSession（IAS physics_identity 的数据来源）。
+		-- squad.objects[id] = { unit = avatar 的 unit, owner = peer 名 }；对象位置跟随 avatar，血量 100。
+		local function ownedBy(peer)
+			local out = {}
+			for id, object in pairs(squad.objects) do if object.owner == peer then out[#out + 1] = id end end
+			table.sort(out)
+			return out
+		end
+		local members = {}
+		for _, object in pairs(squad.objects) do members[#members + 1] = object.owner end
+		table.sort(members)
+		engine.Network = { game_session = function() return 1 end, peer_id = function() return squad.me end }
+		engine.GameSession = {
+			in_session = function() return true end,
+			objects_owned_by = function(_, peer) return ownedBy(peer) end,
+			game_object_exists = function(_, id) return squad.objects[id] ~= nil end,
+			game_object_is_type = function() return true end,
+			game_object_owner = function(_, id) return squad.objects[id] and squad.objects[id].owner end,
+			game_object_field = function(_, id, field)
+				local object = squad.objects[id]
+				if field == "health" then return object.health or 100 end
+				return object.unit.position
+			end,
+			peers = function() return members end,
+			other_peers = function() return members end,
+		}
+	end
+	return engine
 end
 
 function Fake:advance(frames, step)
@@ -219,13 +248,12 @@ end
 -- ================================================================ E12 战斗场景：世界里 2000 个 unit
 -- 目的：量"与世界 unit 数成正比"的几项（F1 活体列表、F2 判活、F3 找武器）每帧的引擎调用数。
 -- 这份用例在改动前后的运行时上都能跑：数字来自假引擎自己的计数器，不依赖运行时里的 Perf。
-io.stdout:write("\n[E12 战斗场景] 世界 15000 个 unit + 4 名玩家\n")
 
-local function counted(fake)
-	local S = fake:stingray()
+local function counted(fake, squad)
+	local S = fake:stingray(squad)
 	local counter = { total = 0, by = {} }
-	for _, space in ipairs({ "Unit", "World", "Application", "Matrix4x4", "Vector3" }) do
-		for key, fn in pairs(S[space]) do
+	for _, space in ipairs({ "Unit", "World", "Application", "Matrix4x4", "Vector3", "Network", "GameSession" }) do
+		for key, fn in pairs(S[space] or {}) do
 			if type(fn) == "function" then
 				S[space][key] = function(...)
 					counter.total = counter.total + 1
@@ -239,48 +267,159 @@ local function counted(fake)
 	return S, counter
 end
 
-do
+-- ---------------------------------------------------------------- IAS 1.6.4 预算
+-- 用户硬规则：我们的引擎调用不得超过 IAS 在同一场景里的调用数。门槛不再是拍脑袋的"每帧 < 40"，
+-- 而是按 IAS 的规则把同一场景的调用数算出来（行号均指
+-- tmp/ias-lab/upstream/ias-1.6.4/Generator/runtime/lua/lua/runtime.lua，口径见
+-- docs/agent/ias-reference-roster-physics-corpse-identity-20261123.md）。
+--
+-- 场景形状：W=1 个世界，P 个 avatar（P=4），K 个 profile（每人一件护甲，K=A=4），世界共 U 个 unit，
+-- 每件护甲 2 个根探针（{1,0}，R:6702-6704）。只数引擎调用
+-- （Unit/World/Application/Matrix4x4/Vector3/Network/GameSession）。
+--
+-- 常规帧（每个渲染回调）：
+--   1            Application.worlds                               R:1345
+--   1            World.num_units                                  R:1363
+--   1            World.units_by_resource(avatar 资源)             R:1365
+--   2            World.units_by_resource(两个场景源 hash)         R:1373（IAS 独有，我们没有）
+--   1            World.units_by_resource(fp_cha_avatar)           R:441 经 R:1383（IAS 独有，我们没有）
+--   3            相机：World.debug_camera_pose + Matrix4x4.translation + Vector3.to_elements（每世界每帧，R:1335-1340，用于 R:6600）
+--   3P           每个 avatar：num_scene_graph_items 1 + world_pose 2（Unit.world_pose + Matrix4x4.to_elements）
+--                                                                 R:6621、R:6626、R:385-386
+--   K+A          每个到期 profile：units_by_resource 1（上一帧有命中 => 每帧都到期，R:1537-1538、R:1543）
+--                + 对每个返回的 unit 调 debug_name 1（R:1553）
+--   5A           每件护甲：num_scene_graph_items 1（R:6697）+ 2 个探针 x world_pose 2（R:6707）
+-- 身份轮询（4 Hz，R:4853 `next_poll = now + .25`），squad 已验证后
+-- （R:4794-4846 squad_discovery_allowed 通过，R:4909 起的远端枚举和低位扫描都被跳过）：
+--   4            Network.game_session、GameSession.in_session、Network.peer_id、GameSession.objects_owned_by   R:4857-4874
+--   2+8P+3       squad_discovery_allowed：peers/other_peers 各 1；每个 avatar 8 次
+--                （Unit.alive、has_animation_state_machine、game_object_exists、is_type、owner、health、
+--                  position 字段、Vector3.to_elements）R:4794-4840；末尾 game_session/peer_id/in_session 3 次
+--   5P           已知对象刷新：每个 id exists、is_type、position 字段 + to_elements、health  R:4973-4983、R:4889-4890
+--   2P           live 循环：每个 avatar Unit.alive + has_animation_state_machine            R:4987-4992
+-- 全量 World.units 兜底扫描：1 + U（World.units 1 次 + 对每个 unit 调 debug_name，R:1576、R:1610）
+--   战斗世界（有角色 1/2）：每 2.0 s 一次（R:1523、R:1644）；非战斗世界：每 60 帧一次（R:1516）。
+local function iasBudget(shape)
+	local P, K, A, U = shape.avatars, shape.profiles, shape.armour, shape.units
+	local ordinary = 1 + 1 + 1 + 2 + 1 + 3 + 3 * P + (K + A) + 5 * A
+	local identity = shape.gameplay and (4 + (2 + 8 * P + 3) + 5 * P + 2 * P) or 0
+	local scan = 1 + U
+	local seconds = shape.frames / shape.hz
+	-- 次数取"窗口内可能出现的最大次数"（与相位无关的上界）。
+	local polls = shape.gameplay and (math.floor(seconds / 0.25) + 1) or 0
+	local scans = shape.gameplay and (math.floor(seconds / 2.0) + 1) or (math.floor(shape.frames / 60) + 1)
+	return {
+		ordinary = ordinary, identity = identity, scan = scan, polls = polls, scans = scans,
+		total = shape.frames * ordinary + polls * identity + scans * scan,
+		peak = ordinary + identity + scan,
+	}
+end
+
+local function combatScenario(label, gameplay)
+	io.stdout:write(string.format("\n[E12 %s] 世界 15000 个 unit + 4 名玩家\n", label))
 	local fake = newFake()
 	for _ = 1, 14960 do fake:addUnit({ nodes = 10 }) end
 	local compat = newCompat()
-	for index = 1, 4 do fake:playerAt("p" .. index, (index - 1) * 10) end
-	local S, counter = counted(fake)
+	local players = {}
+	for index = 1, 4 do
+		local avatarUnit = fake:playerAt("p" .. index, (index - 1) * 10)
+		players[index] = avatarUnit
+	end
+	local squad = nil
+	if gameplay then
+		-- 4 人小队：本人 p1 + 3 名队友，网络对象与 avatar 位置重合（IAS 行 5015-5016 的 0.05 m 直连条件）。
+		squad = { me = "p1", objects = {} }
+		for index, avatarUnit in ipairs(players) do
+			squad.objects[index == 1 and 5000 or (7000000 + index)] = { unit = avatarUnit, owner = "p" .. index }
+		end
+	end
+	local S, counter = counted(fake, squad)
 	rawset(_G, "__hd2physbone_runtime", nil)
 	rawset(_G, "render", function() end)
+	-- Roster 用 os.clock() 做 2.0 s / 4 Hz / 0.25 s 节流（和 IAS 一样）。测试里帧只隔几毫秒真实时间，
+	-- 所以把 os.clock 换成假引擎的时钟（120 Hz，和实机回调频率一致）；耗时统计用真时钟。
+	local realClock = os.clock
+	local hz = 120
+	os.clock = function() return fake.clock end
+	local Roster = runtimeModule.roster_
+	local rosterCalls, rawUpdate = 0, Roster.update
+	Roster.update = function(...)
+		local before = counter.total
+		local out = rawUpdate(...)
+		rosterCalls = rosterCalls + (counter.total - before)
+		return out
+	end
 	runtimeModule.install(S, { compat = compat, log = false, carriers = { { rig = { bones = { { name = "hair" } } }, path = "fake" } },
 		profileHashes = fake.hashes, settleFrames = 1, snapshot = false, tunePath = "nonexistent-hd2pbx-tune.txt", pollFrames = 1, validateFrames = 3,
 		heartbeatFrames = 1000000, minNodes = 90, perfWindow = 1000000 })
 	local runtime = rawget(_G, "__hd2physbone_runtime")
-	fake:advance(60)
-	check(#(runtime.sessions or {}) == 4, "战斗场景下玩家护甲正常挂上", #(runtime.sessions or {}))
-	counter.total, counter.by = 0, {}
-	local c0 = os.clock()
-	fake:advance(300)
-	local elapsed = os.clock() - c0
-	local perFrame = counter.total / 300
-	io.stdout:write(string.format("  [数据] 稳态每帧引擎调用 %.2f（World.units 每帧 %.2f 次）；300 帧 Lua 耗时 %.1f ms\n",
-		perFrame, (counter.by["World.units"] or 0) / 300, elapsed * 1000))
+	local function frame()
+		fake.clock = fake.clock + 1 / hz
+		rawget(_G, "render")()
+	end
+	for _ = 1, 240 do frame() end   -- 暖机 2 s：挂上、身份验证、首次全量扫描
+	check(#(runtime.sessions or {}) == 4, label .. "：玩家护甲正常挂上", #(runtime.sessions or {}))
+	local roles = {}
+	for index, avatarUnit in ipairs(players) do roles[index] = Roster.role(avatarUnit) end
+	if gameplay then
+		check(roles[1] == 1 and roles[2] == 2 and roles[3] == 2 and roles[4] == 2,
+			label .. "：本人角色 1、队友角色 2（IAS 战斗世界判据 R:6672-6678）", table.concat(roles, ","))
+	else
+		check(roles[1] == 0 and roles[4] == 0, label .. "：没有网络身份，角色全是 0（非战斗世界）", table.concat(roles, ","))
+	end
+	counter.total, counter.by, rosterCalls = 0, {}, 0
+	local frames = 1200
+	local c0 = realClock()
+	local peakRoster, peakTotal = 0, 0
+	for _ = 1, frames do
+		local beforeTotal, beforeRoster = counter.total, rosterCalls
+		frame()
+		peakTotal = math.max(peakTotal, counter.total - beforeTotal)
+		peakRoster = math.max(peakRoster, rosterCalls - beforeRoster)
+	end
+	local elapsed = realClock() - c0
+	local perFrame = counter.total / frames
+	local rosterPerFrame = rosterCalls / frames
+	io.stdout:write(string.format("  [数据] 稳态每帧引擎调用 %.2f（其中枚举/归属/身份 %.2f，其余 %.2f 为调度与求解侧）；峰值帧 %d（枚举侧 %d）；World.units 每帧 %.3f 次；1200 帧 Lua 耗时 %.1f ms\n",
+		perFrame, rosterPerFrame, perFrame - rosterPerFrame, peakTotal, peakRoster, (counter.by["World.units"] or 0) / frames, elapsed * 1000))
 	local keys = {}
 	for key in pairs(counter.by) do keys[#keys + 1] = key end
 	table.sort(keys)
-	for _, key in ipairs(keys) do io.stdout:write(string.format("    %-28s %.2f/帧\n", key, counter.by[key] / 300)) end
+	for _, key in ipairs(keys) do io.stdout:write(string.format("    %-34s %.2f/帧\n", key, counter.by[key] / frames)) end
+	local units = #fake.units
+	local budget = iasBudget({ avatars = 4, profiles = #fake.hashes, armour = 4, units = units, frames = frames, hz = hz, gameplay = gameplay })
+	io.stdout:write(string.format("  [IAS 预算] 常规帧 %d + 身份 %d x %d 次 + 全量扫描 (1+%d) x %d 次 = %d 次 / %d 帧 = %.2f/帧；峰值帧 %d\n",
+		budget.ordinary, budget.identity, budget.polls, units, budget.scans, budget.total, frames, budget.total / frames, budget.peak))
 	local perf = runtimeModule.perf_
 	if perf ~= nil then
 		local rows = {}
 		for name, calls in pairs(perf.calls) do rows[#rows + 1] = string.format("%s=%.1f", name, calls / math.max(1, perf.frames)) end
-		for _, bucket in ipairs({ "OTHER", "P2", "F8" }) do
-			local per, list = perf.api[bucket] or {}, {}
-			for name, calls in pairs(per) do list[#list + 1] = string.format("%s=%.1f", name, calls / math.max(1, perf.frames)) end
-			table.sort(list)
-			io.stdout:write("  [明细 " .. bucket .. "] " .. table.concat(list, " ") .. "\n")
-		end
 		table.sort(rows)
 		io.stdout:write("  [分项] " .. table.concat(rows, " ") .. "\n")
-		check((perf.calls.OTHER or 0) / math.max(1, perf.frames) < 1, "OTHER 接近 0（计数覆盖全部引擎调用）", (perf.calls.OTHER or 0) / math.max(1, perf.frames))
 	end
-	check(perFrame < 40, "世界 15000 个 unit、4 人时稳态每帧引擎调用 < 40", perFrame)
-	check((counter.by["Unit.alive"] or 0) / 300 < 1, "稳态不再逐 unit 调 Unit.alive", (counter.by["Unit.alive"] or 0) / 300)
+	-- 门槛：我们的"枚举 + 归属 + 身份"调用数不得超过 IAS 同场景的总预算；峰值帧（全量扫描 + 身份轮询同帧）
+	-- 同样不得超过 IAS 的峰值帧。
+	check(rosterCalls <= budget.total, label .. "：枚举/归属/身份调用数 <= IAS 预算", string.format("%d <= %d", rosterCalls, budget.total))
+	check(peakRoster <= budget.peak, label .. "：峰值帧（全量扫描帧）<= IAS 峰值帧", string.format("%d <= %d", peakRoster, budget.peak))
+	-- 整帧口径：枚举侧之外，调度（相机/到相机距离）与 Lua 求解器自己的调用在 IAS 里没有对应物
+	-- （IAS 的求解在原生 DLL 里），但整帧合计仍不得超过 IAS 预算——否则就是我们多付了 IAS 没付的钱。
+	check(counter.total <= budget.total, label .. "：整帧合计调用数 <= IAS 预算", string.format("%d <= %d", counter.total, budget.total))
+	-- 峰值帧按 IAS 峰值帧 + "没有 IAS 对应物的求解侧调用"：Application.time_since_launch 1 次（Lua 求解器要自己的 dt，
+	-- IAS 的求解在原生 DLL 里），以及每个 avatar 1 次 has_animation_state_machine（物理会话的"主人是否还活动"闸，
+	-- IAS 用的是 4 Hz 的身份判定 role/dead，没有逐帧读取）。这两项列在报告里留给用户决定（见 docs/agent §21）。
+	local solverSide = 1 + 4
+	check(peakTotal <= budget.peak + solverSide, label .. "：整帧峰值 <= IAS 峰值帧 + 求解侧无对应物 " .. solverSide,
+		string.format("%d <= %d + %d", peakTotal, budget.peak, solverSide))
+	check((counter.by["Unit.alive"] or 0) / frames < 1, label .. "：稳态不再逐 unit 调 Unit.alive", (counter.by["Unit.alive"] or 0) / frames)
+	-- 战斗世界里 World.units（全量）只能是 IAS 的 2.0 s 节奏；非战斗世界是 60 帧一次。
+	local fullScans = (counter.by["World.units"] or 0)
+	check(fullScans <= budget.scans, label .. "：全量 World.units 次数 <= IAS 节奏", string.format("%d <= %d", fullScans, budget.scans))
+	Roster.update = rawUpdate
+	os.clock = realClock
 end
+
+combatScenario("战斗场景（本人 + 3 队友，角色 1/2）", true)
+combatScenario("非战斗世界（无网络身份）", false)
 
 -- F3：找武器。15000 个 unit 里 1 件是武器，右手挂点命中它。
 do

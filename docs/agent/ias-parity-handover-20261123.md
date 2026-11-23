@@ -18,7 +18,8 @@ GPT 的 5 小时额度剩下约 34%，任务随时可能中途停下。本文写
 | E9 | IAS 离线真值工具（调 1.6.4 原生 DLL） | 完成，未提交 | `e9/ias_oracle.py`、`compare.py`、`lua_replay.py`、`report.md`，规划 §15 |
 | E10 | 重定向 + 衣物规则对齐（2.1.56），A 档误差千分之几 mm | 完成，Claude 已复验，未提交 | `e10/mod`、`e10/compare_a.py`，规划 §16 |
 | E11 | 握枪和动作分支对齐（2.1.57），B 档误差千分之一 mm | 完成，Claude 已复验（Lua 694 过），未提交 | `e11/compare_b.py`、`e11/blender/`，规划 §17；Mod 沿用 `e10/mod` |
-| **E12** | 物理对齐（C 档） | 未开始 | 任务说明待写 |
+| **E12e** | 物理会话生命周期改 IAS 模型（运行时 2.1.61，分支 `wip/ias-e12e-roster`） | B1/B2/B2b/B3 完成，Lua 回归全绿（2 条尸体定格 pending），未实机验证 | 规划 §21；待做：尸体定格、家族过滤/authored/租约/marker/第一人称门控/对端抑制、物理求解器移植 |
+| E12（其余） | 物理算法对齐（C 档） | 未开始 | 任务说明待写 |
 | 之后 | 实机测试，消耗对标 IAS，降级开关 | 未开始 | |
 
 E6–E11 已提交为一个检查点（见 `git log`，提交信息以"E6–E11 检查点"开头）。注意：`tmp/` 不进 git，所以 E9 真值工具（`tmp/ias-to-patch/e9/`）、各批的对照脚本和产物都只存在本机，不能删。
@@ -30,7 +31,7 @@ E6–E11 已提交为一个检查点（见 `git log`，提交信息以"E6–E11 
 - 发现对齐：没有名单就不扫（连 60 帧全量也不做）；归属取 `{1,0}` 全部探针、每个 avatar 取最小距离、`num_scene_graph_items > 1`；signature 用实例槽位（`Roster.instanceSlot`，IAS 行 925–945）；600 帧没扫的世界记录清掉（行 1651–1656）；只扫"有 avatar 且单位数 > 0"的世界。
 - `physics_rig` 的部分命中条件恢复为 2.1.60 的 `full or allowPartial or score >= 1`（按件切骨的产物只带容器的一部分骨）。
 - 仍缺的 IAS 做法：家族过滤、authored 归属证明、租约、marker、第一人称门控、scene_sources / 第一人称图的 active 世界判据。
-- 仍红的旧用例（等后续批次改写）：runtime-harness 的 T7（尸体/释放）、T8（停写窗口）、T11 discoverOnly、T20/T21（人台/距离）、T24/T26（指针判死日志）；perf-combat 的 "< 40 次/帧" 门槛（测得 328.95，其中 Unit.debug_name 254）。
+- 旧用例已在 B3 改写完毕（规划 §21）：T7/T8/T11/T20/T21/T24/T26 改成 IAS 行为，perf-combat 门槛换成 IAS 同场景预算；依赖尸体定格的两条为 pending。
 
 ## 3. 判断一个批次是不是半成品
 

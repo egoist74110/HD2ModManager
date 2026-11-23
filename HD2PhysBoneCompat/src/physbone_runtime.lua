@@ -100,7 +100,7 @@ local M = {}
 --        flags=0x35（yawCon + angleCon，没有 pitchCon）的长发链：pitch 区间留着初值 [0, 0]，
 --        而求解器在 axisLimits 打开时两个分量都夹 ⇒ 前后甩被锁在 0°，长发看着像一根焊丝。
 --        现在没约束的轴按"不限"处理，总偏角仍由锥兜住。
-M.VERSION = "2.1.60"
+M.VERSION = "2.1.61"
 
 --- 安装标记用的全局键。只写这一个全局，且值就是模块本身（便于外部检查是否已装）。
 local INSTALL_KEY = "__hd2physbone_runtime"
@@ -352,15 +352,6 @@ local function readVector(S_, vector)
 	return nil
 end
 
---- 找玩家用的挂点名。**传名字，不传 id。**
----
---- 教训（2026-11-12，代价三轮实机）：`Application.string_to_id32` 返回的是
---- `IdString32` userdata，而且**会失效**（我们自己的 snapshot 探针里印出过
---- `[Stale IdString32]`）。把这个值存起来、或者跨帧拿去做 `has_node`，
---- 结果是一律 false / 直接抛错 —— 于是匹配全 0，日志还长得像"骨头不在"。
---- 名字字符串没有这个问题（`has_node(unit, "hips")` 稳定为 true），而且更便宜。
-local SUPPORT_MG_NAME = "support_mg"
-
 local function id32(S_, text)
 	local ok, value = pcall(function() return S_.Application.string_to_id32(text) end)
 	if ok then return value end
@@ -376,43 +367,9 @@ local function unit_tag(S_, unit)
 	return text
 end
 
---- 记一条"还没挂上"的原因。
---- 只在**原因变化**时落盘，重复次数留给心跳报——这样"一直卡在同一步"和"来回变"能区分开。
---- `detail` 里的数字会变（分数、节点数…），所以只在变化时打一次，不参与去重键。
-local function note_wait(runtime, reason, detail)
-	if runtime.waitReason == reason then
-		runtime.waitRepeat = (runtime.waitRepeat or 0) + 1
-		return
-	end
-	runtime.logger("[physbone][等待] %s%s", reason, detail ~= nil and ("：" .. detail) or "")
-	runtime.waitReason = reason
-	runtime.waitRepeat = 0
-end
-
 -- ---------------------------------------------------------------------------
 -- 世界发现
 -- ---------------------------------------------------------------------------
-
---- 主世界 + 它的 unit 列表。优先用上次记住的下标（省掉遍历所有世界）。
-local function pickWorld(S_, cache)
-	local worlds = try(S_.Application.worlds)
-	if type(worlds) ~= "table" or #worlds == 0 then return nil, nil end
-	local cached = cache.worldIndex
-	if cached ~= nil and worlds[cached] ~= nil then
-		local units = try(S_.World.units, worlds[cached])
-		if type(units) == "table" and #units >= 64 then return worlds[cached], units end
-	end
-	local bestWorld, bestUnits, bestCount, bestIndex = nil, nil, -1, nil
-	for index = 1, #worlds do
-		local units = try(S_.World.units, worlds[index])
-		local count = type(units) == "table" and #units or -1
-		if count > bestCount then
-			bestWorld, bestUnits, bestCount, bestIndex = worlds[index], units, count, index
-		end
-	end
-	cache.worldIndex = bestIndex
-	return bestWorld, bestUnits
-end
 
 --- 玩家 avatar 的资源路径。同一个角色的所有玩家共用这一个资源，所以
 --- `World.units_by_resource(world, 路径)` **一次调用**就能把场上所有玩家列出来，
@@ -451,10 +408,16 @@ local function cameraPosition(S_, world, cache)
 	return x, y, z
 end
 
---- 场上**所有**玩家 avatar。判据两级：
----   ① `World.units_by_resource(world, avatar 资源路径)` —— 精确、一次调用。
----   ② 拿不到（老版本没这个函数 / 资源路径变了）才退回全量扫描"有动画状态机 + 带 support_mg"。
---- 两种都要求"带 support_mg"：那是玩家 avatar 的挂点骨，人台/敌人没有。
+--- 本帧的相机位置：physics_sync 已经读过就直接用（IAS 每帧只读一次相机，R:1335），否则才问引擎。
+local function frameCamera(S_, runtime)
+	local cached = runtime.poseCamera
+	if cached ~= nil and cached.frame == runtime.frame and cached.z ~= nil and runtime.world == cached.world then
+		return cached.x, cached.y, cached.z
+	end
+	return cameraPosition(S_, runtime.world, runtime.cache or {})
+end
+
+--- 本帧内缓存的"有没有动画状态机"（每个 unit 每帧至多问一次）。
 local function frame_animation_machine(runtime, unit)
 	local cache = runtime.frameAnimation
 	if not cache then
@@ -466,219 +429,6 @@ local function frame_animation_machine(runtime, unit)
 	animation = { active = try(S.Unit.has_animation_state_machine, unit) == true }
 	cache[unit] = animation
 	return animation, 1
-end
-
-local function findAvatars(S_, world, units, count, supportMg, minNodes, options, cache, runtime)
-	local resource = options.avatarResource or DEFAULT_AVATAR_RESOURCE
-	local byResource = nil
-	if type(S_.World) == "table" and type(S_.World.units_by_resource) == "function" then
-		byResource = try(S_.World.units_by_resource, world, resource)
-	end
-
-	local function collect(candidates, requireAnim)
-		local list, seen, noAnim = {}, {}, 0
-		for index = 1, #candidates do
-			local unit = candidates[index]
-			if unit ~= nil and seen[unit] == nil then
-				seen[unit] = true
-				if Compat.unit_alive(S_, unit) then
-					local nodes = try(S_.Unit.num_scene_graph_items, unit)
-					if type(nodes) == "number" and nodes >= minNodes
-						and (supportMg == nil or try(S_.Unit.has_node, unit, supportMg) == true) then
-						if requireAnim and not frame_animation_machine(runtime, unit).active then
-							noAnim = noAnim + 1
-						else
-							list[#list + 1] = { unit = unit, nodes = nodes }
-						end
-					end
-				end
-			end
-		end
-		return list, noAnim
-	end
-
-	local list, dropped = nil, 0
-	if type(byResource) == "table" and #byResource > 0 then
-		cache.avatarSource = "units_by_resource"
-		-- 先要求"有动画状态机"：载具/人台这类同资源的东西通常没有状态机，这一条把它们挡在外面。
-		list, dropped = collect(byResource, true)
-		-- 但绝不因为这一条把所有人都挡掉：退回"只要有 support_mg 就算"。
-		if #list == 0 then list, dropped = collect(byResource, false) end
-	else
-		cache.avatarSource = "scan"
-		local scanned = {}
-		for index = 1, count do
-			local unit = units[index]
-			if unit ~= nil and frame_animation_machine(runtime, unit).active then scanned[#scanned + 1] = unit end
-		end
-		list = collect(scanned, true)
-	end
-	-- 把"同资源但没有动画状态机"的数量报出来：实机里"某个队友没挂上"到底是没找到、
-	-- 还是被这一条挡掉了，只有这个数字能分辨。
-	cache.avatarDroppedNoAnim = dropped
-	return list
-end
-
---- 一趟扫完：**所有**玩家 avatar + 候选护甲件（存活、节点数够），
---- 每个护甲件归属到"离它最近的那个玩家"，按玩家顺序排序。
---- 返回 nil + 原因 表示"还没准备好"（场景在变 / 找不到目标），调用方下一拍再来。
-local function discover(S_, cache, options, logger, runtime)
-	local world, units = pickWorld(S_, cache)
-	if world == nil or units == nil then return nil, "读不到世界或 unit 列表" end
-	local count = #units
-	local previous = cache.lastUnitCount
-	cache.lastUnitCount = count
-	-- 场景还在加载/切换（unit 总数在变）⇒ 不做全量扫描，下一拍再来。
-	-- E12c：战斗里弹体/碎片每帧增减几十到几百个，原来"总数必须完全相同"在战斗中永远过不了，
-	-- 于是"发现目标失败"每 20 帧重试一次永不放弃。现在只有总数变化超过 25%（且 > 500）才算换场景。
-	if previous ~= count then
-		local delta = previous ~= nil and math.abs(count - previous) or math.huge
-		if previous == nil or (delta > 500 and delta > 0.25 * math.max(previous, 1)) or count < 2000 and delta > 0 then
-			return nil, "unit 总数在变（加载/切场景中）"
-		end
-	end
-
-	-- 挂点按**名字**问（`IdString32` 会失效，见 compat 里 `rig_bone_names` 的说明）。
-	local supportMg = SUPPORT_MG_NAME
-	local minNodes = options.minNodes or 90
-	-- 候选上限。**曾经是 64**，而实机在任务里"近距 29 + 远端 35 = 64"正好顶满 ——
-	-- 也就是说候选表被截断在 64，真护甲有可能压根没进表（谁进表取决于引擎枚举顺序）。
-	-- 现在打分是按拍额度的（`scoreUnitsPerFrame`），列表长一点也不多花每拍的钱，
-	-- 所以放宽到 128：多花的只是 discover 里每件 2 次调用（节点数 + support_mg）。
-	local maxUnits = options.maxUnits or 128
-	local maxAvatars = options.maxAvatars or 4
-
-	-- ① 找全所有玩家。
-	local avatars = findAvatars(S_, world, units, count, supportMg, minNodes, options, cache, runtime)
-	if #avatars == 0 then
-		cache.worldIndex = nil   -- 可能选错了世界，下一拍重新挑
-		return nil, string.format("没找到玩家 avatar（%d 个 unit，判据=%s%s）",
-			count, tostring(cache.avatarSource),
-			(cache.avatarDroppedNoAnim or 0) > 0
-				and string.format("，另有 %d 个同资源 unit 因没有动画状态机被跳过", cache.avatarDroppedNoAnim)
-				or "")
-	end
-	if (cache.avatarDroppedNoAnim or 0) > 0 and cache.avatarDroppedLogged ~= true then
-		cache.avatarDroppedLogged = true
-		logger(string.format(
-			"[physbone][玩家] 找到 %d 个玩家；另有 %d 个同资源 unit 没有动画状态机，按载具/人台处理（跳过）",
-			#avatars, cache.avatarDroppedNoAnim))
-	end
-
-	-- ② 位置 + 排序。相机距离最近的那个＝自己（第一人称时相机就在自己头上）。
-	local camX, camY, camZ = cameraPosition(S_, world, cache)
-	if cache.cameraLogged ~= true then
-		cache.cameraLogged = true
-		-- 这条只打一次：实机排查时"第一个到底是不是我"完全取决于它，
-		-- 而 debug_camera_pose 在某些版本上返回的是开发自由相机，那种情况下排序会退化。
-		logger(string.format("[physbone] 玩家排序依据：%s",
-			camX ~= nil and "相机位置（最近的那个＝自己）" or "读不到相机 ⇒ 只按节点数排（功能不受影响）"))
-	end
-	for index = 1, #avatars do
-		local avatar = avatars[index]
-		local ax, ay, az = readVector(S_, try(S_.Unit.world_position, avatar.unit, 1))
-		avatar.x, avatar.y, avatar.z = ax, ay, az
-		if camX ~= nil and ax ~= nil then
-			local dx, dy, dz = ax - camX, ay - camY, az - camZ
-			avatar.cameraDistance = dx * dx + dy * dy + dz * dz
-		end
-	end
-	table.sort(avatars, function(a, b)
-		local da, db = a.cameraDistance, b.cameraDistance
-		if da ~= nil and db ~= nil then return da < db end
-		if da ~= nil then return true end
-		if db ~= nil then return false end
-		return (a.nodes or 0) > (b.nodes or 0)
-	end)
-	if #avatars > maxAvatars then
-		-- 上限只防"某个场景里有几十个 avatar 资源实例"把预算吃光；正常对局是 1~4。
-		for index = #avatars, maxAvatars + 1, -1 do table.remove(avatars, index) end
-	end
-	for index = 1, #avatars do
-		avatars[index].order = index
-		avatars[index].tag = nil   -- 实例名等真要挂载时再读（每个 unit 一次引擎调用）
-	end
-
-	-- ③ 护甲候选：扫一遍 unit。avatar 自己不进候选（它们是骨架，不是护甲件）。
-	local avatarUnits = {}
-	for index = 1, #avatars do avatarUnits[avatars[index].unit] = avatars[index] end
-
-	local withMg, withoutMg = {}, {}
-	-- E12c：逐个 unit 问节点数是实机里 11.7 万次/帧尖峰的来源（15 000 个 unit × 多次调用）。
-	--   ① 判活改用本帧 `World.units` 索引（在表里就是活的），不再每个 unit 调 `Unit.alive`；
-	--   ② "节点数不够 = 不是护甲"的结论按 unit 缓存 600 帧（只缓存否定结论，防指针复用误伤）；
-	--   ③ 一次最多新探 `discoverProbeBudget`（默认 3000）个 unit，超出就分片到下一拍继续，缓存保留。
-	local frameNow = runtime and runtime.frame or 0
-	local negative = cache.nodeNegative
-	if negative == nil or (cache.nodeNegativeBuilt or 0) + 600 <= frameNow then
-		negative = {}
-		cache.nodeNegative, cache.nodeNegativeBuilt = negative, frameNow
-	end
-	local live = runtime and runtime.liveIndexUnits == units and runtime.liveIndex or nil
-	local stamp = runtime and runtime.liveStamp
-	local budget = options.discoverProbeBudget or 3000
-	local probed, sliced = 0, false
-	for index = 1, count do
-		local unit = units[index]
-		if avatarUnits[unit] == nil and negative[unit] == nil
-			and (live ~= nil and live[unit] == stamp or live == nil and Compat.unit_alive(S_, unit)) then
-			if probed >= budget then sliced = true break end
-			probed = probed + 1
-			local nodes = try(S_.Unit.num_scene_graph_items, unit)
-			if type(nodes) == "number" and nodes < minNodes then negative[unit] = true end
-			if type(nodes) == "number" and nodes >= minNodes then
-				if try(S_.Unit.has_node, unit, supportMg) == true then
-					if #withMg < maxUnits then
-						withMg[#withMg + 1] = { unit = unit, nodes = nodes, mg = true }
-					end
-				elseif #withoutMg < maxUnits then
-					withoutMg[#withoutMg + 1] = { unit = unit, nodes = nodes, mg = false }
-				end
-			end
-		end
-	end
-	if sliced then
-		return nil, string.format("扫描分片中（本拍新探 %d 个 unit，缓存否定 %d 个）", probed, 0)
-	end
-	local armorList = withMg
-	for _, candidate in ipairs(withoutMg) do
-		if #armorList >= maxUnits then break end
-		armorList[#armorList + 1] = candidate
-	end
-	if #armorList == 0 then
-		return nil, string.format("没有候选护甲件（%d 个 unit，节点数门槛 %d）", count, minNodes)
-	end
-
-	-- ④ 归属：每个候选件属于**离它最近的那个玩家**。
-	--    玩家那套护甲挂在 avatar 骨架上，位置几乎重合；队友的在队友身上；尸体/人台离谁都远。
-	--    这一个不等式就是全部事实来源——不需要问"谁是主件"，也不会因为"多出来一个候选"就误判换人。
-	for _, candidate in ipairs(armorList) do
-		local ux, uy, uz = readVector(S_, try(S_.Unit.world_position, candidate.unit, 1))
-		if ux ~= nil then
-			local best, bestDistance = avatars[1], math.huge
-			for index = 1, #avatars do
-				local avatar = avatars[index]
-				if avatar.x ~= nil then
-					local dx, dy, dz = ux - avatar.x, uy - avatar.y, uz - avatar.z
-					local distance = dx * dx + dy * dy + dz * dz
-					if distance < bestDistance then best, bestDistance = avatar, distance end
-				end
-			end
-			candidate.owner = best
-			candidate.distance = bestDistance
-		else
-			candidate.owner = avatars[1]
-			candidate.distance = math.huge
-		end
-	end
-	table.sort(armorList, function(a, b)
-		local oa = a.owner ~= nil and a.owner.order or 99
-		local ob = b.owner ~= nil and b.owner.order or 99
-		if oa ~= ob then return oa < ob end
-		if a.mg ~= b.mg then return a.mg end
-		return (a.distance or math.huge) < (b.distance or math.huge)
-	end)
-	return world, units, avatars, armorList
 end
 
 --- 从部署后的 patch 尾部读物理容器。返回 { { rig = ..., path = ... }, ... }。
@@ -773,195 +523,6 @@ end
 -- ---------------------------------------------------------------------------
 -- 挂载 / 卸载
 -- ---------------------------------------------------------------------------
-
--- ---------------------------------------------------------------------------
--- 身份判据：**哪个 unit 是玩家真正在操作的那几件**
---
--- 为什么这是这个功能的核心难题（2026-11-12，用户点出来的）：
--- 算力根本不是瓶颈 —— 4 个玩家 × 每人数件 × 39 条链，全拉满也远在 5 ms 以内。
--- 真正的浪费全来自"驱动了不该驱动的 unit"：军械库里几十件**同资源、同骨名**的
--- 人台/预览/克隆，`has_node` 全命中，和玩家身上那套**无法用骨头区分**。
---
--- 那就别看骨头了，看**行为**：玩家身上那件是挂在玩家骨架上的，玩家一动它就动；
--- 人台/预览固定在房间里，永远不动。这条判据不需要任何新的引擎能力，也无法被
--- "同资源同骨名"骗过去。
--- ---------------------------------------------------------------------------
-
---- 累计一个 unit 的位移（米）。每拍采一次 `world_position(unit, 1)`。
---- 存的是**累计量**而不是瞬时速度：两次尝试可能隔几十帧，累计量对采样间隔不敏感。
----
---- ⚠️ 必须先过 `unit_alive`：销毁后再读 world_position 是**原生 AV**（转储 0xc0000005 / 参数 0x0 0x0），
---- `pcall` 拦不住。identity_watch 每 20 帧都会对会话采一次，而这期间 unit 完全可能已经被销毁
---- （换甲 / 阵亡 / 场景拆解）—— 这是本函数唯一真正的危险点，别省这一个调用。
-local function motion_sample(runtime, S_, unit)
-	local track = runtime.motion
-	if track == nil then
-		track = setmetatable({}, { __mode = "k" })
-		runtime.motion = track
-	end
-	if Compat.unit_alive(S_, unit) ~= true then return nil end
-	local entry = track[unit]
-	if entry == nil then
-		entry = { moved = 0 }
-		track[unit] = entry
-	end
-	local x, y, z = readVector(S_, try(S_.Unit.world_position, unit, 1))
-	if x ~= nil then
-		local last = entry.pos
-		if last ~= nil then
-			local dx, dy, dz = x - last[1], y - last[2], z - last[3]
-			entry.moved = entry.moved + math.sqrt(dx * dx + dy * dy + dz * dz)
-		end
-		entry.pos = { x, y, z }
-	end
-	return entry
-end
-
---- 这个 unit 是不是"跟着那个玩家走"的那一件。
---- 返回 follows（true/false/nil=还没数据）、自身位移、主人位移。
----
---- 判据：主人的累计位移足够大（>5 cm，说明玩家真的动过）时，
---- 候选自己的累计位移**至少要有主人的一半**才算"跟着"。人台是 0，直接出局。
-local function motion_follows(runtime, ownerUnit, unit)
-	local track = runtime.motion
-	if track == nil or ownerUnit == nil then return nil, 0, 0 end
-	local selfEntry, ownerEntry = track[unit], track[ownerUnit]
-	if selfEntry == nil or ownerEntry == nil then return nil, 0, 0 end
-	local ownerMoved = ownerEntry.moved or 0
-	if ownerMoved < 0.05 then return nil, selfEntry.moved or 0, ownerMoved end
-	return (selfEntry.moved or 0) >= ownerMoved * 0.5, selfEntry.moved or 0, ownerMoved
-end
-
---- 身份监视：定期采"谁在动"，并把"玩家动它不动"的件放掉。
----
---- 为什么放在每帧入口而不是 `tryAttach`（T21 抓到的）：`tryAttach` 只在"需要补挂"时才跑；
---- 一旦挂好了就不再调用，于是那些在**有活动量数据之前**挂上去的人台会一直挂着。
---- 身份纠正必须持续跑到分类稳定，所以在 drive 里按固定间隔跑。
---- 成本：每 20 帧一次，每个玩家/会话各 1 次 `world_position`（纯读）。
-local function identity_watch(S_, runtime)
-	local options = runtime.options or {}
-	if options.identityWatch == false then return end
-	local every = math.max(2, math.floor(options.identityPollFrames or 20))
-	local frame = runtime.frame or 0
-	if (frame % every) ~= 0 then return end
-	for index = 1, #(runtime.avatars or {}) do
-		motion_sample(runtime, S_, runtime.avatars[index].unit)
-	end
-	local sessions = runtime.sessions or {}
-	for index = 1, #sessions do motion_sample(runtime, S_, sessions[index].unit) end
-	if #sessions == 0 then return end
-
-	local followCount = {}
-	for _, session in ipairs(sessions) do
-		if motion_follows(runtime, session.owner, session.unit) == true then
-			local key = session.owner or false
-			followCount[key] = (followCount[key] or 0) + 1
-		end
-	end
-	local survivors, released, tags = {}, 0, nil
-	for _, session in ipairs(sessions) do
-		local key = session.owner or false
-		-- 只在"这个主人确实有跟着动的件"时才放掉静止的那些 —— 玩家还没动过时一件都不放。
-		if motion_follows(runtime, session.owner, session.unit) == false and (followCount[key] or 0) > 0 then
-			released = released + 1
-			if tags == nil then tags = {} end
-			if #tags < 4 then tags[#tags + 1] = tostring(session.unitTag) end
-			if Compat.unit_alive(S_, session.unit) then pcall(Compat.release, session) end
-		else
-			survivors[#survivors + 1] = session
-		end
-	end
-	if released > 0 then
-		runtime.sessions = survivors
-		runtime.logger("[physbone][识别] 放掉 %d 件「玩家动它不动」的件（人台/预览），剩 %d 件（%s）",
-			released, #survivors, tags ~= nil and table.concat(tags, ",") or "")
-	end
-end
-
---- 身份类 API 探针：**成组执行 + 断点续测**（`probeIdentity = 1` 时才跑）。
----
---- 为什么要"成组 + 断点续测"（2026-11-12 用户的原话）：一次只测一个是低效率的，
---- 而崩溃本身不是坏事 —— 坏的是"崩了但不知道为什么"。
---- 所以这里：
----   ① 一个进程里把候选接口**全跑一遍**（不是一次一个）；
----   ② **每次调用前**先落一行日志、并先把进度写盘（`next = N+1`）；
----   ③ 万一某个调用把进程打死（原生 AV，pcall 拦不住），进度已经落盘 ⇒
----      下次启动自动从下一个继续，**不需要改任何东西**；
----   ④ 于是"最坏情况崩 N 次"就换来 N 个接口的确定答案，而且每次崩溃都自带名字。
----
---- 进度文件：`%LOCALAPPDATA%\hd2pbx_probe.txt`。写 `next = 0` 表示全部跑完。
---- ⚠️ 默认**关闭**：这些签名从没验证过，且已知能崩（2.1.34 事故，见 docs/agent 的 §13）。
-local function probe_identity_api(runtime, S_, candidate, owner)
-	if runtime.apiProbed == true or candidate == nil or candidate.unit == nil then return end
-	runtime.apiProbed = true
-	local logger = runtime.logger
-	local unit = candidate.unit
-	local ownerUnit = owner ~= nil and owner.unit or nil
-	local base = os.getenv("LOCALAPPDATA") or "."
-	local markerPath = base .. "\\hd2pbx_probe.txt"
-
-	local function readNext()
-		local handle = io.open(markerPath, "r")
-		if handle == nil then return 1 end
-		local text = handle:read("*a") or ""
-		handle:close()
-		local value = tonumber(text:match("next%s*=%s*(%-?%d+)"))
-		return value or 1
-	end
-	local function writeNext(value)
-		local handle = io.open(markerPath, "w")
-		if handle == nil then return end
-		handle:write(string.format("next = %d\n", value))
-		handle:close()
-	end
-	local function repr(value)
-		if type(value) == "table" or type(value) == "userdata" then
-			local okName, name = pcall(function() return S_.Unit.debug_name(value) end)
-			if okName and name ~= nil then return tostring(name) end
-			return type(value)
-		end
-		return tostring(value)
-	end
-
-	local tag = unit_tag(S_, unit)
-	local ownerTag = ownerUnit ~= nil and unit_tag(S_, ownerUnit) or "?"
-	-- 第 1 条是**已知可用**的对照（debug_name）：如果连它都没落下来，
-	-- 说明问题在探针本身（或者日志没刷），不是在被探的 API 上。
-	local steps = {
-		{ "debug_name（对照，已知可用）", function() return S_.Unit.debug_name(unit) end },
-		{ "is_a(unit,'Unit')", function() return S_.Unit.is_a(unit, "Unit") end },
-		{ "has_mesh(unit)", function() return S_.Unit.has_mesh(unit) end },
-		{ "num_meshes(unit)", function() return S_.Unit.num_meshes(unit) end },
-		{ "bones(unit)", function() return S_.Unit.bones(unit) end },
-		{ "scene_graph_parent(unit,1)", function() return S_.Unit.scene_graph_parent(unit, 1) end },
-		{ "scene_graph_link(unit,1)", function() return S_.Unit.scene_graph_link(unit, 1) end },
-		{ "is_child(unit,owner)", function() return S_.Unit.is_child(unit, ownerUnit) end },
-		{ "is_child(owner,unit)", function() return S_.Unit.is_child(ownerUnit, unit) end },
-		{ "Application.main_world()", function() return S_.Application.main_world() end },
-		{ "World.entities(world)", function() return S_.World.entities(runtime.world) end },
-	}
-	local startAt = readNext()
-	if startAt < 1 or startAt > #steps then
-		if startAt > #steps then logger("[physbone][识别API] 全部跑完（%d 项），不再探", #steps) end
-		return
-	end
-	logger("[physbone][识别API] 共 %d 项，从 #%d 开始（目标 %s，归属 %s）", #steps, startAt, tag, ownerTag)
-	for index = startAt, #steps do
-		local step = steps[index]
-		-- 写前落盘：这一行是"断点"。崩在下面那行之后，下次就会从 index+1 继续。
-		writeNext(index + 1)
-		logger("[physbone][识别API] #%d 开始 %s", index, step[1])
-		local ok, value = pcall(step[2])
-		if not ok then
-			local text = tostring(value):gsub("^.*:%d+: ", "")
-			logger("[physbone][识别API] #%d ⇒ 抛错(%s)", index, text:sub(1, 70))
-		else
-			logger("[physbone][识别API] #%d ⇒ %s %s", index, type(value), repr(value):sub(1, 40))
-		end
-	end
-	writeNext(#steps + 1)
-	logger("[physbone][识别API] 全部 %d 项跑完", #steps)
-end
 
 --- 身份链探针：**这件护甲 unit 与玩家 avatar 在场景图里有没有结构关系**。
 ---
@@ -1065,695 +626,12 @@ local function probe_identity_link(runtime, S_)
 	logger("[physbone][身份链] 全部 %d 项跑完", #steps)
 end
 
---- 一次性"候选普查 + has_node / node 交叉验证"（**只在异常态触发**）。
-local function dump_census(runtime, S_, nearCandidates, farCount, carriers)
-	local firstTag = nearCandidates[1] ~= nil and unit_tag(S_, nearCandidates[1].unit) or "?"
-	local key = tostring(#nearCandidates) .. "|" .. firstTag .. "|" .. tostring(farCount)
-	local seen = runtime.censusSeen
-	if seen == nil then
-		seen = {}
-		runtime.censusSeen = seen
-	end
-	if seen[key] == true or (runtime.censusCount or 0) >= 6 then return end
-	seen[key] = true
-	runtime.censusCount = (runtime.censusCount or 0) + 1
-
-	-- ① 候选是谁：把 resource_name 去重 + 节点数直方图（一行的字节数要可控）
-	local byResource, order, nodes = {}, {}, {}
-	for index = 1, #nearCandidates do
-		local candidate = nearCandidates[index]
-		local resource = tostring(try(S_.Unit.resource_name, candidate.unit) or "?")
-		if byResource[resource] == nil then
-			byResource[resource] = 0
-			order[#order + 1] = resource
-		end
-		byResource[resource] = byResource[resource] + 1
-		local count = candidate.nodes or 0
-		nodes[count] = (nodes[count] or 0) + 1
-	end
-	local resourceParts = {}
-	for index = 1, #order do
-		resourceParts[#resourceParts + 1] = string.format("%s×%d",
-			(tostring(order[index]):gsub(".*[\\/]", "")), byResource[order[index]])
-	end
-	local nodeParts = {}
-	for _, count in ipairs({ 171, 148, 132, 121, 108, 96 }) do
-		if nodes[count] ~= nil then nodeParts[#nodeParts + 1] = string.format("%d节×%d", count, nodes[count]) end
-	end
-	runtime.logger("[physbone][普查] 近距 %d 件 / 远端 %d 件 · 资源：%s · 节点：%s",
-		#nearCandidates, farCount,
-		#resourceParts > 0 and table.concat(resourceParts, "、") or "?",
-		#nodeParts > 0 and table.concat(nodeParts, " ") or "?")
-
-	-- ② 交叉验证：容器 #1 的首骨 vs 一个绝不存在的名字。
-	-- **一律按名字问**（`has_node(unit, "骨名")`），并按 id 问一次做对照 ——
-	-- 我们自己的 snapshot 探针早有结论：`string_to_id32` 返回的 `IdString32` 会失效，
-	-- 拿它做 `has_node` 会全 false / 抛错。这一行就是用来把这两种情况分开的。
-	local probeUnit = nearCandidates[1] ~= nil and nearCandidates[1].unit or nil
-	local carrier = carriers[1]
-	local firstBone = carrier ~= nil and carrier.rig ~= nil and type(carrier.rig.bones) == "table"
-		and carrier.rig.bones[1] or nil
-	if probeUnit == nil or firstBone == nil then return end
-
-	local function errText(ok, value)
-		if ok then return tostring(value) end
-		return "抛错(" .. tostring(value):gsub("^.*:%d+: ", "") .. ")"
-	end
-	local function describe(label, name)
-		local aliases = Compat.bone_name_aliases(name) or { name }
-		local okHas, has = pcall(S_.Unit.has_node, probeUnit, aliases[1])
-		local okNode, node = pcall(S_.Unit.node, probeUnit, aliases[1])
-		-- 再按 id 问一次（对照）：如果名字为 true 而 id 抛错/false，就证明"存 id"这条路是坏的。
-		local okId, id = pcall(function() return S_.Application.string_to_id32(aliases[1]) end)
-		local idText = "id=?"
-		if okId and id ~= nil then
-			local okHasId, hasId = pcall(S_.Unit.has_node, probeUnit, id)
-			idText = "has_node(id)=" .. errText(okHasId, hasId) .. " type(id)=" .. type(id)
-		end
-		return string.format("%s has_node(名)=%s node=%s %s", label,
-			errText(okHas, has), errText(okNode, node), idText)
-	end
-	runtime.logger("[physbone][普查] %s（%d 节）对 %s（%d 骨）：%s ；%s ；%s",
-		unit_tag(S_, probeUnit), nearCandidates[1].nodes or 0,
-		(tostring(carrier.path):gsub(".*[\\/]", "")), #carrier.rig.bones,
-		describe("首骨", firstBone.name),
-		describe("末骨", carrier.rig.bones[#carrier.rig.bones].name),
-		describe("对照组", "__hd2pbx_absent__"))
-
-	-- ③ 对这一件做一次完整打分（只做一次）：直接看出"差几根骨"
-	local best, scored = Compat.select_rig(S_, { probeUnit }, carriers)
-	local top = {}
-	for index = 1, math.min(#(scored or {}), 3) do
-		top[#top + 1] = string.format("%d/%d",
-			scored[index].score, scored[index].total)
-	end
-	runtime.logger("[physbone][普查] 该件完整打分：%s ⇒ %s",
-		#top > 0 and table.concat(top, " ") or "无容器",
-		best ~= nil and (best.full and "全命中" or "未全命中") or "无 best")
-end
-
---- 就绪采样 + 增量挂载。
----
---- "增量"是这一版的核心：**只补新 unit、只释放主人已经不在的会话**。
---- 以前是"一有变化就把全部会话丢掉重挂"，多人局里那等于每次有人加入/复活都让所有人
---- 短暂失去物理（而且会把会话挂到错误的玩家身上）。
----
---- 返回 true 表示这一趟真的跑完了（不论有没有新挂上的），false 表示还在等场景稳定。
 --- 相位标记（诊断）：调参文件 `phaseLog = 1` 打开。
 --- 只在排查崩溃时开 —— 打开后每帧会多出十来行（attach/写骨/裙摆各一段）。
 --- 用途：崩了之后看最后一条 `[相位]` 就知道死在**哪个阶段**，不用猜。
 local function phase(runtime, name)
 	if (tune_values(runtime).phaseLog or 0) == 0 then return end
 	runtime.logger("[physbone][相位] %s", name)
-end
-
---- 取某个 bone 名的世界坐标（读不到返回 nil，绝不抛）。
-local function ident_node_pos(S_, unit, name)
-	if S_.Unit == nil or unit == nil then return nil end
-	local okHas, has = pcall(S_.Unit.has_node, unit, name)
-	if not okHas or has ~= true then return nil end
-	local okNode, node = pcall(function() return S_.Unit.node(unit, name) end)
-	if not okNode or type(node) ~= "number" or node < 1 then return nil end
-	local ok, x, y, z = pcall(function()
-		return S_.Vector3.to_elements(S_.Unit.world_position(unit, node))
-	end)
-	if ok and type(x) == "number" then return x, y, z end
-	return nil
-end
-
---- 身份位置诊断（`identLog = 1`）：护甲 hips 与主人 hips 的世界坐标差（米）。
---- 依据：真正**穿在身上**的护甲，hips 与 avatar 的 hips 几乎同点（同一副骨架、被骨架驱动）；
---- 展台件站在台子上，哪怕离你很近，hips 也会差出几十厘米到几米。
---- 只写日志，不参与任何判定。
-local function ident_log_positions(runtime, S_, entry, session)
-	local ux, uy, uz = ident_node_pos(S_, entry.unit, "hips")
-	local ox, oy, oz = ident_node_pos(S_, entry.owner.unit, "hips")
-	if ux == nil or ox == nil then
-		runtime.logger("[physbone][识别·位置] unit=%s 读不到 hips（护甲=%s 主人=%s）",
-			tostring(entry.tag), tostring(ux ~= nil), tostring(ox ~= nil))
-		return
-	end
-	local dx, dy, dz = ux - ox, uy - oy, uz - oz
-	local metres = math.sqrt(dx * dx + dy * dy + dz * dz)
-	runtime.logger("[physbone][识别·位置] unit=%s 链=%d hipsΔ=%.3f m（护甲 %.2f,%.2f,%.2f / 主人 %.2f,%.2f,%.2f）",
-		tostring(entry.tag), #(session.sessions or {}), metres, ux, uy, uz, ox, oy, oz)
-end
-
-local function tryAttach(runtime)
-	local options, cache = runtime.options, runtime.cache
-	local frame = runtime.frame
-	local world, units, avatars, armorList, reason = discover(S, cache, options, runtime.logger, runtime)
-	if world == nil or armorList == nil or avatars == nil then
-		note_wait(runtime, reason or "发现目标失败（未给出原因）")
-		return false
-	end
-	local armor = armorList[1]
-
-	-- 诊断开关（`discoverOnly = 1`）：只做发现，**不挂载、不持有任何 unit 句柄**。
-	-- 用途（2026-11-11）：已确认"写骨"不是触发点（writeOff=1 仍崩）。
-	-- 于是要把"扫描 unit"与"挂载并持有句柄"分开：
-	--   不崩 ⇒ 触发点是挂载/持有句柄；
-	--   还崩 ⇒ 连扫描都不能做（那就是更底层的事）。
-	if (tune_values(runtime).discoverOnly or 0) ~= 0 then
-		if not runtime.discoverOnlyLogged then
-			runtime.discoverOnlyLogged = true
-			runtime.logger("[physbone][诊断] discoverOnly=1 ⇒ 只扫描不挂载（找到 %d 个 avatar、%d 个护甲候选）",
-				#avatars, #armorList)
-		end
-		return false
-	end
-
-	local nodeCount = try(S.Unit.num_scene_graph_items, armor.unit)
-	if type(nodeCount) ~= "number" or nodeCount < 10 then
-		note_wait(runtime, "主件节点数异常", tostring(nodeCount))
-		return false
-	end
-	local sample = readVector(S, try(S.Unit.world_position, armor.unit, 1))
-	if sample == nil then
-		note_wait(runtime, "主件世界坐标读不到")
-		return false
-	end
-
-	-- 两次采样一致 ⇒ 加载/传送/换装已经结束。间隔太短容易在动画还没落位时就 attach。
-	-- ⚠️ 采样一旦记下就**不要每帧覆盖**，否则 (frame - previous.frame) 永远是 1，永远等不到。
-	-- 这一步是正常路径（10 帧内必然过去），所以不记等待原因，免得盖掉真正的卡点。
-	local settleFrames = options.settleFrames or 10
-	local previous = cache.settle
-	if previous == nil or previous.nodes ~= nodeCount then
-		cache.settle = { x = sample, frame = frame, nodes = nodeCount }
-		return false
-	end
-	if (frame - previous.frame) < settleFrames then return false end
-	cache.settle = nil
-
-	-- 逐 unit 选容器：每个 unit 只认"全命中"的那一份，没有就跳过（宁可不驱动也不写错参数）。
-	-- `options.carriers` 可以直接注入（测试 / 由管理器把容器内容传进来时用），省掉扫盘。
-	local carriers = runtime.carriers
-	if carriers == nil then
-		local raw = options.carriers
-		if raw == nil or #raw == 0 then raw = loadCarriers(S, cache, options, runtime.logger) end
-		local removed
-		carriers, removed = filterCarriers(raw, runtime.iasPhysicsGroups)
-		if #raw > 0 then runtime.carriers = carriers end
-		if removed > 0 and not runtime.iasFilterLogged then
-			runtime.logger("[physbone] IAS 可选组掩码=%d，排除 %d 条骨记录",
-				runtime.iasPhysicsGroups, removed)
-			runtime.iasFilterLogged = true
-		end
-	end
-	local allowPartial = options.allowPartial == true
-	-- 只挂**离它那个玩家**近的护甲件。为什么必须过滤：阵亡后尸体留在原地、unit 一直活着，
-	-- 而复活点常在别处 ⇒ 不过滤的话会把尸体也一起挂上（既浪费，也让"给尸体关物理"落空）。
-	-- 注意距离是"到**它自己那个玩家**"的：队友的护甲离队友近，不该因为离我远就被丢掉。
-	local maxDist = options.maxArmorDistance == nil and 5.0 or options.maxArmorDistance
-	local maxDist2 = maxDist > 0 and (maxDist * maxDist) or nil
-	local nearCandidates, farCount = {}, 0
-	for _, candidate in ipairs(armorList) do
-		if maxDist2 == nil or candidate.distance == nil or candidate.distance <= maxDist2 then
-			nearCandidates[#nearCandidates + 1] = candidate
-		else
-			farCount = farCount + 1
-		end
-	end
-	if farCount > 0 then
-		-- 节流：这个数会随玩家走动每拍都变（83/95/97…），逐拍打会把日志冲成一片噪音
-		-- （2026-11-12 实机：一局里几千行全是这句）。只在"数字变了"或每 300 帧打一次。
-		local last = runtime.farLog
-		if last == nil or last.count ~= farCount or (frame - last.frame) >= 300 then
-			runtime.farLog = { count = farCount, frame = frame }
-			runtime.logger("[physbone] 跳过 %d 个离它所属玩家超过 %.1f m 的护甲件（尸体/人台）", farCount, maxDist)
-		end
-	end
-	-- ---------- 活动量采样（身份判据的原料） ----------
-	-- 每件候选 + 每个玩家各 1 次 `world_position`：便宜，而且只在"重扫"时才跑。
-	for index = 1, #avatars do motion_sample(runtime, S, avatars[index].unit) end
-	for index = 1, #nearCandidates do motion_sample(runtime, S, nearCandidates[index].unit) end
-	-- ---------- 一次性诊断在"异常态"触发（见下面 fill 循环之后的调用） ----------
-	-- 给候选打分是这里最贵的一步（每份容器 × 每根骨一次 has_node）。
-	--
-	-- 2026-11-12 改法：**去掉"固定件数额度"**，换成"按 unit 缓存 + 每帧只新打分 N 件"。
-	--   为什么去额度：原来 `max(12, 4×玩家数)` 的额度让**自己**的件先占满（候选按 owner.order
-	--   排序），实测 2 人局 12 件里自己 9 件、队友只剩 3 件 —— 这就是"队友没物理"的直接原因。
-	--   为什么能去：匹配结果按 unit 记住以后，打过的下一拍成本≈0，所以进度是**单调**的，
-	--   不会再出现"每拍都从头打同一批"；跨拍装填时"这一拍打到哪"由下面的每帧上限控制。
-	local rigMatches = runtime.rigMatches
-	-- 容器集合变了（重新加载 boot / 换了物理包）⇒ 缓存必须整份失效，
-	-- 否则旧容器下"没命中"的结论会被继续沿用，那批件永远挂不上（T5 就是这么暴露的）。
-	local carrierKey = #carriers .. "|" .. tostring(carriers[1] ~= nil and carriers[1].path or "")
-	if runtime.rigMatchKey ~= carrierKey then
-		runtime.rigMatchKey = carrierKey
-		rigMatches = nil
-		runtime.bestScoredEver = nil
-		runtime.scoreAttemptAt = nil   -- 重试门也一起失效：否则新容器下要白等一轮 retryFrames
-		runtime.rigProbe = nil         -- 预筛结论同理（容器变了，"能不能全命中"要重算）
-		runtime.probeRejected = nil
-	end
-	if rigMatches == nil then
-		rigMatches = setmetatable({}, { __mode = "k" })   -- 弱键：unit 销毁后自动释放
-		runtime.rigMatches = rigMatches
-	end
-	local scoreUnitsPerFrame = options.scoreUnitsPerFrame or 2
-	-- 预筛（每份容器只问第 1 根骨，用来提前否掉"不可能全命中"的件）。
-	--
-	-- **默认关闭**（2026-11-12 实机教训）：它的前提是"`has_node` 说没有就真的没有"，
-	-- 而这个前提在任务里被证伪了 —— 同一份代码在舰船过 8 件、进任务后 5 分钟过 0 件，
-	-- 而用户明确说同一版本在任务里**本来是有物理的**（v1.5.14）。
-	-- 也就是说：这个"优化"会把真护甲挡在真打分之外，一个字节的收益都没有，风险却是全盘的。
-	-- 需要它时显式给 `probeUnitsPerFrame`（>0）即可，代价见下面那条注释。
-	--
-	-- 成本对比（用来决定要不要开）：预筛 = 每份容器 1 次调用（10 次）；
-	-- 真打分 = 骨数 × 容器数（57 × 10 ≈ 570 次，≈3 ms）。
-	local probeUnitsPerFrame = options.probeUnitsPerFrame or 0
-	-- 预筛只在"全命中才算数"时成立（`allowPartial` 时部分命中是合法的，不能筛）；
-	-- 外置包可能只更新了 runtime、没更新 compat ⇒ 没有这个函数就退回纯真打分。
-	local canProbe = not allowPartial
-		and type(Compat.probe_carriers) == "function"
-		and probeUnitsPerFrame > 0          -- 0 = 关掉预筛（默认）
-	-- 重试间隔（帧）。**只缓存正匹配**，没命中的件不写缓存、只记"上次打分帧"，到点再试。
-	-- 为什么不缓存负结论（2026-11-12 实机踩到）：unit 刚生成时骨骼可能还没就绪，第一拍
-	-- 打分得到"0 命中"；把它当永久结论的话这个 unit 再也不会被重试 —— 现象正是
-	-- "只有先就绪的头盔有物理、护甲的件永远没有"，换护甲后连头盔也没了。
-	local retryFrames = options.negativeRetryFrames or 30
-	local scoreAttemptAt = runtime.scoreAttemptAt
-	if scoreAttemptAt == nil then
-		scoreAttemptAt = setmetatable({}, { __mode = "k" })
-		runtime.scoreAttemptAt = scoreAttemptAt
-	end
-	-- 预筛结论（unit → true 表示"至少含一份容器的第 1 根骨 ⇒ 有可能全命中"）。
-	-- 弱键：unit 销毁后自动释放。
-	local rigProbe = runtime.rigProbe
-	if rigProbe == nil then
-		rigProbe = setmetatable({}, { __mode = "k" })
-		runtime.rigProbe = rigProbe
-	end
-	-- ---------- 处理顺序：**游标轮转**，不依赖任何"单位身份" ----------
-	--
-	-- 为什么不用"按上次处理帧排序"（那是 2.1.28 的做法）：那个排序依赖
-	-- `scoreAttemptAt[unit]` 能命中 —— 也就是依赖 unit 句柄在 Lua 侧**跨帧同一**。
-	-- 一旦这个假设不成立（弱键表里的 userdata 被回收、或引擎每次枚举都新建包装），
-	-- 排序就退化成"永远 index 序"，队首那几件被反复处理，后面的件永远轮不到 ——
-	-- 正是 2.1.27 那个"已打分 2 件、未轮到 15 件"一动不动的死结。
-	--
-	-- 游标只依赖一个整数，随便怎么变都能保证：**ceil(件数 / 每拍额度) 拍之内覆盖全部候选**。
-	local candidateCount = #nearCandidates
-	local cursor = candidateCount > 0 and ((runtime.fillCursor or 0) % candidateCount) or 0
-
-	local plan, bestScored = {}, nil
-	local scoredNow, probedNow, probedOpen, deferred = 0, 0, 0, 0
-	local lastWork = nil   -- 这一拍处理的最后一件是谁、结果如何（写进"装填中"那行，便于看游标在动）
-	local scoreClock = os.clock()
-	for step = 0, candidateCount - 1 do
-		local index = ((cursor + step) % candidateCount) + 1
-		local candidate = nearCandidates[index]
-		local match = rigMatches[candidate.unit]
-		local needsScore = false
-		if match == nil then
-			local last = scoreAttemptAt[candidate.unit]
-			needsScore = last == nil or (frame - last) >= retryFrames
-		end
-		-- ① 便宜预筛：连容器第 1 根骨都没有 ⇒ 一定不可能全命中，不必花真打分的钱。
-		--    只在"全命中才算数"时成立，所以 allowPartial 时整段跳过。
-		if needsScore and canProbe and rigProbe[candidate.unit] ~= true then
-			if probedNow >= probeUnitsPerFrame then
-				deferred = deferred + 1
-				needsScore = false
-			else
-				probedNow = probedNow + 1
-				local okProbe = Compat.probe_carriers(S, candidate.unit, carriers)
-				lastWork = string.format("%s·%d节·预筛%s", unit_tag(S, candidate.unit),
-					candidate.nodes or 0, okProbe and "过" or "挂")
-				if okProbe then
-					probedOpen = probedOpen + 1
-					rigProbe[candidate.unit] = true
-					-- 通过了就别记"打过分"：让它留在队首，下一拍直接真打分。
-				else
-					-- 记一次"处理过"，让它沉到队尾；到点再探（骨骼可能只是还没就绪）。
-					scoreAttemptAt[candidate.unit] = frame
-					runtime.probeRejected = (runtime.probeRejected or 0) + 1
-					if runtime.negativeRetryAt == nil or (frame + retryFrames) < runtime.negativeRetryAt then
-						runtime.negativeRetryAt = frame + retryFrames
-					end
-					needsScore = false
-				end
-			end
-		end
-		-- ② 真打分（贵）：只有"有可能全命中"的件才走到这里。
-		if needsScore then
-			if scoredNow >= scoreUnitsPerFrame then
-				deferred = deferred + 1
-			else
-				local best, scored = Compat.select_rig(S, { candidate.unit }, carriers)
-				scoredNow = scoredNow + 1
-				runtime.fillScoredTotal = (runtime.fillScoredTotal or 0) + 1
-				scoreAttemptAt[candidate.unit] = frame
-				lastWork = string.format("%s·%d节·打分%d/%d", unit_tag(S, candidate.unit),
-					candidate.nodes or 0,
-					scored ~= nil and scored[1] ~= nil and scored[1].score or 0,
-					scored ~= nil and scored[1] ~= nil and scored[1].total or 0)
-				-- ⚠️ `select_rig` 在**0 命中时也会返回非 nil 的 best**（它返回排序后的第一名）。
-				-- 所以"有 best"不等于"可用"。**0 命中必须当"不可用"**，否则这件既不挂载、也永不重试
-				-- （2026-11-12 实机：只有先就绪的头盔有物理，护甲的件全没有）。
-				--
-				-- 可用判据（2026-11-12 定稿）：
-				--   ① 不再要求**全命中** —— 转换器已经改成"每个 unit 只带自己用得到的那几根物理骨"
-				--      （`ExtraBoneSubset`），全命中永远不成立；
-				--   ② 也不再要求"覆盖 10% 的骨" —— 一件只带腿上两条缎带的 unit 在 57 骨的容器上只有
-				--      4 根（7%），按百分比门槛会被直接丢掉，实机表现就是"那块布没有物理"。
-				--      **这正是"限制掩盖真问题"的又一例**：门槛在防"撞上 1 根同名骨的垃圾件"，
-				--      代价却是把真目标判死。
-				-- ⇒ 判据只剩"命中 ≥1 根骨"，该不该挂、能驱动几条链交给 `Compat.attach` 说话：
-				--   它逐链解析节点，缺节点的链跳过，产不出任何链就当场放弃（日志会留一行）。
-				--   换来的成本是偶尔对一件垃圾件发一轮 attach（~骨数 次调用），值。
-				local usable = best ~= nil and (best.full or allowPartial or (best.score or 0) >= 1)
-				if usable then
-					match = { rig = best.rig, path = best.path, full = best.full == true }
-					rigMatches[candidate.unit] = match
-				else
-					match = nil
-					-- 判过"不可能全命中"的，允许下次重新探（骨骼可能只是还没就绪）。
-					rigProbe[candidate.unit] = nil
-				end
-				-- 无论可不可用都记下"最接近的那一份"：没挂上时它是唯一能指出"差几根骨"的线索。
-				-- 记到 runtime 上是因为跨拍装填的最后一拍可能全是缓存命中（本地 bestScored 为 nil）。
-				if not usable and scored ~= nil and scored[1] ~= nil then
-					if bestScored == nil or scored[1].score > bestScored.score then bestScored = scored[1] end
-					if runtime.bestScoredEver == nil or scored[1].score > runtime.bestScoredEver.score then
-						runtime.bestScoredEver = scored[1]
-					end
-				end
-				-- 不可用 ⇒ 不写缓存，只排一次重试（到点后再打）。
-				if not usable then
-					local retryAt = frame + retryFrames
-					if runtime.negativeRetryAt == nil or retryAt < runtime.negativeRetryAt then
-						runtime.negativeRetryAt = retryAt
-					end
-				end
-			end
-		end
-		-- 匹配可用即挂（可能是部分命中：attach 会逐链跳过缺节点的链，见上面 usable 那段说明）。
-		if match ~= nil and match.rig ~= nil then
-			plan[#plan + 1] = {
-				unit = candidate.unit, rig = match.rig, path = match.path, mg = candidate.mg,
-				tag = unit_tag(S, candidate.unit),
-				owner = candidate.owner,
-				distance2 = candidate.distance,   -- 到它主人的距离平方（用于"只留最近的几件"）
-			}
-		end
-	end
-	-- 打分的实测耗时（`os.clock` 是 CPU 时间，正是我们要守的那 5 ms 口径）。
-	-- 不单独打行：逐拍打会把日志预算吃光、反而把驱动心跳挤掉（mp_harness 的 900 字节
-	-- 预算就是这么发现的）。耗时并进下面那一条"已挂载"行。
-	runtime.lastScoreMs = (os.clock() - scoreClock) * 1000
-
-	-- ---------- 身份分流：只认"跟着玩家走"的件 ----------
-	--
-	-- 2026-11-12 用户定调（原话大意）：这些限制卵用没有，反而掩盖了真正的问题 —— **目标错了**。
-	-- 复盘确实如此：预筛把真护甲挡在外面、件数闸/距离闸掩盖"26 件同款全命中"、
-	-- 自己分帧直接造成闪烁。真正要解决的只有一件：**哪几件是玩家在操作的模型**。
-	--
-	-- 所以这里不再有"上限"，只有一条语义规则：
-	--   · 玩家动过之后 —— 跟着一起动的（`follows == true`）留下，不动的人台/预览（false）丢掉；
-	--   · 还没有活动量数据时（刚进场景 / 玩家还没走动）—— **先全收**，等数据到了由
-	--     `identity_watch` 把不跟随的放掉。宁可短暂多驱动几件，也不要用猜测去否决目标。
-	-- 代价是一次性尖峰（军械库里那几秒），换来的是"稳态只剩真目标"，而且没有任何会闪烁的节流。
-	local matchedCount = #plan
-	if matchedCount > 0 then
-		table.sort(plan, function(a, b)
-			local da = a.distance2 or math.huge
-			local db = b.distance2 or math.huge
-			if da ~= db then return da < db end
-			return tostring(a.tag) < tostring(b.tag)
-		end)
-		local kept, followed, static, unknown, followedTags = {}, 0, 0, 0, {}
-		local acceptedByOwner = {}
-		for _, entry in ipairs(plan) do
-			local key = entry.owner ~= nil and entry.owner.unit or nil
-			local follows = motion_follows(runtime, key, entry.unit)
-			local accept = follows ~= false        -- true 或"未知"都先收
-			if follows == true then
-				followed = followed + 1
-				if #followedTags < 6 then
-					followedTags[#followedTags + 1] = string.format("%s@%.2fm", tostring(entry.tag),
-						entry.distance2 ~= nil and math.sqrt(entry.distance2) or 0)
-				end
-			elseif follows == false then
-				static = static + 1
-			else
-				unknown = unknown + 1
-			end
-			entry.__accept = accept
-			if accept and key ~= nil then acceptedByOwner[key] = (acceptedByOwner[key] or 0) + 1 end
-		end
-		-- 兜底：某个玩家一件都没被接受 ⇒ 留他最近的一件（绝不挂零）。
-		for _, entry in ipairs(plan) do
-			local key = entry.owner ~= nil and entry.owner.unit or nil
-			if key ~= nil and (acceptedByOwner[key] or 0) == 0 and entry.__accept == false then
-				entry.__accept = true
-				acceptedByOwner[key] = 1
-				runtime.logger("[physbone][识别] 玩家 %s 没有「跟着动」的件 ⇒ 兜底留最近的一件 %s",
-					tostring(entry.owner ~= nil and entry.owner.tag or "?"), tostring(entry.tag))
-			end
-		end
-		for _, entry in ipairs(plan) do
-			if entry.__accept ~= false then kept[#kept + 1] = entry end
-			entry.__accept = nil
-		end
-		local dropped = matchedCount - #kept
-		if dropped > 0 then
-			plan = kept
-			if runtime.perOwnerLogged ~= true then
-				runtime.perOwnerLogged = true
-				runtime.logger("[physbone][识别] 命中 %d 件 ⇒ 挂 %d 件（跟随=%d 静止=%d 未知=%d）%s",
-					matchedCount, #plan, followed, static, unknown,
-					#followedTags > 0 and ("｜" .. table.concat(followedTags, " ")) or "")
-			end
-		end
-		-- 身份类 API 探针：**成组执行 + 断点续测**，**默认关闭**（调参文件写 `probeIdentity = 1` 才跑）。
-		-- 一个进程把 11 个接口全跑，进度落盘，崩了下次自动从下一个继续。
-		-- 不能默认开：这些签名没验证过，原生 AV 时 pcall 拦不住 —— 实机上普通玩家一进舰船
-		-- （有人台 ⇒ 同款命中多件）就会被连崩数次，探针结果却只写日志、不参与任何判定。
-		-- 放在"同款模型命中多件"的现场跑，因为那正是"分不清哪个是玩家模型"的地方。
-		if matchedCount > 1 and plan[1] ~= nil then
-			local probeSwitch = tune_values(runtime).probeIdentity
-			if probeSwitch ~= nil and probeSwitch ~= 0 then
-				pcall(probe_identity_api, runtime, S, plan[1], plan[1].owner)
-			end
-		end
-	end
-	-- **游标必须每拍前进。** 这是"覆盖全部候选"的唯一保证（不依赖 unit 句柄是否跨帧同一）：
-	-- 前进量 = 这一拍实际处理的件数（至少 1），于是 n 件候选在 ceil(n/额度) 拍内被覆盖一遍。
-	if candidateCount > 0 then
-		local advanced = math.max(1, scoredNow + probedNow)
-		runtime.fillCursor = (cursor + advanced) % candidateCount
-	end
-	-- 异常态：**一件都没挂上、而且这一拍真打分了却一件都没命中** ⇒ 打一次普查。
-	-- ⚠️ 判据里必须带 `#plan == 0`：只看"当前没有会话"的话，第一次成功挂载的那一拍也会中
-	-- （会话是在本函数后半段才建立的），于是在 mp_harness 的 900 字节预算用例里白花掉一大半。
-	if #plan == 0 and scoredNow > 0 and (#(runtime.sessions or {}) == 0) then
-		pcall(dump_census, runtime, S, nearCandidates, farCount, carriers)
-	end
-	if #plan == 0 then
-		if deferred > 0 then
-			-- 这拍额度用完了、还没轮到能命中的那件：不是失败，下一拍继续。
-			-- `fillPending` 也要立起来：等待期那套"等久了就放慢轮询"的退避**必须让位**给装填，
-			-- 否则额度 2 件/拍 + 1 秒一拍 = 十几件候选要十几秒才轮完（实机观感就是"进图后
-			-- 十几秒完全没物理，然后突然出现"）。
-			runtime.fillPending = true
-			note_wait(runtime, "装填中（本拍额度用完）",
-				string.format("真打分 %d 件 / 预筛 %d 件、还剩 %d 件%s",
-					scoredNow, probedNow, deferred,
-					lastWork ~= nil and ("；最近 " .. lastWork) or ""))
-			return false
-		end
-		runtime.fillPending = false
-		local detail
-		if #carriers == 0 then
-			detail = "没有物理容器可匹配"
-		else
-			local closest = bestScored or runtime.bestScoredEver
-			if closest ~= nil then
-				detail = string.format("%d 个候选 unit × %d 份容器，最高命中 %d/%d 根骨（%s）",
-					#nearCandidates, #carriers, closest.score, closest.total, tostring(closest.path))
-			elseif (runtime.probeRejected or 0) > 0 then
-				-- 预筛把它们全挡在真打分之前了：这比"最高命中 0/68"更具体 ——
-				-- 说明这些 unit 连任何一份容器的第 1 根骨都没有（不是同一套模型）。
-				detail = string.format("%d 个候选 unit × %d 份容器，预筛全挂（连容器的第 1 根骨都没有）",
-					#nearCandidates, #carriers)
-			else
-				detail = string.format("%d 个候选 unit × %d 份容器，全部 0 命中", #nearCandidates, #carriers)
-			end
-		end
-		note_wait(runtime, "没有 unit 命中任何物理容器", detail)
-		return false
-	end
-	table.sort(plan, function(a, b)
-		local oa = a.owner ~= nil and a.owner.order or 99
-		local ob = b.owner ~= nil and b.owner.order or 99
-		if oa ~= ob then return oa < ob end
-		if a.mg ~= b.mg then return a.mg end
-		return false
-	end)
-
-	-- ① 先收掉"主人已经不在了"的会话（玩家退出 / 阵亡后尸体不再算玩家）。
-	--
-	-- 这一步取代了老版本那个 `playerChanged`：老版本把"出现一个新的 avatar 候选"当成
-	-- "玩家换人了"，于是**队友一进房间就把我的会话全丢掉、重挂到队友身上**。
-	-- 现在每个会话都记着自己的主人，主人还在就一律不动。
-	local aliveOwners = {}
-	for index = 1, #avatars do aliveOwners[avatars[index].unit] = true end
-	local kept, released = {}, 0
-	for _, session in ipairs(runtime.sessions or {}) do
-		if session.owner ~= nil and aliveOwners[session.owner] == nil then
-			released = released + 1
-			if Compat.unit_alive(S, session.unit) then
-				local ok, restored = pcall(Compat.release, session)
-				runtime.logger("[physbone][玩家] 主人已不在，释放 unit=%s（%s）%s",
-					tostring(session.unitTag or "?"), tostring(session.ownerTag or "?"),
-					ok and ("已交还 " .. tostring(restored) .. " 节基准姿态") or "交还失败")
-			end
-		else
-			kept[#kept + 1] = session
-		end
-	end
-	if released > 0 then
-		runtime.sessions = kept
-		runtime.logger("[physbone][玩家] 释放了 %d 个会话（主人已离开/阵亡），剩 %d 个", released, #kept)
-	end
-
-	-- ①b 身份纠正（"玩家动它不动"的件要放掉）已移到 `identity_watch`：
-	-- 它必须持续跑到分类稳定，而 tryAttach 只在"需要补挂"时才跑（T21 抓到的）。
-
-	-- ② 再补上还没挂的 unit。已有会话的 unit 直接跳过 —— 这是增量的关键：
-	--    队友加入时，我自己的会话一个字节都不该被碰。
-	local attachedUnits = {}
-	for _, session in ipairs(runtime.sessions or {}) do attachedUnits[session.unit] = true end
-
-	local attachOptions = {
-		logger = runtime.logger,
-		world = world,
-		strictIdentity = options.strictIdentity == true,
-		fastWrite = options.fastWrite ~= false,
-		-- `solver` 现在只用于那条**已废弃的角度振子核**（`"angle"`，仅 A/B）。
-		-- 粒子链（`chain`）与碰撞层已在 2026-11-03 移除，不再往下传。
-		solver = options.solver,
-		bendBlend = options.bendBlend,
-	}
-	local attached, emptyUnits, already = 0, 0, 0
-	for index = 1, #plan do
-		local entry = plan[index]
-		if attachedUnits[entry.unit] then
-			already = already + 1
-		elseif Compat.unit_alive(S, entry.unit) then
-			phase(runtime, "attach 前 " .. tostring(entry.tag))
-			local session = Compat.attach(S, entry.unit, entry.rig, attachOptions)
-			phase(runtime, "attach 后 " .. tostring(entry.tag))
-			session.rigSource = entry.path
-			session.unitTag = entry.tag
-			session.attachFrame = frame
-			session.owner = entry.owner ~= nil and entry.owner.unit or nil
-			session.ownerOrder = entry.owner ~= nil and entry.owner.order or 99
-			if entry.owner ~= nil then
-				-- 实例名只在这里读一次：unit 一旦销毁再读就是 AV，而日志里全是 `?` 等于没有信息。
-				entry.owner.tag = entry.owner.tag or unit_tag(S, entry.owner.unit)
-			end
-			session.ownerTag = entry.owner ~= nil and entry.owner.tag or nil
-			-- 身份诊断（`identLog = 1`）：把"这件护甲的 hips 离它主人的 hips 有多远"打出来。
-			-- 依据：真正**穿在身上**的护甲，其 hips 骨和 avatar 的 hips 骨几乎是同一个点（同一副骨架）；
-			-- 而军械库/债券页的**展台件**站在台子上，哪怕离你很近，hips 也会差出几十厘米到几米。
-			-- 这条比"离谁最近"锐利得多，而且用的全是我们已经在读的世界坐标。
-			if (tune_values(runtime).identLog or 0) ~= 0 and entry.owner ~= nil and entry.owner.unit ~= nil then
-				ident_log_positions(runtime, S, entry, session)
-			end
-			if #session.sessions > 0 then
-				if runtime.sessions == nil then runtime.sessions = {} end
-				runtime.sessions[#runtime.sessions + 1] = session
-				attached = attached + 1
-			else
-				-- attach 走完了却一条链都没产出：容器骨名和这个 unit 的节点名对不上，
-				-- 或者锚点全缺。以前这里完全静默，等于"挂上了"和"挂出 0 条"从日志上看一样。
-				--
-				-- 每件只打一次：判据放宽到"命中 ≥1 根骨"之后，偶尔会有"撞上一根同名骨"的垃圾件
-				-- 进来试一轮（它必然产出 0 条链），而它每 30 帧就会被重试一次 —— 逐次打会把日志刷满，
-				-- 反而盖掉真正要看的那几行。
-				emptyUnits = emptyUnits + 1
-				runtime.emptyLogged = runtime.emptyLogged or setmetatable({}, { __mode = "k" })
-				if runtime.emptyLogged[entry.unit] == nil then
-					runtime.emptyLogged[entry.unit] = true
-					runtime.logger("[physbone][失败] unit=%s 挂载完成但产出 0 条链（容器 %s）",
-						entry.tag, tostring(entry.path))
-				end
-			end
-		else
-			runtime.logger("[physbone][失败] unit=%s 在挂载前一刻已销毁（跳过）", tostring(entry.tag))
-		end
-	end
-	if (runtime.sessions == nil or #runtime.sessions == 0) then
-		note_wait(runtime, "attach 没有产出任何链", string.format("%d 个 unit 通过容器匹配、%d 个产出 0 条链", #plan, emptyUnits))
-		return false
-	end
-
-	-- 记下"这次场上有哪些玩家"。下一拍比对它的**实例同一性**（userdata，不是 debug_name：
-	-- 实测那个 id 是按资源算的，拿它比"是不是同一个人"永远为真）。
-	runtime.avatars = avatars
-	runtime.world = world
-	local first = avatars[1]
-	runtime.avatar = first.unit
-	runtime.avatarTag = first.tag
-	runtime.attachedFrame = frame
-	runtime.reArm = 0
-	runtime.rearmAt = nil
-	runtime.waitReason, runtime.waitRepeat = nil, nil
-	runtime.zeroFrames = 0
-	runtime.driveFrames = 0
-	runtime.callsAccum = 0
-	runtime.peakAngle = 0
-	runtime.repeatCalls = 0
-
-	local chains, tags = 0, {}
-	local chainCounts = {}
-	local perOwner = {}
-	for _, session in ipairs(runtime.sessions) do
-		chains = chains + #session.sessions
-		tags[#tags + 1] = tostring(session.unitTag or "?")
-		chainCounts[#chainCounts + 1] = #session.sessions
-		local key = session.ownerOrder or 99
-		perOwner[key] = (perOwner[key] or 0) + 1
-	end
-	local ownerText = {}
-	for _, order in ipairs({ 1, 2, 3, 4, 99 }) do
-		if perOwner[order] ~= nil then ownerText[#ownerText + 1] = string.format("玩家%d=%d件", order, perOwner[order]) end
-	end
-	table.sort(chainCounts, function(a, b) return a > b end)
-	-- 还有候选没轮到打分 ⇒ 排下一拍继续装填。
-	-- 不留这一条的话，剩下的件要等下一次"名单变化/死亡"才会被想起 —— 那正好就是
-	-- "队友的物理要等第三个玩家进来才出现"那个老现象。
-	runtime.fillPending = deferred > 0
-	if runtime.fillPending then
-		runtime.reconcile = frame + (options.reconcilePollFrames or options.pollFrames or 2)
-	end
-	-- 装填期间**不打这条汇总**：跨拍装填会打好几条，把日志预算吃光、连驱动心跳都挤掉
-	-- （mp_harness 的 900 字节预算闸门抓到的）。等装填结束再一次性给出结论。
-	if not runtime.fillPending then
-		-- **每件的链数**（降序）。这一行是"转换器按件切骨"是否真的生效的唯一直接证据：
-		-- 改前每件都是容器全量（Lunalice：7 件 × 39 条 = 273），改后各件各不相同、加起来远小于它。
-		-- 少了它，"273 条链"和"49 条链"在日志里都只是同一句"已挂载 N 个 unit"，看不出区别。
-		--
-		-- 只在**多于一件**时附带：一件的时候这两个数必然相等，纯占字节 ——
-		-- 而日志是有字节预算的（mp_harness 的 900 字节闸门就抓过"噪声把心跳挤掉"）。
-		local perUnit = ""
-		if #runtime.sessions > 1 then
-			local chainTotal = runtime.sessions[1].chainTotal or 0
-			perUnit = string.format("；每件链数 %s（全量会是 %d）",
-				table.concat(chainCounts, ","), #runtime.sessions * chainTotal)
-		end
-		runtime.logger("[physbone] 已挂载 %d 个 unit / %d 条链（%d 份容器，玩家 %d 个%s）；本次新挂 %d、已挂过 %d；打分 %.2f ms（本轮新打分 %d 件）%s；unit=%s",
-			#runtime.sessions, chains, #carriers, #avatars,
-			#ownerText > 0 and ("：" .. table.concat(ownerText, " ")) or "",
-			attached, already, runtime.lastScoreMs or 0, runtime.fillScoredTotal or 0,
-			perUnit, table.concat(tags, ","))
-		runtime.fillScoredTotal = nil
-	end
-	return true
 end
 
 --- 用**指针相等**判断"会话的 unit 还在不在"，全程**不 deref 句柄**。
@@ -1812,124 +690,6 @@ local function session_unit_live(runtime, unit)
 	-- 外部直接塞了 liveUnits（测试 / 旧调用方）：没有索引，退回线性比较。
 	for index = 1, #units do
 		if units[index] == unit then return true end
-	end
-	return false
-end
-
---- 丢掉失效会话。任何一个失效都意味着场景变了 ⇒ 必须重扫（不能"还剩几个就继续开"）。
---- 返回丢弃总数；dead / rebuilt 分开计数并各自落日志。
-local function pruneSessions(runtime)
-	local kept, dead, rebuilt, gone = {}, 0, 0, 0
-	for _, session in ipairs(runtime.sessions or {}) do
-		-- **先做"不碰句柄"的成员检查**：不在当前活体列表里 ⇒ 直接判死，
-		-- 连 `Unit.alive` 都不调（那个调用本身就是 deref，见 refresh_live_units 的注释）。
-		if session.unit ~= nil and not session_unit_live(runtime, session.unit) then
-			session.dead = "gone"
-			gone = gone + 1
-		else
-			local health = Compat.session_health(session, runtime.frame)
-			if health == "ok" then
-				kept[#kept + 1] = session
-			else
-				session.dead = health
-				if health == "rebuilt" then rebuilt = rebuilt + 1 else dead = dead + 1 end
-				-- `unitTag` 是**挂载时**记下的实例名：unit 已经死了，现在再读 debug_name 就是 AV。
-				-- 这条名字是 P0.5 判"换实例（军械库 churn）还是同实例被销毁"的唯一依据。
-				runtime.logger("[physbone][LIFECYCLE] 会话失效（%s）：unit=%s 存活 %d 帧 链=%d%s",
-					health, tostring(session.unitTag or "?"),
-					runtime.frame - (session.attachFrame or runtime.frame),
-					#(session.sessions or {}),
-					session.deadReason ~= nil and (" 判死原因=" .. session.deadReason) or "")
-			end
-		end
-	end
-	runtime.sessions = kept
-	if gone > 0 then
-		-- 这一类是"指针已经不在活体列表里"——它**没有**调过任何引擎 API，所以值得单独计数：
-		-- 这个数字涨得越快，说明场景 churn 越猛（军械库/债券页快切就是这个形状）。
-		runtime.logger("[physbone][LIFECYCLE] %d 个会话的 unit 已不在活体列表里（指针判死，未调用任何 Unit API）",
-			gone)
-	end
-	local dropped = dead + rebuilt + gone
-	if dropped > 0 then
-		runtime.logger("[physbone] 丢弃 %d 个已销毁 / %d 个已重建 / %d 个指针判死，剩 %d 个会话",
-			dead, rebuilt, gone, #kept)
-		-- **死亡之后先停写一小段，等场景拆解落定。**
-		-- 场景拆解是**连续**发生的：一批 unit 死掉之后，同一场景里其余 unit 往往在接下来几帧
-		-- 继续被引擎释放。此时若继续驱动"刚才还活着"的会话，就会把骨写到已释放的对象上——
-		-- 表现为访问违例、崩在引擎内部，而 Lua 层 pcall 抓不到（2026-11-11 实机：
-		-- 多人局换场景必崩、单人必不崩；因为单人的护甲件是一起死的，直接走
-		-- "场景已变"那条分支停手，根本不会有"剩几个继续跑"）。
-		-- 时间照常累积到 pendingDt，所以物理速度不变，只是这几帧不写骨。
-		local grace = runtime.options and runtime.options.deathGraceFrames or 20
-		local holdUntil = runtime.frame + grace
-		if (runtime.driveHoldUntil or 0) < holdUntil then runtime.driveHoldUntil = holdUntil end
-	end
-	return dropped
-end
-
---- 便宜的"场上有哪些玩家"扫描，供驱动中定期比对。
---- 返回 avatar unit 列表；`nil` 表示"这次扫不了"（世界/单位列表取不到）。
----
---- 现在几乎免费：`World.units_by_resource` 一次调用就列出所有玩家 avatar，
---- 之后每个候选只要 1 次 `Unit.alive`。以前这里要遍历 2000+ unit、每个两次引擎调用，
---- 所以只能 1.2 秒跑一次 —— 队友中途加入要多等一拍才接得上。
-local function scanAvatars(runtime)
-	local world, units = pickWorld(S, runtime.cache)
-	if world == nil or units == nil then return nil end
-	local supportMg = SUPPORT_MG_NAME
-	local options = runtime.options or {}
-	local list = findAvatars(S, world, units, #units, supportMg,
-		options.minNodes or 90, options, runtime.cache, runtime)
-	local found = {}
-	for index = 1, #list do
-		if Compat.unit_alive(S, list[index].unit) then found[#found + 1] = list[index].unit end
-	end
-	return found
-end
-
---- 玩家人数有没有变化（有人加入 / 有人退出 / 阵亡后尸体不再算玩家）。
----
---- 取代了旧版的 `playerChanged`。旧版把"出现了一个新的 avatar 候选"当成"玩家换人了"，
---- 在多人局里这是致命的：队友一进房间，我们就把**自己的**会话全丢掉、重新挂到队友身上，
---- 而自己身上从此没有物理。现在"多出一个玩家"只是一个**新玩家**，谁的会话都不该动。
----
---- ⚠️ 判据用 **userdata 同一性**（`rawequal`），不是 `debug_name`：
---- 2026-11-01 实测：丢掉 7 个 unit 之后重新挂上的还是**同一批 `#ID[...]`**，
---- 说明那个 id 是按资源/描述符算的，不是按实例 —— 拿它比"是不是同一个人"永远为真。
----@return boolean changed 需要补挂/收尾
-local function avatarSetChanged(runtime)
-	local live = scanAvatars(runtime)
-	if live == nil then return false end
-	local known = runtime.avatars or {}
-	local knownSet, liveSet = {}, {}
-	for index = 1, #known do knownSet[known[index].unit] = true end
-	local maxAvatars = (runtime.options or {}).maxAvatars or 4
-	for index = 1, #live do
-		local unit = live[index]
-		liveSet[unit] = true
-		if knownSet[unit] == nil then
-			if #known >= maxAvatars then
-				-- 已经到上限了（正常对局 4 人；观战/人台可能更多）。再补会一直"发现新玩家"→
-				-- 每 60 帧白跑一趟 discover，所以这里明确放弃，并留一条日志。
-				if runtime.extraAvatarLogged ~= true then
-					runtime.extraAvatarLogged = true
-					runtime.logger("[physbone][玩家] 场上还有第 %d 个 avatar（%s），超过上限 %d，不挂它的物理",
-						#known + 1, tostring(unit_tag(S, unit)), maxAvatars)
-				end
-			else
-				runtime.logger("[physbone][玩家] 有新玩家（%s）⇒ 补挂它的护甲",
-					tostring(unit_tag(S, unit)))
-				return true
-			end
-		end
-	end
-	for index = 1, #known do
-		if liveSet[known[index].unit] == nil then
-			runtime.logger("[physbone][玩家] 有玩家离开/阵亡（%s）⇒ 收掉它的会话",
-				tostring(known[index].tag or "?"))
-			return true
-		end
 	end
 	return false
 end
@@ -2444,7 +1204,7 @@ local function fp_lock_watch(S_, runtime)
 	if not settings.fpLock then return end
 	local avatars = runtime.avatars
 	if avatars == nil or #avatars == 0 then return end
-	local camX, camY = cameraPosition(S_, runtime.world, runtime.cache or {})
+	local camX, camY = frameCamera(S_, runtime)
 	if camX == nil then return end
 	local lockAvatar, lockH = nil, nil
 	for index = 1, #avatars do
@@ -2501,9 +1261,12 @@ local function scheduler_watch(S_, runtime, dt)
 	if avatars == nil or #avatars == 0 then return end
 	local primary = avatars[1]
 	if primary == nil or primary.unit == nil then return end
-	local camX, camY, camZ = cameraPosition(S_, runtime.world, runtime.cache or {})
+	local camX, camY, camZ = frameCamera(S_, runtime)
 	if camX == nil then return end
-	local ax, ay, az = readVector(S_, try(S_.Unit.world_position, primary.unit, 1))
+	-- 位置同样优先取本帧 Roster 已读到的（physics_sync 填进 runtime.avatars）。
+	local ax, ay, az
+	if primary.positionFrame == runtime.frame and primary.x ~= nil then ax, ay, az = primary.x, primary.y, primary.z end
+	if ax == nil then ax, ay, az = readVector(S_, try(S_.Unit.world_position, primary.unit, 1)) end
 	if ax == nil then return end
 	local dx, dy, dz = ax - camX, ay - camY, az - camZ
 	local distance = math.sqrt(dx * dx + dy * dy + dz * dz)
@@ -2546,12 +1309,14 @@ end
 local function refresh_avatar_distances(S_, runtime)
 	local avatars = runtime.avatars
 	if avatars == nil or #avatars == 0 then return end
+	-- physics_sync 本帧已经按 Roster 的枚举结果填好位置与到相机的距离：不再重读。
+	if runtime.avatarsFreshFrame == runtime.frame then return end
 	local camX, camY, camZ = cameraPosition(S_, runtime.world, runtime.cache or {})
-	runtime.poseCamera = { frame = runtime.frame, x = camX, y = camY }
+	runtime.poseCamera = { frame = runtime.frame, x = camX, y = camY, z = camZ, world = runtime.world }
 	if camX == nil then return end
 	for index = 1, #avatars do
 		local avatar = avatars[index]
-		-- 防御：名单可能来自 `tryAttach`（同一帧），也可能被别处复用；这里再按指针确认一次。
+		-- 防御：名单可能被别处复用；这里再按指针确认一次。
 		if avatar.unit ~= nil and session_unit_live(runtime, avatar.unit) then
 			local ax, ay, az = readVector(S_, try(S_.Unit.world_position, avatar.unit, 1))
 			if ax ~= nil then
@@ -2700,16 +1465,8 @@ local function sched_key_poll(S_, runtime)
 	runtime.logger("[physbone][热键] %s 按下 ⇒ 重排（玩家 %d 个，会话 %d 个）",
 		settings.hotkeyName, #(runtime.avatars or {}), #(runtime.sessions or {}))
 	redistribute(S_, runtime, "手动重设（热键 " .. settings.hotkeyName .. "）")
-	-- **热键同时重新发现并补挂**（2026-11-12）。
-	-- 原来这里只重排：而"队友的件压根没挂上"时，重排多少次都没用（它只换已挂会话的主人），
-	-- 这正是"按 F8 几乎无效"的根因。现在下一拍会跑一次完整的 discover + 增量 attach，
-	-- 有匹配缓存兜底，成本很低。
-	runtime.reconcile = runtime.frame
-	if runtime.sessions == nil then runtime.rearmAt = nil end   -- 正在退避就直接重试
-		-- 顺手把"重试门"清掉（保留已命中的正缓存）：用户按 F8 就是想让它**真的再试一次**。
-	-- 不清的话，那些"打过但没命中"的件还在退避期里，F8 会被它挡住，表现仍是"按了没用"。
-	runtime.scoreAttemptAt = setmetatable({}, { __mode = "k" })
-	runtime.negativeRetryAt = nil
+	-- E12e：发现/补挂/退避重试（reconcile、scoreAttemptAt、negativeRetryAt）都已按 IAS 删除——
+	-- 每帧枚举本来就每帧重新发现并绑定，热键只需要重排一次。
 	runtime.schedNoop = 0
 	runtime.schedBackoffUntil = nil
 end
@@ -6514,8 +5271,10 @@ local function physics_sync(runtime)
 
 	-- 玩家名单：本帧枚举，按到相机的距离排序（第一位 = 离相机最近 = 自己的调度优先级）。
 	local list, ownerOf = {}, {}
+	local cameras = {}
 	for world, row in pairs(roster.byWorld) do
 		local cx, cy, cz = cameraPosition(S, world, runtime.cache)
+		cameras[world] = { cx, cy, cz }
 		for _, item in ipairs(row.avatars) do
 			local entry = { unit = item.unit, world = world, x = item.p[1], y = item.p[2], z = item.p[3], positionFrame = frame }
 			if cx ~= nil then
@@ -6542,6 +5301,15 @@ local function physics_sync(runtime)
 	runtime.avatars = #list > 0 and list or nil
 	if #list > 0 then
 		runtime.world = list[1].world
+		-- 本帧已读过相机与各 avatar 根位置（IAS 同样每帧只读一次，R:1335 / R:6621-6626）：
+		-- refresh_avatar_distances 直接复用，不再重读。
+		local camera = cameras[list[1].world]
+		if camera ~= nil and camera[1] ~= nil then
+			runtime.poseCamera = { frame = frame, x = camera[1], y = camera[2], z = camera[3], world = list[1].world }
+			runtime.avatarsFreshFrame = frame
+		else
+			runtime.avatarsFreshFrame = nil
+		end
 		if not (roster.identity and arm_pose_enabled(runtime)) then runtime.avatar = list[1].unit end
 	end
 
@@ -6757,10 +5525,6 @@ local function drive(runtime)
 	phase(runtime, "refresh_avatar_distances 前")
 	refresh_avatar_distances(S, runtime)
 	phase(runtime, "refresh_avatar_distances 后")
-	-- 身份纠正（"玩家动它不动"的件放掉）：必须每帧入口都跑到，不能只在补挂时跑。
-	phase(runtime, "identity_watch 前")
-	pcall(identity_watch, S, runtime)
-	phase(runtime, "identity_watch 后")
 	fp_lock_watch(S, runtime)
 	phase(runtime, "scheduler_watch 前")
 	scheduler_watch(S, runtime, runtime.dt)
@@ -6791,7 +5555,6 @@ local function drive(runtime)
 	local nearMetres = sched_settings(runtime).metres
 	local nearLimit2 = nearMetres * nearMetres
 	local primaryChains, nearChains, farChains = 0, 0, 0
-	local staleOwners = 0
 	for index = 1, #runtime.sessions do
 		local session = runtime.sessions[index]
 		local chains = #(session.sessions or {})
@@ -6799,22 +5562,11 @@ local function drive(runtime)
 			primaryChains = primaryChains + chains
 		else
 			local ownerDistance = owner_distance_sq(runtime, session)
-			-- 主人不在当前玩家名单里（换场景/换船后 unit 重建）⇒ 距离恒为 math.huge，
-			-- 会把这件永久压进"最远档（每 16 帧）"，看起来就是没物理。
-			-- 正确的动作是**重新归属**，所以这里记一笔，下面触发一次重排/重挂。
-			if ownerDistance == math.huge then staleOwners = staleOwners + 1 end
 			if ownerDistance <= nearLimit2 then
 				nearChains = nearChains + chains
 			else
 				farChains = farChains + chains
 			end
-		end
-	end
-	if staleOwners > 0 and runtime.reconcile == nil then
-		runtime.reconcile = frame
-		if not runtime.staleOwnerLogged then
-			runtime.staleOwnerLogged = true
-			logger("[physbone][玩家] %d 个会话的主人已不在名单里 ⇒ 重新归属一次", staleOwners)
 		end
 	end
 	local nearStride, farStride = schedule_budget(primaryChains, nearChains, farChains, budget)
@@ -6879,7 +5631,12 @@ local function drive(runtime)
 			ownerState = { active = active }
 			ownerStates[owner] = ownerState
 			if active then
-				local x, y, z = readVector(S, try(S.Unit.world_position, owner, 1))
+				-- Roster 本帧已读过 avatar 根位置（physics_sync 写进 runtime.avatars）：直接取，不再读引擎。
+				local x, y, z
+				for _, entry in ipairs(runtime.avatars or {}) do
+					if entry.unit == owner and entry.positionFrame == frame then x, y, z = entry.x, entry.y, entry.z break end
+				end
+				if x == nil then x, y, z = readVector(S, try(S.Unit.world_position, owner, 1)) end
 				if x ~= nil then
 					local previous = ownerRoots[owner]
 					ownerState.teleport = previous ~= nil and vec_dist(x, y, z, previous[1], previous[2], previous[3]) > 2
@@ -6896,9 +5653,8 @@ local function drive(runtime)
 			-- 每 stride 帧就会出现一次成本尖峰（帧时间抖动比平均成本更影响手感）。
 			if stride > 1 and ((frame + index) % stride) ~= 0 then due = false end
 		end
-		-- 拆解窗口：任何会话死亡后的一小段里不写骨（理由见 pruneSessions 里那段注释）。
-		-- 仍然走"没轮到"的同一条路，所以 pendingDt 照常累积、物理速度不变。
-		if due and runtime.driveHoldUntil ~= nil and frame < runtime.driveHoldUntil then due = false end
+		-- E12e：原来这里有"会话死亡后停写 N 帧"的拆解窗口（driveHoldUntil）。IAS 没有：它不跨帧持有句柄，
+		-- 不在本帧枚举里的 unit 本帧压根碰不到，其余的照常处理（R:1417-1428、R:6862-6867、R:7004）。窗口已删除。
 		-- 诊断开关（调参文件 `writeOff = 1`）：发现 / 挂载 / 调度 / 判活全都照旧，**只是不写骨**。
 		-- 用途（2026-11-11）：物理 + 软映射同时开、多人局换场景必崩，而崩溃时我们的 Lua 根本没在跑
 		-- （加载期间不回调，回来之前就崩了）。于是只剩两种可能，这个开关能把它们分开：
@@ -6919,7 +5675,6 @@ local function drive(runtime)
 			if okAlive and alive == false then due = false end
 		end
 		if due or session.independentPresentation and session_unit_live(runtime, session.unit)
-			and (runtime.driveHoldUntil == nil or frame >= runtime.driveHoldUntil)
 			and (tune_values(runtime).writeOff or 0) == 0 then
 			local operation = due and (session.resetPhysics and Compat.reset_physics or Compat.update) or nil
 			local ok, out, solved = pcall(IndependentLink.physics, runtime, session, schedule, operation, pending)
@@ -7097,9 +5852,6 @@ local function drive(runtime)
 			runtime.zeroFrames, tostring(tripped))
 		runtime.sessions = nil
 		runtime.zeroFrames = 0
-		runtime.reArm = (runtime.reArm or 0) + 1
-		local delay = math.min(options.maxReArmFrames or 600, (options.reArmFrames or 60) * runtime.reArm)
-		runtime.rearmAt = frame + delay
 	end
 
 	-- 姿态快照：外部按下热键 ⇒ 写请求文件 ⇒ 这里把骨架采下来。
@@ -7125,11 +5877,8 @@ local function perf_wrap_all()
 	perfWrapped = true
 	refresh_live_units = Perf.wrap("F1", refresh_live_units)
 	refresh_avatar_distances = Perf.wrap("F8", refresh_avatar_distances)
-	identity_watch = Perf.wrap("F8", identity_watch)
 	fp_lock_watch = Perf.wrap("F8", fp_lock_watch)
 	scheduler_watch = Perf.wrap("F8", scheduler_watch)
-	avatarSetChanged = Perf.wrap("F8", avatarSetChanged)
-	pruneSessions = Perf.wrap("F7", pruneSessions)
 	drive = Perf.wrap("F9", drive)   -- drive 本体剩余部分（时钟、生命周期、门控）：未归入子项的调用都记在这里
 	sched_poll = Perf.wrap("F9", sched_poll)
 	independent_frame = Perf.wrap("F4", independent_frame)
@@ -7137,7 +5886,6 @@ local function perf_wrap_all()
 	sample_action_state = Perf.wrap("F5", sample_action_state)
 	frame_animation_machine = Perf.wrap("F5", frame_animation_machine)
 	independent_scan = Perf.wrap("P3", independent_scan)
-	tryAttach = Perf.wrap("P2", tryAttach)
 	IndependentLink.find_weapon = Perf.wrap("F3", IndependentLink.find_weapon)
 	IndependentLink.physics = Perf.wrap("F6", IndependentLink.physics)
 	IndependentLink.present = Perf.wrap("F4p", IndependentLink.present)
@@ -7202,13 +5950,10 @@ function M.install(stingray, options)
 		-- 场上的玩家 avatar 名单（每个玩家一项）。会话按 `session.owner` 归属到其中一项上，
 		-- 名单变化只影响"补挂/收尾"，不会推翻别人的会话。
 		avatars = nil,
-		reconcile = nil,     -- 名单变化后待执行的补挂帧号；nil = 没有待办
 		nearStride = 1,      -- 6 m 内队友的分帧步长（1 = 每帧）
 		farStride = 1,       -- 6 m 外队友的分帧步长
 		frame = 0,
 		dt = options.dt or (1 / 60),
-		reArm = 0,
-		rearmAt = nil,
 		driveFrames = 0,
 		beatFrames = 0,
 		callsAccum = 0,

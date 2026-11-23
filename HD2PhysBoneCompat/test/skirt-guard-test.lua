@@ -97,11 +97,11 @@ end
 -- Unit.bones / scene_graph_parent / scene_graph_link / is_a / is_child，
 -- 进舰船几秒后游戏崩了（0xc0000005，参数 0x0 0x0）。`pcall` 拦不住原生 AV。
 -- 所以这些调用只允许待在**显式开关控制、默认关闭**的探针函数里：
---   · `probe_identity_api`（开关 `probeIdentity`，默认关）
 --   · `probe_identity_link`（开关 `probeIdentityLink`，默认关）
+-- （E12e：另一个探针 `probe_identity_api`（开关 `probeIdentity`）只挂在已按 IAS 删除的 tryAttach 上，随之删除。）
 local PROBE_APIS = { "%.bones%(", "%.scene_graph_parent%(", "%.scene_graph_link%(",
 	"%.is_child%(", "%.is_a%(" }
-local PROBE_HOMES = { "probe_identity_api", "probe_identity_link" }
+local PROBE_HOMES = { "probe_identity_link" }
 local homeBodies = {}
 for _, name in ipairs(PROBE_HOMES) do
 	local body = body_of(name)
@@ -126,19 +126,15 @@ for _, api in ipairs(PROBE_APIS) do
 	local _, link = (linkBodies[api] or ""):gsub(api, "")
 	check(string.format("%s 只在允许入口（%d/%d）", api, inside + link, total), total == inside + link)
 end
-check("两组探针都有开关（probeIdentity / probeIdentityLink）",
-	wholeStripped:find("probeIdentity", 1, true) ~= nil
-		and wholeStripped:find("probeIdentityLink", 1, true) ~= nil)
+check("身份链探针有开关（probeIdentityLink）",
+	wholeStripped:find("probeIdentityLink", 1, true) ~= nil)
 check("身份链探针默认关闭（只在开关非 0 时才调）",
 	wholeStripped:find("identSwitch ~= nil and identSwitch ~= 0", 1, true) ~= nil)
-check("身份 API 探针默认关闭（只在开关非 0 时才调）",
-	wholeStripped:find("probeSwitch ~= nil and probeSwitch ~= 0", 1, true) ~= nil
-		and wholeStripped:find("probeSwitch == nil or", 1, true) == nil)
 -- 2.1.44：心跳不能拿 driveFrames 取模 —— 补挂每次成功都把它归零，挂满之后心跳就永远打不出来。
 check("心跳用独立计数 beatFrames（不被补挂归零）",
 	wholeStripped:find("(runtime.beatFrames % heartbeat) == 0", 1, true) ~= nil
 		and wholeStripped:find("(runtime.driveFrames % heartbeat)", 1, true) == nil)
-check("beatFrames 只在安装时归零（tryAttach 不碰它）",
+check("beatFrames 只在安装时归零",
 	select(2, wholeStripped:gsub("beatFrames = 0", "")) == 1)
 -- 调参文件里 0 一律表示关（devLog / skirt 都是这个约定）。心跳不能例外：
 -- `math.max(1, …)` 会把 0 变成"每帧一条"，一场长局刷几万行，正好烧光心跳要省的预算。
