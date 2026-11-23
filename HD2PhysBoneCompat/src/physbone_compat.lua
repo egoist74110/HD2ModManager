@@ -1728,6 +1728,14 @@ function M.unit_alive(S, unit)
 	return true
 end
 
+--- 判活的统一入口。调用方（运行时）给了 `isLive`（本帧枚举的纯表查询，零引擎调用）就只查表：
+--- 句柄只来自本帧枚举、不跨帧，IAS 不对这类句柄再调 `Unit.alive`（R:894-896、R:1417-1422）。
+--- 没给（单测 / 外部直接用本库）才退回 `Unit.alive`。
+local function unit_live(S, unit, isLive)
+	if type(isLive) == "function" then return isLive(unit) == true end
+	return M.unit_alive(S, unit) == true
+end
+
 --- 会话身份诊断：**只观察，不据此停驱动**。
 --- 返回 { nodes = 当前场景图节点数, has = 抽样骨名是否还能解析 }。
 --- <para>
@@ -1769,13 +1777,21 @@ function M.session_health(session, stamp)
 	if session.dead ~= nil then return session.dead end
 	-- 同一帧只判一次：探针的 prune_sessions 和 update_tip 都会问，不去重就是每帧 2 次引擎调用/会话。
 	if stamp ~= nil and session.healthStamp == stamp then return "ok" end
-	if stamp ~= nil then session.healthStamp = stamp end
 	local S = session.S
-	local aliveNow, aliveError = M.unit_alive(S, session.unit)
-	if not aliveNow then
-		session.dead = "dead"
-		session.deadReason = aliveError
-		return "dead"
+	if type(session.isLive) == "function" then
+		-- E12f-C3：运行时托管的会话——判活只查本帧枚举（零引擎调用，IAS 无逐会话 Unit.alive，R:894-896、R:1417-1422）。
+		-- 本帧不在枚举里 ⇒ 本帧不碰它，但**不**永久判死：枚举失败 / 单帧缺席时下一帧还能恢复；
+		-- 会话的去留由运行时按本帧枚举决定。也不记 healthStamp，同一帧再问仍然如实回答。
+		if not session.isLive(session.unit) then return "dead" end
+		if stamp ~= nil then session.healthStamp = stamp end
+	else
+		if stamp ~= nil then session.healthStamp = stamp end
+		local aliveNow, aliveError = M.unit_alive(S, session.unit)
+		if not aliveNow then
+			session.dead = "dead"
+			session.deadReason = aliveError
+			return "dead"
+		end
 	end
 	session.healthFrames = (session.healthFrames or 0) + 1
 	local every = session.identityEvery or 30
@@ -1932,9 +1948,10 @@ end
 ---@param S table stingray 命名空间
 ---@param units table 候选 unit 数组（会对每个 unit 取最大命中数）
 ---@param candidates table { { rig = <parse_rig 结果>, path = <string> }, ... }
+---@param isLive function|nil 本帧枚举判活（运行时传入；缺省退回 Unit.alive）
 ---@return table|nil best { rig, path, score, total, full }
 ---@return table scored 排序后的完整打分表
-function M.select_rig(S, units, candidates)
+function M.select_rig(S, units, candidates, isLive)
 	if type(candidates) ~= "table" or #candidates == 0 then return nil, {} end
 	units = units or {}
 
@@ -1946,7 +1963,7 @@ function M.select_rig(S, units, candidates)
 			local total = #rig.bones
 			local score = 0
 			for _, unit in ipairs(units) do
-				if M.unit_alive(S, unit) then
+				if unit_live(S, unit, isLive) then
 					local hits = 0
 					for bone = 1, total do
 						local aliases = aliasesByBone[bone]
@@ -2014,7 +2031,7 @@ function M.attach(S, unit, rig, options)
 	logger("[physbone] attach 进入：rig %d 根骨", #rig.bones)
 	-- 生命周期闸：attach 本身要发上百次引擎调用（每根骨 has_node / node / local_pose /
 	-- world_position）。Unit 在 attach 途中被销毁同样是 AV，所以进门先验一次。
-	if not M.unit_alive(S, unit) then
+	if not unit_live(S, unit, options.isLive) then
 		logger("[physbone] attach 放弃：目标 Unit 已销毁（alive=false）")
 		return { S = S, world = options.world, unit = unit, rig = rig, sessions = {}, dead = "dead" }
 	end
@@ -2094,7 +2111,7 @@ function M.attach(S, unit, rig, options)
 		-- attach 整段跑在同一帧里，正常情况引擎不可能中途销毁 Unit（单线程）。
 		-- 这条是保险：万一某个引擎调用内部把它弄失效了（懒加载失败、资源回收），
 		-- 我们宁愿少挂几条链，也不要在失效 Unit 上继续读 local_pose / world_position。
-		if not M.unit_alive(S, unit) then
+		if not unit_live(S, unit, options.isLive) then
 			logger("[physbone] attach 中断：第 %d/%d 条链时目标 Unit 已销毁", chainIndex, #chains)
 			return { S = S, world = options.world, unit = unit, rig = rig,
 				sessions = {}, dead = "dead", partialSessions = sessions }
@@ -2477,6 +2494,8 @@ function M.attach(S, unit, rig, options)
 		nodeCount = nodeCount,          -- 生命周期闸：场景图节点数（仅用于漂移观测）
 		identityNode = identityNode,    -- 生命周期闸：抽样骨名 id（仅用于漂移观测）
 		identityEvery = options.identityEvery or 30,
+		-- E12f-C3：运行时给的本帧枚举判活（零引擎调用）；session_health 用它代替逐会话 Unit.alive。
+		isLive = options.isLive,
 		-- 身份漂移是否参与"停驱动"判定。默认 **false**：只有实机确认了正确判据才打开。
 		-- 2026-11-01：开着它导致每秒一次 attach/丢弃循环（头发冻结并来回切）。
 		strictIdentity = options.strictIdentity == true,
