@@ -2389,6 +2389,7 @@ function M.attach(S, unit, rig, options)
 					end
 					sessions[#sessions + 1] = {
 						chain = chain,
+						optionalIas = ias_group(chain[1]) ~= 0,
 						nodes = nodes,
 						springs = springs,
 						basePoses = basePoses,
@@ -2523,7 +2524,9 @@ function M.reset_physics(session)
 	if session == nil or M.session_health(session, M.frame) ~= "ok" then return 0 end
 	local restored = 0
 	for _, item in ipairs(session.sessions) do
-		if not item.disabled then restored = restored + restore_chain(session, item) end
+		if not item.disabled and not (session.skipOptionalIas and item.optionalIas) then
+			restored = restored + restore_chain(session, item)
+		end
 	end
 	if restored > 0 and session.world ~= nil then pcall(session.S.World.update_unit, session.world, session.unit) end
 	return restored
@@ -2883,15 +2886,51 @@ local function write_pose(S, unit, node, rotation, base)
 		local qx, qy, qz, qw = q_axis_angle(rotation[1], rotation[2], rotation[3], rotation[4])
 		local q = S.Quaternion.from_elements(qx, qy, qz, qw)
 		if q == nil then return false end
-		S.Unit.set_local_rotation(unit, node, q)
-		return true
+		return S.Unit.set_local_rotation(unit, node, q) ~= false
 	end
 	local q = S.Quaternion.axis_angle(S.Vector3(rotation[1], rotation[2], rotation[3]), rotation[4])
 	if q == nil then return false end
 	local pose = S.Matrix4x4.from_quaternion_position(q, S.Vector3(base.px, base.py, base.pz))
 	if pose == nil then return false end
-	S.Unit.set_local_pose(unit, node, pose)
-	return true
+	return S.Unit.set_local_pose(unit, node, pose) ~= false
+end
+
+local function physics_between(from, to, fraction)
+	local ax, ay, az, aw = q_axis_angle(from[1], from[2], from[3], from[4])
+	local bx, by, bz, bw = q_axis_angle(to[1], to[2], to[3], to[4])
+	if ax*bx + ay*by + az*bz + aw*bw < 0 then ax, ay, az, aw = -ax, -ay, -az, -aw end
+	local old = 1 - fraction
+	return { q_to_axis_angle(ax*old + bx*fraction, ay*old + by*fraction,
+		az*old + bz*fraction, aw*old + bw*fraction) }
+end
+
+function M.present_independent_physics(session, fraction)
+	local presentation = session.independentPresentation
+	if not presentation then return 0 end
+	if M.session_health(session, M.frame) ~= "ok" then
+		session.independentPresentation = nil
+		return 0
+	end
+	local written, calls = 0, 0
+	local complete = true
+	for node, row in pairs(presentation.rows) do
+		local rotation = fraction == 1 and row.to or physics_between(row.from, row.to, fraction)
+		local ok, result = pcall(write_pose, session.S, session.unit, node, rotation, row.base)
+		calls = calls + (M._fastWrite and 2 or 5)
+		if ok and result then
+			written = written + 1
+		else
+			complete = false
+		end
+	end
+	if written > 0 then
+		local ok, result = pcall(session.S.World.update_unit, session.world, session.unit)
+		complete = complete and ok and result ~= false
+		calls = calls + 1
+	end
+	session.engineCalls = (session.engineCalls or 0) + calls
+	if fraction == 1 and complete then session.independentPresentation = nil end
+	return written
 end
 
 --- 快路径的**写入语义**校验（只在拿到真实节点后做一次，非破坏性）。
@@ -3064,6 +3103,7 @@ function M.update_tip(session, dt, maxWrite)
 	local h = dt / steps
 
 	local writePose = session.debugPoseCheck and write_pose_checked or write_pose
+	local presentation = session.independentSample
 	-- "姿态没变就别写"的阈值（弧度）。**这是性能上最划算的一个旋钮**：
 	-- 每次写入要 2 次引擎调用（`Quaternion.from_elements` + `set_local_rotation`），
 	-- 而实机实测 ~1000 次引擎调用 ≈ 2.8 ms（341~418 条链）。把几乎没变的姿态跳过，
@@ -3147,7 +3187,7 @@ function M.update_tip(session, dt, maxWrite)
 	for si = 1, itemCount do
 		local item = items[si]
 		local tip = item.tip
-		if not item.disabled and tip ~= nil then
+		if not item.disabled and tip ~= nil and not (session.skipOptionalIas and item.optionalIas) then
 			local anchorNode = item.anchorNode
 			local cached = anchors[anchorNode]
 			if cached == nil then
@@ -3284,8 +3324,16 @@ function M.update_tip(session, dt, maxWrite)
 							if same then
 								skippedSame = skippedSame + 1
 							else
-								local okWrite, didWrite = pcall(writePose, S, unit, nodeIds[index], rotation, base)
+								local displayed = rotation
+								local node = nodeIds[index]
+								local row
+								if presentation and presentation.history and prev then
+									row = { from = { prev[1], prev[2], prev[3], prev[4] }, to = rotation, base = base }
+									displayed = physics_between(row.from, rotation, presentation.lead)
+								end
+								local okWrite, didWrite = pcall(writePose, S, unit, node, displayed, base)
 								if okWrite and didWrite == true then
+									if row then presentation.rows[node] = row end
 									written = written + 1
 									calls = calls + perWrite
 									if prev == nil then prev = {}; lastWritten[index] = prev end
@@ -3692,6 +3740,253 @@ function M.independent_fk(parent, rotation, position)
 		q = { qmul(parent.q[1], parent.q[2], parent.q[3], parent.q[4], rotation[1], rotation[2], rotation[3], rotation[4]) } }
 end
 
+function M.independent_relative(parent, world)
+	local q, p = parent.q, world.p
+	local x, y, z = qrot(-q[1], -q[2], -q[3], q[4],
+		p[1] - parent.p[1], p[2] - parent.p[2], p[3] - parent.p[3])
+	local rotation = M.independent_world_delta(world.q, { 0, 0, 0, 1 }, q)
+	return { x, y, z }, M.independent_hemisphere(rotation, { 0, 0, 0, 1 })
+end
+
+-- Numeric rigid poses are shared by the contact solver and the attachment writer.
+M.contact_math = {}
+do
+	local V = M.contact_math
+	function V.add(a, b) return { a[1]+b[1], a[2]+b[2], a[3]+b[3] } end
+	function V.sub(a, b) return { a[1]-b[1], a[2]-b[2], a[3]-b[3] } end
+	function V.scale(v, s) return { v[1]*s, v[2]*s, v[3]*s } end
+	function V.dot(a, b) return a[1]*b[1]+a[2]*b[2]+a[3]*b[3] end
+	function V.cross(a, b)
+		return { arm_cross(a[1], a[2], a[3], b[1], b[2], b[3]) }
+	end
+	function V.length(v) return math.sqrt(V.dot(v, v)) end
+	function V.normal(v)
+		local n = V.length(v)
+		if n > 1e-6 and n < math.huge then return V.scale(v, 1/n) end
+	end
+	function V.project(v, axis) return V.sub(v, V.scale(axis, V.dot(v, axis))) end
+	function V.rotate(q, v)
+		return { qrot(q[1], q[2], q[3], q[4], v[1], v[2], v[3]) }
+	end
+	function V.arc(a, b, pole)
+		local x, y = V.normal(a), V.normal(b)
+		if not x or not y then return { 0, 0, 0, 1 } end
+		if pole and V.dot(x, y) < -1+1e-6 then
+			local axis = V.normal(V.project(pole, x))
+			if axis then return { axis[1], axis[2], axis[3], 0 } end
+		end
+		return { min_arc_quat(a[1], a[2], a[3], b[1], b[2], b[3]) }
+	end
+	function V.matrix_pose(m)
+		for i = 1, 12 do if not finite_arm_number(m[i]) then return end end
+		local x, y, z = { m[1], m[5], m[9] }, { m[2], m[6], m[10] }, { m[3], m[7], m[11] }
+		if V.length(V.sub(V.cross(x, y), z)) > 0.002 or math.abs(V.dot(x, x)-1) > 0.002
+			or math.abs(V.dot(y, y)-1) > 0.002 or math.abs(V.dot(x, y)) > 0.002 then return end
+		local q = M.independent_quaternion(mat3_to_quat(m[1], m[2], m[3], m[5], m[6], m[7], m[9], m[10], m[11]))
+		if q then return { p = { m[4], m[8], m[12] }, q = q } end
+	end
+	function V.world_pose(S, unit, node)
+		local ok, value = pcall(S.Unit.world_pose, unit, node)
+		if not ok or value == nil then return nil, 1 end
+		local valid, xx, yx, zx, xy, yy, zy, xz, yz, zz, x, y, z = pcall(S.Matrix4x4.to_elements, value)
+		if valid then return V.matrix_pose({ xx, xy, xz, x, yx, yy, yz, y, zx, zy, zz, z }), 2 end
+		return nil, 2
+	end
+	function V.inverse(pose)
+		local p, q = M.independent_relative(pose, { p = { 0, 0, 0 }, q = { 0, 0, 0, 1 } })
+		return { p = p, q = q }
+	end
+	function V.smooth(value)
+		local t = math.max(0, math.min(1, value))
+		return t*t*(3-2*t)
+	end
+	function V.blend(a, b, t)
+		local q, r = a.q, M.independent_hemisphere(b.q, a.q)
+		return { p = V.add(a.p, V.scale(V.sub(b.p, a.p), t)),
+			q = M.independent_quaternion(q[1]+(r[1]-q[1])*t, q[2]+(r[2]-q[2])*t,
+				q[3]+(r[3]-q[3])*t, q[4]+(r[4]-q[4])*t) }
+	end
+end
+
+function M.contact_girdle(chest, shoulder, wrist, lengths, source, singleHand)
+	local V = M.contact_math
+	local a, b = lengths[1], lengths[2]
+	if math.min(a, b) < 1e-6 then return nil, 1 end
+	local shoulderRay, wristRay = V.sub(shoulder.p, chest.p), V.sub(wrist.p, chest.p)
+	local reach = (a+b)*0.99999
+	local factor = 1
+	if singleHand then
+		local upper = V.normal(V.sub(source[2].p, source[1].p))
+		local lower = V.normal(V.sub(source[3].p, source[2].p))
+		if not upper or not lower then return nil, factor end
+		local cosine = math.max(math.cos(math.rad(25)), V.dot(upper, lower))
+		reach = math.sqrt(a*a+b*b+2*a*b*cosine)
+		factor = math.max(1, math.min(1.05, V.length(V.sub(wristRay, shoulderRay))/reach))
+		reach = reach*factor
+	end
+	local product = V.length(shoulderRay) * V.length(wristRay)
+	local axis = V.normal(V.cross(shoulderRay, wristRay))
+	if not axis or product <= 1e-12 or V.length(V.sub(wristRay, shoulderRay)) <= reach then return nil, factor end
+	local function acos(clamped) return math.acos(math.max(-1, math.min(1, clamped))) end
+	local current = acos(V.dot(shoulderRay, wristRay)/product)
+	local limit = acos((V.dot(shoulderRay, shoulderRay)+V.dot(wristRay, wristRay)-reach*reach)/(2*product))
+	local angle = math.min(math.rad(singleHand and 15 or 25), math.max(0, current-limit))
+	if angle > 1e-6 then return { q_axis_angle(axis[1], axis[2], axis[3], angle) }, factor end
+	return nil, factor
+end
+
+function M.contact_arm(model, source, wrist, lengths, factor, freeHand)
+	local V = M.contact_math
+	local sh, el, hand = model[1], model[2], model[3]
+	local nativeUpper = V.sub(source[2].p, source[1].p)
+	local nativeLower = V.sub(source[3].p, source[2].p)
+	local target = V.sub(wrist.p, sh.p)
+	local current = V.sub(hand.p, sh.p)
+	local axis = V.normal(target) or V.normal(current)
+	local span = lengths[1] + lengths[2]
+	if not axis or math.min(lengths[1], lengths[2]) < 1e-6 then return end
+	local distance = V.length(target)
+	local a, b = lengths[1]*factor, lengths[2]*factor
+	if freeHand then
+		local upper, lower = V.normal(nativeUpper), V.normal(nativeLower)
+		if upper and lower then
+			distance = math.min(distance, math.sqrt(math.max(0, a*a+b*b+2*a*b*V.dot(upper, lower))))
+		end
+	end
+	local reach = math.max(math.abs(a-b)+span*1e-5, math.min((a+b)*0.99999, distance))
+	local nativeAxis = V.normal(V.add(nativeUpper, nativeLower))
+	local pole
+	if nativeAxis then
+		local nativePole = V.project(nativeUpper, nativeAxis)
+		if V.length(nativePole) > (V.length(nativeUpper)+V.length(nativeLower))*0.0001 then
+			pole = V.normal(V.rotate(V.arc(nativeAxis, axis, nativePole), nativePole))
+		end
+	end
+	pole = pole or V.normal(V.project(V.sub(el.p, sh.p), axis)) or V.normal(V.project(nativeUpper, axis))
+	if not pole then
+		local fallback = math.abs(axis[1]) < 0.9 and { 1, 0, 0 } or { 0, 1, 0 }
+		pole = V.normal(V.project(fallback, axis))
+	end
+	local along = (a*a-b*b+reach*reach)/(2*reach)
+	local upper = V.add(V.scale(axis, along), V.scale(pole, math.sqrt(math.max(0, a*a-along*along))))
+	local endOffset = V.scale(axis, reach)
+	local shoulderDelta = V.arc(V.sub(el.p, sh.p), upper, pole)
+	local movedElbow = M.independent_fk({ p = sh.p, q = shoulderDelta }, el.q, { 0, 0, 0 })
+	local lowerDelta = V.arc(V.rotate(shoulderDelta, V.sub(hand.p, el.p)), V.sub(endOffset, upper), pole)
+	local elbow = M.independent_fk({ p = V.add(sh.p, upper), q = lowerDelta }, movedElbow.q, { 0, 0, 0 })
+	local shoulder = M.independent_fk({ p = sh.p, q = shoulderDelta }, sh.q, { 0, 0, 0 })
+	return shoulder, elbow, { p = V.add(sh.p, endOffset), q = wrist.q }
+end
+
+function M.contact_palm(wrist, index, pinky)
+	local V = M.contact_math
+	local across = V.sub(index.p, pinky.p)
+	local x = V.normal(V.sub(V.scale(V.add(index.p, pinky.p), 0.5), wrist.p))
+	local y = x and V.normal(V.project(across, x))
+	if not y then return end
+	local z = V.cross(x, y)
+	return M.independent_quaternion(mat3_to_quat(x[1], y[1], z[1], x[2], y[2], z[2], x[3], y[3], z[3]))
+end
+
+function M.calibrate_leg(modelHips, thigh, knee, foot, sourceHips, sourceThigh, sourceFoot, scale, normal)
+	local h, s, f = sourceHips.q, sourceHips.p, sourceFoot.p
+	local ax, ay, az = qrot(h[1], h[2], h[3], h[4], 0, 0, 1)
+	local a, b, c, pivot = thigh.p, knee.p, foot.p, modelHips.p
+	local sourceLateral = (f[1]-s[1])*ax + (f[2]-s[2])*ay + (f[3]-s[3])*az
+	local modelLateral = (c[1]-pivot[1])*ax + (c[2]-pivot[2])*ay + (c[3]-pivot[3])*az
+	local correction = sourceLateral*scale-modelLateral
+	local tx, ty, tz = c[1]+ax*correction-a[1], c[2]+ay*correction-a[2], c[3]+az*correction-a[3]
+	local reach = math.sqrt(tx*tx+ty*ty+tz*tz)
+	if reach < 1e-6 then return end
+	local dx, dy, dz = tx/reach, ty/reach, tz/reach
+	local ux, uy, uz = b[1]-a[1], b[2]-a[2], b[3]-a[3]
+	local lx, ly, lz = c[1]-b[1], c[2]-b[2], c[3]-b[3]
+	local upper2, lower2 = ux*ux+uy*uy+uz*uz, lx*lx+ly*ly+lz*lz
+	local upper, lower = math.sqrt(upper2), math.sqrt(lower2)
+	if math.min(upper, lower) < 1e-6 then return end
+	local margin = (upper+lower)*1e-6
+	reach = math.max(math.abs(upper-lower)+margin, math.min(upper+lower-margin, reach))
+	local along = (upper2-lower2+reach*reach)/(2*reach)
+	local height = math.sqrt(math.max(0, upper2-along*along))
+	local q = sourceThigh.q
+	local nx, ny, nz = qrot(q[1], q[2], q[3], q[4], normal[1], normal[2], normal[3])
+	local px, py, pz = arm_cross(nx, ny, nz, dx, dy, dz)
+	local plen = math.sqrt(px*px+py*py+pz*pz)
+	if plen < 1e-6 then return end
+	local bx, by, bz = dx*along+px*height/plen, dy*along+py*height/plen, dz*along+pz*height/plen
+	local sx, sy, sz, sw = min_arc_quat(ux, uy, uz, bx, by, bz)
+	local aq, bq = thigh.q, knee.q
+	local upperQ = { qmul(sx, sy, sz, sw, aq[1], aq[2], aq[3], aq[4]) }
+	local movedQ = { qmul(sx, sy, sz, sw, bq[1], bq[2], bq[3], bq[4]) }
+	lx, ly, lz = qrot(sx, sy, sz, sw, lx, ly, lz)
+	tx, ty, tz = dx*reach, dy*reach, dz*reach
+	sx, sy, sz, sw = min_arc_quat(lx, ly, lz, tx-bx, ty-by, tz-bz)
+	return { p = a, q = upperQ },
+		{ p = { a[1]+bx, a[2]+by, a[3]+bz }, q = { qmul(sx, sy, sz, sw, movedQ[1], movedQ[2], movedQ[3], movedQ[4]) } },
+		{ p = { a[1]+tx, a[2]+ty, a[3]+tz }, q = foot.q }
+end
+
+function M.clothing_driver_angles(source, reference, neutral)
+	local relative = M.independent_world_delta(source, { 0, 0, 0, 1 }, reference)
+	local x, y, z, w = qmul(-neutral[1], -neutral[2], -neutral[3], neutral[4],
+		relative[1], relative[2], relative[3], relative[4])
+	local xx, yy, zz = x*x, y*y, z*z
+	local r11, r21 = 1-2*(yy+zz), 2*(x*y+w*z)
+	local planar = math.sqrt(r11*r11+r21*r21)
+	local a, b, c = 0, math.atan2(2*(w*y-x*z), planar), 0
+	if planar < 1e-6 then
+		a = math.atan2(2*(w*x-y*z), 1-2*(xx+zz))
+	else
+		local r32, r33 = 2*(y*z+w*x), 1-2*(xx+yy)
+		a, c = math.atan2(r32, r33), math.atan2(r21, r11)
+		local altA, altB, altC = math.atan2(-r32, -r33), math.atan2(2*(w*y-x*z), -planar), math.atan2(-r21, -r11)
+		if math.abs(altA)+math.abs(altB)+math.abs(altC) < math.abs(a)+math.abs(b)+math.abs(c) then
+			a, b, c = altA, altB, altC
+		end
+	end
+	local degrees = 180/math.pi
+	return { a*degrees, b*degrees, c*degrees }
+end
+
+local function clothing_curve(points, at)
+	local first, last = points[1], points[#points]
+	if at <= first[1] then return { first[2], first[3], first[4] } end
+	if at >= last[1] then return { last[2], last[3], last[4] } end
+	for i = 2, #points do
+		local right = points[i]
+		if at <= right[1] then
+			local left = points[i-1]
+			local t = (at-left[1])/(right[1]-left[1])
+			return { left[2]+t*(right[2]-left[2]), left[3]+t*(right[3]-left[3]), left[4]+t*(right[4]-left[4]) }
+		end
+	end
+end
+
+function M.clothing_rotation(rule, primary, secondary, rest)
+	local angles = { 0, 0, 0 }
+	for index, axis in ipairs(rule.axes) do
+		local value = clothing_curve(axis.points, primary[index] * (axis.flags % 2 == 1 and -1 or 1))
+		if rule.mode ~= 0 then
+			local other = clothing_curve(axis.points, secondary[axis.secondaryAxis+1] * (axis.flags >= 2 and -1 or 1))
+			for j = 1, 3 do
+				if rule.mode == 1 then value[j] = math.max(value[j], other[j])
+				elseif rule.mode == 2 then value[j] = math.min(value[j], other[j])
+				else value[j] = math.max(-180, math.min(180, value[j]+other[j])) end
+			end
+		end
+		for j = 1, 3 do angles[j] = angles[j]+value[j] end
+	end
+	local half = math.pi/360
+	local a, b, c = angles[1]*half, angles[2]*half, angles[3]*half
+	local x, y, z, w = qmul(0, 0, math.sin(c), math.cos(c), 0, math.sin(b), 0, math.cos(b))
+	x, y, z, w = qmul(x, y, z, w, math.sin(a), 0, 0, math.cos(a))
+	local basis = rule.basis
+	x, y, z, w = qmul(basis[1], basis[2], basis[3], basis[4], x, y, z, w)
+	x, y, z, w = qmul(x, y, z, w, -basis[1], -basis[2], -basis[3], basis[4])
+	x, y, z, w = qmul(rest[1], rest[2], rest[3], rest[4], x, y, z, w)
+	return { qslerp(rest[1], rest[2], rest[3], rest[4], x, y, z, w, rule.influence) }
+end
+
 local function read_arm_position(S, unit, node)
 	local ok, p = pcall(S.Unit.world_position, unit, node)
 	if not ok or p == nil then return nil, 1 end
@@ -3764,29 +4059,31 @@ local function solve_independent_arm(sh, el, wrist, target, shoulderLocal, stret
 		ax, ay, az, d * ux - ax, d * uy - ay, d * uz - az), factor
 end
 
-function M.write_independent_rotation(S, unit, node, rotation, fastWrite)
+function M.independent_rotation_object(S, rotation, fastWrite)
 	local x, y, z, w = rotation[1], rotation[2], rotation[3], rotation[4]
 	local len2 = x * x + y * y + z * z + w * w
-	if not (len2 > 1e-12 and len2 < 1e12) then return false, 0 end
+	if not (len2 > 1e-12 and len2 < 1e12) then return nil, 0 end
 	local calls = 0
 	if fastWrite then
 		local scale = 1 / math.sqrt(len2)
 		local ok, q = pcall(S.Quaternion.from_elements, x * scale, y * scale, z * scale, w * scale)
-		if ok and q ~= nil then
-			local okWrite, result = pcall(S.Unit.set_local_rotation, unit, node, q)
-			return okWrite and result ~= false, 2
-		end
+		if ok and q ~= nil then return q, 1 end
 		calls = 1
 	end
 	local length = math.sqrt(x*x + y*y + z*z)
 	local ax, ay, az, angle = 0, 0, 1, w < 0 and 2*math.pi or 0
 	if length > 1e-9 then ax, ay, az, angle = x/length, y/length, z/length, 2*math.atan2(length, w) end
 	local okAxis, axis = pcall(S.Vector3, ax, ay, az)
-	if not okAxis or axis == nil then return false, calls + 1 end
+	if not okAxis or axis == nil then return nil, calls + 1 end
 	local okQ, q = pcall(S.Quaternion.axis_angle, axis, angle)
-	if not okQ or q == nil then return false, calls + 2 end
+	return okQ and q or nil, calls + 2
+end
+
+function M.write_independent_rotation(S, unit, node, rotation, fastWrite)
+	local q, calls = M.independent_rotation_object(S, rotation, fastWrite)
+	if q == nil then return false, calls end
 	local written, result = pcall(S.Unit.set_local_rotation, unit, node, q)
-	return written and result ~= false, calls + 3
+	return written and result ~= false, calls + 1
 end
 
 function M.write_independent_position(S, unit, node, position, factor)

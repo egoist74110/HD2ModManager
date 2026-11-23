@@ -16,7 +16,14 @@ public sealed record IasDp8Result(string ModDirectory, int BaseUnits, int Option
 
 public sealed class IasDp8Converter(Func<string, uint> boneHash, Func<ulong, bool, ulong> matchSlot)
 {
-	internal sealed record IndependentPiece(IReadOnlyList<string> Bones, string Slot, string? Option, string? DisabledBy = null);
+	internal sealed record IndependentTranslation(float[] Avatar, float[] Model);
+	internal sealed record IndependentPiece(IReadOnlyList<string> Bones, string Slot, string? Option, string? DisabledBy = null,
+		IReadOnlyDictionary<string, IndependentTranslation>? Translations = null, IReadOnlyDictionary<string, double[]>? Grips = null,
+		IReadOnlyList<ClothingRule>? PoseRules = null, IReadOnlyDictionary<string, LegCalibration>? Legs = null);
+	internal sealed record ClothingDriver(string Bone, string? Reference, float[] Neutral, float[] Offset, float[] ReferenceOffset);
+	internal sealed record ClothingRule(string Target, ClothingDriver Primary, ClothingDriver? Secondary, int Mode,
+		float Influence, IReadOnlyList<IasPoseAxis> Axes, float[] Basis);
+	internal sealed record LegCalibration(double LateralScale, double[] BendNormal);
 
 	private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web) { WriteIndented = true };
 	private readonly PatchTocScanner scanner = new();
@@ -64,38 +71,34 @@ public sealed class IasDp8Converter(Func<string, uint> boneHash, Func<ulong, boo
 			.Select(path => IasPhysicsReader.Read(File.ReadAllBytes(path))).ToDictionary(source => source.UnitId);
 		var sharedPhysics = physicsSources.Values.SingleOrDefault(source => !profiles.ContainsKey(source.UnitId));
 		var physicsProfiles = new Dictionary<ulong, IasRigProfile>(profiles);
-		if (sharedPhysics is not null)
+		foreach (var path in Directory.EnumerateFiles(companion, "*.canonical.rigbin"))
 		{
-			foreach (var path in Directory.EnumerateFiles(companion, "*.canonical.rigbin"))
-			{
-				using var stream = File.OpenRead(path);
-				if (IasRigReader.Read(stream).TryGetValue(sharedPhysics.UnitId, out var canonical))
-					physicsProfiles.Add(sharedPhysics.UnitId, canonical);
-			}
-			if (!physicsProfiles.ContainsKey(sharedPhysics.UnitId))
-				throw new InvalidDataException($"Missing IAS canonical rig for physics unit {sharedPhysics.UnitId:x16}.");
+			using var stream = File.OpenRead(path);
+			foreach (var (id, profile) in IasRigReader.Read(stream))
+				physicsProfiles.TryAdd(id, profile);
 		}
+		if (sharedPhysics is not null && !physicsProfiles.ContainsKey(sharedPhysics.UnitId))
+			throw new InvalidDataException($"Missing IAS canonical rig for physics unit {sharedPhysics.UnitId:x16}.");
+		var posePrograms = Directory.EnumerateFiles(companion, "*.hd2pose").ToDictionary(path => path,
+			path => IasPoseReader.Read(File.ReadAllBytes(path), physicsProfiles));
+		var poseByUnit = posePrograms.Values.ToDictionary(program => program.Unit);
+		var sharedPose = posePrograms.Where(pair => pair.Key.EndsWith(".canonical.hd2pose", StringComparison.OrdinalIgnoreCase))
+			.Select(pair => pair.Value).SingleOrDefault();
 		var sourceTorso = plan.Base.First(route => route.Slot.Part == "Torso");
-		var sourceHead = profiles[sourceTorso.Published].Nodes.Single(node => node.Name == "head").World.Origin;
 		var resolver = new GameDataPackageResolver(game);
 		var avatar = await new CanonicalAvatarRigReader(resolver).ReadTransformInfoAsync(cancellationToken: cancellationToken).ConfigureAwait(false);
 		var names = profiles.Values.SelectMany(profile => profile.SourceNames).Distinct(StringComparer.Ordinal).ToArray();
 		var targetRig = Hd2RigReader.FromTransformInfo(avatar, new UnitBoneNames(names.Select(boneHash).ToArray(), names));
 		var shoulderTargets = IasArmPose.ComputeShoulderTargets(targetRig, profiles[sourceTorso.Published].Nodes);
-		var legTargets = IasArmPose.ComputeLegTargets(targetRig, profiles[sourceTorso.Published].Nodes);
-		// 手臂与腿两条链互不重叠：合成一张逐骨平移表。
-		// 独立骨（实验 2）：两条手臂整棵子树（肩以下，含手指）不做平移，顶点留在模型原位；
-		// 按 Unit 的最终蒙皮权重选改名骨；腿照旧。
-		var arms = IasIndependentBones.ArmRoots.SelectMany(root => IasIndependentBones.Subtree(targetRig, root)).ToHashSet();
-		var independentBones = IasIndependentBones.Collect(targetRig, IasIndependentBones.ArmRoots);
+		var legTargets = new Dictionary<string, HD2SourceModel.Vec3>();
+		var candidates = IasIndependentBones.Collect(targetRig, IasIndependentBones.BodyRoots);
+		var candidateIndices = candidates.Select(name => targetRig.Find(name)!.Index).ToHashSet();
+		var candidateHashes = avatar.NameHashes.ToArray();
+		foreach (var name in candidates)
+			candidateHashes[targetRig.Find(name)!.Index] = boneHash(IasIndependentBones.Prefix + name);
+		var skinRig = avatar with { NameHashes = candidateHashes };
 		var packagedIndependentNames = new HashSet<string>(StringComparer.Ordinal);
 		var independentPieces = new Dictionary<string, IndependentPiece>();
-		var boneShifts = IasArmPose.ComputeBoneShifts(targetRig, profiles[sourceTorso.Published].Nodes)
-			.Concat(IasArmPose.ComputeLegShifts(targetRig, profiles[sourceTorso.Published].Nodes))
-			.Where(pair => !arms.Contains(pair.Key))
-			.ToDictionary(pair => pair.Key, pair => pair.Value);
-		var skinRig = IasIndependentBones.Apply(avatar, targetRig, profiles[sourceTorso.Published].Nodes,
-			independentBones, boneHash);
 		var vanilla = new GameDataUnitMeshReader(resolver);
 		var units = new Dictionary<ulong, GameDataUnitMesh>();
 		var usedMaterials = new HashSet<ulong>();
@@ -122,11 +125,13 @@ public sealed class IasDp8Converter(Func<string, uint> boneHash, Func<ulong, boo
 				ExternalTextures = externalTextures.Select(entry => new { Id = entry.Id.ToString("x16"), entry.GameArchive }),
 				ExternalMaterials = externalMaterials.Select(entry => new { Id = entry.Id.ToString("x16"), entry.GameArchive }),
 			}, JsonOptions), cancellationToken).ConfigureAwait(false);
-			await File.WriteAllTextAsync(Path.Combine(output, "arm-pose.json"), SerializeArmPose(shoulderTargets, legTargets), cancellationToken).ConfigureAwait(false);
+			await File.WriteAllTextAsync(Path.Combine(output, "arm-pose.json"), SerializeArmPose(shoulderTargets), cancellationToken).ConfigureAwait(false);
 			// 同一份数据放进 Mod 根目录：开了「手臂姿态修正」时，管理器部署会读它（HD2ModCore JointPoseData.FileName）。
 			await File.WriteAllTextAsync(Path.Combine(package, "joint-pose.json"),
-				SerializeIndependentBones(independentBones.Where(packagedIndependentNames.Contains).ToArray(),
-					targetRig, skinRig, independentPieces), cancellationToken).ConfigureAwait(false);
+				SerializeIndependentBones(candidates.Where(packagedIndependentNames.Contains).ToArray(),
+					targetRig, IasIndependentBones.Apply(avatar, targetRig, profiles[sourceTorso.Published].Nodes,
+						candidates.Where(packagedIndependentNames.Contains).ToArray(), boneHash), independentPieces),
+				cancellationToken).ConfigureAwait(false);
 			Directory.Move(package, mod);
 			return new(mod, plan.Base.Count, plan.Groups.SelectMany(group => group.Options).Sum(option => option.Routes.Count),
 				externalTextures, externalMaterials, shoulderTargets, legTargets);
@@ -160,25 +165,66 @@ public sealed class IasDp8Converter(Func<string, uint> boneHash, Func<ulong, boo
 							cancellationToken: cancellationToken).ConfigureAwait(false);
 						var profile = profiles[route.Published];
 						var physicsSource = physicsSources.GetValueOrDefault(route.Published) ?? (group.Key ? null : sharedPhysics);
-						var physics = physicsSource is null ? null
-							: new IasPhysicsMigration(physicsSource, route.Published, profile, physicsProfiles[physicsSource.UnitId]);
-						if (physics?.HasBones == false)
+						var program = poseByUnit.GetValueOrDefault(route.Published);
+						if (program.Rules is null && !group.Key)
+							program = sharedPose;
+						var poseRules = program.Rules?.Where(rule => profile.Nodes.Any(node => node.Name == rule.Target)).ToArray();
+						var physics = new IasPhysicsMigration(physicsSource, route.Published, profile,
+							physicsSource is null ? null : physicsProfiles[physicsSource.UnitId], poseRules);
+						if (!physics.HasBones)
 							physics = null;
-						var (lods, materials) = IasNativeMesh.Convert(sourceUnit.Model, profile, targetRig, skinRig,
-							sourceHead, boneHash, refitArms: true, boneShifts, physics);
+						var (lods, materials) = IasNativeMesh.Convert(sourceUnit.Model, profile, targetRig, skinRig, boneHash, physics);
 						var weighted = lods.Values.SelectMany(mesh => mesh.Vertices)
 							.SelectMany(vertex => vertex.Influences).Select(influence => influence.BoneHash).ToHashSet();
 						physics?.KeepWeightedChains(weighted, avatar.NameHashes.Count);
-						var independentNames = IasIndependentBones.SelectWeighted(targetRig, skinRig, independentBones,
-							arms, weighted, physics?.NativeParents(avatar.NameHashes.Count));
+						// The head profile describes just the head branch. Importing the other body
+						// branches there would push the head's full physics rig past 256 nodes.
+						var unitCandidates = group.Key
+							? candidates.Where(name => profile.Nodes.Any(node => node.Name == name && (node.Flags & 1024) != 0)).ToArray()
+							: candidates;
+						var unitCandidateIndices = group.Key
+							? unitCandidates.Select(name => targetRig.Find(name)!.Index).ToHashSet()
+							: candidateIndices;
+						var independentNames = IasIndependentBones.SelectWeighted(targetRig, skinRig, unitCandidates,
+							unitCandidateIndices, weighted, (physics?.NativeParents(avatar.NameHashes.Count) ?? [])
+								.Concat(profile.Nodes.Where(node => IasIndependentBones.ModelAttachments.Contains(node.Name))
+									.Select(node => targetRig.Find(node.Name)!.Index)));
 						packagedIndependentNames.UnionWith(independentNames);
+						var unitSkinRig = IasIndependentBones.Apply(avatar, targetRig, profile.Nodes, independentNames, boneHash);
 						if (independentNames.Count > 0)
-							independentPieces.Add($"#ID[{key.FileId:x16}]", new(independentNames, route.Slot.Part, option,
-								hiddenOptions.GetValueOrDefault(key.FileId)));
-						var unitSkinRig = IasIndependentBones.Apply(avatar, targetRig, profiles[sourceTorso.Published].Nodes,
-							independentNames, boneHash);
-						var unitRig = physics?.Append(unitSkinRig, lods.Values, compact: group.Key) ?? unitSkinRig;
+						{
+							var translating = profile.Nodes.Where(node => (node.Flags & 1) != 0)
+								.Select(node => node.Name).ToHashSet(StringComparer.Ordinal);
+							var translations = independentNames.Where(translating.Contains)
+								.ToDictionary(name => IasIndependentBones.Prefix + name, name =>
+								{
+									var index = targetRig.Find(name)!.Index;
+									return new IndependentTranslation(avatar.LocalTransforms[index].Position.ToArray(),
+										unitSkinRig.LocalTransforms[index].Position.ToArray());
+								});
+							var pieceId = $"#ID[{key.FileId:x16}]";
+							if (independentPieces.TryGetValue(pieceId, out var previous) && option is not null)
+							{
+								// A visible replacement (e.g. shoes/off) keeps the game Unit ID but has its own bind.
+								independentPieces[pieceId] = previous with { DisabledBy = option };
+								pieceId += "@" + option;
+							}
+							independentPieces.Add(pieceId, new(independentNames, route.Slot.Part, option,
+								hiddenOptions.GetValueOrDefault(key.FileId), translations, ConvertGrips(profile, targetRig, unitSkinRig),
+								poseRules is { Length: > 0 } ? ConvertPoseRules(poseRules, program.Basis, profile, targetRig, independentNames) : null,
+								ConvertLegs(profile, targetRig, independentNames)));
+						}
+						var unitRig = physics?.Append(unitSkinRig, lods.Values, compact: group.Key,
+							independentNames.Select(name => boneHash(IasIndependentBones.Prefix + name))) ?? unitSkinRig;
 						var shell = IasNativeMesh.UseFourWeightStreams(donor.Model);
+						if (group.Key)
+						{
+							// Preserve the donor's node indices while letting the expander replace
+							// the bind in place, instead of keeping duplicate original head bones.
+							var renamed = independentNames.ToDictionary(boneHash, name => boneHash(IasIndependentBones.Prefix + name));
+							var hashes = shell.TransformNameHashes.Select(hash => renamed.GetValueOrDefault(hash, hash)).ToArray();
+							shell = shell with { TransformNameHashes = hashes, TransformInfo = shell.TransformInfo with { NameHashes = hashes } };
+						}
 						var result = new UnitAuthor().Author(new UnitAuthorRequest(shell, donor.Payload.TocData, unitRig,
 							lods[0], donor.Model.CustomizationInfo, key.FileId, materials), lods);
 						if (!result.IsValid || result.Model!.TransformNameHashes.Count > 256)
@@ -230,6 +276,14 @@ public sealed class IasDp8Converter(Func<string, uint> boneHash, Func<ulong, boo
 			pair => pair.Value.Bones.Select(name => IasIndependentBones.Prefix + name).ToArray()),
 		independentPieceRoutes = pieces?.ToDictionary(pair => pair.Key,
 			pair => new { pair.Value.Slot, pair.Value.Option, pair.Value.DisabledBy }),
+		independentTranslations = pieces?.Where(pair => pair.Value.Translations != null)
+			.ToDictionary(pair => pair.Key, pair => pair.Value.Translations),
+		independentGrips = pieces?.Where(pair => pair.Value.Grips is { Count: > 0 })
+			.ToDictionary(pair => pair.Key, pair => pair.Value.Grips),
+		independentPoseRules = pieces?.Where(pair => pair.Value.PoseRules is { Count: > 0 })
+			.ToDictionary(pair => pair.Key, pair => pair.Value.PoseRules),
+		independentLegs = pieces?.Where(pair => pair.Value.Legs is { Count: > 0 })
+			.ToDictionary(pair => pair.Key, pair => pair.Value.Legs),
 		independentRest = avatar is null || model is null ? null : bones.Select(name =>
 		{
 			var bone = avatar.Find(name)!;
@@ -244,6 +298,63 @@ public sealed class IasDp8Converter(Func<string, uint> boneHash, Func<ulong, boo
 			};
 		}),
 	}, JsonOptions);
+
+	internal static IReadOnlyDictionary<string, LegCalibration> ConvertLegs(IasRigProfile profile,
+		Hd2Rig avatar, IReadOnlyList<string> independent)
+	{
+		var result = new Dictionary<string, LegCalibration>();
+		var model = profile.Nodes.ToDictionary(node => node.Name, node => node.World, StringComparer.Ordinal);
+		foreach (var side in new[] { "l", "r" })
+		{
+			var thigh = $"{side}_thigh";
+			var knee = $"{side}_knee";
+			var foot = $"{side}_foot";
+			if (!new[] { "hips", thigh, knee, foot }.All(name => independent.Contains(name) && model.ContainsKey(name)))
+				continue;
+			var hipsRest = avatar.Find("hips")!.WorldBind;
+			var thighRest = avatar.Find(thigh)!.WorldBind;
+			var kneeRest = avatar.Find(knee)!.WorldOrigin;
+			var ankleRest = avatar.Find(foot)!.WorldOrigin;
+			var sourceLateral = hipsRest.Inverse().TransformPoint(ankleRest).Z;
+			var modelLateral = model["hips"].Inverse().TransformPoint(model[foot].Origin).Z;
+			var thighLocal = thighRest.Inverse();
+			var restNormal = Vec3.Cross(thighLocal.TransformPoint(ankleRest), thighLocal.TransformPoint(kneeRest)).Normalized();
+			if (Math.Abs(sourceLateral) > 1e-6 && restNormal.Length > 0.5)
+				result.Add(side, new(modelLateral / sourceLateral, [restNormal.X, restNormal.Y, restNormal.Z]));
+		}
+		return result;
+	}
+
+	private static ClothingRule[] ConvertPoseRules(IReadOnlyList<IasPoseRule> rules, Mat4 authorBasis,
+		IasRigProfile profile, Hd2Rig avatar, IReadOnlyList<string> independent)
+	{
+		var nodes = profile.Nodes.ToDictionary(node => node.Name, StringComparer.Ordinal);
+		string Name(string name) => independent.Contains(name) ? IasIndependentBones.Prefix + name : name;
+		Hd2RigBone Avatar(string name) => avatar.Find(name)
+			?? throw new InvalidDataException($"Missing IAS clothing driver {name} in avatar rig.");
+		float[] Offset(string name) => Rotation(Avatar(name).WorldBind.Inverse() * nodes[name].World);
+		ClothingDriver ConvertDriver(IasPoseDriver driver) => new(Name(driver.Bone),
+			driver.Reference is null ? null : Name(driver.Reference), driver.Neutral, Offset(driver.Bone),
+			driver.Reference is null ? Rotation(authorBasis) : Offset(driver.Reference));
+		return rules.Select(rule =>
+		{
+			var node = nodes[rule.Target];
+			var parent = profile.ResolveSemanticNode(node.Parent);
+			var basis = Avatar(profile.Nodes[parent].Name).WorldBind.Inverse() * node.World;
+			return new ClothingRule(IasPhysicsMigration.PoseNodeName(rule.Target), ConvertDriver(rule.Primary),
+				rule.Secondary is null ? null : ConvertDriver(rule.Secondary), rule.Mode, rule.Influence, rule.Axes, Rotation(basis));
+		}).ToArray();
+	}
+
+	internal static IReadOnlyDictionary<string, double[]> ConvertGrips(IasRigProfile profile, Hd2Rig target,
+		UnitTransformInfo model) => profile.Grips.ToDictionary(pair => pair.Key, pair =>
+	{
+		var hand = profile.Nodes.Single(node => node.Slot == pair.Value.Slot);
+		var bind = Hd2RigReader.FromHd2RowVector(model.Matrices[target.Find(hand.Name)!.Index].Values);
+		var grip = bind.Inverse() * hand.World * pair.Value.HandToGrip;
+		return new[] { grip.M11, grip.M12, grip.M13, grip.M14, grip.M21, grip.M22, grip.M23, grip.M24,
+			grip.M31, grip.M32, grip.M33, grip.M34 };
+	});
 
 	private static float[] Rotation(Mat4 world)
 	{

@@ -42,13 +42,8 @@ internal static class IasNativeMesh
 
 	internal static (IReadOnlyDictionary<int, RetargetedMesh> Meshes, IReadOnlyDictionary<int, ulong> Materials)
 		Convert(UnitMeshModel model, IasRigProfile profile, Hd2Rig target, UnitTransformInfo avatar,
-			Vec3 headAnchor, Func<string, uint> hash, bool refitArms,
-			IReadOnlyDictionary<int, Vec3>? boneShifts = null, IasPhysicsMigration? physics = null)
+			Func<string, uint> hash, IasPhysicsMigration? physics = null)
 	{
-		// 给了逐骨平移就不走 ArmRefit：两者都在把手臂搬到潜兵关节上，只能用一个。
-		if (boneShifts is not null)
-			refitArms = false;
-		var shiftByHash = boneShifts?.ToDictionary(pair => avatar.NameHashes[pair.Key], pair => pair.Value);
 		var transform = model.TransformInfo;
 		var byPaletteSlot = profile.Nodes.Select((node, index) => (node.Slot, index)).ToDictionary(item => item.Slot, item => item.index);
 		var sourceBones = profile.Nodes.Select((node, index) =>
@@ -60,7 +55,8 @@ internal static class IasNativeMesh
 			return new Hd2RigBone(index, node.Name, node.Parent, stored);
 		}).ToArray();
 		var semanticBySlot = new Dictionary<int, int>();
-		var armRig = BuildArmFoldContext(sourceBones, target);
+		var resolved = Retargeter.RunNative(sourceBones, target);
+		physics?.Plan(sourceBones, target, resolved);
 		var materials = new List<ulong>();
 		var meshes = new Dictionary<int, RetargetedMesh>();
 		foreach (var lod in model.RawMeshData.Where(mesh => mesh.LodIndex >= 0 &&
@@ -103,7 +99,7 @@ internal static class IasNativeMesh
 					surfaceComponents.Add(vertex.Components.Where(item => item.Type is 4 or 5).ToArray());
 					var weights = weightsByVertex[index];
 					rawWeights?.Add(weights);
-					sourceWeights.Add(FoldVertexWeights(weights, byPaletteSlot, semanticBySlot, profile, worldPos, armRig));
+					sourceWeights.Add(FoldVertexWeights(weights, byPaletteSlot, semanticBySlot, profile, worldPos, null));
 				}
 				foreach (var binding in materialBindings.ResolvedSectionBindings)
 				{
@@ -126,34 +122,31 @@ internal static class IasNativeMesh
 			var trianglesForRetarget = buckets.SelectMany(pair => pair.Value.Select(face =>
 				new SourceTriangle(face.A, face.B, face.C, pair.Key))).ToArray();
 			var geometry = new SourceGeometry(sourceVertices, trianglesForRetarget, []);
-			var result = Retargeter.RunNative(sourceBones, geometry, sourceWeights, target, headAnchor, refitArms);
-			if (meshes.Count == 0)
-				physics?.Plan(sourceBones, target, result, boneShifts);
+			var positions = sourceVertices.Select(vertex => vertex.Position).ToArray();
 			var group = new MeshGroup("IAS", MeshGroupKind.BodyPart, default, 0, 1, [],
 				Enumerable.Range(0, sourceVertices.Count).ToArray());
-			var normals = RetargetedMeshBuilder.ComputeFinalNormals(group, geometry, result.Output, buckets);
+			var normals = RetargetedMeshBuilder.ComputeFinalNormals(group, geometry, positions, buckets);
 			var output = new RetargetedVertex[sourceVertices.Count];
 			for (var i = 0; i < output.Length; i++)
 			{
 				RetargetedInfluence NativeInfluence(SourceVertexWeight item)
 				{
 					var name = sourceBones[item.BoneIndex].DisplayName;
-					if (!result.Resolved.TryGetValue(item.BoneIndex, out var targetIndex) ||
+					if (!resolved.TryGetValue(item.BoneIndex, out var targetIndex) ||
 						target.Bones[targetIndex].Name != name)
 						throw new InvalidDataException($"Native avatar is missing weighted IAS semantic bone {name}.");
 					return new RetargetedInfluence(avatar.NameHashes[targetIndex], item.Weight);
 				}
 				var influences = MergeInfluences(sourceWeights[i].Select(NativeInfluence));
-				var position = shiftByHash is null ? result.Output[i] : result.Output[i] + IasArmPose.BlendShift(influences, shiftByHash);
 				if (physics is not null && rawWeights is not null && rawWeights[i].Any(item => physics.WeightTarget(item.Slot).HasValue))
 				{
 					var remaining = rawWeights[i].Where(item => !physics.WeightTarget(item.Slot).HasValue).ToArray();
 					var physical = rawWeights[i].Where(item => physics.WeightTarget(item.Slot).HasValue)
 						.Select(item => new RetargetedInfluence(physics.WeightTarget(item.Slot)!.Value, item.Weight));
 					influences = MergeInfluences(physical.Concat(FoldVertexWeights(remaining, byPaletteSlot,
-						semanticBySlot, profile, sourceVertices[i].Position, armRig).Select(NativeInfluence)));
+						semanticBySlot, profile, positions[i], null).Select(NativeInfluence)));
 				}
-				output[i] = new(position, normals[i], sourceVertices[i].U, sourceVertices[i].V, influences)
+				output[i] = new(positions[i], normals[i], sourceVertices[i].U, sourceVertices[i].V, influences)
 				{
 					NativeSurfaceComponents = surfaceComponents[i],
 				};

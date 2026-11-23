@@ -10,6 +10,56 @@ namespace HD2SourceMigration.Tests;
 public sealed class IasConversionTests
 {
 	[Fact]
+	public void ClothingReaderResolvesProfileIndicesAndChecksPayloadAndProfileIdentity()
+	{
+		const ulong unit = 42;
+		byte[] digest = Enumerable.Range(0, 32).Select(index => (byte)index).ToArray();
+		var profile = new IasRigProfile(["hips"], [new("hips", -1, 0, 0, 1025, Mat4.Identity),
+			new("Jacket_01", 0, -1, 7, 256, Mat4.Identity)]) { PoseDigest = digest };
+		var profiles = new Dictionary<ulong, IasRigProfile> { [unit] = profile };
+		using var stream = new MemoryStream();
+		using var writer = new BinaryWriter(stream, Encoding.UTF8, leaveOpen: true);
+		writer.Write(new byte[120]);
+		foreach (var value in new[] { 0, 1, 0, -1, -1, 0 })
+			writer.Write(value);
+		writer.Write(0.75f);
+		foreach (var value in new[] { 1f, 0f, 0f, 0f, 1f, 0f, 0f, 0f })
+			writer.Write(value);
+		for (var axis = 0; axis < 3; axis++)
+		{
+			foreach (var value in new[] { 0, axis, 2, 0 })
+				writer.Write(value);
+			foreach (var value in new[] { -10f, 0f, 0f, 0f, 10f, 20f, 0f, 0f })
+				writer.Write(value);
+		}
+		var payload = stream.ToArray();
+		stream.Position = 0;
+		writer.Write("HD2POSE1"u8);
+		writer.Write(1);
+		writer.Write(120);
+		writer.Write(payload.Length);
+		writer.Write(IasRigReader.Crc32(payload.AsSpan(120)));
+		writer.Write(1);
+		writer.Write(0);
+		writer.Write(unit);
+		writer.Write(digest);
+		WriteMatrix(writer, 0);
+		var bytes = stream.ToArray();
+		var parsed = IasPoseReader.Read(bytes, profiles);
+		var rule = Assert.Single(parsed.Rules);
+		Assert.Equal("Jacket_01", rule.Target);
+		Assert.Equal("hips", rule.Primary.Bone);
+		Assert.Equal([0f, 0f, 0f, 1f], rule.Primary.Neutral);
+		Assert.Equal(0.75f, rule.Influence);
+		Assert.Equal(20f, rule.Axes[1].Points[1][1]);
+		bytes[40] ^= 1;
+		Assert.Throws<InvalidDataException>(() => IasPoseReader.Read(bytes, profiles));
+		bytes[40] ^= 1;
+		bytes[^1] ^= 1;
+		Assert.Throws<InvalidDataException>(() => IasPoseReader.Read(bytes, profiles));
+	}
+
+	[Fact]
 	public void RigReaderFoldsCustomChainIntoMappedNativeAncestorAndChecksCrc()
 	{
 		using var payload = new MemoryStream();
@@ -72,20 +122,66 @@ public sealed class IasConversionTests
 	}
 
 	[Fact]
-	public void NativeRetargetKeepsMetresAndFourthInfluence()
+	public void NativeRetargetMapsNamedBonesWithoutGeometryFitting()
 	{
-		var source = new[] { new Hd2RigBone(0, "head", 0, Mat4.Identity), new Hd2RigBone(1, "neck", 1, Mat4.Identity) };
-		var vertices = new[] { new SourceVertex(new(1, 0, 0), new(0, 0, 1), 0, 0, default, default, default),
-			new SourceVertex(new(0, 1, 0), new(0, 0, 1), 1, 0, default, default, default),
-			new SourceVertex(new(0, 0, 0), new(0, 0, 1), 0, 1, default, default, default) };
-		var geometry = new SourceGeometry(vertices, [new(0, 1, 2, 0)], []);
-		var result = Retargeter.RunNative(source, geometry,
-			Enumerable.Repeat(new SourceVertexWeight[] { new(0, 0), new(0, 0), new(0, 0), new(1, 1) }, 3).ToArray(),
-			new Hd2Rig(source), Vec3.Zero);
-		Assert.Equal(new Vec3(1, 0, 0), result.SourcePoints[0]);
-		Assert.Equal(new Vec3(1, 0, 0), result.Output[0]);
-		Assert.Equal(new Vec3(0, 0, 1), Vec3.Cross(result.Output[1] - result.Output[0], result.Output[2] - result.Output[0]));
-		Assert.Equal(1, result.Resolved[1]);
+		Hd2RigBone[] source = [new(0, "head", 0, Mat4.Identity), new(1, "neck", 0, Mat4.Identity),
+			new(2, "decoration", 1, Mat4.Identity)];
+		Hd2RigBone[] target = [new(0, "neck", 0, Translate(0, 0, 1)), new(1, "head", 0, Translate(0, 0, 2))];
+		var mapped = Retargeter.RunNative(source, new Hd2Rig(target));
+		Assert.Equal(1, mapped[0]);
+		Assert.Equal(0, mapped[1]);
+		Assert.False(mapped.ContainsKey(2));
+	}
+
+	[Fact]
+	public void GripReadsProfileNodeIndexAndConvertsFromAuthoredHandToNewBindAxes()
+	{
+		using var payload = new MemoryStream();
+		using var body = new BinaryWriter(payload, Encoding.UTF8, leaveOpen: true);
+		WriteName(body, "r_hand");
+		body.Write(-1);
+		body.Write(0u);
+		WriteMatrix(body, 0);
+		body.Write(42ul);
+		body.Write(1);
+		body.Write(0);
+		body.Write(0);
+		body.Write(5);
+		body.Write(0u);
+		WriteName(body, "r_hand");
+		body.Write(-1);
+		body.Write(0);
+		body.Write(4);
+		body.Write(1024u);
+		body.Write(1f);
+		WriteMatrix(body, 0.5f);
+		body.Write("HD2GRIP1"u8);
+		body.Write(1);
+		body.Write(0);
+		body.Write(0);
+		body.Write(0);
+		body.Write(0);
+		body.Write(0);
+		WriteMatrix(body, 0.25f);
+		using var rig = new MemoryStream();
+		using var header = new BinaryWriter(rig, Encoding.UTF8, leaveOpen: true);
+		header.Write("HD2IRG1\0"u8);
+		header.Write(1);
+		header.Write(32);
+		header.Write(1);
+		header.Write(1);
+		var bytes = payload.ToArray();
+		header.Write(IasRigReader.Crc32(bytes));
+		header.Write(1u);
+		header.Write(bytes);
+		rig.Position = 0;
+		var profile = IasRigReader.Read(rig)[42];
+		Assert.Equal(4, profile.Grips["r"].Slot);
+		var model = UnitTransformInfo.Empty with { Matrices = [new UnitTransformMatrix(
+			[0, 1, 0, 0, -1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0.25f, 1])] };
+		var target = new Hd2Rig([new(0, "r_hand", 0, Mat4.Identity)]);
+		Assert.Equal(new double[] { 0, 1, 0, 0, -1, 0, 0, 0, 0, 0, 1, 0.5 },
+			IasDp8Converter.ConvertGrips(profile, target, model)["r"]);
 	}
 
 	[Fact]
@@ -131,46 +227,6 @@ public sealed class IasConversionTests
 				lines.Add($"free_route={group},off,{slot.Source:x16},{aliases[slot.Source]:x16},{aliases[slot.Source] + 1:x16}");
 			}
 		}
-	}
-
-	[Fact]
-	public void NativeArmRefitInterpolatesTwistResidualAlongSegmentInsteadOfSubtractingMidArmFromElbow()
-	{
-		var source = new[]
-		{
-			new Hd2RigBone(0, "hips", -1, Translate(0, 0, 1.1)),
-			new Hd2RigBone(1, "head", 0, Translate(0, 0, 1.7)),
-			new Hd2RigBone(2, "l_shoulder", 0, Translate(-0.10, 0, 1.50)),
-			// Sample places l_shoulder_twist at the elbow, whereas native HD2 places it mid-upper-arm.
-			new Hd2RigBone(3, "l_shoulder_twist", 2, Translate(-0.35, 0, 1.40)),
-			new Hd2RigBone(4, "l_elbow", 2, Translate(-0.35, 0, 1.40)),
-			new Hd2RigBone(5, "l_hand", 4, Translate(-0.55, 0.10, 1.30)),
-		};
-		var target = new[]
-		{
-			new Hd2RigBone(0, "hips", -1, Translate(0, 0, 1.1)),
-			new Hd2RigBone(1, "head", 0, Translate(0, 0, 1.7)),
-			new Hd2RigBone(2, "l_shoulder", 0, Translate(-0.15, 0, 1.52)),
-			new Hd2RigBone(3, "l_shoulder_twist", 2, Translate(-0.28, 0, 1.44)),
-			new Hd2RigBone(4, "l_elbow", 2, Translate(-0.47, 0, 1.32)),
-			new Hd2RigBone(5, "l_hand", 4, Translate(-0.65, 0.12, 1.22)),
-		};
-		var vertices = new[]
-		{
-			new SourceVertex(new(-0.35, 0, 1.40), new(0, 0, 1), 0, 0, default, default, default),
-			new SourceVertex(new(-0.35, 0.01, 1.40), new(0, 0, 1), 1, 0, default, default, default),
-			new SourceVertex(new(-0.55, 0.10, 1.30), new(0, 0, 1), 0, 1, default, default, default),
-		};
-		var weights = new SourceVertexWeight[][]
-		{
-			[new(3, 1f)],
-			[new(4, 1f)],
-			[new(5, 1f)],
-		};
-		var geometry = new SourceGeometry(vertices, [new(0, 1, 2, 0)], []);
-		var result = Retargeter.RunNative(source, geometry, weights, new Hd2Rig(target), new(0, 0, 1.7), refitArms: true);
-		var twistElbowGap = (result.Output[0] - result.Output[1]).Length;
-		Assert.InRange(twistElbowGap, 0.0, 0.08);
 	}
 
 	private static Mat4 Translate(double x, double y, double z) =>
@@ -264,47 +320,6 @@ public sealed class IasConversionTests
 		Assert.DoesNotContain(folded, w => w.BoneIndex == 3);
 		Assert.Equal(0.4f, folded.Single(w => w.BoneIndex == 2).Weight, 5);
 		Assert.Equal(0.6f, folded.Single(w => w.BoneIndex == 4).Weight, 5);
-	}
-
-	[Fact]
-	public void NativeRetargetDoesNotApplyArmScratchStretchOrL4d2BasisToElbowEdges()
-	{
-		var source = new[]
-		{
-			new Hd2RigBone(0, "hips", -1, Translate(0, 0, 1.1)),
-			new Hd2RigBone(1, "head", 0, Translate(0, 0, 1.7)),
-			new Hd2RigBone(2, "l_shoulder", 0, Translate(-0.10, -0.02, 1.56)),
-			new Hd2RigBone(3, "l_elbow", 2, Translate(-0.35, -0.04, 1.39)),
-			new Hd2RigBone(4, "l_hand", 3, Translate(-0.55, 0.14, 1.30)),
-		};
-		var target = new[]
-		{
-			new Hd2RigBone(0, "hips", -1, Translate(0, 0, 1.1)),
-			new Hd2RigBone(1, "head", 0, Translate(0, 0, 1.7)),
-			new Hd2RigBone(2, "l_shoulder", 0, Translate(-0.21, -0.07, 1.47)),
-			new Hd2RigBone(3, "l_elbow", 2, Translate(-0.47, -0.05, 1.32)),
-			new Hd2RigBone(4, "l_hand", 3, Translate(-0.66, 0.14, 1.22)),
-		};
-		var pA = new Vec3(-0.34, -0.04, 1.39);
-		var pB = new Vec3(-0.36, -0.04, 1.39);
-		var vertices = new[]
-		{
-			new SourceVertex(pA, new(0, 0, 1), 0, 0, default, default, default),
-			new SourceVertex(pB, new(0, 0, 1), 1, 0, default, default, default),
-			new SourceVertex(new(-0.55, 0.14, 1.30), new(0, 0, 1), 0, 1, default, default, default),
-		};
-		var weights = new SourceVertexWeight[][]
-		{
-			[new(2, 0.5f), new(3, 0.5f)],
-			[new(3, 1.0f)],
-			[new(4, 1.0f)],
-		};
-		var result = Retargeter.RunNative(source, new SourceGeometry(vertices, [new(0, 1, 2, 0)], []), weights, new Hd2Rig(target), new(0, 0, 1.7), refitArms: true);
-		var origLen = (pB - pA).Length;
-		var outLen = (result.Output[1] - result.Output[0]).Length;
-		// Neither ArmScratch nor L4D2 InitialBasisRotations should deform the native IAS elbow bone.
-		Assert.InRange((result.Deform[3].Origin - Vec3.Zero).Length, 0.0, 1e-9);
-		Assert.InRange(outLen / origLen, 0.75, 1.50);
 	}
 
 	[Fact]
@@ -492,7 +507,7 @@ public sealed class IasConversionTests
 		var model = new List<IasRigNode>
 		{
 			new("l_shoulder", -1, 0, 0, 0, At(0.17, 0.01, 1.45)),
-			new("l_shoulder_twist", -1, 0, 0, 0, At(9, 9, 9)),   // 扭转骨不用模型位置
+			new("l_shoulder_twist", -1, 0, 0, 0, At(0.35, 0.04, 1.41)),
 			new("l_elbow", -1, 0, 0, 0, At(0.44, 0.02, 1.36)),
 		};
 
@@ -505,8 +520,7 @@ public sealed class IasConversionTests
 		Vec3 World(int index) => Hd2RigReader.FromHd2RowVector(skin.Matrices[index].Values).Origin;
 		Assert.True((World(2) - new Vec3(0.17, 0.01, 1.45)).Length < 1e-6);
 		Assert.True((World(4) - new Vec3(0.44, 0.02, 1.36)).Length < 1e-6);
-		// 扭转骨：保持潜兵里相对父骨的位置（父骨挪到哪，它跟到哪）。
-		Assert.True((World(3) - (new Vec3(0.17, 0.01, 1.45) + new Vec3(0.1, 0, -0.02))).Length < 1e-6);
+		Assert.True((World(3) - new Vec3(0.35, 0.04, 1.41)).Length < 1e-6);
 		// 局部平移 = 改过的父骨全局矩阵的逆 × 新位置（父骨是转过 90° 的锁骨）。
 		for (var index = 2; index <= 4; index++)
 		{

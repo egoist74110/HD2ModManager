@@ -132,10 +132,11 @@ local function make_rig(mode)
 		for _, name in ipairs(names) do
 			local par = parents[name]
 			local lp = locals[name]
-			if par == nil then
+			local link = unit.links and unit.links[name]
+			if par == nil and not link then
 				unit.worldPoses[name] = { p = { lp.p[1], lp.p[2], lp.p[3] }, q = { lp.q[1], lp.q[2], lp.q[3], lp.q[4] } }
 			else
-				local pw = unit.worldPoses[par]
+				local pw = link and link.owner.worldPoses[link.source] or unit.worldPoses[par]
 				local rp = qrot(pw.q, lp.p)
 				unit.worldPoses[name] = {
 					p = { pw.p[1] + rp[1], pw.p[2] + rp[2], pw.p[3] + rp[3] },
@@ -198,14 +199,17 @@ local function make_env(unit, opts)
 			assert(u.machine ~= false)
 			local tuple = {}
 			for i = 1, 31 do tuple[i] = 0 end
-			tuple[4] = u.menu and 76 or 67
+			tuple[3], tuple[4], tuple[11] = u.weaponLayer or 67, u.menu and 76 or (u.upperLayer or 67), u.mainLayer or 0
 			return unpack(tuple)
 		end,
 		animation_layer_info = function(u, layer)
 			engineCalls = engineCalls + 1
 			assert(u.machine ~= false and layer == 11)
-			return 0, u.clip or 1e37
+			return u.clipTime or 0, u.clip or 1e37
 		end,
+		animation_has_variable = function(u, name) return name == "weapon_selected" and u.weaponSelected ~= nil end,
+		animation_find_variable = function() return 14 end,
+		animation_get_variable = function(u, id) assert(id == 14); return u.weaponSelected end,
 		has_node = function(u, name) engineCalls = engineCalls + 1; return u.names[name] ~= nil end,
 		node = function(u, name) engineCalls = engineCalls + 1; return u.names[name] or 1 end,
 		local_pose = function(u, node)
@@ -733,13 +737,13 @@ do
 	check("独立骨：护甲没列出的骨不动", qangle(armor.locals.r_shoulder.q, armorRightQ) < 1e-12)
 	check("独立骨：不再写 avatar", dist(u.locals.l_shoulder.p, avatarShoulderP) < 1e-12)
 	check("独立骨：日志报告找到 1 件", string.find(text, "找到 1 件 / 缺 无", 1, true) ~= nil, text)
-	check("独立骨：日志报肩和手的偏差", string.find(text, "l_shoulder差=", 1, true) ~= nil and string.find(text, "l_hand差=", 1, true) ~= nil, text)
+	check("独立骨：日志报告写入数", string.find(text, "1件 写入=3", 1, true) ~= nil, text)
 	check("独立骨：首次生效", string.find(text, "独立骨首次生效", 1, true) ~= nil, text)
 	-- 无抽样帧：读旋转并拆分 6 + 写 3 + update 1。
 	check("独立骨：旧数据无抽样帧 10 次调用", state.armCalls == 10, "calls=" .. tostring(state.armCalls))
 end
 
--- 7) 独立骨 IK：默认开启，走真实 render 钩子，护甲姿势只有 update_unit 后才刷新。
+-- 7) 持枪时也只驱动局部旋转。
 do
 	local function run(armScale, ik, fastWrite, partial, withRest)
 		local avatar, armor = make_rig("rifle"), make_rig("rifle")
@@ -783,52 +787,18 @@ do
 		return avatar, armor, shoulders, avatarWrites, state.armCalls, engineCalls, length, forearm
 	end
 
-	local avatar, armor, shoulders, writes, calls, engineCalls = run(0.96)
+	local avatar, armor, shoulders, writes, calls, engineCalls = run(0.96, true)
 	for _, side in ipairs({ "l", "r" }) do
 		local a, b = avatar.worldPoses[side .. "_hand"], armor.worldPoses[side .. "_hand"]
-		check("独立骨 IK：手到达目标 < 1 mm " .. side, dist(a.p, b.p) < 0.001)
-		check("独立骨 IK：锁手腕世界朝向 " .. side, qangle(a.q, b.q) < 1e-6)
-		check("独立骨 IK：肩的世界位置固定 " .. side, dist(armor.worldPoses[side .. "_shoulder"].p, shoulders[side]) < 1e-12)
-		local function plane_normal(sh, elbow)
-			local x, y, z = a.p[1] - sh[1], a.p[2] - sh[2], a.p[3] - sh[3]
-			local ex, ey, ez = elbow[1] - sh[1], elbow[2] - sh[2], elbow[3] - sh[3]
-			return { y * ez - z * ey, z * ex - x * ez, x * ey - y * ex }
-		end
-		local n = plane_normal(avatar.worldPoses[side .. "_shoulder"].p, avatar.worldPoses[side .. "_elbow"].p)
-		local m = plane_normal(shoulders[side], armor.worldPoses[side .. "_elbow"].p)
-		check("独立骨 IK：肘平面朝 avatar 当前法线同侧 " .. side, n[1] * m[1] + n[2] * m[2] + n[3] * m[3] > 0)
+		check("独立骨：持枪不拉手 " .. side, dist(a.p, b.p) > 0.001 and qangle(a.q, b.q) < 1e-6)
+		check("独立骨：肩的位置固定 " .. side, dist(armor.worldPoses[side .. "_shoulder"].p, shoulders[side]) < 1e-12)
 	end
-	check("独立骨 IK：avatar 零写入", writes == 0)
+	check("独立骨：avatar 零写入", writes == 0)
 	local _, _, _, _, disabledCalls, disabledEngineCalls = run(0.96, false)
-	check("独立骨 IK：快路径双侧每件护甲额外 40 次调用",
-		calls - disabledCalls == 40 and engineCalls - disabledEngineCalls == 40,
-		string.format("armCalls +%d，mock +%d", calls - disabledCalls, engineCalls - disabledEngineCalls))
-	local _, fallback, _, _, fallbackCalls = run(0.96, nil, false)
-	check("独立骨 IK：回退多 6 次调用，手腕姿态相同",
-		fallbackCalls - calls == 6 and qangle(fallback.worldPoses.l_hand.q, armor.worldPoses.l_hand.q) < 1e-6
-			and dist(fallback.worldPoses.r_hand.p, armor.worldPoses.r_hand.p) < 1e-9)
-
-	local partialAvatar, partialArmor, _, _, partialCalls = run(0.96, nil, nil, true)
-	check("独立骨 IK：首骨缺失仍扫描，只解具备肩肘手的一侧",
-		partialCalls == 35 and dist(partialAvatar.worldPoses.r_hand.p, partialArmor.worldPoses.r_hand.p) < 0.001
-			and qangle(partialAvatar.locals.l_elbow.q, partialArmor.locals.l_elbow.q) < 1e-9)
-
-	local farAvatar, shortArmor = run(0.4)
-	for _, side in ipairs({ "l", "r" }) do
-		local sh = shortArmor.worldPoses[side .. "_shoulder"].p
-		local wrist = shortArmor.worldPoses[side .. "_hand"].p
-		local target = farAvatar.worldPoses[side .. "_hand"].p
-		local reach = (0.28 + 0.26) * 0.4
-		local goalDist = dist(sh, target)
-		local closest = {}
-		for i = 1, 3 do closest[i] = sh[i] + (target[i] - sh[i]) * reach / goalDist end
-		-- NaN 亦会使此比较失败。
-		check("独立骨 IK：够不到时有限且伸直指向目标 " .. side, goalDist > reach and dist(wrist, closest) < 0.001)
-	end
-	local _, stretch, _, _, _, _, upper, lower = run(0.4, nil, nil, nil, true)
-	check("独立骨 IK：连续多帧求解后拉伸仍封顶 5%", math.abs(upper - 0.28*0.4*1.05) < 1e-6
-		and math.abs(lower - 0.26*0.4*1.05) < 1e-6)
-	check("独立骨 IK：卸载还原拉伸前的骨长", math.abs(dist(stretch.worldPoses.l_shoulder.p, stretch.worldPoses.l_elbow.p) - 0.28*0.4) < 1e-6)
+	check("独立骨：旧 IK 选项不改变调用数", calls == disabledCalls and engineCalls == disabledEngineCalls)
+	local _, _, _, _, _, _, upper, lower = run(0.4, true, nil, nil, true)
+	check("独立骨：不可达时仍保持绑定长度", math.abs(upper - 0.28*0.4) < 1e-6
+		and math.abs(lower - 0.26*0.4) < 1e-6)
 	local straight = make_rig("unarmed")
 	local straightEnv = make_env(straight)
 	local previous = { 0, 1, 0 }
@@ -843,7 +813,7 @@ do
 	local function piece(id, x)
 		local armor = make_rig("rifle")
 		armor.tag = id
-		for _, name in ipairs({ "l_shoulder", "l_elbow", "l_hand" }) do
+		for _, name in ipairs({ "hips", "chest", "l_thigh", "l_shoulder", "l_elbow", "l_hand" }) do
 			armor.names["ias_" .. name] = armor.names[name]
 		end
 		armor.locals.root.p[1] = x
@@ -865,7 +835,7 @@ do
 		assert(u ~= tiny, "must filter shoulder before world_position")
 		return position(u, node)
 	end
-	local expected = { "ias_l_shoulder", "ias_l_elbow", "ias_l_hand" }
+	local expected = { "ias_hips", "ias_chest", "ias_l_thigh", "ias_l_shoulder", "ias_l_elbow", "ias_l_hand" }
 	local map, rest = {}, {}
 	local identity = { 0, 0, 0, 1 }
 	for i, name in ipairs(expected) do
@@ -876,15 +846,23 @@ do
 	_G.render = nil
 	local state = Runtime.install(S, { compat = Compat, armPose = true, carriers = {}, pollFrames = 1000,
 		independentPieces = { [first.tag] = expected, [late.tag] = expected }, independentBones = map, independentRest = rest,
+		independentTranslations = { [first.tag] = { ias_l_elbow = { avatar.locals.l_elbow.p, first.locals.l_elbow.p } } },
 		log = false, tunePath = "nonexistent-hd2pbx-tune.txt" })
 	state.avatar, state.world, state.cache.world = avatar, world, world
 	local log = {}
 	state.logger = function(fmt, ...) log[#log + 1] = string.format(fmt, ...) end
 	local function render(n) for _ = 1, n do _G.render() end end
+	avatar.locals.hips.q, avatar.locals.l_thigh.q = { 0, 0, 0.6, 0.8 }, { 0.6, 0, 0, 0.8 }
+	avatar.update_world()
 	render(1)
 	local tracked = state.independent.pieces[1]
 	check("清单：同 ID 的队友件在本地件之前也不会错绑", tracked and tracked.unit == first and #state.independent.pieces == 1)
 	check("动作日志默认关闭", state.actionStateLog == nil)
+	check("全身：躯干、腿和手臂在同一帧复制旋转",
+		qangle(first.locals.hips.q, avatar.locals.hips.q) < 1e-6
+		and qangle(first.locals.chest.q, avatar.locals.chest.q) < 1e-6
+		and qangle(first.locals.l_thigh.q, avatar.locals.l_thigh.q) < 1e-6
+		and qangle(first.locals.l_shoulder.q, avatar.locals.l_shoulder.q) < 1e-6)
 	check("清单：首次明确记录缺件", table.concat(log, "\n"):find("缺 " .. late.tag, 1, true) ~= nil)
 	units[#units + 1] = late
 	first.locals.root.p[1] = -2
@@ -895,33 +873,48 @@ do
 	check("清单：30 帧补齐，存活件越过旧距离阈值仍保留", #state.independent.pieces == 2 and state.independent.pieces[1] == tracked)
 	check("清单：肩骨离本地根超过 1 m 仍可找到", state.independent.pieces[2].unit == late)
 
-	avatar.clip = 0.9
+	state.options.independentGrips, state.options.poseEveryFrame = {}, true
+	avatar.mainLayer, avatar.clip = 865, 3
 	render(1)
-	local fraction = state.independent.alpha
-	check("动作：0.9 s 关 IK 并平滑过渡", state.independent.mode == false and fraction > 0 and fraction < 1)
-	avatar.clip = 0.3
-	render(8)
-	check("动作：短片段保持关，直到过渡完成", state.independent.mode == false and state.independent.alpha == 0)
-	avatar.clip = 1e37
-	render(8)
-	avatar.clip = 0.3
+	check("E11 动作：实测换弹状态及片段匹配", state.independent.action == 2)
+	avatar.clip = 3.006
 	render(1)
-	check("动作：无限片段开，短片段也保持开", state.independent.mode == true and state.independent.alpha == 1)
+	check("E11 动作：换弹片段误差超过 5 ms 时不介入", state.independent.action == 0)
+	avatar.clip, avatar.clipTime = 3, 3.026
+	render(1)
+	check("E11 动作：越过片段 25 ms 时不介入", state.independent.action == 0)
+	avatar.mainLayer, avatar.clip, avatar.clipTime, avatar.weaponSelected = 650, 1e37, 0, 1
+	render(1)
+	check("E11 动作：验证飞船持枪树、空状态和武器变量", state.independent.action == 1)
+	avatar.mainLayer, avatar.clip = 868, 29/60
+	render(1)
+	check("E11 动作：短主动作跟原生手部轨迹", state.independent.action == 2)
+	avatar.mainLayer, avatar.clip, avatar.weaponSelected = 585, 1e37, math.huge
+	render(1)
+	check("E11 动作：无效武器变量关闭求解", state.independent.action == 0)
+	avatar.weaponSelected = 1
+	avatar.upperLayer, avatar.weaponLayer = 75, 99
+	render(1)
+	check("E11 动作：未知武器树关闭求解", state.independent.action == 0)
+	avatar.upperLayer, avatar.weaponLayer = 59, 67
 	avatar.menu = true
-	render(8)
-	check("动作：菜单优先关 IK", state.independent.alpha == 0)
+	render(1)
+	check("E11 动作：菜单恢复基础姿势", state.independent.action == 0 and state.independent.correction.due)
 	avatar.menu, avatar.clip = false, 1e37
-	render(8)
+	render(1)
+	check("E11 动作：任务空主层 585 使用持枪", state.independent.action == 1)
 	avatar.machine = false
 	render(1)
-	check("动作：状态机消失立即停 IK", state.independent.alpha == 0 and next(state.independent.normals) == nil)
+	check("E11 动作：状态机消失清除分类", state.independent.action == 0 and next(state.independent.contacts) == nil)
 	avatar.machine = true
 	local layer = S.Unit.animation_layer_info
 	S.Unit.animation_layer_info = function() error("clip unavailable") end
-	render(8)
-	check("动作：有 31 层状态但读不到片段时按 §E 打开 IK", state.independent.mode == true and state.independent.alpha == 1)
+	avatar.mainLayer = 650
+	render(1)
+	check("E11 动作：飞船空状态无片段证据时不介入", state.independent.action == 0)
 	S.Unit.animation_layer_info = layer
 
+	state.options.independentGrips, state.options.poseEveryFrame = nil, nil
 	local actionCalls, onlyLocal = {}, true
 	for _, name in ipairs({ "has_animation_state_machine", "animation_get_state", "animation_layer_info" }) do
 		local original = S.Unit[name]
@@ -934,31 +927,58 @@ do
 	state.options.stateLog = true
 	state.independent.rescanAt = state.frame + 1
 	render(1)
-	check("动作：同帧补扫、日志和两件 IK 共用本地 avatar 状态",
+	check("动作：同帧补扫与日志复用本地 avatar 状态",
 		onlyLocal and actionCalls.has_animation_state_machine == 1
 		and actionCalls.animation_get_state == 1 and actionCalls.animation_layer_info == 1)
 	state.options.stateLog = false
 
-	state.options.independentIk = false
-	local rotation = S.Unit.world_rotation
-	S.Unit.world_rotation = function(u, node)
-		if u == first and node == first.names.l_clavicle then error("missing parent") end
-		return rotation(u, node)
+	local localPosition = S.Unit.local_position
+	local elbowBind = avatar.locals.l_elbow.p
+	avatar.locals.l_elbow.p = { elbowBind[1] + 0.01, elbowBind[2], elbowBind[3] }
+	avatar.update_world()
+	render(1)
+	check("平移骨：模型静止位置加源骨变化", math.abs(first.locals.l_elbow.p[1] - elbowBind[1] - 0.01) < 1e-9)
+	S.Unit.local_position = function(u, node)
+		if u == avatar and node == avatar.names.l_elbow then return nil end
+		return localPosition(u, node)
 	end
 	render(2)
-	check("隔离：前两帧失败仍可走旋转拷贝", not tracked.isolated and first.visible ~= false
+	check("隔离：平移失败时恢复绑定平移并继续复制旋转", not tracked.isolated and first.visible ~= false
+		and math.abs(first.locals.l_elbow.p[1] - elbowBind[1]) < 1e-9
 		and qangle(first.locals.l_shoulder.q, avatar.locals.l_shoulder.q) < 1e-6)
 	render(1)
-	check("隔离：第三帧进入隔离，其它件继续驱动", tracked.isolated and not state.independent.pieces[2].isolated and first.visible ~= false)
-	first.scale = { 1, 1, 2 }
+	check("隔离：连续三次平移失败，仅隔离该件", tracked.isolated and not state.independent.pieces[2].isolated
+		and first.visible ~= false)
+	local writeRotation = S.Unit.set_local_rotation
+	S.Unit.set_local_rotation = function(u, ...)
+		if u == first then return false end
+		return writeRotation(u, ...)
+	end
 	render(1)
 	check("隔离：旋转兜底也失败则隐藏本件", first.visible == false and late.visible ~= false)
-	first.scale = nil
-	S.Unit.world_rotation = rotation
+	S.Unit.local_position, S.Unit.set_local_rotation = localPosition, writeRotation
 	render(2)
 	check("隔离：两帧正常仍隐藏", first.visible == false)
-	render(1)
-	check("隔离：三帧正常重新显示", first.visible == true and not tracked.isolated)
+	render(3)
+	check("隔离：三次健康检查重新显示", first.visible == true and not tracked.isolated)
+
+	state.avatars = { { unit = avatar, cameraDistance = 0 }, { unit = partner, cameraDistance = 64 } }
+	local beforeRemote = remote.locals.l_elbow.p
+	local remoteUpdates = 0
+	local update = S.World.update_unit
+	S.World.update_unit = function(w, u)
+		if u == remote then remoteUpdates = remoteUpdates + 1 end
+		return update(w, u)
+	end
+	render(4)
+	check("队友：默认关闭", remoteUpdates == 0)
+	state.options.independentTeammates = true
+	render(8)
+	check("队友：远处每四帧更新一次且不写平移", remoteUpdates == 2
+		and dist(beforeRemote, remote.locals.l_elbow.p) < 1e-9)
+	state.options.independentTeammates = false
+	state.avatars = nil
+	S.World.update_unit = update
 
 	S.Unit.world_position = function(u, node)
 		local p = position(u, node)
@@ -1021,7 +1041,7 @@ do
 	Runtime.uninstall()
 end
 
--- 9) 有非同轴绑定时，世界增量沿目标父链换算并保持四元数同半球。
+-- 9) 局部复制直接转发四元数。
 do
 	local avatar, armor = make_rig("unarmed"), make_rig("unarmed")
 	local s = math.sqrt(0.5)
@@ -1044,22 +1064,359 @@ do
 	local state = Runtime.install(S, options)
 	state.avatar, state.world, state.cache.world = avatar, world, world
 	_G.render()
-	local expected = qmul(qz, qx)
-	local previous = armor.locals.l_shoulder.q
-	check("世界增量：按模型静止世界旋转与实际目标父骨反算", qangle(armor.worldPoses.l_shoulder.q, expected) < 1e-6)
-	check("世界增量：非同轴子骨的约简与直接世界旋转一致",
-		qangle(armor.worldPoses.l_elbow.q, qmul(qmul(qz, qy), qz)) < 1e-6)
-	avatar.locals.l_shoulder.q = { -qz[1], -qz[2], -qz[3], -qz[4] }
-	avatar.update_world()
+	check("局部复制：肩肘直接使用源局部旋转", qangle(armor.locals.l_shoulder.q, qz) < 1e-6
+		and qangle(armor.locals.l_elbow.q, qy) < 1e-6)
+	local raw, received, validations, componentReads = nil, nil, 0, 0
+	local read, write = S.Unit.local_rotation, S.Unit.set_local_rotation
+	local toElements = S.Quaternion.to_elements
+	S.Quaternion.is_valid = function(value)
+		validations = validations + 1
+		return value ~= nil
+	end
+	S.Quaternion.to_elements = function(value)
+		componentReads = componentReads + 1
+		return toElements(value)
+	end
+	S.Unit.local_rotation = function(u, node)
+		local value = read(u, node)
+		if u == avatar and node == avatar.names.l_shoulder then raw = value end
+		return value
+	end
+	S.Unit.set_local_rotation = function(u, node, value)
+		if u == armor and node == armor.names.l_shoulder then received = value end
+		return write(u, node, value)
+	end
 	_G.render()
-	local current = armor.locals.l_shoulder.q
-	local dot = 0
-	for i = 1, 4 do dot = dot + previous[i] * current[i] end
-	check("世界增量：源符号翻转后仍保持同半球", dot > 0.99999)
-	state.options.independentRetarget = "localCopy"
-	_G.render()
-	check("世界增量：localCopy 开关恢复旧局部复制", qangle(armor.locals.l_shoulder.q, qz) < 1e-6)
+	check("局部复制：传给 setter 的对象与读取对象相同", raw ~= nil and raw == received)
+	check("局部复制：正常帧校验原对象，无需拆分", validations == 2 and componentReads == 0)
 	Runtime.uninstall()
+end
+
+-- 10) Native links use the live source as a cross-unit parent, even when Lua never writes.
+do
+	local avatar, nextAvatar = make_rig("unarmed"), make_rig("unarmed")
+	local armor, failed = make_rig("unarmed"), make_rig("unarmed")
+	armor.tag, failed.tag = "#ID[e700000000000001]", "#ID[e700000000000002]"
+	local expected = { "ias_hips", "ias_l_thigh", "ias_l_knee" }
+	local map, rest = {}, {}
+	for index, name in ipairs(expected) do
+		local source = name:sub(5)
+		map[index] = { name, source }
+		rest[index] = { armor.parents[source], avatar.locals[source].q, armor.locals[source].q, armor.locals[source].p }
+		for _, piece in ipairs({ armor, failed }) do piece.names[name] = piece.names[source] end
+	end
+	armor.locals.l_thigh.p = { -0.20, 0, 0 }
+	armor.update_world()
+	local S, world = make_env(avatar)
+	local units, owners = { avatar, armor, failed }, { avatar }
+	local replacement, peerPiece
+	S.World.units = function() return units end
+	S.World.units_by_resource = function() return owners end
+	local links, unlinks, poseWrites, refreshes = 0, 0, 0, 0
+	local setPosition, update = S.Unit.set_local_position, S.World.update_unit
+	S.Unit.set_local_position = function(unit, node, p)
+		poseWrites = poseWrites + 1
+		return setPosition(unit, node, p)
+	end
+	S.World.update_unit = function(w, unit)
+		if unit == armor then refreshes = refreshes + 1 end
+		return update(w, unit)
+	end
+	S.Unit.scene_graph_parent = function(unit, node)
+		return unit.names[unit.parents[unit.names[node]]]
+	end
+	S.Unit.scene_graph_link = function(unit, node, parent)
+		unit.parents[unit.names[node]] = unit.names[parent]
+	end
+	S.World.link_unit = function(_, unit, node, owner, source)
+		assert(unit.alive and owner.alive)
+		links = links + 1
+		local name = unit.names[node]
+		if unit == failed and name == "l_thigh" then return false end
+		unit.links = unit.links or {}
+		unit.links[name] = { owner = owner, source = owner.names[source] }
+		unit.parents[name] = nil
+		unit.locals[name].q = { 0, 0, 0, 1 }
+	end
+	S.World.unlink_unit = function(_, unit)
+		assert(unit.alive and (unit == armor or unit == failed or unit == replacement or unit == peerPiece))
+		unlinks = unlinks + 1
+		unit.links = {}
+	end
+	local camera = { 0, -4, 2 }
+	S.World.debug_camera_pose = function() return camera end
+	S.Matrix4x4.translation = function(p) return p end
+	local opts = { compat = Compat, armPose = true, carriers = {}, log = false, poseHz = 30,
+		independentPieces = { [armor.tag] = expected, [failed.tag] = expected },
+		independentBones = map, independentRest = rest }
+	local savedIo = _G.io
+	_G.io = nil
+	local state = Runtime.install(S, opts)
+	state.avatar, state.world, state.cache.world = avatar, world, world
+	state.avatars = { { unit = avatar } }
+	local logs = {}
+	state.logger = function(fmt, ...) logs[#logs + 1] = string.format(fmt, ...) end
+	local function tick(time)
+		state.frame, state.lastTime, state.dt = state.frame + 1, time, 0.01
+		state.frameAnimation, state.liveUnits, state.liveUnitsWorld = nil, units, world
+		for _, unit in ipairs(owners) do unit.update_world() end
+		for _, unit in ipairs(units) do unit.update_world() end
+		Runtime.apply_arm_pose_frame_(state)
+	end
+	tick(0)
+	check("E7：无 io 可启动且默认挂接", #state.independent.pieces == 2
+		and armor.links.hips.owner == avatar and armor.links.l_knee.source == "l_knee" and links == 5)
+	check("E7：挂接到一半失败，仅本件恢复父链并记日志", unlinks == 1 and next(failed.links) == nil
+		and failed.parents.hips == "root" and failed.parents.l_thigh == "hips"
+		and table.concat(logs):find("挂接回退", 1, true) ~= nil)
+	local p = armor.worldPoses.l_thigh.p[1]
+	avatar.locals.root.p[1] = 0.1
+	avatar.locals.hips.q = { 0, 0, 0.6, 0.8 }
+	local oldRefresh = refreshes
+	tick(0.01)
+	check("E7：跟随帧由引擎更新，不刷新已挂件", not state.independent.correction.due
+		and refreshes == oldRefresh and math.abs(armor.worldPoses.l_thigh.p[1] - p) > 0.01)
+	check("E7：失败件继续走 E6 逐帧旋转", qangle(failed.locals.hips.q, avatar.locals.hips.q) < 1e-6)
+	tick(0.04)
+	local linkedPiece = state.independent.pieces[1]
+	check("E7：默认 30 Hz，步态在修正帧展示中点", state.independent.correction.due
+		and linkedPiece.link.pending ~= nil and dist(armor.locals.l_thigh.p, linkedPiece.link.rows[2].endpoint.p) > 1e-4)
+	tick(0.05)
+	check("E7：到半周期写回精确终点", linkedPiece.link.pending == nil
+		and dist(armor.locals.l_thigh.p, linkedPiece.link.rows[2].endpoint.p) < 1e-9)
+	oldRefresh = refreshes
+	tick(0.07)
+	check("E7：修正值相同跳过 update_unit", state.independent.correction.due and refreshes == oldRefresh)
+	camera = { 0.1, 0, 1.72 }
+	tick(0.11)
+	check("E7：第一人称暂停修正", state.independent.correction.paused and not state.independent.correction.due)
+	camera = { 0, -4, 2 }
+	avatar.menu = true
+	tick(0.12)
+	check("E7：菜单暂停修正", state.independent.correction.paused)
+	avatar.menu = false
+	tick(0.13)
+	check("E7：回第三人称立即修正", state.independent.correction.due)
+	opts.independentLink = 0
+	tick(0.14)
+	check("E7：independentLink=0 原地解挂并回到 E6", next(armor.links) == nil and armor.parents.l_thigh == "hips"
+		and qangle(armor.locals.hips.q, avatar.locals.hips.q) < 1e-6)
+	opts.independentLink, opts.poseBlend, opts.poseHz = 1, 0, 60
+	tick(0.15)
+	tick(0.17)
+	check("E7：60 Hz 和关闭插帧生效", state.independent.correction.due and linkedPiece.link.pending == nil)
+	opts.poseEveryFrame, opts.poseBlend = true, 1
+	tick(0.171)
+	check("E10：每帧修正绕过计时与展示插帧", state.independent.correction.due and not state.independent.correction.blend)
+	opts.poseEveryFrame = nil
+	state.avatar, state.avatars = nextAvatar, { { unit = nextAvatar } }
+	units, owners = { nextAvatar, armor }, { nextAvatar }
+	avatar.alive = false
+	tick(0.18)
+	check("E7：avatar 更换时同一件重挂到新主人", armor.links.hips.owner == nextAvatar)
+	units = { nextAvatar }
+	local oldUnlinks = unlinks
+	armor.alive = false
+	tick(0.19)
+	check("E7：件消失时放弃句柄，不向死件解挂或写入", #state.independent.pieces == 0
+		and unlinks == oldUnlinks and state.independent.rescanAt == state.frame + 1)
+	replacement = make_rig("unarmed")
+	replacement.tag = armor.tag
+	for _, name in ipairs(expected) do replacement.names[name] = replacement.names[name:sub(5)] end
+	units = { nextAvatar, replacement }
+	tick(0.20)
+	check("E7：换装后扫描重新挂接同槽新件", replacement.links.hips.owner == nextAvatar)
+	nextAvatar.alive = false
+	tick(0.21)
+	check("E7：avatar 死亡解挂仍活着的件", next(replacement.links) == nil and state.independent == nil
+		and replacement.parents.l_thigh == "hips")
+
+	local peer = make_rig("unarmed")
+	peerPiece = make_rig("unarmed")
+	peerPiece.tag = failed.tag
+	for _, name in ipairs(expected) do peerPiece.names[name] = peerPiece.names[name:sub(5)] end
+	peer.locals.root.p[1], peerPiece.locals.root.p[1] = 4, 4
+	nextAvatar.alive = true
+	state.avatar, state.avatars = nextAvatar, { { unit = nextAvatar }, { unit = peer, cameraDistance = 16 } }
+	units, owners = { nextAvatar, replacement, peer, peerPiece }, { nextAvatar, peer }
+	tick(0.22)
+	check("E7：队友默认关，不建立原生挂接", peerPiece.links == nil)
+	opts.independentTeammates = true
+	local near, far = 0, 0
+	for i = 0, 59 do
+		tick(0.25 + i/60)
+		local remote = state.independentRemotes[peer]
+		if remote.correction.due then near = near + 1 end
+	end
+	check("E7：近处队友 20 Hz，始终关插帧", near == 20
+		and not state.independentRemotes[peer].correction.blend and peerPiece.links.hips.owner == peer)
+	state.avatars[2].cameraDistance = 100
+	for i = 0, 59 do
+		tick(1.25 + i/60)
+		local remote = state.independentRemotes[peer]
+		if remote.frame == state.frame and remote.correction.due then far = far + 1 end
+	end
+	check("E7：6 m 外沿用每四帧检查，60 fps 下最多每秒 15 次", far == 15)
+	Runtime.uninstall()
+	_G.io = savedIo
+end
+
+-- 11) Physics presentation keeps its exact endpoint available to the solver.
+do
+	local armor = make_rig("unarmed")
+	local S, world = make_env(armor)
+	local state = Runtime.install(S, { compat = Compat, log = false })
+	local node = armor.names.hips
+	local session = { S = S, unit = armor, world = world, sessions = {} }
+	local row = { from = { 0, 0, 1, 0 }, to = { 0, 0, 1, 1 }, base = { px = 0, py = 0, pz = 1 } }
+	session.independentPresentation = { start = 0, period = 0.04, step = 1, lead = 0.25, rows = { [node] = row } }
+	state.dt = 0.005
+	local schedule = { due = false, now = 0, nextAt = 0.04, blend = true }
+	Compat.present_independent_physics(session, 0.25)
+	local function display(t)
+		schedule.now = t
+		session.engineCalls = 0
+		return Runtime.independent_physics_(state, session, schedule, nil, 0)
+	end
+	check("E7 物理：四分之一周期内跳过重复展示", display(0.005) == 0 and display(0.010) == 1 and display(0.015) == 0)
+	check("E7 物理：周期内三个中间值，第四步到终点", display(0.020) == 1 and display(0.025) == 0
+		and display(0.030) == 1 and session.independentPresentation == nil)
+	session.independentPresentation = { rows = { [node] = row } }
+	Compat.present_independent_physics(session, 0.5)
+	schedule.due = true
+	local observed
+	local _, solved = Runtime.independent_physics_(state, session, schedule, function()
+		observed = armor.locals.hips.q
+	end, 0.04)
+	check("E7 物理：提前求解也先恢复精确终点", solved and qangle(observed, { 0, 0, math.sin(0.5), math.cos(0.5) }) < 1e-6)
+	Runtime.uninstall()
+end
+
+-- 12) Contact input, girdle limits, and the local weapon transaction.
+do
+	local Link, V = Runtime.independent_contact_, Compat.contact_math
+	local q = { 0, 0, 0, 1 }
+	local function pose(x, y, z) return { p = { x, y, z }, q = q } end
+	local native = { r_hand = pose(0, 0, 0), l_hand = pose(0, 1, 0),
+		attach_hand_r = pose(0.1, 0, 0), attach_hand_l = pose(0.67, 1, 0) }
+	local function read(name) return native[name] end
+	local input = Link.contacts(1, read)
+	check("E11 握点：普通右握点和左侧原生挂点原样保留",
+		input.r == native.attach_hand_r and input.l == native.attach_hand_l)
+	local grip = Link.motionGrips.r
+	local radius = V.length(grip.p)
+	native.attach_hand_r = pose(3.5*radius, 0, 0)
+	input = Link.contacts(1, read)
+	check("E11 握点：长武器在 3r 到 4r 之间按 smoothstep 混合",
+		dist(input.r.p, V.scale(V.add(native.attach_hand_r.p, grip.p), 0.5)) < 1e-8)
+	native.attach_hand_r = pose(0.8, 0, 0)
+	input = Link.contacts(1, read)
+	check("E11 握点：长武器过 4r 时恢复原生手轨迹", dist(input.r.p, grip.p) < 1e-9)
+	input = Link.contacts(2, read)
+	check("E11 握点：换弹两侧都用手骨生成握点",
+		dist(input.r.p, grip.p) < 1e-9 and dist(input.l.p, V.add(native.l_hand.p, Link.motionGrips.l.p)) < 1e-9)
+	native.l_hand = nil
+	check("E11 握点：换弹缺少手骨时不借用武器挂点", Link.contacts(2, read).l == nil)
+	local valid = { 1,0,0,0.08, 0,1,0,0, 0,0,1,0 }
+	local author = V.matrix_pose(valid)
+	local inverse = V.inverse(author)
+	local target = Compat.independent_fk(pose(0.3, 0, 0), inverse.q, inverse.p)
+	check("E11 握点：世界接触框乘作者握点逆得到手腕", dist(target.p, { .22, 0, 0 }) < 1e-9)
+	valid[11] = -1
+	check("E11 握点：拒绝镜像矩阵", V.matrix_pose(valid) == nil)
+
+	local pistol, rifle = { sidearm = true, left = pose(0, 0, 0) }, { left = pose(0, 0, 0) }
+	local _, close = Link.support_weight(pistol, pose(0.029, 0, 0))
+	local _, far = Link.support_weight(pistol, pose(0.030, 0, 0))
+	check("E11 左手权重：手枪分界为 3 cm", close == 1 and far == 0)
+	local _, middle = Link.support_weight(rifle, pose(0.04, 0, 0))
+	check("E11 左手权重：主武器在 2 到 6 cm 之间平滑变化", math.abs(middle-0.5) < 1e-9)
+	rifle.envelope = { 0.2, -0.02, -0.02, 0.3, 0.02, 0.02 }
+	local near, envelope = Link.support_weight(rifle, pose(0.25, 0, 0), nil, pose(0, 0, 0))
+	check("E11 左手权重：控制框扫掠覆盖左手时保留支撑", near and envelope == 1)
+
+	local model = { pose(0.25, 0, 0), pose(0.55, 0, 0), pose(0.55, 0.25, 0) }
+	local lengths, farWrist = { 0.30, 0.25 }, pose(-0.25, 1, 0)
+	local delta, factor = Compat.contact_girdle(pose(0, 0, 0), model[1], farWrist, lengths, model, true)
+	local twoHand = Compat.contact_girdle(pose(0, 0, 0), model[1], farWrist, lengths, model, false)
+	check("E11 单手：肩带 15°、拉伸最高 5%", qangle(delta, q) <= math.rad(15)+1e-7 and factor == 1.05)
+	check("E11 双手：左肩带最多 25°", qangle(twoHand, q) <= math.rad(25)+1e-7)
+	local a, b, c = Compat.contact_arm(model, model, farWrist, lengths, factor, false)
+	check("E11 两骨：不可达手腕裁剪到伸展上限且保留朝向",
+		math.abs(dist(a.p, b.p)-0.30*1.05) < 1e-7 and math.abs(dist(b.p, c.p)-0.25*1.05) < 1e-7
+		and math.abs(dist(a.p, c.p)-0.55*1.05*0.99999) < 1e-7 and c.q == q)
+
+	local avatar = make_rig("unarmed")
+	local weapon = make_rig("unarmed")
+	local magazine = make_rig("unarmed")
+	local fp = make_rig("rifle")
+	local twin = make_rig("rifle")
+	weapon.tag, weapon.nodeCount, weapon.names.StingrayEntityRoot = "#ID[1111111111111111]", 2, 1
+	local S, world = make_env(avatar)
+	magazine.tag, magazine.nodeCount, magazine.names.StingrayEntityRoot = "#ID[2222222222222222]", 2, 1
+	magazine.links = { root = { owner = weapon, source = "hips" } }
+	magazine.update_world()
+	local units, graphs = { avatar, weapon, magazine }, { fp }
+	S.World.units = function() return units end
+	S.World.units_by_resource = function() return graphs end
+	S.Unit.scene_graph_parent = function(unit, node) return unit.names[unit.parents[unit.names[node]]] end
+	local oldUpdate = _G.update
+	local original = weapon.locals.hips.p
+	local observed
+	local function update() observed = weapon.locals.hips.p end
+	_G.update = update
+	local runtime = Runtime.install(S, { compat = Compat, log = false })
+	local spec = { 2, 1, 258, true }
+	local found = Link.find_weapon(units, pose(0, 0, 0), { ["1111111111111111"] = spec })
+	check("E11 武器归属：核对资源、拓扑和原生右手父框", found and found.node == 2 and found.sidearm)
+	check("E11 武器归属：远离或重复匹配时不使用",
+		not Link.find_weapon(units, pose(0.003, 0, 0), { ["1111111111111111"] = spec })
+		and not Link.find_weapon({ weapon, weapon }, pose(0, 0, 0), { ["1111111111111111"] = spec }))
+	local accessoryPos = magazine.worldPoses.root.p
+	Link.weaponMembers[found.id] = "2222222222222222:2"
+	local followers = Link.weapon_followers(units, found)
+	check("E11 拉枪：独立弹匣按原生父框随武器根走",
+		followers and #followers == 2 and followers[2].unit == magazine
+		and Link.weapon_followers({ weapon }, found) == nil)
+	local shifted = Link.shift_weapon(runtime, world, found, { 0.18, 0, 0 }, followers)
+	check("E11 拉枪：武器根以原生父框换算世界偏移",
+		shifted and dist(weapon.locals.hips.p, V.add(original, { 0.18, 0, 0 })) < 1e-9
+		and dist(magazine.worldPoses.root.p, V.add(accessoryPos, { 0.18, 0, 0 })) < 1e-9)
+	_G.update()
+	check("E11 拉枪：先还原根和弹匣再执行原生 update", dist(observed, original) < 1e-9
+		and dist(magazine.worldPoses.root.p, accessoryPos) < 1e-9 and runtime.weaponShift == nil)
+	Link.shift_weapon(runtime, world, found, { 0.1, 0, 0 })
+	weapon.locals.hips.p = { 0, 0, 2 }
+	_G.update()
+	check("E11 拉枪：引擎已更新的位置继续保留", observed[3] == 2 and runtime.weaponShift == nil)
+	weapon.locals.hips.p = original
+	weapon.update_world()
+	magazine.update_world()
+	local updateUnit = S.World.update_unit
+	S.World.update_unit = function(w, unit)
+		if unit == magazine then return false end
+		return updateUnit(w, unit)
+	end
+	followers = Link.weapon_followers(units, found)
+	check("E11 拉枪：子件更新失败撤回根位移并禁用试验",
+		not Link.shift_weapon(runtime, world, found, { 0.1, 0, 0 }, followers)
+		and runtime.weaponTrialDisabled and dist(weapon.locals.hips.p, original) < 1e-9)
+	S.World.update_unit = updateUnit
+	_G.update()
+	check("E11 拉枪：子件可刷新后清除还原记录", runtime.weaponShift == nil)
+	Link.weaponMembers[found.id] = nil
+	local tied = { world = world, pieces = { { unit = twin } } }
+	check("E11 第一人称：当前原生手臂唯一匹配才判 3",
+		Link.first_person_action(tied, function(n) return avatar.worldPoses[n] end) == 3)
+	tied.pieces[1].unit = avatar
+	check("E11 第一人称：第三人称匹配优先",
+		Link.first_person_action(tied, function(n) return avatar.worldPoses[n] end) == 0)
+	graphs = { fp, twin }
+	tied.pieces[1].unit = twin
+	check("E11 第一人称：重复匹配关闭求解",
+		Link.first_person_action(tied, function(n) return avatar.worldPoses[n] end) == 0)
+	check("E11 拉枪：卸载恢复原 update", Runtime.uninstall() and _G.update == update)
+	_G.update = oldUpdate
 end
 
 print(string.format("\n失败 %d 项", failures))

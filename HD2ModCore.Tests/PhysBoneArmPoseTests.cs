@@ -109,6 +109,89 @@ public sealed class PhysBoneArmPoseTests
 	}
 
 	[Fact]
+	public void JointPoseData_UsesTheActiveShoeBindForTheSharedUnitId()
+	{
+		const string json = """
+			{
+			  "independentBones": [{ "bone": "ias_l_ball", "source": "l_ball" }],
+			  "independentPieces": { "#ID[0102030405060708]": ["ias_l_ball"], "#ID[0102030405060708]@shoes/off": ["ias_l_ball"] },
+			  "independentPieceRoutes": {
+			    "#ID[0102030405060708]": { "slot": "LeftLeg", "option": "shoes/on", "disabledBy": "shoes/off" },
+			    "#ID[0102030405060708]@shoes/off": { "slot": "LeftLeg", "option": "shoes/off" }
+			  },
+			  "independentTranslations": {
+			    "#ID[0102030405060708]": { "ias_l_ball": { "avatar": [0,0,0], "model": [0,0,0.125] } },
+			    "#ID[0102030405060708]@shoes/off": { "ias_l_ball": { "avatar": [0,0,0], "model": [0,0,0.25] } }
+			  }
+			}
+			""";
+		var shoesOn = JointPoseData.ToLuaOptions(json, new HashSet<string> { "shoes/on" });
+		var shoesOff = JointPoseData.ToLuaOptions(json, new HashSet<string> { "shoes/off" });
+		Assert.Contains("""["ias_l_ball"] = { { 0, 0, 0 }, { 0, 0, 0.125 } }""", shoesOn);
+		Assert.Contains("""["ias_l_ball"] = { { 0, 0, 0 }, { 0, 0, 0.25 } }""", shoesOff);
+		Assert.DoesNotContain("@shoes/off", shoesOff);
+	}
+
+	[Fact]
+	public void JointPoseData_ClothingAndCalibrationFollowTheActivePiece()
+	{
+		const string json = """
+			{
+			  "independentBones": [{"bone":"ias_hips", "source":"hips"}],
+			  "independentPieces": {"#ID[0102030405060708]": ["ias_hips"]},
+			  "independentPieceRoutes": {"#ID[0102030405060708]": {"slot":"Torso_Armor", "option":"coat/on"}},
+			  "independentLegs": {"#ID[0102030405060708]": {"l": {"lateralScale":0.43, "bendNormal":[1,0,0]}}},
+			  "independentPoseRules": {"#ID[0102030405060708]": [{
+			    "target":"ias_pose_Jacket_01", "mode":0, "influence":0.75, "basis":[0,0,0,1],
+			    "primary":{"bone":"ias_hips","reference":null,"neutral":[0,0,0,1],"offset":[0,0,0,1],"referenceOffset":[0,0,0,1]},
+			    "axes":[
+			      {"flags":1, "secondaryAxis":0, "points":[[-90,0,0,0],[30,1,2,3]]},
+			      {"flags":0, "secondaryAxis":1, "points":[[-90,0,0,0],[30,0,0,0]]},
+			      {"flags":0, "secondaryAxis":2, "points":[[-90,0,0,0],[30,0,0,0]]}
+			    ]
+			  }]}
+			}
+			""";
+		var on = JointPoseData.ToLuaOptions(json, new HashSet<string> { "coat/on" });
+		Assert.Contains("independentPoseRules", on);
+		Assert.Contains("target = \"ias_pose_Jacket_01\"", on);
+		Assert.Contains("{ 30, 1, 2, 3 }", on);
+		Assert.Contains("l = { 0.43, { 1, 0, 0 } }", on);
+		var off = JointPoseData.ToLuaOptions(json, new HashSet<string> { "coat/off" });
+		Assert.DoesNotContain("independentPoseRules", off);
+		Assert.DoesNotContain("independentLegs", off);
+		Assert.Throws<InvalidDataException>(() => JointPoseData.ToLuaOptions(json.Replace("[-90,0,0,0],[30,1,2,3]",
+			"[30,0,0,0],[30,1,2,3]", StringComparison.Ordinal)));
+	}
+
+	[Fact]
+	public void JointPoseData_GripsUseTheSelectedVariant()
+	{
+		const string json = """
+			{
+			  "independentBones": [{"bone":"ias_r_hand", "source":"r_hand"}],
+			  "independentPieces": {"#ID[0102030405060708]": ["ias_r_hand"], "#ID[0102030405060708]@coat/on": ["ias_r_hand"]},
+			  "independentPieceRoutes": {
+			    "#ID[0102030405060708]": {"slot":"RightArm", "disabledBy":"coat/on"},
+			    "#ID[0102030405060708]@coat/on": {"slot":"RightArm", "option":"coat/on"}
+			  },
+			  "independentGrips": {
+			    "#ID[0102030405060708]": {"r": [1,0,0,0.05,0,1,0,0.1,0,0,1,0]},
+			    "#ID[0102030405060708]@coat/on": {"r": [1,0,0,0.06,0,1,0,0.1,0,0,1,0]}
+			  }
+			}
+			""";
+		Assert.Contains("r = { 1, 0, 0, 0.05, 0, 1, 0, 0.1, 0, 0, 1, 0 }",
+			JointPoseData.ToLuaOptions(json));
+		var enabled = new HashSet<string> { "coat/on" };
+		var on = JointPoseData.ToLuaOptions(json, enabled);
+		Assert.Contains("r = { 1, 0, 0, 0.06, 0, 1, 0, 0.1, 0, 0, 1, 0 }", on);
+		Assert.DoesNotContain("0.05", on);
+		Assert.Throws<InvalidDataException>(() => JointPoseData.ToLuaOptions(
+			json.Replace("[1,0,0,0.06,0,1,0,0.1,0,0,1,0]", "[1,0,0]", StringComparison.Ordinal), enabled));
+	}
+
+	[Fact]
 	public void JointPoseDeployment_FlattenedOptionsUseActiveSourceIncludes()
 	{
 		var root = Path.Combine(Path.GetTempPath(), "jointpose-flat-" + Guid.NewGuid().ToString("N"));

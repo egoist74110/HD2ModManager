@@ -91,7 +91,7 @@ if apply ~= nil then
 	check("走 skirt_eligible", apply:find("skirt_eligible(", 1, true) ~= nil)
 end
 
--- ⑤ **未知签名的引擎 API 不许出现在产品路径上**
+-- ⑤ 身份探针里的 API 保持在探针内。E7 的两个已知签名仅允许用于挂接及原骨链恢复。
 --
 -- 2026-11-12 实机：我为了探"身份判据"，在默认路径上成组调了
 -- Unit.bones / scene_graph_parent / scene_graph_link / is_a / is_child，
@@ -99,18 +99,8 @@ end
 -- 所以这些调用只允许待在**显式开关控制、默认关闭**的探针函数里：
 --   · `probe_identity_api`（开关 `probeIdentity`，默认关）
 --   · `probe_identity_link`（开关 `probeIdentityLink`，默认关）
-local function count_plain(text, needle)
-	local count, at = 0, 1
-	while true do
-		local found = text:find(needle, at, true)
-		if found == nil then return count end
-		count = count + 1
-		at = found + #needle
-	end
-end
-
-local PROBE_APIS = { "Unit.bones(", "Unit.scene_graph_parent(", "Unit.scene_graph_link(",
-	"Unit.is_child(", "Unit.is_a(" }
+local PROBE_APIS = { "%.bones%(", "%.scene_graph_parent%(", "%.scene_graph_link%(",
+	"%.is_child%(", "%.is_a%(" }
 local PROBE_HOMES = { "probe_identity_api", "probe_identity_link" }
 local homeBodies = {}
 for _, name in ipairs(PROBE_HOMES) do
@@ -119,13 +109,22 @@ for _, name in ipairs(PROBE_HOMES) do
 	homeBodies[name] = body ~= nil and strip_comments(body) or ""
 end
 local wholeStripped = strip_comments(source)
+local function link_body(name)
+	return assert(wholeStripped:match("function IndependentLink%." .. name .. "%(.-\nend"))
+end
+local linkBodies = {
+	["%.scene_graph_parent%("] = link_body("attach") .. link_body("restore"),
+	["%.scene_graph_link%("] = link_body("restore"),
+}
 for _, api in ipairs(PROBE_APIS) do
-	local total = count_plain(wholeStripped, api)
+	local _, total = wholeStripped:gsub(api, "")
 	local inside = 0
 	for _, name in ipairs(PROBE_HOMES) do
-		inside = inside + count_plain(homeBodies[name], api)
+		local _, n = homeBodies[name]:gsub(api, "")
+		inside = inside + n
 	end
-	check(string.format("%s 只在探针里（%d/%d）", api, inside, total), total == inside)
+	local _, link = (linkBodies[api] or ""):gsub(api, "")
+	check(string.format("%s 只在允许入口（%d/%d）", api, inside + link, total), total == inside + link)
 end
 check("两组探针都有开关（probeIdentity / probeIdentityLink）",
 	wholeStripped:find("probeIdentity", 1, true) ~= nil

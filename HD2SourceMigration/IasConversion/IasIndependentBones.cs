@@ -18,6 +18,14 @@ internal static class IasIndependentBones
 
 	/// <summary>两条手臂的候选子树，从肩起，含手指。</summary>
 	internal static readonly string[] ArmRoots = ["l_shoulder", "r_shoulder"];
+	internal static readonly string[] BodyRoots = ["hips", "spine1"];
+	internal static readonly IReadOnlySet<string> ModelAttachments = new HashSet<string>(StringComparer.Ordinal)
+	{
+		"attach_samplepouch", "attach_intelpad", "support_mg",
+	};
+
+	private static bool IsAttachment(string name) =>
+		name.StartsWith("attach_", StringComparison.Ordinal) || name == "support_mg";
 
 	/// <summary>
 	/// 候选骨：<paramref name="roots"/> 下面所有有名字的骨，父先子后。
@@ -52,7 +60,8 @@ internal static class IasIndependentBones
 		{
 			grew = false;
 			foreach (var index in arms)
-				if (!keep.Contains(index) && keep.Contains(target.Bones[index].ParentIndex))
+				if (!keep.Contains(index) && keep.Contains(target.Bones[index].ParentIndex)
+					&& target.Bones[index].Name is { } name && !IsAttachment(name))
 					grew |= keep.Add(index);
 		}
 		return candidates.Where(name => keep.Contains(target.Find(name)!.Index)).ToArray();
@@ -61,7 +70,7 @@ internal static class IasIndependentBones
 	/// <summary>
 	/// 返回改过的 avatar 骨架：<paramref name="bones"/> 里每根骨换成新名字的哈希，
 	/// 全局矩阵的平移换成模型关节位置（旋转不变），局部平移按新的父骨全局矩阵重算。
-	/// 扭转骨和模型里没有的骨：保持它和父骨在潜兵骨架里的相对位置。
+	/// 模型里没有的骨：保持它和父骨在潜兵骨架里的相对位置。
 	/// 按父先子后的顺序处理，所以父骨也改过时子骨相对的是改过的父骨。
 	/// </summary>
 	internal static UnitTransformInfo Apply(UnitTransformInfo avatar, Hd2Rig target, IReadOnlyList<IasRigNode> modelNodes,
@@ -79,7 +88,7 @@ internal static class IasIndependentBones
 		{
 			var parent = target.Bones[bone.ParentIndex];
 			var parentAt = origins.TryGetValue(parent.Index, out var moved) ? moved : parent.WorldOrigin;
-			origins[bone.Index] = !bone.Name!.Contains("twist", StringComparison.Ordinal) && model.TryGetValue(bone.Name!, out var own)
+			origins[bone.Index] = model.TryGetValue(bone.Name!, out var own)
 				? own
 				: parentAt + (bone.WorldOrigin - parent.WorldOrigin);
 		}
@@ -103,7 +112,18 @@ internal static class IasIndependentBones
 			if (!origins.ContainsKey(bone.Index) && !origins.ContainsKey(bone.ParentIndex))
 				continue;
 			var parentWorld = Hd2RigReader.FromHd2RowVector(matrices[bone.ParentIndex].Values);
-			var local = parentWorld.Inverse().TransformPoint(origins.GetValueOrDefault(bone.Index, bone.WorldOrigin));
+			var local = !origins.ContainsKey(bone.Index) && bone.Name is { } name && IsAttachment(name)
+				? Hd2RigReader.FromHd2RowVector(avatar.Matrices[bone.ParentIndex].Values).Inverse().TransformPoint(bone.WorldOrigin)
+				: parentWorld.Inverse().TransformPoint(origins.GetValueOrDefault(bone.Index, bone.WorldOrigin));
+			if (!origins.ContainsKey(bone.Index) && bone.Name is { } attachment && IsAttachment(attachment))
+			{
+				var at = parentWorld.TransformPoint(local);
+				var values = matrices[bone.Index].Values.ToArray();
+				values[12] = (float)at.X;
+				values[13] = (float)at.Y;
+				values[14] = (float)at.Z;
+				matrices[bone.Index] = new UnitTransformMatrix(values);
+			}
 			locals[bone.Index] = locals[bone.Index] with { Position = [(float)local.X, (float)local.Y, (float)local.Z] };
 		}
 		return avatar with { NameHashes = hashes, Matrices = matrices, LocalTransforms = locals };

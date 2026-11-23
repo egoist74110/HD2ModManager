@@ -231,9 +231,9 @@ public sealed partial class Retargeter
 		}
 
 		_sole = soleCount > 0 ? soleSum / soleCount : Vec3.Zero;
-		_sourceHeadJoint = _nativeHeadAnchor ?? (_shortByName.TryGetValue("Head1", out var headIndex)
+		_sourceHeadJoint = _shortByName.TryGetValue("Head1", out var headIndex)
 			? _sourceWorldMetres[headIndex].Origin
-			: Vec3.Zero);
+			: Vec3.Zero;
 		var headHd2 = _byName.TryGetValue("head", out var headBone)
 			? _restHd2[headBone.Index].Origin
 			: Vec3.Zero;

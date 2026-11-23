@@ -13,20 +13,27 @@ internal sealed class IasPhysicsMigration
 
 	private sealed record Joint(IasPhysicsChain Chain, IasPhysicsJoint Parameters, int ChainIndex);
 	private readonly Dictionary<int, Joint> joints = [];
+	private readonly Dictionary<int, string> poseAnchors = [];
 	private readonly string prefix;
 	private readonly IasRigProfile profile;
 	private readonly float step;
 	private RetargetExtraBone[] extras = [];
 	private Dictionary<int, RetargetExtraBone> bySlot = [];
 
-	internal IasPhysicsMigration(IasPhysicsSource source, ulong published, IasRigProfile profile, IasRigProfile canonical)
+	internal IasPhysicsMigration(IasPhysicsSource? source, ulong published, IasRigProfile profile, IasRigProfile? canonical,
+		IReadOnlyList<IasPoseRule>? poseRules = null)
 	{
 		this.profile = profile;
-		step = source.FixedStep;
-		prefix = $"ias_phys_{source.UnitId:x16}_{published:x16}/";
-		var canonicalBySlot = canonical.Nodes.ToDictionary(node => node.Slot);
+		step = source?.FixedStep ?? 0f;
+		prefix = $"ias_phys_{source?.UnitId:x16}_{published:x16}/";
 		var consumerByName = profile.Nodes.Select((node, index) => (node.Name, index))
 			.ToDictionary(item => item.Name, item => item.index, StringComparer.Ordinal);
+		foreach (var rule in poseRules ?? [])
+			if (consumerByName.TryGetValue(rule.Target, out var index))
+				poseAnchors.Add(index, PoseNodeName(rule.Target));
+		if (source is null)
+			return;
+		var canonicalBySlot = canonical!.Nodes.ToDictionary(node => node.Slot);
 		foreach (var chain in source.Chains)
 		{
 			for (var i = 0; i < chain.Joints.Count; i++)
@@ -40,7 +47,9 @@ internal sealed class IasPhysicsMigration
 		}
 	}
 
-	internal bool HasBones => joints.Count > 0;
+	internal bool HasBones => joints.Count > 0 || poseAnchors.Count > 0;
+
+	internal static string PoseNodeName(string name) => "ias_pose_" + name;
 
 	internal static int Group(string name)
 	{
@@ -55,15 +64,14 @@ internal sealed class IasPhysicsMigration
 		return 0;
 	}
 
-	internal void Plan(IReadOnlyList<Hd2RigBone> sourceBones, Hd2Rig target, RetargetResult geometry,
-		IReadOnlyDictionary<int, Vec3>? shifts)
+	internal void Plan(IReadOnlyList<Hd2RigBone> sourceBones, Hd2Rig target, IReadOnlyDictionary<int, int> mapped)
 	{
-		var selected = joints.Keys.ToHashSet();
+		var selected = joints.Keys.Concat(poseAnchors.Keys).ToHashSet();
 		var resolved = new Dictionary<int, int>();
 		int Native(int index)
 		{
 			var source = profile.ResolveSemanticNode(index);
-			return geometry.Resolved.TryGetValue(source, out var native)
+			return mapped.TryGetValue(source, out var native)
 				? native : throw new InvalidDataException($"Missing IAS physics anchor for {profile.Nodes[index].Name}.");
 		}
 
@@ -75,23 +83,17 @@ internal sealed class IasPhysicsMigration
 			if (selected.Contains(bone.Index))
 			{
 				resolved[bone.Index] = Native(bone.Index);
-				name = prefix + name;
+				name = poseAnchors.GetValueOrDefault(bone.Index) ?? prefix + name;
 				if (parent >= 0 && !selected.Contains(parent))
 					resolved[parent] = Native(parent);
 			}
 			bones.Add(new(bone.Index, name, parent, Mat4.Identity, bone.WorldBind, null));
 		}
-		extras = Retargeter.PlanJiggleBones(bones, resolved, target.Bones.Count, index =>
-		{
-			var anchor = Native(index);
-			var position = sourceBones[index].WorldBind.Origin;
-			if (geometry.Deform.TryGetValue(anchor, out var deform))
-				position = deform.TransformPoint(position);
-			return position + (shifts?.GetValueOrDefault(anchor) ?? Vec3.Zero);
-		}, selected).ToArray();
-		if (extras.Length != joints.Count)
-			throw new InvalidDataException($"Only {extras.Length}/{joints.Count} IAS physics bones have a bind anchor.");
-		bySlot = joints.Keys.ToDictionary(index => profile.Nodes[index].Slot,
+		extras = Retargeter.PlanJiggleBones(bones, resolved, target.Bones.Count,
+			index => sourceBones[index].WorldBind.Origin, selected).ToArray();
+		if (extras.Length != selected.Count)
+			throw new InvalidDataException($"Only {extras.Length}/{selected.Count} IAS custom bones have a bind anchor.");
+		bySlot = selected.ToDictionary(index => profile.Nodes[index].Slot,
 			index => extras[resolved[index] - target.Bones.Count]);
 	}
 
@@ -101,10 +103,11 @@ internal sealed class IasPhysicsMigration
 	internal void KeepWeightedChains(IReadOnlySet<uint> weighted, int nativeCount)
 	{
 		var chainsByName = joints.Values.ToDictionary(joint => prefix + joint.Parameters.Name, joint => joint.Chain);
-		var chainByIndex = extras.Select(extra => chainsByName[extra.Name]).ToArray();
+		var chainByIndex = extras.Select(extra => chainsByName.GetValueOrDefault(extra.Name)).ToArray();
+		var keepAnchors = poseAnchors.Values.ToHashSet(StringComparer.Ordinal);
 		var keep = new HashSet<IasPhysicsChain>();
 		var pending = new Queue<IasPhysicsChain>(extras.Select((extra, index) => (extra, index))
-			.Where(pair => weighted.Contains(pair.extra.NameHash)).Select(pair => chainByIndex[pair.index]));
+			.Where(pair => weighted.Contains(pair.extra.NameHash)).Select(pair => chainByIndex[pair.index]).OfType<IasPhysicsChain>());
 		var members = Enumerable.Range(0, extras.Length).ToLookup(index => chainByIndex[index]);
 		while (pending.TryDequeue(out var chain))
 		{
@@ -113,15 +116,15 @@ internal sealed class IasPhysicsMigration
 			foreach (var index in members[chain])
 			{
 				var parent = extras[index].ParentIndex - nativeCount;
-				if (parent >= 0 && chainByIndex[parent] != chain)
-					pending.Enqueue(chainByIndex[parent]);
+				if (parent >= 0 && chainByIndex[parent] is { } parentChain && parentChain != chain)
+					pending.Enqueue(parentChain);
 			}
 		}
 		var retained = new List<RetargetExtraBone>();
 		var remap = new int[extras.Length];
 		for (var i = 0; i < extras.Length; i++)
 		{
-			if (!keep.Contains(chainByIndex[i]))
+			if (!keepAnchors.Contains(extras[i].Name) && (chainByIndex[i] is not { } chain || !keep.Contains(chain)))
 				continue;
 			var extra = extras[i];
 			var parent = extra.ParentIndex - nativeCount;
@@ -134,7 +137,8 @@ internal sealed class IasPhysicsMigration
 	internal IEnumerable<int> NativeParents(int nativeCount) => extras
 		.Select(extra => extra.ParentIndex).Where(parent => parent < nativeCount).Distinct();
 
-	internal UnitTransformInfo Append(UnitTransformInfo rig, IEnumerable<RetargetedMesh> lods, bool compact)
+	internal UnitTransformInfo Append(UnitTransformInfo rig, IEnumerable<RetargetedMesh> lods, bool compact,
+		IEnumerable<uint> independentHashes)
 	{
 		var combined = UnitTransformInfoAppender.Append(rig, extras)!;
 		if (!compact || extras.Length == 0)
@@ -143,6 +147,7 @@ internal sealed class IasPhysicsMigration
 		// Keep the skin and physics nodes plus their native ancestors so the 256-node IAS limit still applies.
 		var used = lods.SelectMany(mesh => mesh.Vertices)
 			.SelectMany(vertex => vertex.Influences).Select(weight => weight.BoneHash)
+			.Concat(independentHashes)
 			.Concat(extras.Select(bone => bone.NameHash)).ToHashSet();
 		var keep = new HashSet<int>();
 		for (var i = 0; i < combined.NameHashes.Count; i++)
@@ -169,13 +174,14 @@ internal sealed class IasPhysicsMigration
 
 	internal void AddFacts(List<SourceJiggleBoneFact> facts, Hd2Rig target, IReadOnlySet<string> independent)
 	{
-		var start = facts.Count;
 		var extrasByName = extras.ToDictionary(extra => extra.Name);
 		var byName = joints.Values.ToDictionary(joint => prefix + joint.Parameters.Name);
+		var factIndices = new Dictionary<int, int>();
 		for (var i = 0; i < extras.Length; i++)
 		{
 			var extra = extras[i];
-			var joint = byName[extra.Name];
+			if (!byName.TryGetValue(extra.Name, out var joint))
+				continue;
 			var parent = extra.ParentIndex - target.Bones.Count;
 			var anchor = parent < 0 ? target.Bones[extra.ParentIndex].Name! : extras[parent].Name;
 			if (independent.Contains(anchor))
@@ -187,7 +193,8 @@ internal sealed class IasPhysicsMigration
 				? (neighbor.WorldOrigin - extra.WorldOrigin).Length
 				: (extra.WorldOrigin - (parent < 0 ? target.Bones[extra.ParentIndex].WorldOrigin : extras[parent].WorldOrigin)).Length;
 			var parameters = ConvertParameters(joint.Chain, joint.Parameters, step, (float)length, joint.ChainIndex == 1);
-			facts.Add(new(start + i, extra.Name, parent < 0 ? -1 : start + parent, anchor,
+			factIndices.Add(i, facts.Count);
+			facts.Add(new(facts.Count, extra.Name, factIndices.GetValueOrDefault(parent, -1), anchor,
 				parameters.Flags, [], extra.WorldOrigin, parameters));
 		}
 	}

@@ -100,7 +100,7 @@ local M = {}
 --        flags=0x35（yawCon + angleCon，没有 pitchCon）的长发链：pitch 区间留着初值 [0, 0]，
 --        而求解器在 axisLimits 打开时两个分量都夹 ⇒ 前后甩被锁在 0°，长发看着像一根焊丝。
 --        现在没约束的轴按"不限"处理，总偏角仍由锥兜住。
-M.VERSION = "2.1.53"
+M.VERSION = "2.1.57"
 
 --- 安装标记用的全局键。只写这一个全局，且值就是模块本身（便于外部检查是否已装）。
 local INSTALL_KEY = "__hd2physbone_runtime"
@@ -167,7 +167,7 @@ local function makeLogger(options)
 	-- 不影响运行期性能。产品环境不设它 ⇒ 行为与之前完全一致。
 	if (options and options.devLog == true) or os.getenv("HD2_PHYSBONE_DEV") == "1" then
 		maxBytes = math.huge
-	else
+	elseif io and type(io.open) == "function" then
 		local tunePath = (options and options.tunePath) or ((os.getenv("LOCALAPPDATA") or "") .. "\\hd2pbx_tune.txt")
 		local ok, handle = pcall(io.open, tunePath, "r")
 		if ok and handle ~= nil then
@@ -179,7 +179,7 @@ local function makeLogger(options)
 		end
 	end
 	local rotateBytes = (options and options.logRotateBytes) or DEFAULT_LOG_ROTATE_BYTES
-	if path then
+	if path and io and type(io.open) == "function" then
 		-- 轮转：先量旧文件，超阈值就挪到 `.1`（覆盖上一次的 `.1`）。
 		pcall(function()
 			local probe = io.open(path, "r")
@@ -566,6 +566,7 @@ end
 --- 那 +5 是余量：万一部署序列中间出现空洞（理论上不会，管理器每次从 0 连续重编），
 --- 二分可能低估，多探五格兜住。
 local function loadCarriers(S_, cache, options, logger)
+	if not io or type(io.open) ~= "function" then return {} end
 	local archives = options.archiveId and { options.archiveId }
 		or { "9ba626afa44a3aa3", "59d238094a164c88", "d2fde496226be96f" }
 	local carriers = {}
@@ -1836,7 +1837,7 @@ tune_values = function(runtime)
 		local base = os.getenv("LOCALAPPDATA")
 		if type(base) == "string" and #base > 0 then path = base .. "\\hd2pbx_tune.txt" end
 	end
-	if path ~= nil then
+	if path ~= nil and io and type(io.open) == "function" then
 		local ok, handle = pcall(io.open, path, "r")
 		if ok and handle ~= nil then
 			local okRead, text = pcall(handle.read, handle, "*a")
@@ -2401,6 +2402,7 @@ local function refresh_avatar_distances(S_, runtime)
 	local avatars = runtime.avatars
 	if avatars == nil or #avatars == 0 then return end
 	local camX, camY, camZ = cameraPosition(S_, runtime.world, runtime.cache or {})
+	runtime.poseCamera = { frame = runtime.frame, x = camX, y = camY }
 	if camX == nil then return end
 	for index = 1, #avatars do
 		local avatar = avatars[index]
@@ -2408,7 +2410,7 @@ local function refresh_avatar_distances(S_, runtime)
 		if avatar.unit ~= nil and session_unit_live(runtime, avatar.unit) then
 			local ax, ay, az = readVector(S_, try(S_.Unit.world_position, avatar.unit, 1))
 			if ax ~= nil then
-				avatar.x, avatar.y, avatar.z = ax, ay, az
+				avatar.x, avatar.y, avatar.z, avatar.positionFrame = ax, ay, az, runtime.frame
 				local dx, dy, dz = ax - camX, ay - camY, az - camZ
 				avatar.cameraDistance = dx * dx + dy * dy + dz * dz
 			end
@@ -2928,6 +2930,7 @@ end
 
 --- 轮询一次请求。只有目录存在、请求内容变了才动手；平时每 30 帧一次 io.open，成本可忽略。
 local function snapshot_poll(S_, runtime, options)
+	if not io or type(io.open) ~= "function" then return end
 	local dir = snapshot_dir(options)
 	if dir == nil then return end
 	local state = runtime.snapshotState
@@ -3736,10 +3739,10 @@ end
 --
 -- 实机证实（护甲探针 1、2）：护甲网格里和 avatar 同名的骨，画面直接用角色动画，
 -- 运行时写 avatar 或护甲上的同名骨都不认。转换器把要换转轴的骨改了名（`ias_` + 原名），
--- 它们就成了普通场景节点。以模型关节为转轴，按 avatar 的世界旋转增量驱动。
+-- 它们就成了普通场景节点。以模型关节为转轴，复制同父链的 avatar 局部旋转。
 --
 -- 选项 `independentBones = { { "ias_l_shoulder", "l_shoulder" }, ... }`（父骨在前）。
--- `independentRetarget = "localCopy"` 可切回局部旋转拷贝。旧 Mod 无静止姿态时也用这条路径。
+-- `independentTranslations` 按件给出平移骨的潜兵/模型静止局部位置。
 -- ---------------------------------------------------------------------------
 local INDEPENDENT_RESCAN_FRAMES = 1800
 local INDEPENDENT_LOG_FRAMES = { [1] = true, [600] = true }
@@ -3781,57 +3784,1179 @@ local function frame_animation_layer(animation, avatar)
 	return animation.time, animation.length, 1
 end
 
-local function independent_action(runtime, state, avatar)
-	local animation, calls = frame_animation_machine(runtime, avatar)
-	local enabled = false
-	if not animation.active then
-		state.mode, state.alpha, state.normals = false, 0, {}
-		return 0, calls
-	end
-	local tuple, stateCalls = frame_animation_state(animation, avatar)
-	calls = calls + stateCalls
-	if tuple and tuple.n == 31 and type(tuple[4]) == "number" and type(tuple[11]) == "number"
-		and tuple[4] ~= 76 and tuple[4] ~= 77 then
-		local _, length, layerCalls = frame_animation_layer(animation, avatar)
-		calls = calls + layerCalls
-		if type(length) ~= "number" or length ~= length or length <= 0 or length > 1000 then
-			enabled = true
-		elseif length < 0.9 then
-			enabled = state.mode == true
-		end
-	end
-	state.mode = enabled
-	local blend = arm_pose_options(runtime).armBlendTime
-	local step = blend > 0 and (runtime.dt or 1/60) / blend or 1
-	local alpha = state.alpha
-	if alpha == nil then alpha = enabled and 1 or 0 end
-	state.alpha = math.max(0, math.min(1, alpha + (enabled and step or -step)))
-	return state.alpha, calls
-end
-
 local function independent_visibility(piece, show)
 	local ok, result = pcall(S.Unit.set_unit_visibility, piece.unit, show)
 	if ok and result ~= false then piece.hidden = not show end
 	return 1
 end
 
-local function independent_release(runtime, state)
-	if not state or state.world ~= runtime.world or refresh_live_units(runtime, S) ~= "ok" then return end
-	for _, piece in ipairs(state.pieces) do
-		if (piece.hidden or next(piece.stretched) ~= nil) and session_unit_live(runtime, piece.unit)
-			and Compat.unit_alive(S, piece.unit) then
-			for a in pairs(piece.stretched) do
-				local arm = state.arms[a]
-				for _, b in ipairs({ arm.el, arm.ha }) do
-					if safe_node(S, piece.unit, state.list[b][1]) == piece.nodes[b] then
-						Compat.write_independent_position(S, piece.unit, piece.nodes[b], state.rest[b][4], 1)
+local IndependentLink = {}
+
+-- IAS 1.6.4 layer roles plus the locally observed ship/prone empty states.
+-- Reload lengths are in 60 Hz clip ticks. The game clock reports seconds.
+IndependentLink.reloadClips = {
+	[159]=170, [168]=90, [446]=180, [475]=185, [476]=135, [477]=200, [478]=115, [479]=150,
+	[488]=185, [489]=185, [490]=135, [491]=135, [494]=90, [499]=200, [500]=200, [501]=130, [502]=130,
+	[510]=170, [511]=170, [573]=170, [586]=90, [592]=180, [593]=120, [594]=120, [595]=180,
+	[596]=220, [597]=220, [600]=299, [601]=250, [612]=60, [633]=180, [634]=215, [635]=175,
+	[636]=110, [637]=50, [638]=40, [639]=50, [640]=30, [665]=105, [666]=105, [681]=180,
+	[686]=40, [687]=50, [691]=154, [698]=190, [699]=135, [700]=90, [701]=70, [702]=90, [703]=70,
+	[704]=190, [705]=190, [706]=120, [707]=120, [725]=120, [732]=200, [733]=130, [744]=130,
+	[745]=90, [748]=130, [749]=90, [767]=190, [768]=135, [774]=210, [775]=125, [781]=150,
+	[799]=180, [800]=130, [865]=180,
+}
+IndependentLink.motionGrips = {
+	r = { p = { 0.051216014, -0.006265312, -0.055564534 }, q = { -0.579370737, -0.437321216, -0.442053050, 0.526942849 } },
+	l = { p = { 0.059206679, -0.001960278, -0.046801239 }, q = { 0.386549324, 0.487733185, -0.622131407, 0.475024790 } },
+}
+
+-- Asset IDs, scene-graph sizes, root slots, parent signatures and sidearm
+-- flags from the IAS 1.6.4 weapon catalogue. Optional bounds cover the
+-- native moving left-control sweep in the right-control frame.
+IndependentLink.weaponGraphs = {
+	["03e67a19b07c6523"] = { 38, 2, 1819903690, false },
+	["05d8d8c073b9d502"] = { 51, 2, 274910700, false, { 0.2235870, 0.0559892, -0.2017267, 0.3600964, 0.0718231, -0.1779306 } },
+	["05e4e5c2db6e44a2"] = { 33, 2, 1561093617, true },
+	["076dd5d4f4360204"] = { 32, 2, 128809422, false, { 0.3606843, 0.0153683, -0.1502686, 0.4710091, 0.0159076, -0.1402258 } },
+	["0b882808c6f498e8"] = { 39, 2, 378417319, true },
+	["0f83639ab8c86165"] = { 50, 15, 787771201, false },
+	["11ec8e2296a3d662"] = { 74, 2, 870721566, false, { 0.2411331, 0.0333919, -0.1703917, 0.3778624, 0.0494076, -0.1465957 } },
+	["14d5d4506056c7a4"] = { 43, 2, 1117374565, true },
+	["186ea95de7306b1a"] = { 36, 2, 1978993991, false },
+	["1a437158e1b8d2a1"] = { 36, 2, 1710260533, true },
+	["1abbff60d26ba391"] = { 30, 2, 1247580091, false },
+	["27ee1ed8f6fb6356"] = { 40, 3, 1361605581, false },
+	["295beb26dc4f8ff1"] = { 39, 2, 1367166588, false },
+	["2b28e17ffed05f7c"] = { 43, 2, 858667509, true },
+	["30061f91af477f5e"] = { 36, 3, 476231973, false },
+	["3575aabc5f1f9326"] = { 35, 3, 1966170913, true },
+	["3c86e871923f3970"] = { 45, 2, 93729406, false },
+	["3f92ba65ef65cca9"] = { 33, 2, 83927365, true },
+	["416d053372c4e433"] = { 32, 2, 768516475, true },
+	["41eac4a03987faa0"] = { 75, 2, 787402567, false, { 0.2235870, 0.0559892, -0.2017267, 0.3603163, 0.0720048, -0.1779306 } },
+	["46183b50961d1328"] = { 37, 3, 1428336574, false },
+	["4ba41b6f9f405cc2"] = { 40, 3, 1310516119, false },
+	["4d58c77087b774c5"] = { 36, 2, 1710260535, true },
+	["4dbd74f49c8ffc13"] = { 36, 2, 171269624, false },
+	["4e4a613eb9bf5c24"] = { 38, 2, 1217661892, false },
+	["4fb0f8c02f55c82b"] = { 30, 2, 1839515245, false },
+	["52e4334e6a128caf"] = { 32, 2, 47759735, true },
+	["53eebe75cd6e26df"] = { 75, 2, 787402567, false, { 0.2235870, 0.0559892, -0.2017267, 0.3603163, 0.0720048, -0.1779306 } },
+	["5fecab819f96a3e8"] = { 37, 2, 1891200416, false },
+	["708ea298c82093d0"] = { 38, 2, 639684404, false },
+	["72170a55a1f37ff1"] = { 38, 2, 1646819641, false, { 0.2423786, 0.0466107, -0.1496554, 0.2506835, 0.0657484, -0.1487711 } },
+	["7b06196e90154c88"] = { 34, 3, 1302795119, true },
+	["7b75e5132ffd4ca6"] = { 42, 2, 450936345, false, { 0.2017704, 0.0965996, -0.1967479, 0.4060056, 0.1558298, -0.1227190 } },
+	["7e3145a5baa4b948"] = { 32, 2, 2116111373, false },
+	["80f1a156d9fa1e36"] = { 38, 3, 1105069466, false },
+	["84354339522c932d"] = { 36, 2, 1918168807, false },
+	["8645f167b3c813a2"] = { 37, 2, 389142160, false },
+	["8a307bd1811a5fe9"] = { 34, 2, 1407847902, false },
+	["8d3d52a3b2f19402"] = { 60, 3, 103015341, true },
+	["8dc91f277c6096ee"] = { 38, 3, 1276517676, false },
+	["90ddc374f4e3d756"] = { 38, 2, 1159570608, false, { 0.2740060, 0.0123188, -0.1606764, 0.3630209, 0.0226438, -0.1451595 } },
+	["94bd931b5fb4ee95"] = { 39, 2, 290697657, false },
+	["9571ca51f0daf35b"] = { 35, 2, 1244341504, false },
+	["968211c0033dce64"] = { 43, 2, 1365212662, false },
+	["9eb160830321bfd6"] = { 33, 3, 755676466, true },
+	["a6a735accb4a327f"] = { 41, 2, 2075574723, false },
+	["a7ee1ebf58fcdf1f"] = { 43, 2, 683329037, false },
+	["aa69a60d74a3ec54"] = { 43, 3, 338970381, true },
+	["bc29613666df696b"] = { 38, 2, 1601355231, false },
+	["be70ee0d8d44028e"] = { 35, 2, 80160173, false, { 0.1960675, 0.0005412, -0.1625393, 0.2044715, 0.0630153, -0.1589530 } },
+	["c12a34f375bd5a87"] = { 39, 3, 1246493056, false },
+	["c4232a0e62166d91"] = { 38, 2, 123780754, false },
+	["c780bcd79547da0f"] = { 44, 2, 934893741, true },
+	["cdf28be026bb7d84"] = { 44, 3, 393988844, false },
+	["ce063aa33d95a812"] = { 38, 2, 431026281, false },
+	["cf8934ff6567a42d"] = { 44, 2, 949681621, true },
+	["d323de60855898ac"] = { 75, 2, 787402567, false, { 0.2235870, 0.0559892, -0.2017267, 0.3603163, 0.0720048, -0.1779306 } },
+	["d6b1fb05b9109353"] = { 46, 2, 290653440, true },
+	["dbb6c961c59fadc1"] = { 32, 2, 758111369, true },
+	["dcd1c835407ef7ba"] = { 38, 2, 1437803423, false, { 0.2065672, -0.0005330, -0.1740642, 0.2848286, 0.0085447, -0.1604218 } },
+	["e5796355a8fd67e0"] = { 39, 2, 200464068, false },
+	["e6d932be83729076"] = { 41, 2, 508840821, false },
+	["eea5e3cef1e12c14"] = { 46, 2, 1830706571, false },
+	["efdcef306cea63fe"] = { 47, 2, 1030894062, false },
+	["f0338468dcdb6a6c"] = { 35, 2, 326188192, false },
+	["f49227a0630a3f7f"] = { 50, 2, 601786065, false },
+	["f992ce97577c8a7f"] = { 40, 2, 1567577924, false, { 0.3563594, 0.0170015, -0.1217884, 0.3817801, 0.0530078, -0.1166465 } },
+	["02eecd0b1fa49630"] = { 40, 2, 1575613387, false },
+	["11c27d3babb38956"] = { 46, 2, 696751716, false },
+	["2152d5147b0ac418"] = { 39, 2, 1326004856, false },
+	["25aa2fd4643cf4ee"] = { 32, 2, 1430532530, false },
+	["26e40437ea275296"] = { 38, 2, 1168239596, false },
+	["2e9d0bdc48b09e60"] = { 39, 3, 1270607482, false },
+	["35a61296619cc47e"] = { 41, 2, 503420083, false },
+	["3828e2051aa9e897"] = { 47, 2, 788655962, false },
+	["39ab99895147a3bf"] = { 33, 3, 1860855984, false },
+	["43a58cb89cfa197c"] = { 33, 2, 1185781154, false },
+	["52071f49263415e4"] = { 35, 2, 1460748206, false },
+	["5990123d142b16cb"] = { 42, 2, 1026156458, false },
+	["6cfcc7f8801a0266"] = { 36, 2, 290032866, false },
+	["7617642765ac38c7"] = { 32, 2, 263546244, false },
+	["78a8185f63a70795"] = { 31, 2, 1574060098, false },
+	["80932fa0ed6901d3"] = { 33, 2, 2072574442, false },
+	["88c2d09ad85a7c9f"] = { 38, 2, 848326378, false },
+	["89c5493e08ca4207"] = { 39, 2, 1602264935, false },
+	["96de9cd50f7306e6"] = { 44, 2, 1508873121, false },
+	["9f80d67a12a7e40f"] = { 42, 2, 1597238702, false },
+	["a8cffb316f0b5c5f"] = { 63, 3, 283677617, false },
+	["b16c9d490aa59b77"] = { 51, 2, 125009885, false },
+	["b2b5e0d185605f9e"] = { 40, 2, 1462781686, false },
+	["cc786f6491fe7e65"] = { 39, 2, 320010747, false },
+	["d54b9505c0f72873"] = { 37, 2, 1469459401, false },
+	["e8d5f49ad7780e54"] = { 37, 2, 1869403091, false },
+	["fe3b29b2cfa63f9b"] = { 55, 2, 511412428, false },
+	["a8a91eb54892b6b2"] = { 43, 2, 706204382, false },
+	["e91f569c2ad8af01"] = { 36, 2, 511394286, true },
+	["c85f576d5e086147"] = { 48, 2, 1019708248, false },
+}
+
+-- Resource/count pairs identify candidate child Units for the optional root trial.
+IndependentLink.weaponMembers = {
+	["03e67a19b07c6523"] = "07d605bd50c98461:16 44a2a59ca08ac865:12 642f2be0417d0beb:15 6d54652ee217d712:12 6e68194b95d60145:38 7b153e02ad22d12c:12 7fdd884ecd57231b:6 9b30d4ac39ddff10:16 bd4245dcfd4b832f:11 bdbefa6543a75942:22 e5796355a8fd67e0:39",
+	["05d8d8c073b9d502"] = "0c7314742b88806c:13 aca180fc6f846411:12 f9df21c8e52cac95:13 fa6f926a77b78b55:12",
+	["05e4e5c2db6e44a2"] = "0ec5ef9ec5cbd1b2:5 309f7e645a8d2b56:14 4851d75853622a47:15 4e4a613eb9bf5c24:38 4f839e923046e631:15 52071f49263415e4:35 6b88fea13ec2d78e:12 6b9572ac0f687394:6 77c5d934407114f4:17 8d3d52a3b2f19402:60 9dbc8aa8702ac9e1:12 b5b4395852e871bc:6 b96cc3b704a76464:7 e6b6467135035059:13 e71dbcb6a50f321b:158",
+	["076dd5d4f4360204"] = "9dbc8aa8702ac9e1:12 e307b6e78b0a8573:3",
+	["0b882808c6f498e8"] = "45be635fb904f4dc:12 7441b048b94491fc:12 bb8e970248330bdb:12 e2177e205d9a7a55:26 e98a9be765e0e236:5",
+	["0f83639ab8c86165"] = "44a2a59ca08ac865:12 7fdd884ecd57231b:6 89cce4d15db88aa8:16 a9a19cffe985c468:12 bf9504e95c0103a1:12",
+	["11ec8e2296a3d662"] = "3d58ea61b2b485cc:12 7f19d05cd188c768:6",
+	["14d5d4506056c7a4"] = "350168e3fd02b325:9 6b9572ac0f687394:6",
+	["186ea95de7306b1a"] = "309f7e645a8d2b56:14 7b153e02ad22d12c:12 8f141212b0f6f515:13 9d5e0d88df992aa6:6 9dbc8aa8702ac9e1:12",
+	["1a437158e1b8d2a1"] = "005c2262f672caf4:18 309f7e645a8d2b56:14 6b9572ac0f687394:6",
+	["1abbff60d26ba391"] = "3a8ad42985c52dc7:14 8a7631bbb4f6f3d8:10",
+	["27ee1ed8f6fb6356"] = "129e5fb1b13c2018:12 309f7e645a8d2b56:14 50cd7e9f909fe5a1:12 cebd25f8778bfdee:14",
+	["295beb26dc4f8ff1"] = "129e5fb1b13c2018:12 80e8335ab4042fcf:12",
+	["2b28e17ffed05f7c"] = "7f19d05cd188c768:6",
+	["30061f91af477f5e"] = "7301b3dc5b1bffb8:17 dd8cbbac49f7c628:15",
+	["3575aabc5f1f9326"] = "78829731a0563576:13 9d5e0d88df992aa6:6 c891acf9e8dbda97:12 e6b6467135035059:13",
+	["3c86e871923f3970"] = "309f7e645a8d2b56:14 3d58ea61b2b485cc:12 b1bc2b7252ccbc03:12",
+	["3f92ba65ef65cca9"] = "a134e110ef4ef865:7",
+	["416d053372c4e433"] = "50cd7e9f909fe5a1:12 78829731a0563576:13 7b06196e90154c88:34 e53e4b0c20563d21:5 e6b6467135035059:13",
+	["41eac4a03987faa0"] = "7f19d05cd188c768:6 8f6f7c8c1e4b9b6d:11 9dbc8aa8702ac9e1:12",
+	["46183b50961d1328"] = "309f7e645a8d2b56:14 3ddb9d36da22555d:36 45be635fb904f4dc:12 6228d0242bde56b6:38 68b8d040421e8a49:25 8cd335a5f711bb59:12 9dbc8aa8702ac9e1:12 b7cd78c71e0a48ed:6 d8cf7fe059b4bf1e:12",
+	["4ba41b6f9f405cc2"] = "48d2ddc8e9a80b1e:14 6b9572ac0f687394:6",
+	["4d58c77087b774c5"] = "4ffb842ce1093f3f:17 6b9572ac0f687394:6 e69567209a83df39:11",
+	["4dbd74f49c8ffc13"] = "0040c16bd48573e2:10 7f49b46efdd850ef:16 7fdd884ecd57231b:6",
+	["4e4a613eb9bf5c24"] = "05e4e5c2db6e44a2:33 0ec5ef9ec5cbd1b2:5 309f7e645a8d2b56:14 4851d75853622a47:15 4f839e923046e631:15 52071f49263415e4:35 6b88fea13ec2d78e:12 6b9572ac0f687394:6 77c5d934407114f4:17 8d3d52a3b2f19402:60 9dbc8aa8702ac9e1:12 b5b4395852e871bc:6 b96cc3b704a76464:7 e6b6467135035059:13 e71dbcb6a50f321b:158",
+	["4fb0f8c02f55c82b"] = "511910c41a70122d:14",
+	["52e4334e6a128caf"] = "5f4b129d947d79d7:13 78829731a0563576:13",
+	["53eebe75cd6e26df"] = "3d58ea61b2b485cc:12 8f6f7c8c1e4b9b6d:11 e6caddc3ed05dd7e:4",
+	["5fecab819f96a3e8"] = "129e5fb1b13c2018:12 7fdd884ecd57231b:6 c245c696e80677ed:20 ffc18b2ce10ca381:11",
+	["708ea298c82093d0"] = "45be635fb904f4dc:12 7441b048b94491fc:12 7be1e04a7738e673:18 7fdd884ecd57231b:6",
+	["72170a55a1f37ff1"] = "91eb62e0a02302ba:5",
+	["7b06196e90154c88"] = "416d053372c4e433:32 50cd7e9f909fe5a1:12 78829731a0563576:13 e53e4b0c20563d21:5 e6b6467135035059:13",
+	["7b75e5132ffd4ca6"] = "206cb0dd1696ceaa:5 7fdd884ecd57231b:6 8a35c1dc19f41870:10 a9a19cffe985c468:12",
+	["7e3145a5baa4b948"] = "129e5fb1b13c2018:12 309f7e645a8d2b56:14 7dc6dda584cc5223:11 d44c25420aa3e2ff:26",
+	["80f1a156d9fa1e36"] = "1ec5f54265a91c83:16 309f7e645a8d2b56:14 3d58ea61b2b485cc:12 ab9e1ad1597d5d9e:6",
+	["84354339522c932d"] = "5d268a6f943792d4:10 963aca558cd906bc:17 cf907add37bfa9be:6",
+	["8645f167b3c813a2"] = "129e5fb1b13c2018:12 e3541de70b7ec1c0:13",
+	["8a307bd1811a5fe9"] = "1b1fcc0e025c1f7d:14 6b9572ac0f687394:6 72fe4b13f726c344:24 7b153e02ad22d12c:12 d5cb9b5401b261f9:11",
+	["8d3d52a3b2f19402"] = "05e4e5c2db6e44a2:33 0ec5ef9ec5cbd1b2:5 309f7e645a8d2b56:14 4851d75853622a47:15 4e4a613eb9bf5c24:38 4f839e923046e631:15 52071f49263415e4:35 6b88fea13ec2d78e:12 6b9572ac0f687394:6 77c5d934407114f4:17 9dbc8aa8702ac9e1:12 b5b4395852e871bc:6 b96cc3b704a76464:7 e6b6467135035059:13 e71dbcb6a50f321b:158",
+	["8dc91f277c6096ee"] = "029cfc4c193211c3:16 6d54652ee217d712:12 719f42b7d137789c:11 ab9e1ad1597d5d9e:6",
+	["90ddc374f4e3d756"] = "0040c16bd48573e2:10 36e235816805c17e:5",
+	["94bd931b5fb4ee95"] = "16051937941bb709:11 309f7e645a8d2b56:14 6b9572ac0f687394:6 7372947782b91123:17 fa6f926a77b78b55:12",
+	["9571ca51f0daf35b"] = "309f7e645a8d2b56:14 7b153e02ad22d12c:12 9d5e0d88df992aa6:6 9dbc8aa8702ac9e1:12 be4590c2f615c441:14",
+	["968211c0033dce64"] = "129e5fb1b13c2018:12 309f7e645a8d2b56:14 756e3fdaca41cfca:12 7be1e04a7738e673:18 7fdd884ecd57231b:6 a1a026c8bb37a96e:19 cb8d6dbe2ad74be4:58",
+	["9eb160830321bfd6"] = "9dbc8aa8702ac9e1:12 b3bf071f477fc155:3",
+	["a6a735accb4a327f"] = "028a1ed2394fb808:6 309f7e645a8d2b56:14 45be635fb904f4dc:12 73a5ecad32ba599b:35 756e3fdaca41cfca:12 7fdd884ecd57231b:6",
+	["a7ee1ebf58fcdf1f"] = "2d761a80bcbfe792:18 309f7e645a8d2b56:14 45be635fb904f4dc:12 756e3fdaca41cfca:12 7fdd884ecd57231b:6",
+	["aa69a60d74a3ec54"] = "aca180fc6f846411:12",
+	["bc29613666df696b"] = "16ab263bc03b4f96:18 309f7e645a8d2b56:14 756e3fdaca41cfca:12 7fdd884ecd57231b:6 9dbc8aa8702ac9e1:12 bfe35746f5084222:3",
+	["be70ee0d8d44028e"] = "0040c16bd48573e2:10 43639dc374b75c5f:15",
+	["c12a34f375bd5a87"] = "309f7e645a8d2b56:14 3ddb9d36da22555d:36 b7cd78c71e0a48ed:6 cdf733b0106a23c3:11 fa6f926a77b78b55:12",
+	["c4232a0e62166d91"] = "309f7e645a8d2b56:14 6b88fea13ec2d78e:12 6b9572ac0f687394:6 9dbc8aa8702ac9e1:12 fa6c1158a93b8ec4:17",
+	["c780bcd79547da0f"] = "6b9572ac0f687394:6 7441b048b94491fc:12 bcbbe9bb1a49c7fd:5",
+	["cdf28be026bb7d84"] = "7f0e355dedbdf3d5:17 7fdd884ecd57231b:6 83970097f3d997ad:12 e6b6467135035059:13",
+	["ce063aa33d95a812"] = "129e5fb1b13c2018:12 2383b0439f0bc465:11 309f7e645a8d2b56:14 7fdd884ecd57231b:6 89cce4d15db88aa8:16",
+	["cf8934ff6567a42d"] = "11eccafa4b56a49c:6 6b9572ac0f687394:6 fc1f0a3b3fc97238:15",
+	["d323de60855898ac"] = "9dbc8aa8702ac9e1:12 e0e097b347bdfe6c:11 f401191f6b5a7879:5",
+	["d6b1fb05b9109353"] = "4431931242cbcd54:5 7de84a343186671f:11 e98a9be765e0e236:5",
+	["dbb6c961c59fadc1"] = "20e05bca458a39e8:5 619795f79ceda1b3:15",
+	["dcd1c835407ef7ba"] = "36e235816805c17e:5 8a35c1dc19f41870:10 f40dea68b213b005:11",
+	["e5796355a8fd67e0"] = "03e67a19b07c6523:38 07d605bd50c98461:16 44a2a59ca08ac865:12 642f2be0417d0beb:15 6d54652ee217d712:12 6e68194b95d60145:38 7b153e02ad22d12c:12 7fdd884ecd57231b:6 9b30d4ac39ddff10:16 bd4245dcfd4b832f:11 bdbefa6543a75942:22",
+	["e6d932be83729076"] = "44a2a59ca08ac865:12 cda482684a202fd2:4",
+	["eea5e3cef1e12c14"] = "193becdf64aa66a9:12 309f7e645a8d2b56:14 3d58ea61b2b485cc:12 80f0a339e905d2d3:12 bc9182001d0312bd:13 efdcef306cea63fe:47",
+	["efdcef306cea63fe"] = "193becdf64aa66a9:12 309f7e645a8d2b56:14 3d58ea61b2b485cc:12 80f0a339e905d2d3:12 bc9182001d0312bd:13 eea5e3cef1e12c14:46",
+	["f0338468dcdb6a6c"] = "44a2a59ca08ac865:12 462fc89d4903b33d:18 7441b048b94491fc:12 7fdd884ecd57231b:6",
+	["f49227a0630a3f7f"] = "3d58ea61b2b485cc:12 820ac4b5db9b2585:20 8f063c5d3929316e:6",
+	["f992ce97577c8a7f"] = "129e5fb1b13c2018:12 618c00f2f115c1fe:26",
+	["02eecd0b1fa49630"] = "68513d59bafa8c7a:6 b98f2b3d1bde24b0:48 fa6f926a77b78b55:12",
+	["11c27d3babb38956"] = "3d58ea61b2b485cc:12 66cb402846eaaa31:6 7b153e02ad22d12c:12 7fdd884ecd57231b:6 9d81323b153dc429:43",
+	["2152d5147b0ac418"] = "085c1edb038ec24e:39 17c6e9bafcd646d2:6 45be635fb904f4dc:12 66cb402846eaaa31:6 b7cd35e0edc15cd7:38",
+	["25aa2fd4643cf4ee"] = "1f012c3a0fa74fe2:10 48fd06b465e8b681:15 8666e5f49f440d44:12 8ec3026b5f2e579a:47",
+	["26e40437ea275296"] = "2457b559aa341cc1:12 36ab9a3dcae3d562:7",
+	["2e9d0bdc48b09e60"] = "503c0e01fbafa86a:15 b2d5147255a12545:6 e8ffad77b73c221c:7 f5e1e4bd4ecdc192:13",
+	["35a61296619cc47e"] = "2457b559aa341cc1:12 612f7f6193fb1b2b:9 b2d5147255a12545:6 d54b9505c0f72873:37",
+	["3828e2051aa9e897"] = "3d58ea61b2b485cc:12 503c0e01fbafa86a:15 f21e8dd5e27fef7c:3",
+	["39ab99895147a3bf"] = "444880f62ca7eae8:40 9c22a90da9c79de3:11",
+	["43a58cb89cfa197c"] = "056de1c5e21e723e:27 66cb402846eaaa31:6 7fdd884ecd57231b:6 9ba9f700137c6325:26",
+	["52071f49263415e4"] = "0ec5ef9ec5cbd1b2:5",
+	["5990123d142b16cb"] = "2457b559aa341cc1:12 afd03c31434b6ee5:12",
+	["6cfcc7f8801a0266"] = "076692fd83a83c5c:10 2457b559aa341cc1:12",
+	["7617642765ac38c7"] = "0511db0bca94fa78:7",
+	["78a8185f63a70795"] = "23d09a05d1574ec9:27 43eb1c3c1a1860e0:26",
+	["80932fa0ed6901d3"] = "692eb345969d368e:5",
+	["88c2d09ad85a7c9f"] = "bb4b15b588f974fd:27 bf7082f0287c254f:27 cba5983612dace3f:5",
+	["89c5493e08ca4207"] = "17c6e9bafcd646d2:6 6d54652ee217d712:12 6e165f05a49233f6:14",
+	["96de9cd50f7306e6"] = "f5e1e4bd4ecdc192:13",
+	["9f80d67a12a7e40f"] = "2457b559aa341cc1:12 db50297b40133d12:13",
+	["a8cffb316f0b5c5f"] = "2457b559aa341cc1:12 9bc319730887bdd8:5 a91e4527859ada75:5",
+	["b2b5e0d185605f9e"] = "2457b559aa341cc1:12",
+	["cc786f6491fe7e65"] = "46427f2630a80d88:12 6a4c2138009b625e:18 b8feb0cc191c1ef3:30 be0ac4e655b2e19f:19 ffb0f21dcc7b5e15:10",
+	["d54b9505c0f72873"] = "2457b559aa341cc1:12 35a61296619cc47e:41 612f7f6193fb1b2b:9 b2d5147255a12545:6",
+	["e8d5f49ad7780e54"] = "2457b559aa341cc1:12 52ff81fcba0c059d:12",
+	["fe3b29b2cfa63f9b"] = "adc87d576c20ad57:6 b98f2b3d1bde24b0:48 fa6f926a77b78b55:12",
+	["a8a91eb54892b6b2"] = "129e5fb1b13c2018:12 20c03774d6e1d87f:13 7f19d05cd188c768:6 b9c209b4f99b5335:24",
+	["e91f569c2ad8af01"] = "6b9572ac0f687394:6 ccf18b6315a3d67f:7 fc1f0a3b3fc97238:15",
+	["c85f576d5e086147"] = "129e5fb1b13c2018:12 6600b5e755a21f1f:12 679e174bb3bcca68:10 a188cbb5913fbd63:10",
+}
+IndependentLink.weaponAccessories =
+	"07d605bd50c98461:16 0aae32c4479eaa26:12 129e5fb1b13c2018:12 13a5fc03ec21e8fb:14 16ab263bc03b4f96:18 1b1fcc0e025c1f7d:14 1ec5f54265a91c83:16 2383b0439f0bc465:11 " ..
+	"2457b559aa341cc1:12 26ec4f9513fc6525:12 28aee9c6a2282aa3:13 2d761a80bcbfe792:18 2e7f91374c0b471c:12 2ed76d29ce509a74:12 309f7e645a8d2b56:14 316a396d1939a997:12 " ..
+	"369b53e850e72ba9:18 37c2891774b38c87:18 3ae1f60c5efd2b43:14 3ae8ba6377efe3ae:12 3d58ea61b2b485cc:12 411c4fd07740a7dd:13 44a2a59ca08ac865:12 45be635fb904f4dc:12 " ..
+	"4851d75853622a47:15 4f839e923046e631:15 5c1e075cba68340b:12 6b88fea13ec2d78e:12 6b9572ac0f687394:6 6d54652ee217d712:12 6f5afa606a4400d1:17 7301b3dc5b1bffb8:17 " ..
+	"74b9289347cc3503:12 756e3fdaca41cfca:12 75713afac474d9c4:12 77c5d934407114f4:17 78829731a0563576:13 7b153e02ad22d12c:12 7be1e04a7738e673:18 8039834a4b7489b9:11 " ..
+	"8cd335a5f711bb59:12 9237ccec8fe86d22:14 9549ff64ba3fd5a1:14 963aca558cd906bc:17 990b06bf5c26bd01:12 9dbc8aa8702ac9e1:12 a0b52d203e689d18:13 a4fa3ef43a8cecaf:18 " ..
+	"a9a19cffe985c468:12 aca180fc6f846411:12 b191a4f26558a9cc:12 b1bc2b7252ccbc03:12 b571e0428ca83b9e:12 bd4245dcfd4b832f:11 be4590c2f615c441:14 bfe35746f5084222:3 " ..
+	"c70345c3342ca205:12 c891acf9e8dbda97:12 cc4cd9593abb87be:17 d8cf7fe059b4bf1e:12 e6b6467135035059:13 e8de5e95b9635c21:18 ec824b9d8b7f7b58:13 ee89d98cbe33e976:18 " ..
+	"f40dea68b213b005:11 f9c6092b665018b8:12 f9df21c8e52cac95:13 f9f37dcce764fad6:13 fa6f926a77b78b55:12 ffc18b2ce10ca381:11"
+
+function IndependentLink.action(avatar, animation)
+	if not animation.active or try(S.Unit.alive, avatar) ~= true then return 0, false, 1 end
+	local tuple, calls = frame_animation_state(animation, avatar)
+	if not tuple or tuple.n ~= 31 then return 0, false, calls + 1 end
+	local base, upper, main = tonumber(tuple[3]), tonumber(tuple[4]), tonumber(tuple[11])
+	if not base or not upper or not main or base%1 ~= 0 or upper%1 ~= 0 or main%1 ~= 0
+		or upper == 76 or upper == 77 then return 0, false, calls + 1 end
+	local time, length, clipCalls = frame_animation_layer(animation, avatar)
+	calls = calls + clipCalls + 1
+	local validClip = type(time) == "number" and type(length) == "number" and time >= 0
+		and length > 0 and length < math.huge and time <= length+0.025
+	local empty = main == 585 or ((main == 230 or main == 650) and validClip and length > 1000)
+	if (main == 230 or main == 650) and not empty then return 0, false, calls end
+	local expected = IndependentLink.reloadClips[main]
+	-- The captured ship catalogue also uses 640 and 681 for short transitions.
+	local observedTransition = (main == 636 and validClip and math.abs(length-0.500) <= 0.005)
+		or (main == 640 and validClip and math.abs(length-0.650) <= 0.005)
+		or (main == 681 and validClip and math.abs(length-29/60) <= 0.005)
+	if expected and not observedTransition then
+		if validClip and math.abs(length-expected/60) <= 0.005 then return 2, false, calls end
+		return 0, false, calls
+	end
+	local lowered = upper == 8 or upper == 18 or upper == 67
+	local raised = (upper >= 0 and upper <= 7) or upper == 11 or upper == 12 or upper == 17
+		or (upper >= 19 and upper <= 66) or upper == 70 or upper == 71
+	local weaponTree = (base >= 1 and base <= 7) or base == 10 or base == 11
+		or (base >= 13 and base <= 58) or (base >= 60 and base <= 71)
+		or (empty and (base == 8 or base == 72 or base == 73))
+	if not raised and not weaponTree then return 0, false, calls end
+	if try(S.Unit.animation_has_variable, avatar, "weapon_selected") ~= true then return 0, false, calls + 1 end
+	local id = try(S.Unit.animation_find_variable, avatar, "weapon_selected")
+	if type(id) ~= "number" or id < 0 or id%1 ~= 0 then return 0, false, calls + 2 end
+	local selected = tonumber(try(S.Unit.animation_get_variable, avatar, id))
+	if not selected or not (selected > 0 and selected < math.huge) then return 0, false, calls + 3 end
+	if empty and (raised or lowered) then return 1, true, calls + 3 end
+	return 2, false, calls + 3
+end
+
+function IndependentLink.contacts(action, readPose)
+	local V = Compat.contact_math
+	local contacts = {}
+	for _, side in ipairs({ "r", "l" }) do
+		local anchor = readPose("attach_hand_" .. side)
+		if anchor and (action == 2 or side == "r") then
+			local hand = readPose(side .. "_hand")
+			local grip = IndependentLink.motionGrips[side]
+			local native = hand and Compat.independent_fk(hand, grip.q, grip.p)
+			if action == 2 then
+				anchor = native
+			elseif native then
+				local r = V.length(grip.p)
+				local gap = V.length(V.sub(anchor.p, hand.p))
+				if gap > 3*r then anchor = V.blend(anchor, native, V.smooth((gap-3*r)/r)) end
+			end
+		end
+		contacts[side] = anchor
+	end
+	return contacts
+end
+
+function IndependentLink.pose_matches(a, b, metres, degrees)
+	if not a or not b then return false end
+	local x, y = a.q, b.q
+	local dot = math.abs(x[1]*y[1]+x[2]*y[2]+x[3]*y[3]+x[4]*y[4])
+	return dot >= math.cos(math.rad(degrees)*0.5)
+		and Compat.contact_math.length(Compat.contact_math.sub(a.p, b.p)) <= metres
+end
+
+function IndependentLink.local_pose(unit, node)
+	local x, y, z = readVector(S, try(S.Unit.local_position, unit, node))
+	local ok, qx, qy, qz, qw = pcall(S.Quaternion.to_elements, try(S.Unit.local_rotation, unit, node))
+	local q = ok and Compat.independent_quaternion(qx, qy, qz, qw)
+	if x and q then return { p = { x, y, z }, q = q } end
+end
+
+function IndependentLink.weapon_graph(unit, spec, attachment)
+	local U, V = S.Unit, Compat.contact_math
+	if try(U.num_scene_graph_items, unit) ~= spec[1] or try(U.has_node, unit, "StingrayEntityRoot") ~= true then return end
+	local base = try(U.node, unit, "StingrayEntityRoot")
+	if base ~= 0 and base ~= 1 then return end
+	local signature, owned = 0, false
+	for i = 0, spec[1]-1 do
+		local node = i+base
+		local ok, parent = pcall(U.scene_graph_parent, unit, node)
+		if not ok then return end
+		local external = parent == nil or parent == -1 or (base == 1 and parent == 0)
+		if not external and (type(parent) ~= "number" or parent%1 ~= 0 or parent < base or parent > node
+			or (i > 0 and parent == node)) then return end
+		local value = i == 0 and 0 or (external and 65535 or parent-base)
+		signature = (signature*257+value+1)%2147483647
+		if external or i == 0 then
+			local worldPose = Compat.independent_world_pose(S, unit, node)
+			local localPose = IndependentLink.local_pose(unit, node)
+			if worldPose and localPose then
+				local inv = V.inverse(localPose)
+				local projected = Compat.independent_fk(worldPose, inv.q, inv.p)
+				owned = owned or IndependentLink.pose_matches(projected, attachment, 0.002, 0.15)
+			end
+		end
+	end
+	if owned and signature == spec[3] then return spec[2]+base end
+end
+
+function IndependentLink.find_weapon(units, attachment, graphs)
+	local found
+	for _, unit in ipairs(units or {}) do
+		if Compat.unit_alive(S, unit) then
+			local tag = unit_tag(S, unit):match("^#ID%[([%da-fA-F]+)%]$")
+			local spec = tag and graphs[tag:lower()]
+			local root = spec and IndependentLink.weapon_graph(unit, spec, attachment)
+			if root then
+				if found then return end
+				found = { unit = unit, node = root, sidearm = spec[4], envelope = spec[5], spec = spec, id = tag:lower() }
+			end
+		end
+	end
+	return found
+end
+
+function IndependentLink.support_weight(weapon, left, palm, right)
+	local V = Compat.contact_math
+	if not weapon.left or not left then return false, 0 end
+	local control = weapon.left.p
+	local gap = V.length(V.sub(left.p, control))
+	local near = gap < 0.03
+	if weapon.sidearm then return near, near and 1 or 0 end
+	local weight = V.smooth((0.06-gap)/0.04)
+	local function envelope_distance(p)
+		if not weapon.envelope or not right then return math.huge end
+		local relative = Compat.independent_relative(right, { p = p, q = right.q })
+		local box = weapon.envelope
+		local x = math.max(box[1]-relative[1], relative[1]-box[4], 0)
+		local y = math.max(box[2]-relative[2], relative[2]-box[5], 0)
+		local z = math.max(box[3]-relative[3], relative[3]-box[6], 0)
+		return math.sqrt(x*x+y*y+z*z)
+	end
+	local envelope = envelope_distance(left.p)
+	weight = math.max(weight, V.smooth((0.06-envelope)/0.04))
+	near = near or envelope < 0.03
+	if palm then
+		local reach = V.length(V.sub(palm[2].p, palm[1].p))
+		if reach >= 0.02 and reach <= 0.2 then
+			local distance = math.min(V.length(V.sub(palm[1].p, control)), envelope_distance(palm[1].p))
+			near = near or distance <= reach
+			weight = math.max(weight, V.smooth((reach+0.04-distance)/0.04))
+		end
+	end
+	return near, weight
+end
+
+function IndependentLink.held_weapon(runtime, state, readPose)
+	local root = readPose("root")
+	local camera = runtime.poseCamera
+	local right = state.contacts.r and readPose("attach_hand_r")
+	if not right or not root or not camera or not camera.z then return end
+	local V = Compat.contact_math
+	if V.length(V.sub(root.p, { camera.x, camera.y, camera.z })) <= 1 then return end
+	local weapon = IndependentLink.find_weapon(runtime.liveUnits, right, IndependentLink.weaponGraphs)
+	if not weapon then return end
+	local lnode = safe_node(S, weapon.unit, "IK_left")
+	local rnode = safe_node(S, weapon.unit, "IK_right")
+	weapon.left = lnode and Compat.independent_world_pose(S, weapon.unit, lnode)
+	if not weapon.sidearm and not (weapon.left and state.contacts.l) then return end
+	local hand, finger = readPose("l_hand"), readPose("l_middle_finger1")
+	local palm = hand and finger and { hand, finger }
+	local rightControl = rnode and Compat.independent_world_pose(S, weapon.unit, rnode)
+	weapon.support, weapon.weight = IndependentLink.support_weight(weapon, state.contacts.l, palm, rightControl)
+	return weapon
+end
+
+function IndependentLink.weapon_snapshot(unit, count)
+	local U, V = S.Unit, Compat.contact_math
+	if try(U.num_scene_graph_items, unit) ~= count or try(U.has_node, unit, "StingrayEntityRoot") ~= true then return end
+	local base = try(U.node, unit, "StingrayEntityRoot")
+	if base ~= 0 and base ~= 1 then return end
+	local nodes = {}
+	for node = base, base+count-1 do
+		local ok, parent = pcall(U.scene_graph_parent, unit, node)
+		if not ok then return end
+		local external = parent == nil or parent == -1 or node == base or (base == 1 and parent == 0)
+		if not external and not nodes[parent] then return end
+		local localPose = IndependentLink.local_pose(unit, node)
+		local worldPose = V.world_pose(S, unit, node)
+		if not localPose or not worldPose then return end
+		local row = { localPose = localPose, worldPose = worldPose }
+		if external then
+			local inv = V.inverse(localPose)
+			row.parentFrame = Compat.independent_fk(worldPose, inv.q, inv.p)
+		else
+			row.parent = parent
+		end
+		nodes[node] = row
+	end
+	return { unit = unit, count = count, base = base, nodes = nodes, tag = unit_tag(S, unit) }
+end
+
+function IndependentLink.mark_weapon_descendants(graph, roots)
+	graph.affected = roots
+	for node = graph.base, graph.base+graph.count-1 do
+		local parent = graph.nodes[node].parent
+		if parent and roots[parent] then roots[node] = true end
+	end
+end
+
+function IndependentLink.weapon_followers(units, weapon)
+	local members = IndependentLink.weaponMembers[weapon.id]
+	local wanted = {}
+	for id, count in ((members or "") .. " " .. IndependentLink.weaponAccessories):gmatch("(%x+):(%d+)") do
+		count = tonumber(count)
+		if wanted[id] and wanted[id] ~= count then return end
+		wanted[id] = count
+	end
+	local root = IndependentLink.weapon_snapshot(weapon.unit, weapon.spec[1])
+	if not root or not root.nodes[weapon.node] then return end
+	IndependentLink.mark_weapon_descendants(root, { [weapon.node] = true })
+	local pending, ordered, groups = {}, { root }, {}
+	for _, unit in ipairs(units) do
+		if unit ~= weapon.unit and Compat.unit_alive(S, unit) then
+			local id = unit_tag(S, unit):match("^#ID%[(%x+)%]$")
+			id = id and id:lower()
+			if id and wanted[id] then
+				groups[id] = (groups[id] or 0)+1
+				if groups[id] > 16 or #pending >= 48 then return end
+				local graph = IndependentLink.weapon_snapshot(unit, wanted[id])
+				if not graph then return end
+				pending[#pending+1] = graph
+			end
+		end
+	end
+	for _ = 1, 8 do
+		local nextPending = {}
+		for _, child in ipairs(pending) do
+			local roots, owner, ambiguous = {}, nil, false
+			for node, row in pairs(child.nodes) do
+				if row.parentFrame then
+					for _, candidate in ipairs(ordered) do
+						for bone in pairs(candidate.affected) do
+							if IndependentLink.pose_matches(row.parentFrame, candidate.nodes[bone].worldPose, 0.0002, 0.05) then
+								ambiguous = ambiguous or (owner ~= nil and owner ~= candidate)
+								owner, roots[node] = candidate, true
+							end
+						end
 					end
 				end
 			end
-			if next(piece.stretched) ~= nil then try(S.World.update_unit, state.world, piece.unit) end
+			if owner and not ambiguous then
+				IndependentLink.mark_weapon_descendants(child, roots)
+				ordered[#ordered+1] = child
+			else
+				nextPending[#nextPending+1] = child
+			end
+		end
+		if #nextPending == #pending then break end
+		pending = nextPending
+	end
+	if not members or #ordered > 1 then return ordered end
+end
+
+function IndependentLink.verify_weapon_shift(world, graphs, delta)
+	local V = Compat.contact_math
+	for index, graph in ipairs(graphs or {}) do
+		if index > 1 then
+			assert(Compat.unit_alive(S, graph.unit) and try(S.Unit.num_scene_graph_items, graph.unit) == graph.count)
+			assert(S.World.update_unit(world, graph.unit) ~= false)
+		end
+		for node, row in pairs(graph.nodes) do
+			local p = graph.affected[node] and V.add(row.worldPose.p, delta) or row.worldPose.p
+			assert(IndependentLink.pose_matches(V.world_pose(S, graph.unit, node), { p = p, q = row.worldPose.q }, 0.001, 0.05))
+			if index > 1 then
+				assert(IndependentLink.pose_matches(IndependentLink.local_pose(graph.unit, node), row.localPose, 0.00001, 0.001))
+			end
+		end
+	end
+end
+
+function IndependentLink.restore_weapon(runtime)
+	local shift = runtime.weaponShift
+	if not shift then return true end
+	local worlds = try(S.Application.worlds)
+	if type(worlds) ~= "table" then return false end
+	local worldLive = false
+	for _, world in ipairs(worlds) do if world == shift.world then worldLive = true; break end end
+	if not worldLive then runtime.weaponShift = nil; return true end
+	local units = try(S.World.units, shift.world)
+	if type(units) ~= "table" then return false end
+	local live = {}
+	for _, unit in ipairs(units) do live[unit] = true end
+	local unit = shift.unit
+	if live[unit] and Compat.unit_alive(S, unit) and unit_tag(S, unit) == shift.tag
+		and try(S.Unit.num_scene_graph_items, unit) == shift.count then
+		local pose = IndependentLink.local_pose(unit, shift.node)
+		if not pose then return false end
+		if IndependentLink.pose_matches(pose, shift.target, 0.00001, 0.001) then
+			local ok = Compat.write_independent_position(S, unit, shift.node, shift.original.p, 1)
+			if not ok then return false end
+			shift.refresh = true
+		end
+		if shift.refresh then
+			local ok, result = pcall(S.World.update_unit, shift.world, unit)
+			if not ok or result == false then return false end
+			shift.refresh = false
+		end
+	end
+	for _, child in ipairs(shift.followers) do
+		if live[child.unit] and Compat.unit_alive(S, child.unit) and unit_tag(S, child.unit) == child.tag
+			and try(S.Unit.num_scene_graph_items, child.unit) == child.count then
+			local ok, result = pcall(S.World.update_unit, shift.world, child.unit)
+			if not ok or result == false then return false end
+		end
+	end
+	runtime.weaponShift = nil
+	return true
+end
+
+function IndependentLink.enable_weapon_trial(runtime)
+	if runtime.weaponUpdate then return true end
+	local update = rawget(_G, "update")
+	if type(update) ~= "function" then return false end
+	runtime.originalWeaponUpdate = update
+	runtime.weaponUpdate = function(...)
+		if not IndependentLink.restore_weapon(runtime) and not runtime.weaponRestoreLogged then
+			runtime.weaponRestoreLogged = true
+			runtime.logger("[physbone][握枪] 武器根还原失败")
+		end
+		return update(...)
+	end
+	rawset(_G, "update", runtime.weaponUpdate)
+	return true
+end
+
+function IndependentLink.shift_weapon(runtime, world, weapon, delta, graphs)
+	local V = Compat.contact_math
+	if runtime.weaponShift or runtime.weaponTrialDisabled or not IndependentLink.enable_weapon_trial(runtime) then return false end
+	local localPose = IndependentLink.local_pose(weapon.unit, weapon.node)
+	local worldPose = Compat.independent_world_pose(S, weapon.unit, weapon.node)
+	if not localPose or not worldPose then return false end
+	local inv = V.inverse(localPose)
+	local parent = Compat.independent_fk(worldPose, inv.q, inv.p)
+	local shifted = V.add(localPose.p, V.rotate(V.inverse(parent).q, delta))
+	local followers = {}
+	for i = 2, #(graphs or {}) do
+		local child = graphs[i]
+		followers[#followers+1] = { unit = child.unit, count = child.count, tag = child.tag }
+	end
+	local saved = { world = world, unit = weapon.unit, node = weapon.node, count = weapon.spec[1],
+		tag = unit_tag(S, weapon.unit), original = localPose, target = { p = shifted, q = localPose.q }, followers = followers }
+	runtime.weaponShift = saved
+	local ok = pcall(function()
+		assert(Compat.write_independent_position(S, weapon.unit, weapon.node, shifted, 1))
+		assert(S.World.update_unit(world, weapon.unit) ~= false)
+		local desired = { q = worldPose.q, p = V.add(worldPose.p, delta) }
+		assert(IndependentLink.pose_matches(Compat.independent_world_pose(S, weapon.unit, weapon.node), desired, 0.001, 0.05))
+		IndependentLink.verify_weapon_shift(world, graphs, delta)
+	end)
+	if not ok then
+		local current = IndependentLink.local_pose(weapon.unit, weapon.node)
+		if current then saved.target = current end
+		IndependentLink.restore_weapon(runtime)
+		runtime.weaponTrialDisabled = true
+	end
+	return ok
+end
+
+function IndependentLink.restore(state, piece, layoutChanged)
+	local link = piece.link
+	if not link then return true end
+	if not link.changed then
+		piece.link = nil
+		return true
+	end
+	local ok = pcall(function()
+		local unit = piece.unit
+		assert(S.World.unlink_unit(state.world, unit) ~= false, "unlink_unit")
+		if layoutChanged then return end
+		for _, b in ipairs(link.order) do
+			local row, node = link.rows[b], piece.nodes[b]
+			if row.attempted then
+				if S.Unit.scene_graph_parent(unit, node) ~= row.parent then
+					assert(S.Unit.scene_graph_link(unit, node, row.parent) ~= false, "scene_graph_link")
+					assert(S.Unit.scene_graph_parent(unit, node) == row.parent, "restore parent")
+				end
+				assert(Compat.write_independent_position(S, unit, node, row.originalP, 1), "restore position")
+				assert(Compat.write_independent_rotation(S, unit, node, row.originalQ, true), "restore rotation")
+			end
+		end
+		assert(S.World.update_unit(state.world, unit) ~= false, "restore update")
+	end)
+	if ok then piece.link = nil end
+	return ok
+end
+
+function IndependentLink.fail(runtime, state, piece, reason)
+	local restored = IndependentLink.restore(state, piece)
+	if not piece.linkFailed then
+		runtime.logger("[physbone][独立骨][警告][挂接回退] %s %s%s", piece.tag, tostring(reason),
+			restored and "" or "，待恢复原骨链")
+	end
+	piece.linkFailed = true
+	return restored
+end
+
+function IndependentLink.attach(runtime, state, piece)
+	local U, W = S.Unit, S.World
+	local unit, avatar = piece.unit, state.avatar
+	local link = { rows = {}, order = piece.bones, byNode = {} }
+	local ok, reason = pcall(function()
+		assert(type(W.link_unit) == "function" and type(W.unlink_unit) == "function"
+			and type(U.scene_graph_parent) == "function" and type(U.scene_graph_link) == "function", "挂接 API")
+		assert(session_unit_live(runtime, unit) and session_unit_live(runtime, avatar)
+			and U.alive(unit) == true and U.alive(avatar) == true, "件或 avatar 已消失")
+		for _, b in ipairs(piece.bones) do
+			local node, source = piece.nodes[b], state.sources[b]
+			assert(node and source and state.rest[b], "缺少节点 " .. state.list[b][1])
+			local x, y, z = readVector(S, U.local_scale(unit, node))
+			assert(x and math.abs(x-1) <= 1e-6 and math.abs(y-1) <= 1e-6 and math.abs(z-1) <= 1e-6,
+				"缩放 " .. state.list[b][1])
+			local px, py, pz = readVector(S, U.local_position(unit, node))
+			local q = Compat.independent_quaternion(S.Quaternion.to_elements(U.local_rotation(unit, node)))
+			local parent = U.scene_graph_parent(unit, node)
+			assert(px and q and type(parent) == "number" and parent >= 0 and parent ~= node,
+				"原骨链 " .. state.list[b][1])
+			link.rows[b] = { parent = parent, originalP = { px, py, pz }, originalQ = q }
+			link.byNode[node] = b
+		end
+		piece.link = link
+		for _, b in ipairs(piece.bones) do
+			local row, node = link.rows[b], piece.nodes[b]
+			local called, result = pcall(W.link_unit, state.world, unit, node, avatar, state.sources[b])
+			row.attempted = called and result ~= false
+			link.changed = link.changed or row.attempted
+			local parent = U.scene_graph_parent(unit, node)
+			row.attempted = row.attempted or parent ~= row.parent
+			link.changed = link.changed or row.attempted
+			assert(called and result ~= false, "link_unit " .. state.list[b][1])
+			assert(parent ~= row.parent and (parent == nil or parent == -1 or parent == 0),
+				"原父节点仍在 " .. state.list[b][1])
+			row.q = Compat.independent_quaternion(S.Quaternion.to_elements(U.local_rotation(unit, node)))
+			assert(row.q, "挂接局部旋转")
+		end
+	end)
+	if not ok then
+		IndependentLink.fail(runtime, state, piece, reason)
+		return false
+	end
+	return true
+end
+
+function IndependentLink.same(a, b, rotation)
+	if not a or not b then return false end
+	local sign = rotation and (a[1]*b[1] + a[2]*b[2] + a[3]*b[3] + a[4]*b[4]) < 0 and -1 or 1
+	return math.abs(a[1]-sign*b[1]) <= 1e-6 and math.abs(a[2]-sign*b[2]) <= 1e-6
+		and math.abs(a[3]-sign*b[3]) <= 1e-6 and (not rotation or math.abs(a[4]-sign*b[4]) <= 1e-6)
+end
+
+function IndependentLink.write(state, piece, values, objects)
+	local written, calls = 0, 0
+	for b, value in pairs(values) do
+		local row, node = piece.link.rows[b], piece.nodes[b]
+		local p, q = value.p, value.q
+		if not IndependentLink.same(p, row.p) then
+			local cached = objects[b] or {}
+			if not IndependentLink.same(p, cached.p) then
+				cached.p, cached.vector = p, S.Vector3(p[1], p[2], p[3])
+				calls = calls + 1
+				objects[b] = cached
+			end
+			assert(cached.vector, "offset vector")
+			assert(S.Unit.set_local_position(piece.unit, node, cached.vector) ~= false, "offset position")
+			row.p, written, calls = p, written + 1, calls + 1
+		end
+		if not IndependentLink.same(q, row.q, true) then
+			local cached = objects[b] or {}
+			if not IndependentLink.same(q, cached.q, true) then
+				local cost
+				cached.rotation, cost = Compat.independent_rotation_object(S, q, true)
+				calls = calls + cost
+				cached.q, objects[b] = q, cached
+			end
+			assert(cached.rotation and S.Unit.set_local_rotation(piece.unit, node, cached.rotation) ~= false, "offset rotation")
+			row.q, written, calls = q, written + 1, calls + 1
+		end
+	end
+	if written > 0 then
+		assert(S.World.update_unit(state.world, piece.unit) ~= false, "offset update")
+		calls = calls + 1
+	end
+	return written, calls
+end
+
+function IndependentLink.is_gait(name)
+	local suffix = name:match("^[lr]_(.+)$")
+	return name == "hips" or suffix == "thigh" or suffix == "knee" or suffix == "foot" or suffix == "ball" or suffix == "toe"
+end
+
+function IndependentLink.first_person(runtime, state)
+	local cache = runtime.poseCamera
+	if not cache or cache.frame ~= runtime.frame then
+		local x, y, z = cameraPosition(S, state.world, runtime.cache)
+		cache = { frame = runtime.frame, x = x, y = y, z = z }
+		runtime.poseCamera = cache
+	end
+	if cache.x == nil then return false end
+	local x, y
+	for _, owner in ipairs(runtime.avatars or {}) do
+		if owner.unit == state.avatar and owner.positionFrame == runtime.frame then
+			x, y = owner.x, owner.y
+			break
+		end
+	end
+	if x == nil then x, y = readVector(S, try(S.Unit.world_position, state.avatar, 1)) end
+	if x == nil then return false end
+	local dx, dy = x-cache.x, y-cache.y
+	local threshold = sched_settings(runtime).fpLockMetres
+	return dx*dx + dy*dy < threshold*threshold
+end
+
+function IndependentLink.first_person_action(state, readPose)
+	local graphs = try(S.World.units_by_resource, state.world, "content/fac_helldivers/fp_cha_avatar/fp_cha_avatar")
+	if type(graphs) ~= "table" or #graphs == 0 then return 0 end
+	for _, piece in ipairs(state.pieces) do
+		if Compat.unit_alive(S, piece.unit) then
+			local native = {}
+			for _, side in ipairs({ "r_", "l_" }) do
+				local arm = {}
+				for _, joint in ipairs({ "shoulder", "elbow", "hand", "shoulder_twist", "hand_twist" }) do
+					local name = side .. joint
+					local node = safe_node(S, piece.unit, name)
+					arm[name] = node and Compat.independent_world_pose(S, piece.unit, node)
+				end
+				if arm[side.."shoulder"] and arm[side.."elbow"] and arm[side.."hand"] then
+					for name, pose in pairs(arm) do native[name] = pose end
+				end
+			end
+			if next(native) then
+				local function matches(read)
+					for name, pose in pairs(native) do
+						if not IndependentLink.pose_matches(pose, read(name), 0.002, 0.5) then return false end
+					end
+					return true
+				end
+				if not matches(readPose) then
+					local count = 0
+					for _, unit in ipairs(graphs) do
+						if Compat.unit_alive(S, unit) and matches(function(name)
+							local node = safe_node(S, unit, name)
+							return node and Compat.independent_world_pose(S, unit, node)
+						end) then count = count + 1 end
+					end
+					if count == 1 then return 3 end
+				end
+			end
+		end
+	end
+	return 0
+end
+
+function IndependentLink.move_subtree(piece, fk, bone, pose)
+	local prior = fk[bone]
+	local moved = { [bone] = true }
+	for _, b in ipairs(piece.bones) do
+		if moved[piece.link.byNode[piece.link.rows[b].parent]] then
+			local p, q = Compat.independent_relative(prior, fk[b])
+			fk[b] = Compat.independent_fk(pose, q, p)
+			moved[b] = true
+		end
+	end
+	fk[bone] = pose
+end
+
+function IndependentLink.rotate_about(pose, pivot, delta)
+	local V = Compat.contact_math
+	local p = V.add(pivot, V.rotate(delta, V.sub(pose.p, pivot)))
+	return Compat.independent_fk({ p = p, q = delta }, pose.q, { 0, 0, 0 })
+end
+
+function IndependentLink.calibrate_thumb(state, piece, fk, side, readPose)
+	local V = Compat.contact_math
+	local function bone(name) return state.boneBySource[side .. "_" .. name] end
+	local hand, index, pinky = bone("hand"), bone("index_finger1"), bone("pinky_finger1")
+	local thumb = { bone("thumb_finger1"), bone("thumb_finger2"), bone("thumb_finger3") }
+	if not (fk[hand] and fk[index] and fk[pinky] and fk[thumb[1]] and fk[thumb[2]] and fk[thumb[3]]) then return end
+	local function source(b) return readPose(state.list[b][2]) end
+	local srcHand, srcIndex, srcPinky = source(hand), source(index), source(pinky)
+	local srcThumb = { source(thumb[1]), source(thumb[2]), source(thumb[3]) }
+	if not (srcHand and srcIndex and srcPinky and srcThumb[1] and srcThumb[2] and srcThumb[3]) then return end
+	local modelPalm = Compat.contact_palm(fk[hand], fk[index], fk[pinky])
+	local sourcePalm = Compat.contact_palm(srcHand, srcIndex, srcPinky)
+	if not modelPalm or not sourcePalm then return end
+	local palmInverse = { -sourcePalm[1], -sourcePalm[2], -sourcePalm[3], sourcePalm[4] }
+	local normal = V.rotate(modelPalm, { 0, 0, 1 })
+	for i = 1, 3 do
+		local b, nextBone = thumb[i], thumb[i+1]
+		local from, to
+		if nextBone then
+			from = V.sub(fk[nextBone].p, fk[b].p)
+			to = V.sub(srcThumb[i+1].p, srcThumb[i].p)
+		else
+			local row = piece.link.rows[b]
+			local q = row.originalQ
+			local axis = V.rotate({ -q[1], -q[2], -q[3], q[4] }, piece.bind[b] or row.originalP)
+			from = V.rotate(fk[b].q, axis)
+			to = V.rotate(srcThumb[i].q, { 1, 0, 0 })
+		end
+		local delta = V.arc(from, V.rotate(modelPalm, V.rotate(palmInverse, to)), normal)
+		IndependentLink.move_subtree(piece, fk, b,
+			Compat.independent_fk({ p = fk[b].p, q = delta }, fk[b].q, { 0, 0, 0 }))
+	end
+end
+
+function IndependentLink.solve_contacts(runtime, state, piece, fk, readPose)
+	local grips = runtime.options.independentGrips and runtime.options.independentGrips[piece.tag]
+	if not grips then return end
+	local V = Compat.contact_math
+	for _, side in ipairs({ "r", "l" }) do
+		local grip = grips[side] and V.matrix_pose(grips[side])
+		local sh = state.boneBySource[side .. "_shoulder"]
+		local el = state.boneBySource[side .. "_elbow"]
+		local ha = state.boneBySource[side .. "_hand"]
+		if grip and fk[sh] and fk[el] and fk[ha] then
+			local source = { readPose(side .. "_shoulder"), readPose(side .. "_elbow"), readPose(side .. "_hand") }
+			if source[1] and source[2] and source[3] then
+				local contact = state.contacts[side]
+				local inverse = V.inverse(grip)
+				local wrist = contact and Compat.independent_fk(contact, inverse.q, inverse.p)
+					or { p = source[3].p, q = fk[ha].q }
+				local lengths = { V.length(piece.bind[el] or piece.link.rows[el].originalP),
+					V.length(piece.bind[ha] or piece.link.rows[ha].originalP) }
+				local single = state.singleHand and side == "r"
+				local factor = 1
+				local chest = fk[state.boneBySource.chest]
+				local clavicle = state.boneBySource[side .. "_clavicle"]
+				if contact and chest and fk[clavicle] and (single or (side == "l" and not state.singleHand)) then
+					local delta
+					delta, factor = Compat.contact_girdle(chest, fk[sh], wrist, lengths, source, single)
+					if delta then
+						IndependentLink.move_subtree(piece, fk, clavicle, IndependentLink.rotate_about(fk[clavicle], chest.p, delta))
+					end
+				end
+				local freeHand = side == "l" and state.action == 1 and state.contacts.r and not contact
+				local shoulder, elbow, hand = Compat.contact_arm({ fk[sh], fk[el], fk[ha] }, source, wrist, lengths, factor, freeHand)
+				if shoulder then
+					IndependentLink.move_subtree(piece, fk, sh, shoulder)
+					IndependentLink.move_subtree(piece, fk, el, elbow)
+					IndependentLink.move_subtree(piece, fk, ha, hand)
+					for _, suffix in ipairs({ "_shoulder_twist", "_hand_twist" }) do
+						local b = state.boneBySource[side .. suffix]
+						if fk[b] then
+							local row = piece.link.rows[b]
+							local parent = fk[piece.link.byNode[row.parent]]
+							local length = V.length(piece.bind[b] or row.originalP) * factor
+							local axis = parent and V.normal(V.sub(fk[b].p, parent.p))
+							if axis then
+								IndependentLink.move_subtree(piece, fk, b, { q = fk[b].q, p = V.add(parent.p, V.scale(axis, length)) })
+							end
+						end
+					end
+					if contact then IndependentLink.calibrate_thumb(state, piece, fk, side, readPose) end
+				end
+			end
+		end
+	end
+end
+
+function IndependentLink.targets(runtime, state, piece, sample, vectors)
+	local link = piece.link
+	local fk, roots = {}, {}
+	local function target(b)
+		if fk[b] then return fk[b] end
+		local row = link.rows[b]
+		local source = assert(sample(b), "源骨姿势 " .. state.list[b][2])
+		local parent = link.byNode[row.parent]
+		if parent then
+			parent = target(parent)
+		else
+			if not roots[row.parent] then
+				local pose, cost = Compat.independent_world_pose(S, piece.unit, row.parent)
+				vectors.calls = vectors.calls + cost
+				roots[row.parent] = assert(pose, "模型父节点")
+			end
+			parent = roots[row.parent]
+		end
+		local p = piece.bind[b] or state.rest[b][4] or row.originalP
+		local translation = not state.remote and piece.translations[b]
+		if translation then
+			local a, m, v = translation[1], translation[2], assert(sample(b, true).p, "源骨平移")
+			p = { m[1]+v[1]-a[1], m[2]+v[2]-a[2], m[3]+v[3]-a[3] }
+		end
+		fk[b] = Compat.independent_fk(parent, source.q, p)
+		return fk[b]
+	end
+	local legs = runtime.options.independentLegs and runtime.options.independentLegs[piece.tag]
+	if legs then
+		local hips = state.boneBySource.hips
+		for side, data in pairs(legs) do
+			local thigh = state.boneBySource[side .. "_thigh"]
+			local knee = state.boneBySource[side .. "_knee"]
+			local foot = state.boneBySource[side .. "_foot"]
+			if link.rows[hips] and link.rows[thigh] and link.rows[knee] and link.rows[foot] then
+				local a, b, c = Compat.calibrate_leg(target(hips), target(thigh), target(knee), target(foot),
+					sample(hips).world, sample(thigh).world, sample(foot).world, data[1], data[2])
+				if a then fk[thigh], fk[knee], fk[foot] = a, b, c end
+			end
+		end
+	end
+	for _, b in ipairs(piece.bones) do target(b) end
+	return fk
+end
+
+function IndependentLink.weapon_trial(runtime, state, weapon, sample, vectors, readPose)
+	if runtime.weaponShift or not state.contacts.r then return end
+	local V = Compat.contact_math
+	local sh, el, ha, chest = state.boneBySource.r_shoulder, state.boneBySource.r_elbow,
+		state.boneBySource.r_hand, state.boneBySource.chest
+	local sourceSh, sourceEl, sourceHa = readPose("r_shoulder"), readPose("r_elbow"), readPose("r_hand")
+	if not sourceSh or not sourceEl or not sourceHa then return end
+	local upper = V.normal(V.sub(sourceEl.p, sourceSh.p))
+	local lower = V.normal(V.sub(sourceHa.p, sourceEl.p))
+	if not upper or not lower then return end
+	local shared, chestAt
+	for _, piece in ipairs(state.pieces) do
+		local grips = runtime.options.independentGrips[piece.tag]
+		local grip = grips and grips.r and V.matrix_pose(grips.r)
+		if grip then
+			local link = piece.link
+			if not link or not link.rows[sh] or not link.rows[el] or not link.rows[ha] or not link.rows[chest] then return end
+			local ok, fk = pcall(IndependentLink.targets, runtime, state, piece, sample, vectors)
+			if not ok then return end
+			if chestAt and V.length(V.sub(chestAt, fk[chest].p)) > 0.0002 then return end
+			chestAt = chestAt or fk[chest].p
+			local inv = V.inverse(grip)
+			local contact = state.contacts.r
+			local wrist = Compat.independent_fk(contact, inv.q, inv.p)
+			local ray = V.sub(wrist.p, fk[sh].p)
+			local distance = V.length(ray)
+			local a = V.length(piece.bind[el] or link.rows[el].originalP)
+			local b = V.length(piece.bind[ha] or link.rows[ha].originalP)
+			local chord = math.sqrt(math.max(0, a*a+b*b+2*a*b*V.dot(upper, lower)))
+			if distance < 1e-6 or distance-chord > 0.75*(a+b) then return end
+			local delta = V.scale(ray, math.max(-0.18, math.min(0, 0.99999*(a+b)-distance))/distance)
+			if shared and V.length(V.sub(shared, delta)) > 0.0003 then return end
+			shared = shared or delta
+		end
+	end
+	if not shared or runtime.weaponTrialDisabled then return end
+	local graphs = runtime.liveUnits and IndependentLink.weapon_followers(runtime.liveUnits, weapon)
+	if not graphs then return end
+	if V.length(shared) > 1e-6 and not IndependentLink.shift_weapon(runtime, state.world, weapon, shared, graphs) then return end
+	local right, left = state.contacts.r, state.contacts.l
+	state.contacts.r = { q = right.q, p = V.add(right.p, shared) }
+	if left and weapon.left and (weapon.weight > 0 or not weapon.sidearm) then
+		state.contacts.l = { q = left.q, p = V.add(left.p, V.scale(shared, weapon.weight)) }
+	else
+		state.contacts.l = nil
+	end
+	state.singleHand = false
+end
+
+function IndependentLink.present(runtime, state, piece, due, now, blend, sample, vectors, readPose)
+	local link = piece.link
+	if link.pending and (due or not blend or now + (runtime.dt or 0)*0.5 + 1e-6 >= link.finishAt) then
+		local n, cost = IndependentLink.write(state, piece, link.pending, vectors.finish)
+		link.pending = nil
+		if not due then return n, cost end
+		vectors.written, vectors.calls = vectors.written + n, vectors.calls + cost
+	end
+	if not due then return 0, 0 end
+
+	local fk = IndependentLink.targets(runtime, state, piece, sample, vectors)
+	local display, pending = {}, {}
+	if state.action == 1 or state.action == 2 then
+		IndependentLink.solve_contacts(runtime, state, piece, fk, readPose)
+	end
+	for _, b in ipairs(piece.bones) do
+		local row = link.rows[b]
+		local desired = fk[b]
+		local p, q = Compat.independent_relative(sample(b).world, desired)
+		local value, previous = { p = p, q = q }, row.endpoint
+		if blend and previous and IndependentLink.is_gait(state.list[b][2]) and
+			(not IndependentLink.same(p, previous.p) or not IndependentLink.same(q, previous.q, true)) then
+			local oldP, oldQ = previous.p, Compat.independent_hemisphere(previous.q, q)
+			display[b] = { p = { (p[1]+oldP[1])*0.5, (p[2]+oldP[2])*0.5, (p[3]+oldP[3])*0.5 },
+				q = Compat.independent_quaternion(q[1]+oldQ[1], q[2]+oldQ[2], q[3]+oldQ[3], q[4]+oldQ[4]) }
+			pending[b] = value
+		else
+			display[b] = value
+		end
+		row.endpoint = value
+	end
+	link.pending = next(pending) and pending or nil
+	link.finishAt = (now + state.nextCorrection)*0.5
+	local written, calls = IndependentLink.write(state, piece, display, vectors.display)
+	local count, cost = IndependentLink.present_clothing(runtime, state, piece, fk)
+	return written + count, calls + cost
+end
+
+function IndependentLink.physics(runtime, session, schedule, operation, dt)
+	local presentation = session.independentPresentation
+	local written, presentationCalls = 0, 0
+	if presentation then
+		local fraction
+		if not schedule or schedule.due or not schedule.blend or schedule.paused then
+			fraction = 1
+		else
+			local elapsed = (schedule.now - presentation.start) / presentation.period
+			local step = math.min(4, 1 + math.floor(4*elapsed + 1e-8))
+			if step > presentation.step then
+				fraction = math.min(1, presentation.lead + elapsed)
+				if step == 4 or (fraction >= 0.75 and schedule.now + runtime.dt >= schedule.nextAt) then
+					fraction = 1
+				end
+				presentation.step = step
+			end
+		end
+		if fraction then
+			written = Compat.present_independent_physics(session, fraction)
+			presentationCalls = session.engineCalls or 0
+		end
+	end
+	if not operation or session.independentPresentation then
+		if not schedule or schedule.paused then session.independentHistory = nil end
+		return written, false
+	end
+	local sample
+	if schedule and schedule.blend and operation == Compat.update and session.solver ~= "angle" then
+		local period = schedule.nextAt - schedule.now
+		sample = { start = schedule.now, period = period, step = 1, rows = {},
+			lead = math.max(0.25, math.min(0.5, runtime.dt / period)), history = session.independentHistory }
+	end
+	session.independentSample = sample
+	session.engineCalls = 0
+	local ok, out = pcall(operation, session, dt)
+	session.independentSample = nil
+	session.engineCalls = presentationCalls + (session.engineCalls or 0)
+	session.independentHistory = ok and sample ~= nil or nil
+	if sample and next(sample.rows) then session.independentPresentation = sample end
+	if not ok then error(out, 0) end
+	return written + (type(out) == "number" and out or 0), true
+end
+
+function IndependentLink.present_clothing(runtime, state, piece, solved)
+	local rules = runtime.options.independentPoseRules and runtime.options.independentPoseRules[piece.tag]
+	if not rules then return 0, 0 end
+	local calls, written, poses, desired = 0, 0, {}, {}
+	local U = S.Unit
+	piece.clothingRest = piece.clothingRest or {}
+	local function world_rotation(name, offset)
+		if poses[name] == nil then
+			local node = safe_node(S, piece.unit, name)
+			local pose = solved and solved[piece.link.byNode[node]]
+			if not pose and node then
+				local cost
+				pose, cost = Compat.independent_world_pose(S, piece.unit, node)
+				calls = calls + cost
+			end
+			poses[name] = pose and pose.q or false
+		end
+		local q = poses[name]
+		return q and Compat.independent_fk({ p = { 0, 0, 0 }, q = q }, offset, { 0, 0, 0 }).q
+	end
+	local function driver_angles(driver)
+		local source = world_rotation(driver.bone, driver.offset)
+		local reference
+		if driver.reference then
+			reference = world_rotation(driver.reference, driver.referenceOffset)
+		else
+			reference = world_rotation("root", { -driver.referenceOffset[1], -driver.referenceOffset[2],
+				-driver.referenceOffset[3], driver.referenceOffset[4] })
+		end
+		if source and reference then return Compat.clothing_driver_angles(source, reference, driver.neutral) end
+	end
+	for _, rule in ipairs(rules) do
+		local node = safe_node(S, piece.unit, rule.target)
+		local primary = driver_angles(rule.primary)
+		local secondary = rule.secondary and driver_angles(rule.secondary)
+		if node and primary and (not rule.secondary or secondary) then
+			local rest = piece.clothingRest[rule.target]
+			if not rest or rest.node ~= node then
+				local raw = try(U.local_rotation, piece.unit, node)
+				local ok, x, y, z, w = pcall(S.Quaternion.to_elements, raw)
+				local q = ok and Compat.independent_quaternion(x, y, z, w)
+				calls = calls + 2
+				rest = q and { node = node, q = q }
+				piece.clothingRest[rule.target] = rest
+			end
+			if rest then desired[#desired + 1] = { node, Compat.clothing_rotation(rule, primary, secondary, rest.q) } end
+		end
+	end
+	for _, row in ipairs(desired) do
+		local ok, cost = Compat.write_independent_rotation(S, piece.unit, row[1], row[2], true)
+		calls = calls + cost
+		if ok then written = written + 1 end
+	end
+	if written > 0 then
+		try(S.World.update_unit, state.world, piece.unit)
+		calls = calls + 1
+	end
+	return written, calls
+end
+
+function IndependentLink.restore_clothing(state, piece)
+	if not piece.clothingRest then return end
+	for name, rest in pairs(piece.clothingRest) do
+		if safe_node(S, piece.unit, name) == rest.node then
+			Compat.write_independent_rotation(S, piece.unit, rest.node, rest.q, true)
+		end
+	end
+	try(S.World.update_unit, state.world, piece.unit)
+	piece.clothingRest = nil
+end
+
+local function independent_release(runtime, state)
+	if not state or state.world ~= runtime.world or refresh_live_units(runtime, S) ~= "ok" then return end
+	for _, piece in ipairs(state.pieces) do
+		if (piece.link or piece.hidden or piece.positionDirty or piece.clothingRest) and session_unit_live(runtime, piece.unit)
+			and Compat.unit_alive(S, piece.unit) then
+			local restored = IndependentLink.restore(state, piece)
+			IndependentLink.restore_clothing(state, piece)
+			if restored and piece.positionDirty then
+				for b, translation in pairs(piece.translations) do
+					if safe_node(S, piece.unit, state.list[b][1]) == piece.nodes[b] then
+						Compat.write_independent_position(S, piece.unit, piece.nodes[b], translation[2], 1)
+					end
+				end
+				try(S.World.update_unit, state.world, piece.unit)
+			end
 			if piece.hidden then independent_visibility(piece, true) end
 		end
 	end
+end
+
+function IndependentLink.release_all(runtime)
+	independent_release(runtime, runtime.independent)
+	for _, state in pairs(runtime.independentRemotes or {}) do independent_release(runtime, state) end
+	runtime.independent, runtime.independentRemotes = nil, nil
 end
 
 local function independent_scan(runtime, state, avatar, world, list)
@@ -3840,7 +4965,8 @@ local function independent_scan(runtime, state, avatar, world, list)
 	local units = runtime.liveUnitsWorld == world and runtime.liveUnits or try(S.World.units, world)
 	if type(units) ~= "table" then return false end
 	local frame = runtime.frame or 0
-	local owners = findAvatars(S, world, units, #units, SUPPORT_MG_NAME, options.minNodes or 90, options, {}, runtime)
+	local owners = runtime.avatars or findAvatars(S, world, units, #units, SUPPORT_MG_NAME, options.minNodes or 90, options, {}, runtime)
+	state.owners = owners
 	local nearby = {}
 	local function add_owner(unit)
 		if Compat.unit_alive(S, unit) then nearby[#nearby + 1] = { unit = unit, at = {} } end
@@ -3899,6 +5025,8 @@ local function independent_scan(runtime, state, avatar, world, list)
 		if valid then
 			seen[piece.unit], claimed[piece.slot] = true, true
 		else
+			if alive and piece.link then IndependentLink.restore(state, piece, true) end
+			if alive then IndependentLink.restore_clothing(state, piece) end
 			if alive and piece.hidden then independent_visibility(piece, true) end
 			table.remove(state.pieces, i)
 		end
@@ -3934,15 +5062,17 @@ local function independent_scan(runtime, state, avatar, world, list)
 						end
 					end
 					if complete and #bones > 0 then
-						local piece = { unit = unit, nodes = nodes, bones = bones, arms = {}, wrists = {}, parents = {},
-							tag = tag, slot = slot, previous = {}, stretched = {} }
-						for a, arm in ipairs(state.arms) do
-							if nodes[arm.sh] and nodes[arm.el] and nodes[arm.ha] then
-								piece.arms[#piece.arms + 1] = a
-							end
-						end
+						local piece = { unit = unit, nodes = nodes, bones = bones, wrists = {}, parents = {},
+							tag = tag, slot = slot, translations = {}, bind = {} }
+						local translations = options.independentTranslations and options.independentTranslations[tag]
+						piece.bodyBind = translations ~= nil
 						for _, b in ipairs(bones) do
 							local source = list[b][2]
+							if translations then
+								piece.translations[b] = translations[list[b][1]]
+								local x, y, z = readVector(S, try(S.Unit.local_position, unit, nodes[b]))
+								if x ~= nil then piece.bind[b] = { x, y, z } end
+							end
 							if source == "l_hand" or source == "r_hand" then piece.wrists[#piece.wrists + 1] = b end
 							local parent = state.parents[b]
 							if parent and (not parent.bone or not nodes[parent.bone]) then
@@ -3963,7 +5093,6 @@ local function independent_scan(runtime, state, avatar, world, list)
 		state.sources[b] = safe_node(S, avatar, bone[2])
 		if state.sources[b] == nil then sourceMissing = true end
 	end
-	if #state.pieces > 0 and options.fastWrite ~= false then Compat.probe_fast_write(S, runtime.logger) end
 
 	local tags, absent, total = {}, {}, 0
 	for _, piece in ipairs(state.pieces) do tags[#tags + 1] = piece.tag end
@@ -3995,19 +5124,17 @@ end
 local function independent_state(runtime, avatar, world, list)
 	local rest = runtime.options.independentRest
 	local state = { avatar = avatar, world = world, rest = rest, list = list, pieces = {}, sources = {}, parents = {},
-		arms = {}, probes = {}, offsets = {}, frames = 0, normals = {}, rescanAt = 0 }
+		probes = {}, frames = 0, normals = {}, rescanAt = 0 }
 	local sources = {}
 	for b, bone in ipairs(list) do sources[bone[2]] = b end
+	state.boneBySource = sources
 	for b, data in ipairs(rest or {}) do
 		state.parents[b] = { name = data[1], bone = sources[data[1]] }
-		local q, identity = Compat.independent_rest_offset(data[2], data[3])
-		state.offsets[b] = { q = q, identity = identity }
 	end
 	for _, side in ipairs({ "l", "r" }) do
 		local sh, el, ha = sources[side .. "_shoulder"], sources[side .. "_elbow"], sources[side .. "_hand"]
 		if sh then state.probes[#state.probes + 1] = sh end
 		if sh and el and ha then
-			state.arms[#state.arms + 1] = { sh = sh, el = el, ha = ha }
 			if not rest then
 				state.parents[sh] = { name = side .. "_clavicle" }
 				state.parents[el] = { name = side .. "_shoulder", bone = sh }
@@ -4015,325 +5142,340 @@ local function independent_state(runtime, avatar, world, list)
 			end
 		end
 	end
+	for _, source in ipairs({ "hips", "spine1" }) do
+		if sources[source] then table.insert(state.probes, 1, sources[source]) end
+	end
 	return state
 end
 
-local function independent_frame(runtime, avatar, world, list)
-	if world == nil then return 0, 0 end
-	local options = runtime.options
-	local state = runtime.independent
+local function independent_frame(runtime, avatar, world, list, state, remote)
+	if world == nil then return 0, 0, state end
 	local frame = runtime.frame or 0
 	if not state or state.avatar ~= avatar or state.world ~= world then
 		independent_release(runtime, state)
 		state = independent_state(runtime, avatar, world, list)
-		runtime.independent = state
+	end
+	state.remote = remote
+	state.frame = frame
+	local tune = tune_values(runtime)
+	local linkOption = tune.independentLink
+	if linkOption == nil then linkOption = runtime.options.independentLink end
+	local linkEnabled = linkOption ~= 0 and linkOption ~= false
+	if state.linkEnabled ~= linkEnabled then
+		for _, piece in ipairs(state.pieces) do piece.linkFailed = nil end
+		state.linkEnabled, state.nextCorrection = linkEnabled, nil
 	end
 	if frame >= state.rescanAt and not independent_scan(runtime, state, avatar, world, list) then
 		state.rescanAt = frame + 30
 	end
-	if #state.pieces == 0 then return 0, 0 end
+	if #state.pieces == 0 then
+		state.hasLinks, state.linkedUnits, state.nextCorrection = false, {}, nil
+		return 0, 0, state
+	end
 
 	local calls, written = 0, 0
-	local rest = options.independentRest
-	local tune = tune_values(runtime)
-	local mode = (tune.text and tune.text.independentRetarget) or options.independentRetarget
-	local worldDelta = rest ~= nil and mode ~= "localCopy"
-	local fastWrite = options.fastWrite ~= false and Compat._fastWrite == true
-	local alpha = 0
-	if options.independentIk ~= false and #state.arms > 0 then alpha, calls = independent_action(runtime, state, avatar) end
-
-	local localCache, worldCache, targets, used = {}, {}, {}, {}
-	local function read_rotation(unit, node, read)
-		if not node then return nil end
-		local raw = try(read, unit, node)
-		calls = calls + 1
-		if raw == nil then return nil end
-		calls = calls + 1
+	local rotations, positions = {}, {}
+	local function rotation_components(raw)
 		local ok, x, y, z, w = pcall(S.Quaternion.to_elements, raw)
-		if ok then return Compat.independent_quaternion(x, y, z, w), raw end
-	end
-	local function source_rotation(cache, node, read)
-		if not node then return nil end
-		local result = cache[node]
-		if result == nil then
-			local q, raw = read_rotation(avatar, node, read)
-			result = q and { q = q, raw = raw } or false
-			cache[node] = result
-		end
-		return result or nil
-	end
-	local function set_rotation(piece, b, q, raw)
-		local stable = Compat.independent_hemisphere(q, piece.previous[b])
-		if raw and stable == q then
-			local ok, result = pcall(S.Unit.set_local_rotation, piece.unit, piece.nodes[b], raw)
-			calls = calls + 1
-			return ok and result ~= false, stable
-		end
-		local ok, cost = Compat.write_independent_rotation(S, piece.unit, piece.nodes[b], stable, fastWrite)
-		calls = calls + cost
-		return ok, stable
-	end
-	local function update(piece)
-		local ok, result = pcall(S.World.update_unit, world, piece.unit)
 		calls = calls + 1
-		return ok and result ~= false
+		return ok and Compat.independent_quaternion(x, y, z, w) or nil
 	end
-	-- 一轮只在同一帧抽一件。大件分几帧查缩放，最后一帧同时回读手腕。
+	local function read_rotation(node, numeric)
+		if node == nil then return nil end
+		if rotations[node] == nil then
+			local raw = try(S.Unit.local_rotation, avatar, node)
+			calls = calls + 1
+			local valid, q
+			if raw ~= nil then
+				if not numeric and type(S.Quaternion.is_valid) == "function" then
+					valid = try(S.Quaternion.is_valid, raw)
+					calls = calls + 1
+				else
+					q = rotation_components(raw)
+					valid = q ~= nil
+				end
+			end
+			rotations[node] = valid == true and { raw = raw, q = q } or false
+		end
+		return rotations[node] or nil
+	end
+	local function read_position(node)
+		if node == nil then return nil end
+		if positions[node] == nil then
+			local x, y, z = readVector(S, try(S.Unit.local_position, avatar, node))
+			calls = calls + (x ~= nil and 2 or 1)
+			positions[node] = x and x == x and y == y and z == z
+				and math.abs(x) < math.huge and math.abs(y) < math.huge and math.abs(z) < math.huge
+				and { x, y, z } or false
+		end
+		return positions[node] or nil
+	end
+
+	local hz = tonumber(tune.poseHz or runtime.options.poseHz) or 30
+	if hz ~= hz then hz = 30 end
+	local everyFrame = not remote and runtime.options.poseEveryFrame == true
+	local period = 1 / (remote and 20 or math.max(15, math.min(60, hz)))
+	local blendOption = tune.poseBlend
+	if blendOption == nil then blendOption = runtime.options.poseBlend end
+	local blend = not remote and not everyFrame and blendOption ~= 0 and blendOption ~= false
+	local now = (state.poseTime or 0) + (runtime.dt or 1/60)
+	state.poseTime = now
+	-- Remote callbacks may be skipped by the distance stride. Use the same
+	-- engine clock as local callbacks when available, including across skips.
+	now = runtime.lastTime or now
+	if state.period ~= period then state.nextCorrection, state.period = nil, period end
+	local deadline = state.nextCorrection
+	local due = everyFrame or not deadline or now + 1e-6 >= deadline
+	local paused = false
+	local sourcePoses = {}
+	local function readPose(name)
+		if sourcePoses[name] == nil then
+			local node = state.sources[state.boneBySource[name]] or safe_node(S, avatar, name)
+			local pose, cost
+			if node then pose, cost = Compat.contact_math.world_pose(S, avatar, node) end
+			calls = calls + (cost or 0)
+			sourcePoses[name] = pose or false
+		end
+		return sourcePoses[name] or nil
+	end
+	local weapon, viewFirstPerson, presentationAction
+	if linkEnabled and state.rest and (state.hasLinks or due) then
+		local animation, cost = frame_animation_machine(runtime, avatar)
+		calls = calls + cost
+		paused = not animation.active
+		if not remote and not paused then
+			viewFirstPerson = IndependentLink.first_person(runtime, state)
+			if runtime.options.independentGrips and (due or viewFirstPerson) then
+				presentationAction = IndependentLink.first_person_action(state, readPose)
+			end
+			paused = viewFirstPerson or presentationAction == 3
+			if due then
+				local tuple, animationCost = frame_animation_state(animation, avatar)
+				calls = calls + animationCost
+				if not runtime.options.independentGrips then
+					paused = paused or tuple ~= nil and (tuple[4] == 76 or tuple[4] == 77)
+				end
+			end
+		end
+		if paused then
+			state.action, state.contacts, state.singleHand = presentationAction or 0, {}, false
+		elseif due and not remote and runtime.options.independentGrips then
+			local eligible, actionCost
+			state.action, eligible, actionCost = IndependentLink.action(avatar, animation)
+			calls = calls + actionCost
+			state.contacts = state.action > 0 and IndependentLink.contacts(state.action, readPose) or {}
+			state.singleHand = false
+			if eligible then
+				weapon = IndependentLink.held_weapon(runtime, state, readPose)
+				state.singleHand = weapon ~= nil and (weapon.sidearm or not weapon.support)
+			end
+		end
+	end
+	if paused then
+		due, state.nextCorrection = false, nil
+	elseif due then
+		if deadline and not everyFrame then
+			state.nextCorrection = deadline + (math.floor((now + 1e-6 - deadline) / period) + 1) * period
+		else
+			state.nextCorrection = now + period
+		end
+	end
+	local samples, sourceWorlds = {}, {}
+	local vectors = { finish = {}, display = {}, calls = 0, written = 0 }
+	local function sample(b, position)
+		local node = state.sources[b]
+		local cached = samples[b]
+		if cached then
+			if position then cached.p = read_position(node) end
+			return cached
+		end
+		local rotation = read_rotation(node, true)
+		if not rotation then return nil end
+		rotation.q = rotation.q or rotation_components(rotation.raw)
+		if sourceWorlds[node] == nil then
+			local pose, cost = Compat.independent_world_pose(S, avatar, node)
+			sourceWorlds[node] = pose or false
+			calls = calls + cost
+		end
+		if rotation.q and sourceWorlds[node] then
+			local value = { q = rotation.q, world = sourceWorlds[node] }
+			samples[b] = value
+			return value
+		end
+	end
+	if weapon and (tune.weaponRootTrial == 1 or (tune.weaponRootTrial == nil and runtime.options.weaponRootTrial == true))
+		and type(rawget(_G, "update")) == "function" then
+		IndependentLink.weapon_trial(runtime, state, weapon, sample, vectors, readPose)
+	end
+
+	-- Each normal frame samples a bounded slice of one piece. An isolated piece
+	-- gets priority on intervening frames so the rest of the set is still checked.
 	if not state.sampleRound or (not state.samplePiece and state.frames >= state.sampleRound + 30) then
 		local bones = 0
 		for _, piece in ipairs(state.pieces) do bones = bones + #piece.bones end
 		state.sampleChunk = math.max(6, math.ceil(bones / math.max(1, 30 - #state.pieces)))
 		state.sampleRound, state.samplePiece, state.sampleBone = state.frames, 1, 1
 	end
-	local routinePiece = state.pieces[state.samplePiece or 0]
-	local sampledPiece
-	if not routinePiece or state.frames % 2 == 0 then
+	local routine = state.pieces[state.samplePiece or 0]
+	local sampled, first, last, checkWrist
+	if not routine or state.frames % 2 == 0 then
 		for _, piece in ipairs(state.pieces) do
-			if piece.recheck and session_unit_live(runtime, piece.unit)
-				and (not sampledPiece or piece.lastSample < sampledPiece.lastSample) then
-				sampledPiece = piece
-			end
+			if piece.recheck and (not sampled or piece.lastSample < sampled.lastSample) then sampled = piece end
 		end
 	end
-	local retry = sampledPiece ~= nil
-	sampledPiece = sampledPiece or routinePiece
-	local sampleFirst, sampleLast, sampleWrist
-	if retry then
-		sampleFirst = sampledPiece.scaleFault
-		sampleLast, sampleWrist = sampleFirst, true
-	elseif routinePiece then
-		sampleFirst = state.sampleBone
-		sampleLast = math.min(sampleFirst + state.sampleChunk - 1, #routinePiece.bones)
-		sampleWrist = sampleLast == #routinePiece.bones
-		if sampleWrist then
+	if sampled then
+		first = sampled.scaleFault
+		last, checkWrist = first, not remote
+	elseif routine then
+		sampled, first = routine, state.sampleBone
+		last = math.min(first + state.sampleChunk - 1, #routine.bones)
+		checkWrist = last == #routine.bones and not remote
+		if last == #routine.bones then
 			state.samplePiece, state.sampleBone = state.samplePiece + 1, 1
 		else
-			state.sampleBone = sampleLast + 1
+			state.sampleBone = last + 1
+		end
+		if not state.pieces[state.samplePiece] then state.samplePiece = nil end
+	end
+
+	local function check_scale(piece, from, to)
+		for index = from, to do
+			local b = piece.bones[index]
+			local x, y, z = readVector(S, try(S.Unit.local_scale, piece.unit, piece.nodes[b]))
+			calls = calls + (x ~= nil and 2 or 1)
+			if x == nil or not (math.abs(x-1) <= 0.0001 and math.abs(y-1) <= 0.0001
+				and math.abs(z-1) <= 0.0001) then return index end
 		end
 	end
-	if not state.pieces[state.samplePiece or 0] then state.samplePiece = nil end
 
-	local function pose_piece(piece, copyOnly, allowIk, sampled)
-		local healthy, count = true, 0
-		local rotations, rawRotations, expected = {}, {}, {}
-		local parentRotations, parentPoses, poseRoots = {}, {}, {}
-		local useWorld = worldDelta and not copyOnly
-		local useFkIk = rest ~= nil
-		for _, a in ipairs(piece.arms) do
-			local arm = state.arms[a]
-			if not rest or state.parents[arm.el].bone ~= arm.sh or state.parents[arm.ha].bone ~= arm.el then
-				useFkIk = false
+	local function pose(piece)
+		local healthy, fallback, posed = true, true, {}
+		local translations = {}
+		for _, b in ipairs(piece.bones) do
+			local source = read_rotation(state.sources[b])
+			posed[b] = source
+			if source then
+				local ok, result = pcall(S.Unit.set_local_rotation, piece.unit, piece.nodes[b], source.raw)
+				calls = calls + 1
+				if ok and result ~= false then written = written + 1 else fallback = false end
+			else
+				fallback = false
 			end
 		end
-		local solveIk = allowIk and alpha > 0
-		local function require_root_pose(b)
-			for _ = 1, #piece.bones do
+		if not remote and fallback and not piece.scaleFault then
+			for b, translation in pairs(piece.translations) do
+				local p = read_position(state.sources[b])
+				if p == nil then healthy = false break end
+				local a, m = translation[1], translation[2]
+				translations[b] = { m[1]+p[1]-a[1], m[2]+p[2]-a[2], m[3]+p[3]-a[3] }
+			end
+			if healthy then
+				for b, value in pairs(translations) do
+					piece.positionDirty = true
+					local ok, cost = Compat.write_independent_position(S, piece.unit, piece.nodes[b], value, 1)
+					calls = calls + cost
+					if not ok then healthy = false break end
+				end
+			end
+		end
+		if (not healthy or not fallback or piece.scaleFault or remote) and piece.positionDirty then
+			local restored = true
+			for b, translation in pairs(piece.translations) do
+				local ok, cost = Compat.write_independent_position(S, piece.unit, piece.nodes[b], translation[2], 1)
+				calls = calls + cost
+				restored = restored and ok
+			end
+			piece.positionDirty = not restored
+			fallback = fallback and restored
+			translations = {}
+		end
+		local ok, result = pcall(S.World.update_unit, world, piece.unit)
+		calls = calls + 1
+		fallback = fallback and ok and result ~= false and piece.scaleFault == nil
+		if piece == sampled and fallback and state.rest and (checkWrist or (last and piece.bodyBind and not remote)) then
+			local fk, roots = {}, {}
+			local function bone_pose(b)
+				if fk[b] then return fk[b] end
 				local parent = state.parents[b]
-				if not (parent and parent.bone and piece.nodes[parent.bone]) then
-					local node = piece.parents[b]
-					if node then poseRoots[node] = true end
-					return
-				end
-				b = parent.bone
-			end
-		end
-		if solveIk and useFkIk then
-			for _, a in ipairs(piece.arms) do require_root_pose(state.arms[a].sh) end
-		end
-		if sampled then
-			for _, b in ipairs(piece.wrists) do require_root_pose(b) end
-		end
-		local function model_parent_pose(node)
-			if node and parentPoses[node] == nil then
-				local cost
-				parentPoses[node], cost = Compat.independent_world_pose(S, piece.unit, node)
-				calls = calls + cost
-				parentPoses[node] = parentPoses[node] or false
-			end
-			return node and parentPoses[node] or nil
-		end
-		local function target_for(a)
-			local target = targets[a]
-			if target == nil then
-				local arm, cost = state.arms[a]
-				target, cost = Compat.independent_ik_target(S, avatar, state.sources[arm.sh],
-					state.sources[arm.el], state.sources[arm.ha], state.normals[a])
-				calls = calls + cost
-				if target then state.normals[a] = target.normal end
-				targets[a] = target or false
-			end
-			return target
-		end
-		local function model_parent_rotation(node)
-			if not node then return nil end
-			if parentRotations[node] == nil then
-				if poseRoots[node] then
-					local pose = model_parent_pose(node)
-					parentRotations[node] = pose and pose.q or false
-				else
-					parentRotations[node] = read_rotation(piece.unit, node, S.Unit.world_rotation) or false
-				end
-			end
-			return parentRotations[node] or nil
-		end
-
-		for _, b in ipairs(piece.bones) do
-			used[b] = true
-			local q, raw
-			local parent = state.parents[b]
-			if useWorld then
-				local offset = state.offsets[b]
+				local parentPose
 				if parent.bone and piece.nodes[parent.bone] then
-					-- Wtarget = Wsource * offset. 父骨的源世界旋转在求局部量时约掉，
-					-- 所以内部节点只需 inv(offsetParent) * sourceLocal * offset。
-					local source = source_rotation(localCache, state.sources[b], S.Unit.local_rotation)
-					local parentOffset = state.offsets[parent.bone]
-					if source and parentOffset.q and offset.q then
-						if offset.identity and parentOffset.identity then
-							q, raw = source.q, source.raw
-						else
-							q = Compat.independent_world_delta(source.q, offset.q, parentOffset.q)
-						end
+					parentPose = bone_pose(parent.bone)
+				elseif piece.parents[b] then
+					local node = piece.parents[b]
+					if roots[node] == nil then
+						local cost
+						roots[node], cost = Compat.independent_world_pose(S, piece.unit, node)
+						calls = calls + cost
+						roots[node] = roots[node] or false
 					end
-				else
-					local source = source_rotation(worldCache, state.sources[b], S.Unit.world_rotation)
-					local parentQ = model_parent_rotation(piece.parents[b])
-					if source and parentQ and offset.q then q = Compat.independent_world_delta(source.q, offset.q, parentQ) end
+					parentPose = roots[node]
 				end
-			else
-				local source = source_rotation(localCache, state.sources[b], S.Unit.local_rotation)
-				if source then q, raw = source.q, source.raw end
-			end
-			if not q then healthy = false end
-			rotations[b], rawRotations[b] = q, raw
-		end
-
-		local factors, lengths, fk = {}, {}, {}
-		local function bone_pose(b)
-			if fk[b] ~= nil then return fk[b] or nil end
-			fk[b] = false
-			local parent, q = state.parents[b], rotations[b]
-			if not parent or not q then return nil end
-			local parentPose
-			if parent.bone and piece.nodes[parent.bone] then
-				parentPose = bone_pose(parent.bone)
-			else
-				parentPose = model_parent_pose(piece.parents[b])
-			end
-			if not parentPose then return nil end
-			local position = rest and rest[b][4]
-			if not position then
-				local x, y, z = readVector(S, try(S.Unit.local_position, piece.unit, piece.nodes[b]))
-				calls = calls + (x ~= nil and 2 or 1)
-				if x ~= nil then position = { x, y, z } end
-			end
-			if not position then return nil end
-			local factor = lengths[b]
-			if factor then position = { position[1]*factor, position[2]*factor, position[3]*factor } end
-			fk[b] = Compat.independent_fk(parentPose, q, position)
-			return fk[b]
-		end
-
-		if healthy and solveIk and useFkIk then
-			for _, a in ipairs(piece.arms) do
-				local arm, target = state.arms[a], target_for(a)
-				if target then
-					local sh, el, ha = arm.sh, arm.el, arm.ha
-					local shPose, elPose, haPose = bone_pose(sh), bone_pose(el), bone_pose(ha)
-					if shPose and elPose and haPose then
-						local rot, factor = Compat.solve_independent_fk_ik(shPose, elPose, haPose, target, alpha,
-							{ rotations[sh], rotations[el], rotations[ha] },
-							{ piece.previous[sh], piece.previous[el], piece.previous[ha] })
-						if rot then
-							rotations[sh], rotations[el], rotations[ha] = rot[1], rot[2], rot[3]
-							rawRotations[sh], rawRotations[el], rawRotations[ha] = nil, nil, nil
-							factors[a], lengths[el], lengths[ha] = factor, factor, factor
-							fk = {}
-						end
-					else
-						healthy = false
-					end
+				local position = translations[b] or piece.bind[b] or state.rest[b][4]
+				local rotation = posed[b]
+				if parentPose and rotation then
+					-- Numeric components are only needed for the sampled FK check.
+					rotation.q = rotation.q or rotation_components(rotation.raw)
+					if rotation.q then fk[b] = Compat.independent_fk(parentPose, rotation.q, position) end
 				end
+				return fk[b]
 			end
-		end
-
-		-- 求解只使用绑定长度。拉伸倍率没变时，沿用已经写入的平移。
-		for _, a in ipairs(piece.arms) do
-			local arm = state.arms[a]
-			local factor, previous = factors[a] or 1, piece.stretched[a] or 1
-			if factor ~= previous then
-				piece.stretched[a] = true -- 部分写入失败也必须在兜底时恢复两段。
-				local updated = true
-				for _, b in ipairs({ arm.el, arm.ha }) do
-					local ok, cost = Compat.write_independent_position(S, piece.unit, piece.nodes[b], rest[b][4], factor)
-					calls = calls + cost
-					updated = updated and ok
-				end
-				if updated then piece.stretched[a] = factor > 1 and factor or nil else healthy = false end
-			end
-		end
-		for _, b in ipairs(piece.bones) do
-			local q = rotations[b]
-			if q then
-				local ok, stable = set_rotation(piece, b, q, rawRotations[b])
-				if ok then rotations[b], count = stable, count + 1 else healthy = false end
-			end
-		end
-		if not update(piece) then healthy = false end
-		if healthy and solveIk and not useFkIk then
-			local changed = false
-			for _, a in ipairs(piece.arms) do
-				local arm = state.arms[a]
-				local target = target_for(a)
-				if target then
-					local sh, el, ha = arm.sh, arm.el, arm.ha
-					local nodes = { piece.nodes[sh], piece.nodes[el], piece.nodes[ha] }
-					local positions = rest and { rest[sh][4], rest[el][4], rest[ha][4] }
-					local writes, cost, rot, stretched, hand = Compat.apply_independent_ik(S, piece.unit, nodes,
-						target, fastWrite, alpha, { rotations[sh], rotations[el], rotations[ha] },
-						{ piece.previous[sh], piece.previous[el], piece.previous[ha] }, positions, sampled)
-					calls = calls + cost
-					if stretched then piece.stretched[a] = true end
-					if writes < 0 then
-						healthy = false
-						break
-					elseif writes > 0 then
-						changed, count = true, count + writes
-						rotations[sh], rotations[el], rotations[ha] = rot[1], rot[2], rot[3]
-						expected[ha] = hand
-					end
-				end
-			end
-			if changed and not update(piece) then healthy = false end
-		end
-		if sampled and healthy then
-			for _, b in ipairs(piece.wrists) do
-				if not expected[b] then
-					local pose = bone_pose(b)
-					if pose then expected[b] = pose.p elseif rest then healthy = false end
-				end
-			end
-			for b, position in pairs(expected) do
+			local function check_position(b)
+				local expected = bone_pose(b)
 				local x, y, z = readVector(S, try(S.Unit.world_position, piece.unit, piece.nodes[b]))
 				calls = calls + (x ~= nil and 2 or 1)
-				local d = vec_dist(x, y, z, position[1], position[2], position[3])
-				if not (d and d <= 0.02) then healthy = false end
+				local p = expected and expected.p
+				local distance = p and vec_dist(x, y, z, p[1], p[2], p[3])
+				return distance and distance <= 0.02
+			end
+			if last and piece.bodyBind and not remote then fallback = check_position(piece.bones[last]) end
+			if checkWrist and fallback then
+				for _, b in ipairs(piece.wrists) do
+					if not check_position(b) then fallback = false break end
+				end
 			end
 		end
-		if healthy then piece.previous = rotations end
-		return healthy, count
+		return healthy and fallback, fallback
 	end
 
-	local function check_scale(piece, first, last)
-		for index = first, last do
-			local b = piece.bones[index]
-			local sx, sy, sz = readVector(S, try(S.Unit.local_scale, piece.unit, piece.nodes[b]))
-			calls = calls + (sx ~= nil and 2 or 1)
-			if sx == nil or not (math.abs(sx-1) <= 0.0001 and math.abs(sy-1) <= 0.0001
-				and math.abs(sz-1) <= 0.0001) then return index end
+	local function legacy_piece(piece)
+		local sampledNow = piece == sampled
+		if sampledNow then
+			if first then
+				local fault = check_scale(piece, first, last)
+				if fault or (piece.scaleFault and piece.scaleFault >= first and piece.scaleFault <= last) then
+					piece.scaleFault = fault
+				end
+			end
+			piece.lastSample = state.frames
 		end
+		local healthy, fallback = pose(piece)
+		if not healthy and piece.scaleFault == nil then
+			piece.scaleFault = check_scale(piece, 1, #piece.bones)
+			fallback = fallback and piece.scaleFault == nil
+		end
+		local checked = sampledNow and (checkWrist or piece.scaleFault ~= nil or remote)
+		if checked then piece.recheck = not healthy or piece.isolated end
+		if healthy and (checked or not piece.recheck) then
+			piece.failures = 0
+			piece.successes = (piece.successes or 0) + 1
+			if piece.isolated and piece.successes >= 3 then
+				piece.isolated, piece.recheck = false, nil
+				runtime.logger("[physbone][独立骨] 恢复 %s", piece.tag)
+			end
+		elseif not healthy and (piece.scaleFault == nil or checked) then
+			piece.successes = 0
+			piece.failures = (piece.failures or 0) + 1
+			if not piece.isolated and piece.failures >= 3 then
+				piece.isolated = true
+				runtime.logger("[physbone][独立骨][警告] 隔离 %s", piece.tag)
+			end
+		end
+		if piece.isolated and not fallback and not piece.hidden then calls = calls + independent_visibility(piece, false) end
+		if not piece.isolated and healthy and piece.hidden then calls = calls + independent_visibility(piece, true) end
 	end
 
+	state.hasLinks, state.linkedUnits = false, {}
+	state.correction = { due = due, now = now, nextAt = state.nextCorrection, blend = blend, paused = paused }
 	for index = #state.pieces, 1, -1 do
 		local piece = state.pieces[index]
 		if not session_unit_live(runtime, piece.unit) or not Compat.unit_alive(S, piece.unit) then
@@ -4341,82 +5483,49 @@ local function independent_frame(runtime, avatar, world, list)
 			state.samplePiece, state.sampleRound = nil, nil
 			state.rescanAt = frame + 1
 		else
-			local sampled = piece == sampledPiece
-			if sampled then
-				if sampleFirst then
-					local fault = check_scale(piece, sampleFirst, sampleLast)
-					if fault or (piece.scaleFault and piece.scaleFault >= sampleFirst and piece.scaleFault <= sampleLast) then
-						piece.scaleFault = fault
+			local linked = piece.link and not piece.linkFailed
+			local pieceDue = due or not piece.link
+			if piece.link and (not linkEnabled or piece.linkFailed) then
+				if not IndependentLink.restore(state, piece) then pieceDue = false end
+				linked = false
+			end
+			if linkEnabled and state.rest and pieceDue and not paused and not piece.link and not piece.linkFailed then
+				linked = IndependentLink.attach(runtime, state, piece)
+			end
+			if linked then
+				local ok, n, cost = pcall(IndependentLink.present, runtime, state, piece, pieceDue, now,
+					blend and not paused, sample, vectors, readPose)
+				if ok then
+					written, calls = written + n, calls + cost
+					state.hasLinks, state.linkedUnits[piece.unit] = true, true
+					if paused then
+						for _, row in pairs(piece.link.rows) do row.endpoint = nil end
 					end
-				end
-				piece.lastSample = state.frames
-			end
-			local scaleOk = piece.scaleFault == nil
-			local healthy, count = pose_piece(piece, false,
-				scaleOk and not piece.isolated and ((sampled and sampleWrist) or not piece.recheck),
-				sampled and sampleWrist and scaleOk)
-			if not healthy and scaleOk then
-				piece.scaleFault = check_scale(piece, 1, #piece.bones)
-				scaleOk = piece.scaleFault == nil
-			end
-			healthy = healthy and scaleOk
-			local checked = sampled and (sampleWrist or not scaleOk)
-			if checked or not scaleOk then
-				piece.recheck = not healthy or piece.isolated
-				piece.lastSample = piece.lastSample or state.frames
-			end
-			written = written + count
-			if healthy and (checked or not piece.recheck) then
-				piece.failures = 0
-				piece.successes = (piece.successes or 0) + 1
-				if piece.isolated and piece.successes >= 3 then
-					piece.isolated = false
-					piece.recheck = nil
-					runtime.logger("[physbone][独立骨] 恢复 %s", piece.tag)
-				end
-			elseif not healthy and (scaleOk or checked) then
-				piece.successes = 0
-				piece.failures = (piece.failures or 0) + 1
-				if not piece.isolated and piece.failures >= 3 then
-					piece.isolated = true
-					runtime.logger("[physbone][独立骨][警告] 隔离 %s", piece.tag)
+					if piece.hidden then calls = calls + independent_visibility(piece, true) end
+				else
+					IndependentLink.fail(runtime, state, piece, n)
+					if runtime.weaponShift then
+						IndependentLink.restore_weapon(runtime)
+						state.nextCorrection = nil
+					end
+					linked = false
 				end
 			end
-			if piece.isolated or not healthy or (piece.recheck and not checked) then
-				local fallback = healthy
-				if worldDelta or not healthy then
-					local fallbackCount
-					fallback, fallbackCount = pose_piece(piece, true, false, sampled and sampleWrist and scaleOk)
-					written = written + fallbackCount
-				end
-				fallback = fallback and scaleOk
-				if piece.isolated and not fallback and not piece.hidden then calls = calls + independent_visibility(piece, false) end
+			if not linked and not piece.link and (not paused or piece.linkFailed) then
+				legacy_piece(piece)
 			end
-			if not piece.isolated and healthy and piece.hidden then calls = calls + independent_visibility(piece, true) end
+			if not linked and not piece.link and pieceDue and not paused and not piece.hidden then
+				local count, cost = IndependentLink.present_clothing(runtime, state, piece)
+				written, calls = written + count, calls + cost
+			end
 		end
 	end
-
-	local sourceBones = {}
-	for b in ipairs(list) do if used[b] then sourceBones[#sourceBones + 1] = b end end
-	state.sourceBones = sourceBones
+	written, calls = written + vectors.written, calls + vectors.calls
 	state.frames = state.frames + 1
-	if INDEPENDENT_LOG_FRAMES[state.frames] == true and #state.pieces > 0 then
-		-- 肩和手在模型上和 avatar 上各差多少（左右各报一次；没有就跳过）。
-		local piece = state.pieces[1]
-		local parts = {}
-		for _, b in ipairs(piece.bones) do
-			local source = list[b][2]
-			if source == "l_shoulder" or source == "l_hand" or source == "r_shoulder" or source == "r_hand" then
-				local px, py, pz = readVector(S, try(S.Unit.world_position, piece.unit, piece.nodes[b]))
-				local qx, qy, qz = readVector(S, try(S.Unit.world_position, avatar, state.sources[b]))
-				calls = calls + 2
-				parts[#parts + 1] = source .. "差=" .. format_mm(vec_dist(px, py, pz, qx, qy, qz))
-			end
-		end
-		runtime.logger("[physbone][独立骨] 第%d帧 %d根骨 写入=%d 调用=%d ｜%s：%s",
-			state.frames, #state.sourceBones, written, calls, piece.tag, table.concat(parts, "，"))
+	if INDEPENDENT_LOG_FRAMES[state.frames] then
+		runtime.logger("[physbone][独立骨] 第%d帧 %d件 写入=%d 调用=%d", state.frames, #state.pieces, written, calls)
 	end
-	return written, calls
+	return written, calls, state
 end
 
 local function sample_action_state(runtime, avatar)
@@ -4501,13 +5610,16 @@ end
 local function apply_arm_pose_frame(runtime)
 	if type(Compat.apply_arm_pose) ~= "function" then return 0, 0 end
 	local unit = runtime.avatar
+	if unit ~= nil and not session_unit_live(runtime, unit) then
+		runtime.avatar, unit = nil, nil
+	end
 	if unit == nil then
 		unit = resolve_local_avatar_for_arm(runtime)
 	end
 	sample_action_state(runtime, unit)
 	if unit == nil then
 		runtime.armState = nil
-		if runtime.independent then runtime.independent.alpha, runtime.independent.mode = nil, nil end
+		IndependentLink.release_all(runtime)
 		runtime.armCalls = 0
 		-- 一次性：开着却一直找不到玩家角色（实机排查"到底跑没跑"用）。
 		runtime.armMissFrames = (runtime.armMissFrames or 0) + 1
@@ -4523,9 +5635,7 @@ local function apply_arm_pose_frame(runtime)
 		runtime.avatars = nil
 		runtime.armState = nil
 		runtime.armScanAt = nil
-		if runtime.independent then
-			runtime.independent.alpha, runtime.independent.mode, runtime.independent.normals = nil, nil, {}
-		end
+		IndependentLink.release_all(runtime)
 		runtime.armCalls = 0
 		return 0, 0
 	end
@@ -4533,7 +5643,34 @@ local function apply_arm_pose_frame(runtime)
 	local independent = runtime.options and runtime.options.independentBones
 	if type(independent) == "table" and #independent > 0 then
 		-- 给了独立骨就只驱动独立骨：写 avatar 同名骨画面不认（实机证实），白花调用。
-		local written, calls = independent_frame(runtime, unit, world, independent)
+		local written, calls, state = independent_frame(runtime, unit, world, independent, runtime.independent, false)
+		runtime.independent = state
+		local remoteStates = runtime.independentRemotes or {}
+		runtime.independentRemotes = {}
+		local tune = tune_values(runtime)
+		local remoteEnabled = runtime.options.independentTeammates == true
+		if tune.text and tune.text.independentTeammates ~= nil then
+			remoteEnabled = tune.text.independentTeammates == "true" or tune.text.independentTeammates == "1"
+		end
+		if remoteEnabled and state then
+			local metres = sched_settings(runtime).metres
+			local frame = runtime.frame or 0
+			for index, owner in ipairs(runtime.avatars or state.owners or {}) do
+				if owner.unit ~= unit and session_unit_live(runtime, owner.unit) and Compat.unit_alive(S, owner.unit) then
+					local distance = owner.cameraDistance or math.huge
+					local stride = distance <= metres * metres and 1 or 4
+					local remote = remoteStates[owner.unit]
+					remoteStates[owner.unit] = nil
+					if (frame + index) % stride == 0 then
+						local n, cost
+						n, cost, remote = independent_frame(runtime, owner.unit, world, independent, remote, true)
+						written, calls = written + n, calls + cost
+					end
+					runtime.independentRemotes[owner.unit] = remote
+				end
+			end
+		end
+		for _, remote in pairs(remoteStates) do independent_release(runtime, remote) end
 		if not runtime.armFirstLogged and written > 0 then
 			runtime.armFirstLogged = true
 			runtime.logger("[physbone] 独立骨首次生效 unit=%s 写入=%d 调用=%d",
@@ -4593,6 +5730,7 @@ local function drive(runtime)
 	end
 
 	Compat.begin_frame(frame)
+	if runtime.independent and not arm_pose_enabled(runtime) then IndependentLink.release_all(runtime) end
 	local driveClock = os.clock()   -- 这一拍驱动块占用的 CPU 时间（心跳里报出来）
 
 	-- ---------- 生命周期：**先"不碰句柄"地判死** ----------
@@ -4616,7 +5754,7 @@ local function drive(runtime)
 			runtime.avatars = nil
 			runtime.avatar = nil
 			runtime.armState = nil
-			runtime.independent, runtime.actionStateLog, runtime.armScanAt = nil, nil, nil
+			runtime.independent, runtime.independentRemotes, runtime.actionStateLog, runtime.armScanAt = nil, nil, nil, nil
 			runtime.liveUnits, runtime.physicsOwnerRoots = nil, nil
 			runtime.reArm = 1
 			runtime.rearmAt = frame + 1
@@ -4952,6 +6090,11 @@ local function drive(runtime)
 	end
 
 	local written, skippedSame, engineCalls, staticChains = 0, 0, 0, 0
+	local armCalls
+	if arm_pose_enabled(runtime) and runtime.options.independentBones then
+		local _
+		_, armCalls = apply_arm_pose_frame(runtime)
+	end
 	local attempted = 0
 	local dt = runtime.dt or (1 / 60)
 	local ownerStates = {}
@@ -4967,8 +6110,16 @@ local function drive(runtime)
 		-- 丢了它，物理会比真实时间慢 —— 表现是"队友的头发像在水里"。
 		local pending = (session.pendingDt or 0) + dt
 		local order = session.ownerOrder or 99
+		session.skipOptionalIas = order > 1 and runtime.options.independentTranslations ~= nil
 		local due = true
 		local owner = session.owner
+		local poseState = runtime.independent and runtime.independent.avatar == owner and runtime.independent
+			or (runtime.independentRemotes or {})[owner]
+		local schedule = poseState and poseState.linkedUnits and poseState.linkedUnits[session.unit] and poseState.correction
+		if schedule and (schedule.paused or not schedule.due or poseState.frame ~= frame) then due = false end
+		if schedule and schedule.paused then
+			pending, session.resetPhysics, session.independentHistory = 0, true, nil
+		end
 		local ownerState = owner and ownerStates[owner]
 		if owner ~= nil and ownerState == nil and session_unit_live(runtime, owner) then
 			local active = Compat.unit_alive(S, owner) and frame_animation_machine(runtime, owner).active
@@ -5014,14 +6165,16 @@ local function drive(runtime)
 			local okAlive, alive = pcall(Compat.unit_alive, S, session.unit)
 			if okAlive and alive == false then due = false end
 		end
-		if not due then
-			session.pendingDt = pending
-		else
-			session.pendingDt = 0
-			attempted = attempted + 1
-			local operation = session.resetPhysics and Compat.reset_physics or Compat.update
-			local ok, out = pcall(operation, session, pending)
-			session.resetPhysics = nil
+		if due or session.independentPresentation and session_unit_live(runtime, session.unit)
+			and (runtime.driveHoldUntil == nil or frame >= runtime.driveHoldUntil)
+			and (tune_values(runtime).writeOff or 0) == 0 then
+			local operation = due and (session.resetPhysics and Compat.reset_physics or Compat.update) or nil
+			local ok, out, solved = pcall(IndependentLink.physics, runtime, session, schedule, operation, pending)
+			if solved or due and not ok then
+				pending = 0
+				attempted = attempted + 1
+				session.resetPhysics = nil
+			end
 			if ok then
 				if type(out) == "number" then written = written + out end
 			elseif not session.updateErrorLogged then
@@ -5032,6 +6185,7 @@ local function drive(runtime)
 			skippedSame = skippedSame + (session.skippedSame or 0)
 			engineCalls = engineCalls + (session.engineCalls or 0)
 		end
+		session.pendingDt = pending
 
 		for _, item in ipairs(session.sessions) do
 			if (item.staticFrames or 0) > 0 then staticChains = staticChains + 1 end
@@ -5048,7 +6202,10 @@ local function drive(runtime)
 
 	local armSuffix = ""
 	if arm_pose_enabled(runtime) then
-		local _, armCalls = apply_arm_pose_frame(runtime)
+		if armCalls == nil then
+			local _
+			_, armCalls = apply_arm_pose_frame(runtime)
+		end
 		local avgArm = (runtime.armFrames or 0) > 0 and ((runtime.armCallsAccum or 0) / runtime.armFrames) or 0
 		armSuffix = string.format(" 手臂调用=%d(%.0f/帧) alpha=%.2f", armCalls, avgArm, runtime.armAlpha or 0)
 	end
@@ -5256,11 +6413,13 @@ function M.install(stingray, options)
 		-- 先让原来的 render 跑完（别的 mod 可能也在包装），再写我们的姿态：
 		-- 这样引擎已经算完动画、还没画，我们写进去的 local pose 会直接用于本帧蒙皮。
 		local result
+		if driver.weaponShift then IndependentLink.restore_weapon(driver) end
 		if originalRender ~= nil then result = originalRender(...) end
 		if driver.installed then
 			driver.frame = driver.frame + 1
 			local ok, err = pcall(drive, driver)
 			driver.frameAnimation = nil
+			if not ok and driver.weaponShift then IndependentLink.restore_weapon(driver) end
 			if not ok and not driver.driveErrorLogged then
 				driver.driveErrorLogged = true
 				driver.logger("[physbone][错误] 驱动失败：%s", tostring(err))
@@ -5290,13 +6449,17 @@ end
 function M.uninstall()
 	local runtime = state
 	if runtime == nil then return false end
+	if not IndependentLink.restore_weapon(runtime) then return false end
 	runtime.installed = false
-	independent_release(runtime, runtime.independent)
+	IndependentLink.release_all(runtime)
 	for _, session in ipairs(runtime.sessions or {}) do
 		pcall(Compat.release, session)
 	end
 	runtime.sessions = nil
 	rawset(_G, "render", originalRender)
+	if runtime.weaponUpdate and rawget(_G, "update") == runtime.weaponUpdate then
+		rawset(_G, "update", runtime.originalWeaponUpdate)
+	end
 	rawset(_G, INSTALL_KEY, nil)
 	state = nil
 	return true
@@ -5332,6 +6495,8 @@ M.snapshot_ids_ = snapshot_ids
 M.snapshot_json_ = snapshot_json
 M.arm_pose_enabled_ = arm_pose_enabled
 M.apply_arm_pose_frame_ = apply_arm_pose_frame
+M.independent_physics_ = IndependentLink.physics
+M.independent_contact_ = IndependentLink
 M.snapshot_poll_ = snapshot_poll
 M.snapshot_dir_ = snapshot_dir
 

@@ -47,7 +47,14 @@ public static class JointPoseData
 			if (root.TryGetProperty("independentPieces", out var pieces) && pieces.ValueKind != JsonValueKind.Null)
 			{
 				var names = independent.EnumerateArray().Select(item => BoneName(item, "bone")).ToHashSet(StringComparer.Ordinal);
-				parts.AddRange(Pieces(root, pieces, names, activeOptions));
+				try
+				{
+					parts.AddRange(Pieces(root, pieces, names, activeOptions));
+				}
+				catch (Exception error) when (error is KeyNotFoundException or FormatException or InvalidOperationException)
+				{
+					throw new InvalidDataException($"{FileName} contains malformed independent piece data.", error);
+				}
 			}
 		}
 		if (parts.Count == 0)
@@ -74,15 +81,27 @@ public static class JointPoseData
 	{
 		var entries = new List<string>();
 		var slots = new List<string>();
+		var positions = new List<string>();
+		var clothing = new List<string>();
+		var legs = new List<string>();
+		var grips = new List<string>();
+		var selectedUnits = new HashSet<string>(StringComparer.Ordinal);
 		root.TryGetProperty("independentPieceRoutes", out var routes);
+		root.TryGetProperty("independentTranslations", out var translations);
+		root.TryGetProperty("independentPoseRules", out var poseRules);
+		root.TryGetProperty("independentLegs", out var legCalibration);
+		root.TryGetProperty("independentGrips", out var gripCalibration);
 		foreach (var piece in pieces.EnumerateObject())
 		{
-			var id = piece.Name;
+			var separator = piece.Name.IndexOf('@');
+			var id = separator < 0 ? piece.Name : piece.Name[..separator];
+			if (separator >= 0 && (activeOptions is null || !activeOptions.Contains(piece.Name[(separator + 1)..])))
+				continue;
 			if (id.Length != 21 || !id.StartsWith("#ID[", StringComparison.Ordinal) || id[^1] != ']'
 				|| !id.AsSpan(4, 16).ToString().All(c => c is >= '0' and <= '9' or >= 'a' and <= 'f'))
 				throw new InvalidDataException($"Invalid independent unit ID: {id}");
 			var slot = id;
-			if (routes.ValueKind == JsonValueKind.Object && routes.TryGetProperty(id, out var route))
+			if (routes.ValueKind == JsonValueKind.Object && routes.TryGetProperty(piece.Name, out var route))
 			{
 				if (activeOptions is not null && route.TryGetProperty("option", out var option)
 					&& option.ValueKind != JsonValueKind.Null && !activeOptions.Contains(option.GetString()!))
@@ -93,13 +112,116 @@ public static class JointPoseData
 				slot = BoneName(route, "slot", allowUppercase: true);
 			}
 			var bones = piece.Value.EnumerateArray().Select(bone => bone.GetString()).ToArray();
+			if (!selectedUnits.Add(id))
+				throw new InvalidDataException($"Multiple active independent variants for {id}.");
 			if (bones.Length == 0 || bones.Any(bone => bone is null || !names.Contains(bone)) || bones.Distinct().Count() != bones.Length)
 				throw new InvalidDataException($"Invalid independent bones for {id}.");
 			entries.Add($"[\"{id}\"] = {{ " + string.Join(", ", bones.Select(bone => $"\"{bone}\"")) + " }");
 			slots.Add($"[\"{id}\"] = \"{slot}\"");
+			if (translations.ValueKind == JsonValueKind.Object && translations.TryGetProperty(piece.Name, out var translated))
+			{
+				var translatedBones = new List<string>();
+				foreach (var bone in translated.EnumerateObject())
+				{
+					if (!bones.Contains(bone.Name))
+						throw new InvalidDataException($"Invalid independent translation bone {bone.Name} for {id}.");
+					translatedBones.Add($"[\"{bone.Name}\"] = {{ " + Vector(bone.Value, "avatar") + ", "
+						+ Vector(bone.Value, "model") + " }");
+				}
+				positions.Add($"[\"{id}\"] = {{ " + string.Join(", ", translatedBones) + " }");
+			}
+			if (poseRules.ValueKind == JsonValueKind.Object && poseRules.TryGetProperty(piece.Name, out var rules))
+				clothing.Add($"[\"{id}\"] = " + PoseRules(rules));
+			if (gripCalibration.ValueKind == JsonValueKind.Object && gripCalibration.TryGetProperty(piece.Name, out var calibratedGrips))
+			{
+				var sides = calibratedGrips.EnumerateObject().Select(grip =>
+				{
+					if (grip.Name is not ("l" or "r") || grip.Value.GetArrayLength() != 12)
+						throw new InvalidDataException("Invalid IAS hand-to-grip matrix.");
+					return grip.Name + " = { " + string.Join(", ", grip.Value.EnumerateArray()
+						.Select((value, index) =>
+						{
+							var number = value.GetDouble();
+							var bound = index % 4 == 3 ? 1e7 : 1.001;
+							if (!double.IsFinite(number) || Math.Abs(number) > bound)
+								throw new InvalidDataException("Invalid IAS hand-to-grip matrix element.");
+							return number.ToString("R", CultureInfo.InvariantCulture);
+						})) + " }";
+				});
+				grips.Add($"[\"{id}\"] = {{ " + string.Join(", ", sides) + " }");
+			}
+			if (legCalibration.ValueKind == JsonValueKind.Object && legCalibration.TryGetProperty(piece.Name, out var calibrated))
+			{
+				var sides = calibrated.EnumerateObject().Select(leg =>
+				{
+					var scale = leg.Value.GetProperty("lateralScale").GetDouble();
+					if (leg.Name is not ("l" or "r") || !double.IsFinite(scale))
+						throw new InvalidDataException("Invalid IAS leg calibration.");
+					return $"{leg.Name} = {{ {scale.ToString("R", CultureInfo.InvariantCulture)}, " + Vector(leg.Value, "bendNormal") + " }";
+				});
+				legs.Add($"[\"{id}\"] = {{ " + string.Join(", ", sides) + " }");
+			}
 		}
-		return ["independentPieces = { " + string.Join(", ", entries) + " }",
-			"independentPieceSlots = { " + string.Join(", ", slots) + " }"];
+		yield return "independentPieces = { " + string.Join(", ", entries) + " }";
+		yield return "independentPieceSlots = { " + string.Join(", ", slots) + " }";
+		if (positions.Count > 0)
+			yield return "independentTranslations = { " + string.Join(", ", positions) + " }";
+		if (clothing.Count > 0)
+			yield return "independentPoseRules = { " + string.Join(", ", clothing) + " }";
+		if (legs.Count > 0)
+			yield return "independentLegs = { " + string.Join(", ", legs) + " }";
+		if (grips.Count > 0)
+			yield return "independentGrips = { " + string.Join(", ", grips) + " }";
+	}
+
+	private static string PoseRules(JsonElement rules)
+	{
+		if (rules.ValueKind != JsonValueKind.Array || rules.GetArrayLength() is < 1 or > 64)
+			throw new InvalidDataException("Invalid independent clothing rule count.");
+		return "{ " + string.Join(", ", rules.EnumerateArray().Select(rule =>
+		{
+			var mode = rule.GetProperty("mode").GetInt32();
+			if (mode is < 0 or > 3)
+				throw new InvalidDataException("Invalid clothing combination mode.");
+			var axes = rule.GetProperty("axes");
+			if (axes.GetArrayLength() != 3)
+				throw new InvalidDataException("A clothing rule must have three curves.");
+			var curves = axes.EnumerateArray().Select(axis =>
+			{
+				var flags = axis.GetProperty("flags").GetInt32();
+				var secondary = axis.GetProperty("secondaryAxis").GetInt32();
+				var points = axis.GetProperty("points");
+				if (flags is < 0 or > 3 || secondary is < 0 or > 2 || points.GetArrayLength() is < 2 or > 256)
+					throw new InvalidDataException("Invalid clothing curve.");
+				var previous = double.NegativeInfinity;
+				var rows = points.EnumerateArray().Select(point =>
+				{
+					if (point.GetArrayLength() != 4 || point[0].GetDouble() <= previous)
+						throw new InvalidDataException("Clothing curve points must have increasing inputs.");
+					previous = point[0].GetDouble();
+					return "{ " + string.Join(", ", point.EnumerateArray().Select(value => PoseNumber(value, -180, 180))) + " }";
+				});
+				return $"{{ flags = {flags}, secondaryAxis = {secondary}, points = {{ " + string.Join(", ", rows) + " } }";
+			});
+			return "{ target = \"" + BoneName(rule, "target", allowUppercase: true) + "\", primary = " + PoseDriver(rule.GetProperty("primary"))
+				+ (mode == 0 ? "" : ", secondary = " + PoseDriver(rule.GetProperty("secondary")))
+				+ $", mode = {mode}, influence = " + PoseNumber(rule.GetProperty("influence"), 0, 1)
+				+ ", basis = " + Vector(rule, "basis", 4) + ", axes = { " + string.Join(", ", curves) + " } }";
+		})) + " }";
+	}
+
+	private static string PoseDriver(JsonElement driver) => "{ bone = \"" + BoneName(driver, "bone") + "\""
+		+ (driver.GetProperty("reference").ValueKind == JsonValueKind.Null ? ""
+			: ", reference = \"" + BoneName(driver, "reference") + "\"")
+		+ ", neutral = " + Vector(driver, "neutral", 4) + ", offset = " + Vector(driver, "offset", 4)
+		+ ", referenceOffset = " + Vector(driver, "referenceOffset", 4) + " }";
+
+	private static string PoseNumber(JsonElement value, double min, double max)
+	{
+		var number = value.GetDouble();
+		if (!double.IsFinite(number) || number < min || number > max)
+			throw new InvalidDataException("Clothing pose value is outside its authored range.");
+		return number.ToString("R", CultureInfo.InvariantCulture);
 	}
 
 	private static string BoneName(JsonElement item, string property, bool allowUppercase = false)
