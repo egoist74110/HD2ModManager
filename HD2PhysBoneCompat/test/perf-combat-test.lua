@@ -537,6 +537,96 @@ end
 combatScenario("战斗场景（本人 + 3 队友，角色 1/2）", true)
 combatScenario("非战斗世界（无网络身份）", false)
 
+-- P1（2026-11-23 真实日志，运行时 2.1.65）：进任务后 F9 从 ~500 次 / 1.1 ms 跳到 ~2880 次 / 7.1 ms 每帧，峰值帧 ~20000 次。
+-- 原因：尸体定格的活体采样（IAS observe R:5602-5634，每 0.25 s 桶每主人一次整组）在我们这里是真实引擎读——
+-- 4 人 x 14 件 x ~180 节点 x 2 次调用 ≈ 20000 次，全挤在桶翻转的那一帧。IAS 同一读取走 retarget 的 `explicit`（R:4705），几乎免费。
+-- 战前（ship）所有人 role 0、尸体定格直接返回，所以进任务才跳。本场景按实机形状复现（世界 19000 个 unit，30 fps）。
+-- 门槛：采样频率不变（每桶每主人恰好一次，样本新鲜度不变）；单帧峰值 <= 一个主人的一整组（不再 4 个主人挤同一帧）。
+do
+	io.stdout:write("\n[P1 任务场景] 世界 19000 个 unit + 4 名玩家 x 14 件护甲（~180 节点/件），30 fps\n")
+	local fake = newFake()
+	for _ = 1, 18900 do fake:addUnit({ nodes = 10 }) end
+	local compat = newCompat()
+	local PIECES, NODES = 14, 180
+	local players = {}
+	for index = 1, 4 do
+		local x = (index - 1) * 10
+		players[index] = fake:addUnit({ name = "p" .. index .. "-avatar", avatar = true, position = { x = x, y = 0, z = 0 } })
+		for piece = 1, PIECES do
+			fake:addUnit({ name = "p" .. index .. "-piece" .. piece, anim = false, mg = true, nodes = NODES, chains = piece <= 4 and 3 or 0,
+				position = { x = x + 0.1, y = 0, z = 0 }, armour = true })
+		end
+	end
+	local squad = { me = "p1", objects = {} }
+	for index, avatarUnit in ipairs(players) do
+		squad.objects[index == 1 and 5000 or (7000000 + index)] = { unit = avatarUnit, owner = "p" .. index }
+	end
+	local S, counter = counted(fake, squad)
+	rawset(_G, "__hd2physbone_runtime", nil)
+	rawset(_G, "render", function() end)
+	local realClock = os.clock
+	local hz = 30
+	os.clock = function() return fake.clock end
+	local Roster = runtimeModule.roster_
+	runtimeModule.install(S, { compat = compat, log = false, carriers = { { rig = { bones = { { name = "hair" } } }, path = "fake" } },
+		profileHashes = fake.hashes, settleFrames = 1, snapshot = false, tunePath = "nonexistent-hd2pbx-tune.txt", pollFrames = 1, validateFrames = 3,
+		heartbeatFrames = 1000000, minNodes = 90, perfWindow = 1000000 })
+	local runtime = rawget(_G, "__hd2physbone_runtime")
+	local function frame()
+		fake.clock = fake.clock + 1 / hz
+		rawget(_G, "render")()
+	end
+	for _ = 1, 240 do frame() end
+	local roles = {}
+	for index, avatarUnit in ipairs(players) do roles[index] = Roster.role(avatarUnit) end
+	check(roles[1] == 1 and roles[2] == 2 and roles[3] == 2 and roles[4] == 2, "P1：任务里本人角色 1、队友角色 2（尸体定格开始采样的前提）", table.concat(roles, ","))
+	local freeze = runtimeModule.corpse_
+	local corpse = wrapCorpse(counter)
+	local perf = runtimeModule.perf_
+	perf.reset()
+	counter.total, counter.by = 0, {}
+	local frames, captures = 900, {}
+	local worldPose = counter.by
+	local peakCorpse, totalCorpse = 0, 0
+	local rawPose = S.Unit.world_pose
+	local currentOwnerPose = 0
+	for _ = 1, frames do
+		corpse.frame = 0
+		frame()
+		corpse.endFrame()
+		peakCorpse = math.max(peakCorpse, corpse.peak)
+	end
+	totalCorpse = corpse.total
+	corpse.restore()
+	local seconds = frames / hz
+	local buckets = math.floor(seconds * 4)
+	local group = PIECES * NODES * 2
+	local cb = iasCorpseBudget({ roles = { 1, 2, 2, 2 }, pieces = PIECES, nodes = NODES, frames = frames, hz = hz })
+	io.stdout:write(string.format("  [数据] 尸体定格模块 %d 次 / %d 帧 = %.1f/帧；峰值帧 %d（一个主人的一整组 = %d）；IAS 尸体项口径：合计 %d、采样帧峰值 %d（四个主人挤同一帧）\n",
+		totalCorpse, frames, totalCorpse / frames, peakCorpse, group, cb.total, cb.peak))
+	local rows = {}
+	for _, name in ipairs(perf.order) do
+		local calls = perf.calls[name]
+		if calls then rows[#rows + 1] = string.format("%s=%.1f", name, calls / math.max(1, perf.frames)) end
+	end
+	io.stdout:write("  [分项] " .. table.concat(rows, " ") .. "\n")
+	check(peakCorpse <= group + 300, "P1：采样帧峰值 <= 一个主人的一整组（不再 4 个主人挤同一帧）", string.format("%d <= %d + 300", peakCorpse, group))
+	check(peakCorpse <= cb.peak / 3, "P1：采样帧峰值 <= IAS 同形状采样帧的 1/3", string.format("%d <= %d/3", peakCorpse, cb.peak))
+	check(totalCorpse <= cb.total, "P1：尸体定格总调用数 <= IAS 尸体项（均值口径，采样频率不变）", string.format("%d <= %d", totalCorpse, cb.total))
+	-- 频率：每桶每主人恰好一次 => 总采样节点读取 ~ 主人数 x 桶数 x 整组（允许开头 / 结尾各一桶误差）
+	local approxGroups = totalCorpse / group
+	check(approxGroups >= 4 * (buckets - 1) and approxGroups <= 4 * (buckets + 1) + 4,
+		"P1：每个 0.25 s 桶每个主人采样一次（样本新鲜度不变）", string.format("%.1f 组，期望 ~%d", approxGroups, 4 * buckets))
+	-- PERF 行：F9 拆项 + F3 / F4p / F9 的逐 API 明细
+	local line
+	perf.summary({ logger = function(format, ...) line = string.format(format, ...) end })
+	check(line ~= nil and line:find("F9c明细[", 1, true) ~= nil and line:find("F9d", 1, true) ~= nil and line:find("F9i", 1, true) ~= nil,
+		"P1：PERF 行带 F9 子项（F9d 发现 / F9i 身份 / F9c 尸体 / F9s 物理同步）与 F9c 的逐 API 明细", line and line:sub(1, 200))
+	check(line ~= nil and line:find("F9明细[", 1, true) ~= nil, "P1：PERF 行带 F9 剩余部分的逐 API 明细")
+	Roster.update = Roster.update
+	os.clock = realClock
+end
+
 -- F3：找武器。15000 个 unit 里 1 件是武器，右手挂点命中它。
 do
 	local fake = newFake()

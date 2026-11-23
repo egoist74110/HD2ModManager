@@ -108,7 +108,15 @@ local M = {}
 -- 2.1.65：E12f-D2。尸体定格成本对账（按 IAS 逐项，见 perf-combat-test / corpse-integration-test）：StingrayEntityRoot 节点号按实例槽缓存
 --        （采样帧不再每件多付 2 次查询）；死者撕裂估计（IAS 由原生快照免费给）改为摊到连续几帧、每帧至多 10 次调用，
 --        已死未满 4 s 阶段的每帧峰值不再超过 IAS 的 core 开销。
-M.VERSION = "2.1.65"
+-- 2.1.66：P1 实机卡顿（2026-11-23 真实日志）。① 尸体定格的活体采样（观察 R:5602-5634 的 0.25 s 桶）在实机一个桶里要读 ~10000 个节点
+--        （4 人 x 14 件 x ~180 节点 x 2 次调用 ≈ 20000 次/帧，每 0.25 s 一帧）：F9 从 ~500 次跳到 ~2880 次/帧、峰值 20034。
+--        IAS 的同一读取由 retarget 求解结果（`explicit`，R:4705）供给、几乎免费；我们没有那份数据，必须自己读。
+--        所以只改"谁在哪一帧采"：桶翻转后每帧只采一个主人的整组（桶号最旧的先），每桶每主人仍恰好一次、样本新鲜度不变（铰接下落要求 <= 0.8 s）；
+--        单帧峰值从 ~20000 降到一个主人的一组（~5000），平均不变。
+--        ② PERF 行补 F3 / F4p / F9 的逐 API 明细，F9 拆成 F9d 发现 / F9i 身份 / F9c 尸体 / F9s 物理同步。
+--        ③ 独立骨（retarget）不再等本人身份：IAS 对每个绑定的 avatar 每帧 retarget（R:6860-7010，role 只喂物理类别），
+--        我们原来只给 role 1 的本人做、队友默认关 ⇒ 身份没解出来前站 T 字、队友永远 T 字。
+M.VERSION = "2.1.66"
 
 --- 安装标记用的全局键。只写这一个全局，且值就是模块本身（便于外部检查是否已装）。
 local INSTALL_KEY = "__hd2physbone_runtime"
@@ -259,7 +267,7 @@ end
 -- 关掉：调参文件 `perfCounters = 0` 或 install 选项 `perfCounters = false`（关掉后不包装任何引擎函数）。
 -- ---------------------------------------------------------------------------
 local Perf = { on = false, active = false, api = {}, cur = nil, n = {}, calls = {}, clock = {}, events = {}, frames = 0, totalCalls = 0, window = 600,
-	order = { "F1", "F2", "F3", "F4", "F4p", "F4a", "F5", "F6", "F7", "F8", "F9", "P1", "P2", "P3", "P4", "P5", "P6", "P7", "P8", "OTHER" } }
+	order = { "F1", "F2", "F3", "F4", "F4p", "F4a", "F5", "F6", "F7", "F8", "F9", "F9d", "F9i", "F9c", "F9s", "P1", "P2", "P3", "P4", "P5", "P6", "P7", "P8", "OTHER" } }
 
 function Perf.reset()
 	Perf.n, Perf.calls, Perf.clock, Perf.events, Perf.frames, Perf.totalCalls, Perf.api = {}, {}, {}, {}, 0, 0, {}
@@ -337,7 +345,7 @@ function Perf.summary(runtime, extra)
 	local events = {}
 	for key, value in pairs(Perf.events) do events[#events + 1] = key .. "=" .. tostring(value) end
 	table.sort(events)
-	for _, bucket in ipairs({ "F4", "F6", "F7", "P2", "OTHER" }) do
+	for _, bucket in ipairs({ "F3", "F4", "F4p", "F6", "F7", "F9", "F9d", "F9i", "F9c", "F9s", "P2", "OTHER" }) do
 		local per = Perf.api[bucket]
 		if per ~= nil then
 			local rows = {}
@@ -5315,7 +5323,9 @@ local function apply_arm_pose_frame(runtime)
 		unit = resolve_local_avatar_for_arm(runtime)
 	end
 	sample_action_state(runtime, unit)
-	if unit == nil then
+	local independent = runtime.options and runtime.options.independentBones
+	local hasIndependent = type(independent) == "table" and #independent > 0
+	if unit == nil and not hasIndependent then
 		runtime.armState = nil
 		IndependentLink.release_all(runtime)
 		runtime.armCalls = 0
@@ -5330,33 +5340,49 @@ local function apply_arm_pose_frame(runtime)
 	-- E12f-C3：原来这里对本人 avatar 再调一次 `Compat.unit_alive`。IAS 没有：unit 只来自本帧枚举（R:894-896、R:1417-1422）。
 	-- 走到这里 `unit` 要么刚过 `Roster.isLive`（上面），要么来自 `Roster.localAvatar`（现在只认本帧枚举），所以必是本帧句柄。
 	local world = runtime.cache and runtime.cache.world or nil
-	local independent = runtime.options and runtime.options.independentBones
-	if type(independent) == "table" and #independent > 0 then
+	if hasIndependent then
+		-- 2.1.66：IAS 对每个绑定的 avatar 每帧 retarget（R:6860-7010 bind_unit / push_avatar），不等身份；role 只喂物理类别（R:6975-6976）。
+		-- 所以：本人（role 1）走完整路径；其余每个在场 avatar（队友、或身份还没解出来时的所有人）走"只写旋转"路径。
 		-- 给了独立骨就只驱动独立骨：写 avatar 同名骨画面不认（实机证实），白花调用。
-		local written, calls, state = independent_frame(runtime, unit, world, independent, runtime.independent, false)
-		runtime.independent = state
+		local written, calls = 0, 0
+		if unit ~= nil then
+			local state
+			written, calls, state = independent_frame(runtime, unit, world, independent, runtime.independent, false)
+			runtime.independent = state
+		elseif runtime.independent ~= nil then
+			independent_release(runtime, runtime.independent)
+			runtime.independent = nil
+			runtime.armState = nil
+		end
 		local remoteStates = runtime.independentRemotes or {}
 		runtime.independentRemotes = {}
 		local tune = tune_values(runtime)
-		local remoteEnabled = runtime.options.independentTeammates == true
+		local remoteEnabled = runtime.options.independentTeammates ~= false
 		if tune.text and tune.text.independentTeammates ~= nil then
 			remoteEnabled = tune.text.independentTeammates == "true" or tune.text.independentTeammates == "1"
 		end
-		if remoteEnabled and state then
+		local roster = runtime.roster
+		if remoteEnabled and roster ~= nil and roster.frame == (runtime.frame or 0) then
 			local metres = sched_settings(runtime).metres
 			local frame = runtime.frame or 0
-			for index, owner in ipairs(runtime.avatars or state.owners or {}) do
-				if owner.unit ~= unit and Roster.isLive(runtime, owner.unit) then
-					local distance = owner.cameraDistance or math.huge
-					local stride = distance <= metres * metres and 1 or 4
-					local remote = remoteStates[owner.unit]
-					remoteStates[owner.unit] = nil
-					if (frame + index) % stride == 0 then
-						local n, cost
-						n, cost, remote = independent_frame(runtime, owner.unit, world, independent, remote, true)
-						written, calls = written + n, calls + cost
+			local distances = {}
+			for _, owner in ipairs(runtime.avatars or {}) do distances[owner.unit] = owner.cameraDistance end
+			local index = 0
+			for avatarWorld, row in pairs(roster.byWorld) do
+				for _, owner in ipairs(row.avatars) do
+					if owner.unit ~= unit then
+						index = index + 1
+						local distance = distances[owner.unit] or math.huge
+						local stride = distance <= metres * metres and 1 or 4
+						local remote = remoteStates[owner.unit]
+						remoteStates[owner.unit] = nil
+						if (frame + index) % stride == 0 then
+							local n, cost
+							n, cost, remote = independent_frame(runtime, owner.unit, avatarWorld, independent, remote, true)
+							written, calls = written + n, calls + cost
+						end
+						runtime.independentRemotes[owner.unit] = remote
 					end
-					runtime.independentRemotes[owner.unit] = remote
 				end
 			end
 		end
@@ -5364,7 +5390,7 @@ local function apply_arm_pose_frame(runtime)
 		if not runtime.armFirstLogged and written > 0 then
 			runtime.armFirstLogged = true
 			runtime.logger("[physbone] 独立骨首次生效 unit=%s 写入=%d 调用=%d",
-				tostring(unit_tag(S, unit)), written, calls)
+				tostring(unit ~= nil and unit_tag(S, unit) or "队友/未解身份"), written, calls)
 		end
 		runtime.armCalls = calls
 		runtime.armCallsAccum = (runtime.armCallsAccum or 0) + calls
@@ -5411,7 +5437,7 @@ CorpseFreeze.enabled, CorpseFreeze.active = false, false
 local cf = {
 	frozen = {}, clones = {}, liveCache = {}, livePending = {}, logged = {}, failed = {}, errors = {},
 	pending = {}, cores = {}, tornCache = {}, tornCore = {}, tornBudget = 0, jointCache = {}, offsetCache = {}, stopped = {},
-	tick = 0, now = 0, created = 0, runtime = nil,
+	tick = 0, now = 0, created = 0, runtime = nil, sampleTried = {},
 }
 CorpseFreeze.state = cf   -- 仅测试读取
 
@@ -5648,6 +5674,11 @@ end
 --- 把一个桶的读取摊到连续几帧：每帧最多 CZ_TORN_BUDGET 次调用（= 10）——先读一次 owner 的 core（≤10，同帧已缓存则免费），
 --- 之后每帧最多 5 个关节（各 2 次）；全部读完才判 detached（用 core 那一帧的 hips 位置，几帧内位移远小于 3.5 m 的判据）。
 local CZ_TORN_BUDGET = 10
+-- 活体采样的分帧。IAS 每个 0.25 s 桶对每个主人采一次，读的是 retarget 已算好的 `explicit` 世界姿态（R:4705），几乎免费；
+-- 我们的采样是真实引擎读（每节点 2 次调用）。实机一个桶里把 4 人 x 14 件全读完 ≈ 20000 次调用 ⇒ 每 0.25 s 一帧卡 ~50 ms。
+-- 频率不能降：铰接下落要求活体样本不老于 0.8 s（R:5981 / cz_start_motion），IAS 的桶保证样本 <= 0.25 s。
+-- IAS 的活体缓存按"同一帧的一整组（一个主人的全部件）"发布（R:5862-5868），一组不能拆到几帧；
+-- 所以只改"谁在哪一帧采"：桶翻转后，每帧只采一个主人的整组（桶号最旧的先），其余主人排到后面几帧。每桶每主人仍恰好一次。
 local function cz_torn_estimate(b, key, bucket)
 	local e = cf.tornCache[key]
 	if e and e.bucket == bucket and e.done then return e.early end
@@ -5750,7 +5781,7 @@ end
 function CorpseFreeze.reset()
 	cf.frozen, cf.clones, cf.liveCache, cf.livePending, cf.logged, cf.failed, cf.errors = {}, {}, {}, {}, {}, {}, {}
 	cf.pending, cf.cores, cf.tornCache, cf.tornCore, cf.jointCache, cf.offsetCache, cf.stopped = {}, {}, {}, {}, {}, {}, {}
-	cf.created, cf.runtime = 0, nil
+	cf.created, cf.runtime, cf.sampleTried, cf.sampleOwner = 0, nil, {}, nil
 	lifecycle.live, lifecycle.counter, lifecycle.forgotten = {}, 0, 0
 	for key in pairs(Roster.corpsePins) do Roster.corpsePins[key] = nil end
 	CorpseFreeze.enabled, CorpseFreeze.active = false, false
@@ -5761,6 +5792,7 @@ function CorpseFreeze.begin(runtime)
 	cf.runtime, cf.tick, cf.now = runtime, runtime.frame or 0, os.clock()
 	cf.pending, cf.cores, cf.livePending = {}, {}, {}
 	cf.tornBudget = CZ_TORN_BUDGET
+	cf.sampleOwner = nil
 	local was = CorpseFreeze.enabled
 	CorpseFreeze.enabled = cz_enabled(runtime)
 	if was ~= CorpseFreeze.enabled then
@@ -5802,7 +5834,7 @@ function CorpseFreeze.observe(b, explicit)
 	end
 	-- 以下与 IAS 顺序不同处：先看桶 / 上限（零引擎调用），再读动画机与 core，调用数只会比 IAS 少。
 	local old = cf.liveCache[key]
-	if old and old.bucket == bucket then return end
+	if cf.sampleOwner ~= cz_slot(b.avatar.unit) then return end   -- 本帧轮到的主人才采（见 frame）；一组必须同帧采完
 	local count = 0
 	for _ in pairs(cf.liveCache) do count = count + 1 end
 	if not old and count >= 256 then return end
@@ -6268,6 +6300,26 @@ function CorpseFreeze.frame(runtime)
 			end
 		end
 	end
+	-- 本帧轮到谁采样：活着的主人（role 1/2）里"最近一次发布 / 尝试"最久远的那个（桶号翻转之后、本桶还没试过的）。
+	local groups = {}
+	for _, b in ipairs(bindings) do
+		local role = Roster.role(b.avatar.unit)
+		if role == 1 or role == 2 then
+			local owner = cz_slot(b.avatar.unit)
+			local g = groups[owner]
+			if g == nil then g = { owner = owner, last = math.huge }; groups[owner] = g end
+			local cached = cf.liveCache[cz_slot(b.unit)]
+			local t = cached and cached.bucket or -math.huge
+			if t < g.last then g.last = t end
+		end
+	end
+	local pick, bucket = nil, math.floor(cf.now * 4)
+	for owner, g in pairs(groups) do
+		local t = math.max(g.last, cf.sampleTried[owner] or -math.huge)   -- 一组一直采不齐也不在同一桶里反复重试
+		g.t = t
+		if t < bucket and (pick == nil or t < pick.t or (t == pick.t and owner < pick.owner)) then pick = g end
+	end
+	if pick then cf.sampleOwner, cf.sampleTried[pick.owner] = pick.owner, bucket end
 	for _, b in ipairs(bindings) do
 		local ok, err = pcall(CorpseFreeze.queue_input, b, nil)
 		if not ok then CorpseFreeze.report('input', err) end
@@ -6923,6 +6975,14 @@ local function perf_wrap_all()
 	scheduler_watch = Perf.wrap("F8", scheduler_watch)
 	drive = Perf.wrap("F9", drive)   -- drive 本体剩余部分（时钟、生命周期、门控）：未归入子项的调用都记在这里
 	sched_poll = Perf.wrap("F9", sched_poll)
+	-- 2.1.66：F9 拆项（2026-11-23 实机 F9 从 ~500 跳到 ~2880 次/帧，当时只有总数、看不出是谁）。
+	-- 子项排他记账：F9d 装甲件发现 / F9i 身份轮询 / F9c 尸体定格 / F9s 物理同步；F9 本身是剩下的（时钟、门控、调度）。
+	roster_discover = Perf.wrap("F9d", roster_discover)
+	roster_identity = Perf.wrap("F9i", roster_identity)
+	physics_sync = Perf.wrap("F9s", physics_sync)
+	for _, name in ipairs({ "begin", "filter", "frame", "lifecycleObserve" }) do
+		CorpseFreeze[name] = Perf.wrap("F9c", CorpseFreeze[name])
+	end
 	independent_frame = Perf.wrap("F4", independent_frame)
 	apply_arm_pose_frame = Perf.wrap("F4", apply_arm_pose_frame)
 	sample_action_state = Perf.wrap("F5", sample_action_state)

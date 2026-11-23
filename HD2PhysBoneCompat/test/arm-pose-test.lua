@@ -1015,8 +1015,9 @@ do
 		if u == remote then remoteUpdates = remoteUpdates + 1 end
 		return update(w, u)
 	end
+	state.options.independentTeammates = false
 	render(4)
-	check("队友：默认关闭", remoteUpdates == 0)
+	check("队友：显式关闭时不更新", remoteUpdates == 0)
 	state.options.independentTeammates = true
 	render(8)
 	check("队友：远处每四帧更新一次且不写平移", remoteUpdates == 2
@@ -1290,8 +1291,10 @@ do
 	S.testLocal = nextAvatar
 	state.avatar, state.avatars = nextAvatar, { { unit = nextAvatar }, { unit = peer, cameraDistance = 16 } }
 	units, owners = { nextAvatar, replacement, peer, peerPiece }, { nextAvatar, peer }
+	opts.independentTeammates = false
 	tick(0.22)
-	check("E7：队友默认关，不建立原生挂接", peerPiece.links == nil)
+	check("E7：显式关队友时不建立原生挂接", peerPiece.links == nil)
+	opts.independentTeammates = nil   -- 2.1.66：默认开（IAS 对每个绑定的 avatar 都 retarget）
 	opts.independentTeammates = true
 	local near, far = 0, 0
 	for i = 0, 59 do
@@ -1308,6 +1311,28 @@ do
 		if remote.frame == state.frame and remote.correction.due then far = far + 1 end
 	end
 	check("E7：6 m 外沿用每四帧检查，60 fps 下最多每秒 15 次", far == 15)
+
+	-- P1（2026-11-23 实机：落地后站 T 字 ~20 s）：身份还没解出来（没有 role 1）时，IAS 照样对每个绑定的 avatar 每帧 retarget
+	-- （R:6860-7010，role 只喂物理类别 R:6975-6976）。本组：清掉网络身份，本人 / 队友都不该因为等身份而不被驱动。
+	S.GameSession.objects_owned_by = function() return {} end
+	S.GameSession.game_object_exists = function() return false end
+	Runtime.roster_.reset()
+	state.avatar, state.independent = nil, state.independent
+	state.avatars[2].cameraDistance = 0
+	replacement.links, peerPiece.links = replacement.links, peerPiece.links
+	local writes = 0
+	local rawSet = S.Unit.set_local_rotation
+	S.Unit.set_local_rotation = function(...) writes = writes + 1; return rawSet(...) end
+	Runtime.roster_.pollInterval = 1e9   -- 整段不再轮询身份：一直是"没解出来"
+	for i = 0, 11 do tick(3 + i/60) end
+	S.Unit.set_local_rotation = rawSet
+	check("P1：身份没解出来时本人没有 role 1，也没有本地独立骨状态", Runtime.roster_.role(nextAvatar) == 0 and state.independent == nil)
+	check("P1：身份没解出来时每个在场 avatar 仍被 retarget（本人与队友都有远端状态）",
+		state.independentRemotes[nextAvatar] ~= nil and state.independentRemotes[peer] ~= nil
+		and #state.independentRemotes[nextAvatar].pieces > 0 and #state.independentRemotes[peer].pieces > 0)
+	print(string.format("  INFO P1 两个 avatar（各 2 件、本人未解身份）12 帧：旋转写入 %d 次", writes))
+	check("P1：身份没解出来时旋转照常写入（不站 T 字）", writes > 0, writes)
+	Runtime.roster_.pollInterval = 0.25
 	Runtime.uninstall()
 	_G.io = savedIo
 end

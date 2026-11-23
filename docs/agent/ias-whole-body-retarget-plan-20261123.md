@@ -696,3 +696,17 @@ IAS 规则：unit 句柄只来自本回调的枚举、不跨帧（IAS `runtime.l
 1. `cz_root_offset` 按实例槽缓存（30 s 未读到即丢，`cz_prepare` 仍会重新断言根节点号）：IAS 的 offset 来自 retarget 本来就做的 authored_scene_node_offset，我们没有那一步，不缓存则采样帧每件多付 2 次，战斗峰值帧 955 > 947。缓存后峰值持平 947（首个采样帧会多 2 x 件数次一次性读取）。
 2. 死者撕裂估计（`cz_torn_estimate`）摊到连续几帧：先读一次 owner 的 core（≤10），再每帧至多 5 个关节（各 2 次），全读完才判 detached；之前一个桶内一帧 40 次，高于 IAS 此阶段每帧 10 次的 core。副作用：撕裂发现比以前晚约 4 帧（60 Hz 下约 67 ms）。这一项**没有 IAS 对应物**（IAS 的关节位置来自原生快照），属于非 IAS 的限额机制，请用户知悉。
 3. 更低的原因（不是缺陷）：我们的 set 只需 4 次引擎调用（Quaternion.from_elements + set_local_rotation + Vector3 + set_local_position），IAS 的 engine_quaternion 要 3 次；活人阶段我们在节流之前就返回，IAS 每帧都做 core 与 has_asm。
+
+## 25. P1 实机卡顿与 T 字（运行时 2.1.66）
+
+**证据**（`%LOCALAPPDATA%\hd2physbone.log`，运行时 2.1.65）：进任务后 `F9`（drive 里没归入子项的部分）从 ~500 次 / 1.1 ms 跳到 ~2880 次 / 7.1 ms 每帧，`maxFrameCalls` ≈ 20034；同时落地后站 T 字约 20 s（物理 f6144 挂上，`[独立骨] 清单 8 件` 到 f7498 才出现）。
+
+**F9 的根因**：尸体定格的活体采样。战前所有人 role 0，`CorpseFreeze.observe` 直接返回；进任务后本人 / 队友是 role 1/2，每个 0.25 s 桶对每个主人的每件护甲做一次整件 `capture`（每节点 `Unit.world_pose` + `Matrix4x4.to_elements` = 2 次调用）。实机形状 4 人 x 14 件 x ~180 节点 x 2 ≈ 20000 次，**全挤在桶翻转的那一帧**（平均 2880 = 20000 x 每 0.25 s 一帧 / 约 27 fps）。IAS 的同一读取（R:5602-5634）走 retarget 的 `explicit` 世界姿态（R:4705），几乎免费。
+复现（`perf-combat-test.lua` 的「P1 任务场景」，19000 unit、4 人 x 14 件 x 180 节点、30 fps）：改前 F9 = 3461 次 / 帧、峰值帧 20279（与实机 2880 / 20034 吻合）。
+
+**改动**（只改"谁在哪一帧采"，频率与新鲜度不变——铰接下落要求活体样本不老于 0.8 s，R:5981）：桶翻转后每帧只采**一个主人的整组**（桶号最旧的先；IAS 的活体缓存按整组发布，R:5862-5868，一组不能拆帧）。改后峰值帧 5087（= 一个主人的一组 5040），平均不变（2713 次 / 帧）。**平均没有降**：要降平均只能有 retarget 供给的姿态（我们的 retarget 不产出每节点世界姿态）或降采样频率（破坏 0.8 s 规则），这是遗留的一个决定。
+其余 F9 项（发现 ~430、身份 ~3）与 IAS 同量：发现是 IAS 的 60 帧 / 2 s 全量扫描（19000 unit）。
+
+**PERF 行**：补 F3 / F4p / F9 的逐 API 明细；F9 拆成 F9d（发现）/ F9i（身份）/ F9c（尸体定格）/ F9s（物理同步），F9 只剩时钟、门控、调度。
+
+**T 字**：独立骨（retarget）只给 role 1 的本人做，身份没解出来前 `unit == nil` ⇒ 直接 `release_all` 返回；队友默认关（`independentTeammates` 默认 off）。IAS 不等身份：对每个绑定的 avatar 每帧 retarget（R:6860-7010 `bind_unit` / `push_avatar`），role 只喂 `set_avatar_physics_class`（R:6975-6976）。现在：本人（role 1）走完整路径；其余每个在场 avatar（队友，或身份未解出来时的所有人）走"只写旋转"路径（20 Hz，6 m 外每 4 帧），默认开（`independentTeammates=0` 才关）。测试：`arm-pose-test.lua` 的 P1 组（清掉网络身份后本人与队友仍被 retarget、旋转照常写入）。
