@@ -126,6 +126,10 @@ public sealed class PhysBoneArmPoseTests
 		Assert.Equal("""profileHashes = { "0102030405060708", "aaaaaaaaaaaaaaaa" }""",
 			JointPoseData.ToLuaOptions(json, new HashSet<string> { "coat/on" }));
 		Assert.Equal("""profileHashes = { "0102030405060708" }""", JointPoseData.ToLuaOptions(json, new HashSet<string>()));
+		var declared = json.Replace("\"option\": \"coat/on\"", "\"option\": \"coat/on\", \"corpseEligible\": true, \"disabledBy\": \"coat/off\"");
+		Assert.Contains("""corpseProfiles = { ["aaaaaaaaaaaaaaaa"] = true }""",
+			JointPoseData.ToLuaOptions(declared, new HashSet<string> { "coat/on" }));
+		Assert.DoesNotContain("corpseProfiles", JointPoseData.ToLuaOptions(declared, new HashSet<string> { "coat/on", "coat/off" }));
 		// 与独立骨并存时 independentPieces 的语义不变。
 		var both = JointPoseData.ToLuaOptions("""
 			{

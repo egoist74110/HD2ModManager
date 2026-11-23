@@ -38,7 +38,10 @@ public static class JointPoseData
 		{
 			try
 			{
-				var hashes = ProfileHashes(profiles, activeOptions);
+				var eligible = new SortedSet<string>(StringComparer.Ordinal);
+				var hashes = ProfileHashes(profiles, activeOptions, eligible);
+				if (eligible.Count > 0)
+					parts.Add("corpseProfiles = { " + string.Join(", ", eligible.Select(hash => $"[\"{hash}\"] = true")) + " }");
 				if (hashes.Count > 0)
 					parts.Add("profileHashes = { " + string.Join(", ", hashes.Select(hash => $"\"{hash}\"")) + " }");
 			}
@@ -83,7 +86,7 @@ public static class JointPoseData
 	/// <summary>
 	/// <c>[{ "hash": "0123456789abcdef", "option": null | "coat/on" }, ...]</c>：基础件总是参与，选项件只在该选项启用时参与。
 	/// </summary>
-	private static List<string> ProfileHashes(JsonElement value, IReadOnlySet<string>? activeOptions)
+	private static List<string> ProfileHashes(JsonElement value, IReadOnlySet<string>? activeOptions, SortedSet<string> eligible)
 	{
 		if (value.ValueKind != JsonValueKind.Array)
 			throw new InvalidDataException($"{FileName} 的 profileHashes 必须是数组。");
@@ -97,6 +100,10 @@ public static class JointPoseData
 				&& activeOptions is not null && !activeOptions.Contains(option.GetString()!))
 				continue;
 			result.Add(hash);
+			if (item.TryGetProperty("corpseEligible", out var declared) && declared.ValueKind == JsonValueKind.True
+				&& !(item.TryGetProperty("disabledBy", out var disabled) && disabled.ValueKind == JsonValueKind.String
+					&& activeOptions?.Contains(disabled.GetString()!) == true))
+				eligible.Add(hash);
 		}
 		return [.. result];
 	}

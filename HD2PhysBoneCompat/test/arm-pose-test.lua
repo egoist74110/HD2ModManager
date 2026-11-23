@@ -1227,7 +1227,12 @@ do
 	check("E7：跟随帧由引擎更新，不刷新已挂件", not state.independent.correction.due
 		and refreshes == oldRefresh and math.abs(armor.worldPoses.l_thigh.p[1] - p) > 0.01)
 	check("E7：失败件继续走 E6 逐帧旋转", qangle(failed.locals.hips.q, avatar.locals.hips.q) < 1e-6)
+	state.corpseExplicit = {}
+	opts.corpseProfiles = { ["e700000000000001"] = true }
 	tick(0.04)
+	local emitted = state.corpseExplicit[armor].rows[armor.names.l_thigh+1]
+	check("P1 显式世界姿态取插值帧实际展示值", dist(emitted.p, armor.worldPoses.l_thigh.p)<1e-8
+		and qangle(emitted.q, armor.worldPoses.l_thigh.q)<1e-6)
 	local linkedPiece = state.independent.pieces[1]
 	check("E7：默认 30 Hz，步态在修正帧展示中点", state.independent.correction.due
 		and linkedPiece.link.pending ~= nil and dist(armor.locals.l_thigh.p, linkedPiece.link.rows[2].endpoint.p) > 1e-4)
@@ -1258,6 +1263,10 @@ do
 	opts.poseEveryFrame, opts.poseBlend = true, 1
 	tick(0.171)
 	check("E10：每帧修正绕过计时与展示插帧", state.independent.correction.due and not state.independent.correction.blend)
+	local expectedLocal = armor.locals.l_thigh.p
+	armor.locals.l_thigh.p = {expectedLocal[1]+0.005, expectedLocal[2], expectedLocal[3]}
+	tick(0.172)
+	check("P1 外部覆盖局部姿态后，同目标重新写入",dist(armor.locals.l_thigh.p,expectedLocal)<1e-7)
 	opts.poseEveryFrame = nil
 	S.testLocal = nextAvatar
 	state.avatar, state.avatars = nextAvatar, { { unit = nextAvatar } }
@@ -1365,6 +1374,13 @@ do
 		observed = armor.locals.hips.q
 	end, 0.04)
 	check("E7 物理：提前求解也先恢复精确终点", solved and qangle(observed, { 0, 0, math.sin(0.5), math.cos(0.5) }) < 1e-6)
+	session.iasPose = true
+	session.independentPresentation = {rows={ [node]=row }}
+	check("P1 F6 当前旋转等于目标时跳过", Compat.present_independent_physics(session,1)==0)
+	armor.locals.hips.q = {0,0,0,1}
+	session.independentPresentation = {rows={ [node]=row }}
+	check("P1 F6 动画重置后写回同一个终点", Compat.present_independent_physics(session,1)==1
+		and qangle(armor.locals.hips.q,observed)<1e-6)
 	Runtime.uninstall()
 end
 

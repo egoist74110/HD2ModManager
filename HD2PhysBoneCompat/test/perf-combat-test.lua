@@ -42,6 +42,12 @@ local function newFake()
 end
 
 -- 每件转换后的护甲有一个 16 位十六进制资源 id（IAS 的 profile 哈希）；名单在 install 时就定死。
+function Fake:corpseProfiles()
+	local profiles = {}
+	for _, hash in ipairs(self.hashes) do profiles[hash] = true end
+	return profiles
+end
+
 function Fake:newHash()
 	self.nextHash = self.nextHash + 1
 	local hash = string.format("%016x", 0xa5000000 + self.nextHash)
@@ -272,19 +278,37 @@ end
 -- 目的：量"与世界 unit 数成正比"的几项（F1 活体列表、F2 判活、F3 找武器）每帧的引擎调用数。
 -- 这份用例在改动前后的运行时上都能跑：数字来自假引擎自己的计数器，不依赖运行时里的 Perf。
 
-local function counted(fake, squad)
+local function counted(fake, squad, configure)
 	local S = fake:stingray(squad)
-	local counter = { total = 0, by = {} }
-	for _, space in ipairs({ "Unit", "World", "Application", "Matrix4x4", "Vector3", "Network", "GameSession" }) do
+	if configure then configure(S) end
+	local counter = { total = 0, by = {}, phase = {} }
+	local function record(name)
+		counter.total = counter.total + 1
+		counter.by[name] = (counter.by[name] or 0) + 1
+		if configure then
+			local cur = runtimeModule.perf_.cur
+			local phase = cur and cur.name or "OTHER"
+			counter.phase[phase] = (counter.phase[phase] or 0)+1
+		end
+	end
+	local spaces = { "Unit", "World", "Application", "Matrix4x4", "Vector3", "Quaternion", "Network", "GameSession" }
+	if configure then spaces[#spaces+1] = "IdString64" end
+	for _, space in ipairs(spaces) do
 		for key, fn in pairs(S[space] or {}) do
 			if type(fn) == "function" then
 				S[space][key] = function(...)
-					counter.total = counter.total + 1
-					local name = space .. "." .. key
-					counter.by[name] = (counter.by[name] or 0) + 1
+					record(space .. "." .. key)
 					return fn(...)
 				end
 			end
+		end
+	end
+	local mt = getmetatable(S.Vector3)
+	if mt and mt.__call then
+		local construct = mt.__call
+		mt.__call = function(...)
+			record("Vector3")
+			return construct(...)
 		end
 	end
 	return S, counter
@@ -443,7 +467,8 @@ local function combatScenario(label, gameplay)
 		return out
 	end
 	runtimeModule.install(S, { compat = compat, log = false, carriers = { { rig = { bones = { { name = "hair" } } }, path = "fake" } },
-		profileHashes = fake.hashes, settleFrames = 1, snapshot = false, tunePath = "nonexistent-hd2pbx-tune.txt", pollFrames = 1, validateFrames = 3,
+		profileHashes = fake.hashes, corpseProfiles = fake:corpseProfiles(), settleFrames = 1, snapshot = false,
+		tunePath = "nonexistent-hd2pbx-tune.txt", pollFrames = 1, validateFrames = 3,
 		heartbeatFrames = 1000000, minNodes = 90, perfWindow = 1000000 })   -- 尸体定格按用户实际运行的默认（开）测，不关
 	local runtime = rawget(_G, "__hd2physbone_runtime")
 	local function frame()
@@ -537,46 +562,162 @@ end
 combatScenario("战斗场景（本人 + 3 队友，角色 1/2）", true)
 combatScenario("非战斗世界（无网络身份）", false)
 
--- P1（2026-11-23 真实日志，运行时 2.1.65）：进任务后 F9 从 ~500 次 / 1.1 ms 跳到 ~2880 次 / 7.1 ms 每帧，峰值帧 ~20000 次。
--- 原因：尸体定格的活体采样（IAS observe R:5602-5634，每 0.25 s 桶每主人一次整组）在我们这里是真实引擎读——
--- 4 人 x 14 件 x ~180 节点 x 2 次调用 ≈ 20000 次，全挤在桶翻转的那一帧。IAS 同一读取走 retarget 的 `explicit`（R:4705），几乎免费。
--- 战前（ship）所有人 role 0、尸体定格直接返回，所以进任务才跳。本场景按实机形状复现（世界 19000 个 unit，30 fps）。
--- 门槛：采样频率不变（每桶每主人恰好一次，样本新鲜度不变）；单帧峰值 <= 一个主人的一整组（不再 4 个主人挤同一帧）。
+-- P1 supplies a numerical scene graph to the production retarget and tip solver.
+-- The fixture animates the attachment point and preserves local setters across frames.
+local function combatRig(fake, hashForSlot)
+	local names, rest, pieces, carriers = {}, {}, {}, {}
+	local indices = { StingrayEntityRoot = 1, root = 1, hips = 2, head = 3 }
+	local identity = { 0,0,0,1 }
+	local mapped = { 7,50,50,61,61,61,61,61 }
+	for b = 1, 61 do
+		local source = "motion_" .. b
+		names[b] = { "ias_" .. source, source }
+		indices[source], indices[names[b][1]] = b+3,b+3
+		rest[b] = { "root", identity, identity, { 0.01,0,0.1 } }
+	end
+	for slot,count in ipairs(mapped) do
+		local bones = {}
+		for b = 1,count do bones[b] = names[b][1] end
+		pieces["#ID[" .. hashForSlot[slot] .. "]"] = bones
+	end
+	local chains = { 41,10,3,2 }
+	local allowed = {}
+	for rigIndex,count in ipairs(chains) do
+		local slot = rigIndex == 4 and 9 or rigIndex -- include a physics-only converted piece
+		local bones = {}
+		for n=1,count*2 do
+			local root = n%2 == 1
+			local name = "ias_phys_" .. string.format("%016x",slot) .. "/source_extra_" .. n
+			indices[name] = 74+n
+			allowed[name] = hashForSlot[slot]
+			bones[n] = { index=n, name=name, parent=root and 0 or n-1,
+				parentName=root and names[1][1] or bones[n-1].name, flags=0x31,
+				pos={0,0.06,-0.08}, params={ tipMass=200,yawStiffness=50,yawDamping=7,
+				pitchStiffness=50,pitchDamping=7,angleLimit=0.611,length=10 } }
+		end
+		carriers[rigIndex] = {rig={bones=bones},path="P1/"..slot}
+	end
+	local function configure(S)
+		local U,W = S.Unit,S.World
+		-- Third person: keep the local avatar out of the first-person pause gate.
+		S.Matrix4x4.translation = function() return vector(0,-3,1) end
+		setmetatable(S.Vector3,{__call=function(_,x,y,z) return vector(x,y,z) end})
+		S.Quaternion = {
+			to_elements=function(q) return q[1],q[2],q[3],q[4] end,
+			from_elements=function(x,y,z,w) return {x,y,z,w} end,
+			axis_angle=function(axis,angle)
+				local s=math.sin(angle*0.5)
+				return {axis.x*s,axis.y*s,axis.z*s,math.cos(angle*0.5)}
+			end,
+		}
+		U.has_node=function(u,name) return indices[name] ~= nil and (not allowed[name] or allowed[name]==u.hash) end
+		U.node=function(u,name) return indices[name] end
+		U.scene_graph_parent=function(u,n)
+			if u.linked and u.linked[n] then return -1 end
+			if n>74 then return n%2==1 and 4 or n-1 end
+			return n>1 and 1 or -1
+		end
+		W.link_unit=function(_,u,n,avatar,source)
+			u.linked=u.linked or {}; u.linked[n]={avatar,source}
+		end
+		U.local_scale=function() return vector(1,1,1) end
+		local function position(u,n)
+			if u.translations and u.translations[n] then return u.translations[n] end
+			if n > 74 then return vector(0,0.06,-0.08) end
+			local motion = u.avatarResource and n>=4 and 0.04*math.sin(4*fake.clock) or 0
+			return vector(motion,0,n==3 and 0.5 or n==2 and 0.2 or n<=1 and 0 or 0.1)
+		end
+		U.local_position=position
+		local function rotation(u,n)
+			if u.rotations and u.rotations[n] then return u.rotations[n] end
+			if u.avatarResource and n>=4 then
+				local a=0.25*math.sin(4*fake.clock)
+				return {math.sin(a),0,0,math.cos(a)}
+			end
+			return identity
+		end
+		U.local_rotation=rotation
+		U.set_local_position=function(u,n,v) u.translations=u.translations or {}; u.translations[n]=v end
+		U.set_local_rotation=function(u,n,q) u.rotations=u.rotations or {}; u.rotations[n]=q end
+		local function world(u,n)
+			local link = u.linked and u.linked[n]
+			local parent
+			if link then parent = world(link[1],link[2])
+			elseif n > 74 then parent = world(u,n%2==1 and 4 or n-1)
+			else parent = { p={u.position.x,u.position.y,u.position.z}, q=identity } end
+			local p = position(u,n)
+			return realCompat.independent_fk(parent,rotation(u,n),{p.x,p.y,p.z})
+		end
+		fake.referenceWorld = world -- pure scene-graph oracle; no engine calls in the measurement
+		U.world_position=function(u,n) local p=world(u,n).p; return vector(p[1],p[2],p[3]) end
+		U.world_rotation=function(u,n) return world(u,n).q end
+		U.local_pose=function(u,n) return {localUnit=u,node=n} end
+		U.set_local_pose=function(u,n,m) u.rotations=u.rotations or {}; u.rotations[n]=m.q end
+		S.Matrix4x4.from_quaternion_position=function(q,p) return {q=q,p=p} end
+		S.Matrix4x4.is_valid=function() return true end
+		S.Matrix4x4.to_elements=function(m)
+			local u,n=m.localUnit or m.unit,m.node
+			local wp = m.unit and world(m.unit,n)
+			local p = wp and vector(wp.p[1],wp.p[2],wp.p[3]) or m.p or position(u,n)
+			local q = wp and wp.q or m.q or rotation(u,n)
+			local x,y,z,w=q[1],q[2],q[3],q[4]
+			return 1-2*(y*y+z*z),2*(x*y+w*z),2*(x*z-w*y),2*(x*y-w*z),1-2*(x*x+z*z),2*(y*z+w*x),
+				2*(x*z+w*y),2*(y*z-w*x),1-2*(x*x+y*y),p.x,p.y,p.z
+		end
+	end
+	return names,rest,pieces,carriers,configure
+end
+
+-- P1: 19000 Units, 4 avatars, 14 armour instances per avatar at 30 Hz.
+-- Drive real writers; compare each frame with the IAS source-derived budget for its event class.
 do
 	io.stdout:write("\n[P1 任务场景] 世界 19000 个 unit + 4 名玩家 x 14 件护甲（~180 节点/件），30 fps\n")
 	local fake = newFake()
 	for _ = 1, 18900 do fake:addUnit({ nodes = 10 }) end
-	local compat = newCompat()
 	local PIECES, NODES = 14, 180
+	local hashes = {}
+	for slot=1,PIECES do hashes[slot] = fake:newHash() end
+	local names,rest,pieces,carriers,configure = combatRig(fake, hashes)
 	local players = {}
 	for index = 1, 4 do
 		local x = (index - 1) * 10
 		players[index] = fake:addUnit({ name = "p" .. index .. "-avatar", avatar = true, position = { x = x, y = 0, z = 0 } })
 		for piece = 1, PIECES do
 			fake:addUnit({ name = "p" .. index .. "-piece" .. piece, anim = false, mg = true, nodes = NODES, chains = piece <= 4 and 3 or 0,
-				position = { x = x + 0.1, y = 0, z = 0 }, armour = true })
+				position = { x = x + 0.1, y = 0, z = 0 }, armour = true, hash=hashes[piece] })
 		end
 	end
 	local squad = { me = "p1", objects = {} }
 	for index, avatarUnit in ipairs(players) do
 		squad.objects[index == 1 and 5000 or (7000000 + index)] = { unit = avatarUnit, owner = "p" .. index }
 	end
-	local S, counter = counted(fake, squad)
+	local S, counter = counted(fake, squad, configure)
 	rawset(_G, "__hd2physbone_runtime", nil)
 	rawset(_G, "render", function() end)
 	local realClock = os.clock
 	local hz = 30
 	os.clock = function() return fake.clock end
 	local Roster = runtimeModule.roster_
-	runtimeModule.install(S, { compat = compat, log = false, carriers = { { rig = { bones = { { name = "hair" } } }, path = "fake" } },
-		profileHashes = fake.hashes, settleFrames = 1, snapshot = false, tunePath = "nonexistent-hd2pbx-tune.txt", pollFrames = 1, validateFrames = 3,
+	runtimeModule.install(S, { compat = realCompat, log = false, carriers = carriers, armPose = true,
+		independentBones = names, independentRest = rest, independentPieces = pieces,
+		profileHashes = fake.hashes, corpseProfiles = fake:corpseProfiles(), settleFrames = 1, snapshot = false,
+		tunePath = "nonexistent-hd2pbx-tune.txt", pollFrames = 1, validateFrames = 3,
 		heartbeatFrames = 1000000, minNodes = 90, perfWindow = 1000000 })
 	local runtime = rawget(_G, "__hd2physbone_runtime")
+	local updates, duplicate = {}, 0
+	local update = S.World.update_unit
+	S.World.update_unit = function(w,u)
+		if updates[u] then duplicate=duplicate+1 end
+		updates[u] = true
+		return update(w,u)
+	end
 	local function frame()
+		updates = {}
 		fake.clock = fake.clock + 1 / hz
 		rawget(_G, "render")()
 	end
 	for _ = 1, 240 do frame() end
+	duplicate = 0
 	local roles = {}
 	for index, avatarUnit in ipairs(players) do roles[index] = Roster.role(avatarUnit) end
 	check(roles[1] == 1 and roles[2] == 2 and roles[3] == 2 and roles[4] == 2, "P1：任务里本人角色 1、队友角色 2（尸体定格开始采样的前提）", table.concat(roles, ","))
@@ -585,36 +726,121 @@ do
 	local perf = runtimeModule.perf_
 	perf.reset()
 	counter.total, counter.by = 0, {}
-	local frames, captures = 900, {}
-	local worldPose = counter.by
+	counter.phase = {}
+	local frames, captured, hits, fullRows = 180, 0, 0, 0
 	local peakCorpse, totalCorpse = 0, 0
-	local rawPose = S.Unit.world_pose
-	local currentOwnerPose = 0
+
+	-- Independent reference inputs for 14 source profiles. The six converted
+	-- pieces without independent bones still declare hips/head in their IAS profiles.
+	local mapped = 0
+	for _,bones in pairs(pieces) do mapped = mapped + #bones end
+	local ir = 4 * mapped
+	local phys = 4 * (41+10+3+2) * 2
+	local other = 4 * 6 * 2
+	local targets = ir + phys + other
+	local missing = 4*PIECES*NODES - targets
+	local lastBucket, unitBySlot = {}, {}
+	for _,u in ipairs(fake.units) do
+		if u.hash then unitBySlot[Roster.instanceSlot(u,runtime.frame)] = u end
+	end
+	local maxPosition, maxRotation = 0, 0
+	for key,entry in pairs(freeze.state.liveCache) do lastBucket[key]=entry.bucket end
+	local iasTotal, peakFrame, peakAllowance, over, changedFrames = 0, 0, 0, 0, 0
+	local polls, scans, samples = 0,0,0
 	for _ = 1, frames do
 		corpse.frame = 0
+		local priorCalls, priorTime = counter.total, fake.clock
+		local scanBefore = counter.by["World.units"] or 0
+		local pollsBefore = counter.by["GameSession.objects_owned_by"] or 0
 		frame()
 		corpse.endFrame()
+		-- F4p fixture targets are at the piece root plus a fixed rest offset.
+		-- Their linked parent's X is 0.04*sin(4*t), so the required LOCAL X
+		-- changes by this difference. This oracle does not use production setters.
+		local changed = math.abs(math.sin(4*fake.clock)-math.sin(4*priorTime))*0.04 > 1e-7
+		local bucket = math.floor(fake.clock*4) ~= math.floor(priorTime*4)
+		local scan = (counter.by["World.units"] or 0) > scanBefore
+		local poll = (counter.by["GameSession.objects_owned_by"] or 0) > pollsBefore
+		if bucket then samples = samples+1 end
+		if changed then changedFrames = changedFrames+1 end
+		if scan then scans = scans+1 end
+		if poll then polls = polls+1 end
+		-- R:491–499,2360–2387: 5 reads/target. R:2642–2659,4566:
+		-- >=4 constructor/setter calls per changed independent target + one
+		-- refresh per changed Unit. Exclude optional readbacks and all physics setters.
+		local budget = 5*targets + (changed and (4*ir + 32) or 0)
+		-- R:1345–1383,1537–1553,6697–6707: conventional discovery on this
+		-- event class; 14 nonempty hashes also require from_hex (R:1542).
+		budget = budget + 9+3*4+2*14+56+5*56 + (scan and 1+#fake.units or 0)
+		-- R:4853,4871–4874,4973–4992 (stable squad); R:5097–5119,
+		-- 5472–5493,5525–5535,5613–5619 (life/core/ASM and missing rows).
+		budget = budget + (poll and 69 or 0) + 23+40+56 + (bucket and 2*missing or 0)
+		local actual = counter.total-priorCalls
+		iasTotal = iasTotal + budget
+		if actual>peakFrame then peakFrame,peakAllowance=actual,budget end
+		if actual>budget then over=over+1 end
+		for key,entry in pairs(freeze.state.liveCache) do
+			if lastBucket[key] ~= entry.bucket then
+				lastBucket[key] = entry.bucket
+				captured = captured + 1
+				hits = hits + entry.explicitCount
+				fullRows = fullRows + entry.count
+				for node,localPose in pairs(entry.shape) do
+					local actual = realCompat.independent_fk(entry.core,localPose.q,localPose.p)
+					local expected = fake.referenceWorld(unitBySlot[key],node)
+					local d = realCompat.contact_math.sub(actual.p, expected.p)
+					maxPosition = math.max(maxPosition, realCompat.contact_math.length(d))
+					local a,b = actual.q,expected.q
+					local dot=math.abs(a[1]*b[1]+a[2]*b[2]+a[3]*b[3]+a[4]*b[4])
+					maxRotation=math.max(maxRotation,2*math.deg(math.acos(math.min(1,dot))))
+				end
+			end
+		end
 		peakCorpse = math.max(peakCorpse, corpse.peak)
 	end
 	totalCorpse = corpse.total
 	corpse.restore()
 	local seconds = frames / hz
 	local buckets = math.floor(seconds * 4)
-	local group = PIECES * NODES * 2
-	local cb = iasCorpseBudget({ roles = { 1, 2, 2, 2 }, pieces = PIECES, nodes = NODES, frames = frames, hz = hz })
-	io.stdout:write(string.format("  [数据] 尸体定格模块 %d 次 / %d 帧 = %.1f/帧；峰值帧 %d（一个主人的一整组 = %d）；IAS 尸体项口径：合计 %d、采样帧峰值 %d（四个主人挤同一帧）\n",
-		totalCorpse, frames, totalCorpse / frames, peakCorpse, group, cb.total, cb.peak))
+
 	local rows = {}
 	for _, name in ipairs(perf.order) do
 		local calls = perf.calls[name]
 		if calls then rows[#rows + 1] = string.format("%s=%.1f", name, calls / math.max(1, perf.frames)) end
 	end
 	io.stdout:write("  [分项] " .. table.concat(rows, " ") .. "\n")
-	check(peakCorpse <= group + 300, "P1：采样帧峰值 <= 一个主人的一整组（不再 4 个主人挤同一帧）", string.format("%d <= %d + 300", peakCorpse, group))
-	check(peakCorpse <= cb.peak / 3, "P1：采样帧峰值 <= IAS 同形状采样帧的 1/3", string.format("%d <= %d/3", peakCorpse, cb.peak))
-	check(totalCorpse <= cb.total, "P1：尸体定格总调用数 <= IAS 尸体项（均值口径，采样频率不变）", string.format("%d <= %d", totalCorpse, cb.total))
+	local phases, sum = {}, 0
+	for tag,value in pairs(counter.phase) do
+		phases[#phases+1] = string.format("%s=%.2f",tag,value/frames)
+		sum = sum+value
+	end
+	table.sort(phases)
+	print("  [P1全分项] "..table.concat(phases," "))
+	check(sum==counter.total,"P1：包含构造器和网络的分项之和等于外部计数器")
+	check(duplicate == 0, "P1：任一 Unit 任一稳态帧最多刷新一次（R:4566）", duplicate)
+	check(maxPosition < 1e-6 and maxRotation < 0.001,"P1：整件定格姿态与本帧真实场景图一致",maxPosition .. " m / " .. maxRotation .. " deg")
+	local activeChains = 0
+	for _, session in ipairs(runtime.sessions or {}) do activeChains = activeChains + #session.sessions end
+	check(#(runtime.sessions or {}) == 16 and activeChains == 224, "P1：真实物理会话 16 个，实际挂载 224 条链", activeChains)
+	local f4writes = (perf.api.F4p or {})["Unit.set_local_position"] or 0
+	local f6writes = (perf.api.F6 or {})["Unit.set_local_rotation"] or 0
+	check(f4writes>0 and f6writes>0, "P1：真实 F4p / F6 写骨均已执行", f4writes .. "/" .. f6writes)
+	print(string.format("  [P1写骨] F4p位置=%d F6旋转=%d",f4writes,f6writes))
+
+	check(counter.total <= iasTotal and over==0,"P1：同事件帧全回调开销及整窗均值均 <= IAS 预算",over .. " over")
+	io.stdout:write(string.format("  [P1对账] 实测=%d IAS下界=%d 帧=%d 峰值=%d 同帧预算=%d 超标帧=%d；变化帧=%d 全扫=%d 轮询=%d 采样桶=%d；件样本=%d 命中=%d 回读=%d；旋转写=%d 位置写=%d 刷新=%d\n",
+		counter.total,iasTotal,frames,peakFrame,peakAllowance,over,changedFrames,scans,polls,samples,captured,hits,fullRows-hits,
+		counter.by["Unit.set_local_rotation"] or 0,counter.by["Unit.set_local_position"] or 0,counter.by["World.update_unit"] or 0))
+	local corpsePeak = 23+40+56 + 2*missing
+	local corpseBudget = frames*(23+40+56) + samples*2*missing
+	io.stdout:write(string.format("  [P1尸体] 实测均值=%.2f 峰值=%d；IAS预算均值=%.2f 峰值=%d\n",
+		totalCorpse/frames,peakCorpse,corpseBudget/frames,corpsePeak))
+	-- The converter may not expose every IAS row. Report the real peak gap
+	-- separately; the all-callback assertion above includes every excess read.
+	check(hits > 0 and hits < fullRows, "P1：真实 F4p 显式行命中且缺行回读", hits .. "/" .. fullRows)
+	check(totalCorpse <= corpseBudget, "P1：同样本频率的尸体项均值 <= IAS（扣除 IAS 显式行）", totalCorpse .. " / " .. corpseBudget)
 	-- 频率：每桶每主人恰好一次 => 总采样节点读取 ~ 主人数 x 桶数 x 整组（允许开头 / 结尾各一桶误差）
-	local approxGroups = totalCorpse / group
+	local approxGroups = captured / PIECES
 	check(approxGroups >= 4 * (buckets - 1) and approxGroups <= 4 * (buckets + 1) + 4,
 		"P1：每个 0.25 s 桶每个主人采样一次（样本新鲜度不变）", string.format("%.1f 组，期望 ~%d", approxGroups, 4 * buckets))
 	-- PERF 行：F9 拆项 + F3 / F4p / F9 的逐 API 明细

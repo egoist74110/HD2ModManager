@@ -556,13 +556,16 @@ public sealed class IasConversionTests
 	{
 		using var document = JsonDocument.Parse(IasDp8Converter.SerializeIndependentBones([], profiles:
 		[
-			("bbbbbbbbbbbbbbbb", "coat/on"), ("aaaaaaaaaaaaaaaa", null), ("bbbbbbbbbbbbbbbb", null),
+			new("bbbbbbbbbbbbbbbb", "coat/on", true, "coat/off"), new("aaaaaaaaaaaaaaaa", null, false), new("bbbbbbbbbbbbbbbb", null, true),
 		]));
 		var items = document.RootElement.GetProperty("profileHashes");
 		Assert.Equal(3, items.GetArrayLength());
 		Assert.Equal("aaaaaaaaaaaaaaaa", items[0].GetProperty("hash").GetString());
 		Assert.Equal("bbbbbbbbbbbbbbbb", items[1].GetProperty("hash").GetString());
 		Assert.Equal("coat/on", items[2].GetProperty("option").GetString());
+		Assert.False(items[0].GetProperty("corpseEligible").GetBoolean());
+		Assert.True(items[2].GetProperty("corpseEligible").GetBoolean());
+		Assert.Equal("coat/off", items[2].GetProperty("disabledBy").GetString());
 	}
 
 	[Fact]

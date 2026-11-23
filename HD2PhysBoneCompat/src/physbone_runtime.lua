@@ -116,7 +116,8 @@ local M = {}
 --        ② PERF 行补 F3 / F4p / F9 的逐 API 明细，F9 拆成 F9d 发现 / F9i 身份 / F9c 尸体 / F9s 物理同步。
 --        ③ 独立骨（retarget）不再等本人身份：IAS 对每个绑定的 avatar 每帧 retarget（R:6860-7010，role 只喂物理类别），
 --        我们原来只给 role 1 的本人做、队友默认关 ⇒ 身份没解出来前站 T 字、队友永远 T 字。
-M.VERSION = "2.1.66"
+-- 2.1.67：IAS profile 定格资格、显式与缺行采样、同帧写骨比较和合并刷新（规划 §26）。
+M.VERSION = "2.1.67"
 
 --- 安装标记用的全局键。只写这一个全局，且值就是模块本身（便于外部检查是否已装）。
 local INSTALL_KEY = "__hd2physbone_runtime"
@@ -4145,6 +4146,8 @@ function IndependentLink.restore(state, piece, layoutChanged)
 end
 
 function IndependentLink.fail(runtime, state, piece, reason)
+	if runtime.iasCommits then runtime.iasCommits[piece.unit] = nil end
+	if runtime.corpseExplicit then runtime.corpseExplicit[piece.unit] = false end
 	local restored = IndependentLink.restore(state, piece)
 	if not piece.linkFailed then
 		runtime.logger("[physbone][独立骨][警告][挂接回退] %s %s%s", piece.tag, tostring(reason),
@@ -4196,8 +4199,7 @@ function IndependentLink.attach(runtime, state, piece)
 			assert(called and result ~= false, "link_unit " .. state.list[b][1])
 			assert(parent ~= row.parent and (parent == nil or parent == -1 or parent == 0),
 				"原父节点仍在 " .. state.list[b][1])
-			row.q = Compat.independent_quaternion(S.Quaternion.to_elements(U.local_rotation(unit, node)))
-			assert(row.q, "挂接局部旋转")
+			assert(Compat.independent_quaternion(S.Quaternion.to_elements(U.local_rotation(unit, node))), "挂接局部旋转")
 		end
 	end)
 	if not ok then
@@ -4214,37 +4216,55 @@ function IndependentLink.same(a, b, rotation)
 		and math.abs(a[3]-sign*b[3]) <= 1e-6 and (not rotation or math.abs(a[4]-sign*b[4]) <= 1e-6)
 end
 
-function IndependentLink.write(state, piece, values, objects)
-	local written, calls = 0, 0
-	for b, value in pairs(values) do
-		local row, node = piece.link.rows[b], piece.nodes[b]
-		local p, q = value.p, value.q
-		if not IndependentLink.same(p, row.p) then
-			local cached = objects[b] or {}
-			if not IndependentLink.same(p, cached.p) then
-				cached.p, cached.vector = p, S.Vector3(p[1], p[2], p[3])
-				calls = calls + 1
-				objects[b] = cached
+-- R:4560–4568: a successful Unit commit publishes all local changes together.
+function IndependentLink.refresh(runtime, world, unit)
+	local commits = runtime.iasCommits
+	if commits then
+		local group = commits[unit]
+		if not group then group = { rows = {}, before = {}, world = world }; commits[unit] = group end
+		group.dirty = true
+		return 0
+	end
+	assert(S.World.update_unit(world, unit) ~= false, "pose update")
+	return 1
+end
+
+function IndependentLink.flush(runtime)
+	local commits = runtime.iasCommits
+	runtime.iasCommits = nil
+	for unit, group in pairs(commits or {}) do
+		local ok, result = true, true
+		if group.dirty and not group.failed then ok, result = pcall(S.World.update_unit, group.world, unit) end
+		if group.failed or not ok or result == false then
+			-- IAS R:4556–4569: never publish a partly committed Unit.
+			if runtime.corpseExplicit then runtime.corpseExplicit[unit] = false end
+			local restored = true
+			for node, before in pairs(group.before or {}) do
+				local q = Compat.write_independent_rotation(S, unit, node, before.q, true)
+				local p = Compat.write_independent_position(S, unit, node, before.p, 1)
+				restored = restored and q and p
 			end
-			assert(cached.vector, "offset vector")
-			assert(S.Unit.set_local_position(piece.unit, node, cached.vector) ~= false, "offset position")
-			row.p, written, calls = p, written + 1, calls + 1
-		end
-		if not IndependentLink.same(q, row.q, true) then
-			local cached = objects[b] or {}
-			if not IndependentLink.same(q, cached.q, true) then
-				local cost
-				cached.rotation, cost = Compat.independent_rotation_object(S, q, true)
-				calls = calls + cost
-				cached.q, objects[b] = q, cached
-			end
-			assert(cached.rotation and S.Unit.set_local_rotation(piece.unit, node, cached.rotation) ~= false, "offset rotation")
-			row.q, written, calls = q, written + 1, calls + 1
+			local updated, value = pcall(S.World.update_unit, group.world, unit)
+			runtime.logger("[physbone][错误] Unit pose commit failed; rollback=%s", tostring(restored and updated and value ~= false))
 		end
 	end
-	if written > 0 then
-		assert(S.World.update_unit(state.world, piece.unit) ~= false, "offset update")
-		calls = calls + 1
+end
+
+function IndependentLink.write(state, piece, values, group)
+	local written, calls = 0, 0
+	for b, value in pairs(values) do
+		local node = piece.nodes[b]
+		local before, cost = Compat.contact_math.local_pose(S, piece.unit, node)
+		calls = calls + cost
+		assert(before, "missing current local pose")
+		if not Compat.contact_math.unchanged(before, value.q, value.p) then
+			if group then group.before[node] = group.before[node] or before end
+			local ok, qcost = Compat.write_independent_rotation(S, piece.unit, node, value.q, true)
+			assert(ok, "offset rotation")
+			local positioned, pcost = Compat.write_independent_position(S, piece.unit, node, value.p, 1)
+			assert(positioned, "offset position")
+			written, calls = written + 2, calls + qcost + pcost
+		end
 	end
 	return written, calls
 end
@@ -4521,11 +4541,26 @@ end
 
 function IndependentLink.present(runtime, state, piece, due, now, blend, sample, vectors, readPose)
 	local link = piece.link
-	if link.pending and (due or not blend or now + (runtime.dt or 0)*0.5 + 1e-6 >= link.finishAt) then
-		local n, cost = IndependentLink.write(state, piece, link.pending, vectors.finish)
+	local group
+	if runtime.iasCommits then
+		group = { world = state.world, rows = {}, before = {} }
+		runtime.iasCommits[piece.unit] = group
+	end
+	if due then link.pending = nil end -- the new display supersedes the old interpolation endpoint
+	if link.pending and (not blend or now + (runtime.dt or 0)*0.5 + 1e-6 >= link.finishAt) then
+		local values = link.pending
+		local n, cost = IndependentLink.write(state, piece, values, group)
 		link.pending = nil
-		if not due then return n, cost end
-		vectors.written, vectors.calls = vectors.written + n, vectors.calls + cost
+		local rows = {}
+		for b, value in pairs(values) do
+			rows[piece.nodes[b]+1] = Compat.independent_fk(sample(b).world, value.q, value.p)
+		end
+		if group then group.rows = rows end
+		if runtime.corpseExplicit and runtime.options.corpseProfiles[piece.hash] then
+			runtime.corpseExplicit[piece.unit] = { owner = state.avatar, rows = rows }
+		end
+		if n > 0 then cost = cost + IndependentLink.refresh(runtime, state.world, piece.unit) end
+		return n, cost
 	end
 	if not due then return 0, 0 end
 
@@ -4552,8 +4587,20 @@ function IndependentLink.present(runtime, state, piece, due, now, blend, sample,
 	end
 	link.pending = next(pending) and pending or nil
 	link.finishAt = (now + state.nextCorrection)*0.5
-	local written, calls = IndependentLink.write(state, piece, display, vectors.display)
+	local written, calls = IndependentLink.write(state, piece, display, group)
+	local rows = {}
+	for b, value in pairs(display) do
+		local pose = not pending[b] and fk[b] or Compat.independent_fk(sample(b).world, value.q, value.p)
+		rows[piece.nodes[b] + 1] = pose
+	end
+	if group then group.rows = rows end
 	local count, cost = IndependentLink.present_clothing(runtime, state, piece, fk)
+	if written + count > 0 then calls = calls + IndependentLink.refresh(runtime, state.world, piece.unit) end
+	-- IAS R:2384,4707: publish callback-local world poses after the successful write.
+	-- Blend frames display an intermediate local correction under the linked avatar node.
+	if runtime.corpseExplicit and runtime.options.corpseProfiles[piece.hash] then
+		runtime.corpseExplicit[piece.unit] = { owner = state.avatar, rows = rows }
+	end
 	return written + count, calls + cost
 end
 
@@ -4611,7 +4658,10 @@ function IndependentLink.present_clothing(runtime, state, piece, solved)
 		if poses[name] == nil then
 			local node = safe_node(S, piece.unit, name)
 			local pose = solved and solved[piece.link.byNode[node]]
-			if not pose and node then
+			local group = runtime.iasCommits and runtime.iasCommits[piece.unit]
+			if group and node then
+				pose = Compat.contact_math.projected(S, piece.unit, node, group.rows, piece.nodeCount)
+			elseif not pose and node then
 				local cost
 				pose, cost = Compat.independent_world_pose(S, piece.unit, node)
 				calls = calls + cost
@@ -4650,14 +4700,30 @@ function IndependentLink.present_clothing(runtime, state, piece, solved)
 		end
 	end
 	for _, row in ipairs(desired) do
-		local ok, cost = Compat.write_independent_rotation(S, piece.unit, row[1], row[2], true)
-		calls = calls + cost
-		if ok then written = written + 1 end
+		local node, rotation = row[1], row[2]
+		local before, reads = Compat.contact_math.local_pose(S, piece.unit, node)
+		calls = calls + reads
+		if before and not Compat.contact_math.unchanged(before, rotation) then
+			local group = runtime.iasCommits and runtime.iasCommits[piece.unit]
+			local parentWorld
+			if group then
+				group.before[node] = group.before[node] or before
+				-- IAS R:2191–2214,4291–4317: retain the world result for downstream drivers.
+				local current = Compat.contact_math.projected(S, piece.unit, node, group.rows, piece.nodeCount)
+				if current then
+					local inverse = Compat.contact_math.inverse(before)
+					parentWorld = Compat.independent_fk(current, inverse.q, inverse.p)
+				end
+			end
+			local ok, cost = Compat.write_independent_rotation(S, piece.unit, node, rotation, true)
+			calls = calls + cost
+			if ok then
+				written = written + 1
+				if group then group.rows[node+1] = parentWorld and Compat.independent_fk(parentWorld, rotation, before.p) end
+			elseif group then group.failed = true end
+		end
 	end
-	if written > 0 then
-		try(S.World.update_unit, state.world, piece.unit)
-		calls = calls + 1
-	end
+	if written > 0 and not solved then calls = calls + IndependentLink.refresh(runtime, state.world, piece.unit) end
 	return written, calls
 end
 
@@ -4760,7 +4826,7 @@ local function independent_scan(runtime, state, avatar, world, list)
 					end
 					if complete and #bones > 0 then
 						local piece = { unit = unit, nodes = nodes, bones = bones, wrists = {}, parents = {},
-							tag = tag, slot = slot, translations = {}, bind = {} }
+							hash = row.hash, nodeCount = row.nodes, tag = tag, slot = slot, translations = {}, bind = {} }
 						local translations = options.independentTranslations and options.independentTranslations[tag]
 						piece.bodyBind = translations ~= nil
 						for _, b in ipairs(bones) do
@@ -4904,7 +4970,8 @@ local function independent_frame(runtime, avatar, world, list, state, remote)
 
 	local hz = tonumber(tune.poseHz or runtime.options.poseHz) or 30
 	if hz ~= hz then hz = 30 end
-	local everyFrame = not remote and runtime.options.poseEveryFrame == true
+	-- IAS R:7015–7019 prepares every bound avatar on every successful callback.
+	local everyFrame = runtime.options.profileHashes ~= nil or (not remote and runtime.options.poseEveryFrame == true)
 	local period = 1 / (remote and 20 or math.max(15, math.min(60, hz)))
 	local blendOption = tune.poseBlend
 	if blendOption == nil then blendOption = runtime.options.poseBlend end
@@ -4977,7 +5044,7 @@ local function independent_frame(runtime, avatar, world, list, state, remote)
 		end
 	end
 	local samples, sourceWorlds = {}, {}
-	local vectors = { finish = {}, display = {}, calls = 0, written = 0 }
+	local vectors = { calls = 0, written = 0 }
 	local function sample(b, position)
 		local node = state.sources[b]
 		local cached = samples[b]
@@ -5373,7 +5440,7 @@ local function apply_arm_pose_frame(runtime)
 					if owner.unit ~= unit then
 						index = index + 1
 						local distance = distances[owner.unit] or math.huge
-						local stride = distance <= metres * metres and 1 or 4
+						local stride = (runtime.options.profileHashes ~= nil or distance <= metres * metres) and 1 or 4
 						local remote = remoteStates[owner.unit]
 						remoteStates[owner.unit] = nil
 						if (frame + index) % stride == 0 then
@@ -5437,7 +5504,7 @@ CorpseFreeze.enabled, CorpseFreeze.active = false, false
 local cf = {
 	frozen = {}, clones = {}, liveCache = {}, livePending = {}, logged = {}, failed = {}, errors = {},
 	pending = {}, cores = {}, tornCache = {}, tornCore = {}, tornBudget = 0, jointCache = {}, offsetCache = {}, stopped = {},
-	tick = 0, now = 0, created = 0, runtime = nil, sampleTried = {},
+	tick = 0, now = 0, created = 0, runtime = nil,
 }
 CorpseFreeze.state = cf   -- 仅测试读取
 
@@ -5537,8 +5604,11 @@ function CorpseFreeze.report(kind, err)   -- IAS R:5442-5449：同类错误 5 s 
 end
 
 --- IAS `eligible`（R:5451-5457）要求 profile 声明了性别 / authored / active / 非 observe_only。
---- 我们的 profile 表就是转换器写出的 profileHashes，没有这些标志位 ⇒ 名单内的件一律合格（见交接文档）。
-local function cz_eligible(b) return type(b) == "table" and type(b.hash) == "string" and #b.hash > 0 end
+--- 转换与部署已按原始 flags、节点 authored 位和启用的路由筛选。旧包没有声明。
+local function cz_eligible(b)
+	local profiles = cf.runtime and cf.runtime.options.corpseProfiles
+	return profiles and b and profiles[b.hash] == true and not b.pose_only
+end
 
 local function cz_available()   -- IAS R:5461-5470（去掉原生 ABI 一项）
 	for _, name in ipairs({ 'spawn_unit', 'destroy_unit', 'unlink_unit', 'update_unit' }) do
@@ -5602,17 +5672,17 @@ end
 
 --- IAS `capture`（R:5528-5544）：整件每个节点相对 hips 的姿态。
 local function cz_capture(unit, count, offset, c, explicit)
-	local rows = {}
+	local rows, hits = {}, 0
 	for n = offset, count - 1 + offset do
 		local chosen = explicit and explicit[n + 1]
 		local q, p
-		if chosen then q, p = chosen.q, chosen.p else q, p = cz_world_pose(unit, n) end
+		if chosen then q, p, hits = chosen.q, chosen.p, hits + 1 else q, p = cz_world_pose(unit, n) end
 		if not q or not p then return nil end
 		q, p = CZ.relative_pose(c.q, c.p, q, p)
 		if not q or not p then return nil end
 		rows[n] = { q = { q[1], q[2], q[3], q[4] }, p = { p[1], p[2], p[3] } }
 	end
-	return rows
+	return rows, hits
 end
 
 --- StingrayEntityRoot 节点号（IAS 的 node_offset，只可能是 0 或 1，R:5638-5639）。
@@ -5674,11 +5744,7 @@ end
 --- 把一个桶的读取摊到连续几帧：每帧最多 CZ_TORN_BUDGET 次调用（= 10）——先读一次 owner 的 core（≤10，同帧已缓存则免费），
 --- 之后每帧最多 5 个关节（各 2 次）；全部读完才判 detached（用 core 那一帧的 hips 位置，几帧内位移远小于 3.5 m 的判据）。
 local CZ_TORN_BUDGET = 10
--- 活体采样的分帧。IAS 每个 0.25 s 桶对每个主人采一次，读的是 retarget 已算好的 `explicit` 世界姿态（R:4705），几乎免费；
--- 我们的采样是真实引擎读（每节点 2 次调用）。实机一个桶里把 4 人 x 14 件全读完 ≈ 20000 次调用 ⇒ 每 0.25 s 一帧卡 ~50 ms。
--- 频率不能降：铰接下落要求活体样本不老于 0.8 s（R:5981 / cz_start_motion），IAS 的桶保证样本 <= 0.25 s。
--- IAS 的活体缓存按"同一帧的一整组（一个主人的全部件）"发布（R:5862-5868），一组不能拆到几帧；
--- 所以只改"谁在哪一帧采"：桶翻转后，每帧只采一个主人的整组（桶号最旧的先），其余主人排到后面几帧。每桶每主人仍恰好一次。
+
 local function cz_torn_estimate(b, key, bucket)
 	local e = cf.tornCache[key]
 	if e and e.bucket == bucket and e.done then return e.early end
@@ -5781,7 +5847,7 @@ end
 function CorpseFreeze.reset()
 	cf.frozen, cf.clones, cf.liveCache, cf.livePending, cf.logged, cf.failed, cf.errors = {}, {}, {}, {}, {}, {}, {}
 	cf.pending, cf.cores, cf.tornCache, cf.tornCore, cf.jointCache, cf.offsetCache, cf.stopped = {}, {}, {}, {}, {}, {}, {}
-	cf.created, cf.runtime, cf.sampleTried, cf.sampleOwner = 0, nil, {}, nil
+	cf.created, cf.runtime = 0, nil
 	lifecycle.live, lifecycle.counter, lifecycle.forgotten = {}, 0, 0
 	for key in pairs(Roster.corpsePins) do Roster.corpsePins[key] = nil end
 	CorpseFreeze.enabled, CorpseFreeze.active = false, false
@@ -5792,9 +5858,10 @@ function CorpseFreeze.begin(runtime)
 	cf.runtime, cf.tick, cf.now = runtime, runtime.frame or 0, os.clock()
 	cf.pending, cf.cores, cf.livePending = {}, {}, {}
 	cf.tornBudget = CZ_TORN_BUDGET
-	cf.sampleOwner = nil
+
 	local was = CorpseFreeze.enabled
 	CorpseFreeze.enabled = cz_enabled(runtime)
+	runtime.corpseExplicit = CorpseFreeze.enabled and runtime.options.corpseProfiles and {} or nil -- R:4707
 	if was ~= CorpseFreeze.enabled then
 		cz_log('corpse-copy-v4 enabled=' .. tostring(CorpseFreeze.enabled))
 		if not CorpseFreeze.enabled then lifecycle.observe({}, function() return nil end) end
@@ -5834,7 +5901,7 @@ function CorpseFreeze.observe(b, explicit)
 	end
 	-- 以下与 IAS 顺序不同处：先看桶 / 上限（零引擎调用），再读动画机与 core，调用数只会比 IAS 少。
 	local old = cf.liveCache[key]
-	if cf.sampleOwner ~= cz_slot(b.avatar.unit) then return end   -- 本帧轮到的主人才采（见 frame）；一组必须同帧采完
+	if old and old.bucket == bucket then return end -- IAS R:5614–5616
 	local count = 0
 	for _ in pairs(cf.liveCache) do count = count + 1 end
 	if not old and count >= 256 then return end
@@ -5843,14 +5910,14 @@ function CorpseFreeze.observe(b, explicit)
 	if not c then return end
 	local offset = cz_root_offset(b.unit)
 	if not offset then return end
-	local shape = cz_capture(b.unit, b.node_count, offset, c, explicit)
+	local shape, explicitCount = cz_capture(b.unit, b.node_count, offset, c, explicit)
 	if not shape then return end
 	local joints = cz_unit_joints(b)
 	local native = cz_native_from_shape(shape, joints, c)
 	if cz_detached(native, c, old and old.native) then return end   -- 撕裂的样本不进缓存
 	local named = {}
 	for n, name in pairs(joints) do named[n] = name end
-	cf.livePending[key] = { shape = shape, bucket = bucket, time = cf.now, world = cz_slot(b.world), native = native, up = c.up,
+	cf.livePending[key] = { shape = shape, explicitCount = explicitCount, bucket = bucket, time = cf.now, world = cz_slot(b.world), native = native, up = c.up,
 		owner = c.owner, hash = b.hash, count = b.node_count, offset = offset, joints = named,
 		core = { q = { unpack(c.q) }, p = { unpack(c.p) } } }
 end
@@ -6300,31 +6367,15 @@ function CorpseFreeze.frame(runtime)
 			end
 		end
 	end
-	-- 本帧轮到谁采样：活着的主人（role 1/2）里"最近一次发布 / 尝试"最久远的那个（桶号翻转之后、本桶还没试过的）。
-	local groups = {}
-	for _, b in ipairs(bindings) do
-		local role = Roster.role(b.avatar.unit)
-		if role == 1 or role == 2 then
-			local owner = cz_slot(b.avatar.unit)
-			local g = groups[owner]
-			if g == nil then g = { owner = owner, last = math.huge }; groups[owner] = g end
-			local cached = cf.liveCache[cz_slot(b.unit)]
-			local t = cached and cached.bucket or -math.huge
-			if t < g.last then g.last = t end
-		end
-	end
-	local pick, bucket = nil, math.floor(cf.now * 4)
-	for owner, g in pairs(groups) do
-		local t = math.max(g.last, cf.sampleTried[owner] or -math.huge)   -- 一组一直采不齐也不在同一桶里反复重试
-		g.t = t
-		if t < bucket and (pick == nil or t < pick.t or (t == pick.t and owner < pick.owner)) then pick = g end
-	end
-	if pick then cf.sampleOwner, cf.sampleTried[pick.owner] = pick.owner, bucket end
+
 	for _, b in ipairs(bindings) do
 		local ok, err = pcall(CorpseFreeze.queue_input, b, nil)
 		if not ok then CorpseFreeze.report('input', err) end
-		ok, err = pcall(CorpseFreeze.observe, b)
-		if not ok then CorpseFreeze.report('capture', err) end
+		local explicit = runtime.corpseExplicit and runtime.corpseExplicit[b.unit]
+		if explicit ~= false then
+			ok, err = pcall(CorpseFreeze.observe, b, explicit and explicit.owner == b.avatar.unit and explicit.rows or nil)
+			if not ok then CorpseFreeze.report('capture', err) end
+		end
 	end
 	local ok, err = pcall(CorpseFreeze.flush, bindings)
 	if not ok then CorpseFreeze.report('flush', err) end
@@ -6332,6 +6383,7 @@ end
 
 local function corpse_frame(runtime)
 	if CorpseFreeze.active then CorpseFreeze.frame(runtime) end
+	runtime.corpseExplicit = nil -- numeric results and Unit keys belong to this callback (IAS R:4044,4707).
 end
 
 -- ---------------------------------------------------------------------------
@@ -6479,6 +6531,9 @@ local function physics_sync(runtime)
 			end
 		end
 		if session ~= nil then
+			session.iasPose = options.profileHashes ~= nil and (options.independentBones ~= nil or options.corpseProfiles ~= nil
+				or session.rig and session.rig.bones[1] and session.rig.bones[1].name:match('^ias_phys_') ~= nil)
+			session.corpseEligible = options.corpseProfiles and options.corpseProfiles[want.hash]
 			session.owner, session.ownerOrder, session.ownerTag = want.owner.unit, want.owner.order, want.owner.tag
 		end
 	end
@@ -6628,10 +6683,12 @@ local function drive(runtime)
 
 	-- E12e：物理会话 = 本帧 Roster 枚举 ∩ 已有容器（IAS bind_unit：实例槽位 + profile，每帧）。
 	physics_sync(runtime)
+	runtime.iasCommits = runtime.options.profileHashes and {} or nil
 	if runtime.sessions == nil or #runtime.sessions == 0 then
 		runtime.sessions = nil
-		corpse_frame(runtime)   -- E12f-C2：没有物理会话的帧（尸体的件已被停物理）也要跑尸体副本的采样 / flush
 		drive_arm_only_and_beat()
+		IndependentLink.flush(runtime)
+		corpse_frame(runtime) -- R:7017–7019: observe the same frame's retarget output before flush.
 		return
 	end
 
@@ -6733,7 +6790,7 @@ local function drive(runtime)
 		-- 丢了它，物理会比真实时间慢 —— 表现是"队友的头发像在水里"。
 		local pending = (session.pendingDt or 0) + dt
 		local order = session.ownerOrder or 99
-		session.skipOptionalIas = order > 1 and runtime.options.independentTranslations ~= nil
+		session.skipOptionalIas = not session.iasPose and order > 1 and runtime.options.independentTranslations ~= nil
 		local due = true
 		local owner = session.owner
 		local poseState = runtime.independent and runtime.independent.avatar == owner and runtime.independent
@@ -6766,7 +6823,7 @@ local function drive(runtime)
 			end
 		end
 		if resetPhysics or (ownerState and ownerState.teleport) then session.resetPhysics = true end
-		if order > 1 then
+		if order > 1 and not session.iasPose then
 			local stride = owner_distance_sq(runtime, session) <= nearLimit2 and nearStride or farStride
 			-- 用**会话下标**错峰，而不是玩家序号：同一个玩家的若干护甲件如果同帧，
 			-- 每 stride 帧就会出现一次成本尖峰（帧时间抖动比平均成本更影响手感）。
@@ -6793,7 +6850,16 @@ local function drive(runtime)
 		if due or session.independentPresentation and Roster.isLive(runtime, session.unit)
 			and (tune_values(runtime).writeOff or 0) == 0 then
 			local operation = due and (session.resetPhysics and Compat.reset_physics or Compat.update) or nil
+			if session.iasPose and runtime.iasCommits then
+				local group = runtime.iasCommits[session.unit] or { world = session.world, rows = {}, before = {} }
+				runtime.iasCommits[session.unit], session.iasCommit = group, group
+				if session.corpseEligible and runtime.corpseExplicit and runtime.corpseExplicit[session.unit] ~= false then
+					runtime.corpseExplicit[session.unit] = { owner = session.owner, rows = group.rows }
+				end
+			end
 			local ok, out, solved = pcall(IndependentLink.physics, runtime, session, schedule, operation, pending)
+			if not ok and session.iasCommit then session.iasCommit.failed = true end
+			session.iasCommit = nil
 			if solved or due and not ok then
 				pending = 0
 				attempted = attempted + 1
@@ -6815,6 +6881,7 @@ local function drive(runtime)
 			if (item.staticFrames or 0) > 0 then staticChains = staticChains + 1 end
 		end
 	end
+	IndependentLink.flush(runtime)
 	runtime.driveFrames = (runtime.driveFrames or 0) + 1
 	-- 心跳专用计数：`driveFrames` 每次 tryAttach 成功都会归零（补挂在挂满后仍每 1~2 秒成功一次），
 	-- 拿它取模，心跳就永远打不出来。这个只在安装时归零。

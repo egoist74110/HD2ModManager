@@ -2540,6 +2540,12 @@ local function restore_chain(session, item)
 	return restored
 end
 
+-- IAS R:4566 updates once after all changed nodes on this Unit were written.
+local function refresh_physics(session)
+	if session.iasCommit then session.iasCommit.dirty = true; return true, true end
+	return pcall(session.S.World.update_unit, session.world, session.unit)
+end
+
 function M.reset_physics(session)
 	if session == nil or M.session_health(session, M.frame) ~= "ok" then return 0 end
 	local restored = 0
@@ -2548,7 +2554,7 @@ function M.reset_physics(session)
 			restored = restored + restore_chain(session, item)
 		end
 	end
-	if restored > 0 and session.world ~= nil then pcall(session.S.World.update_unit, session.world, session.unit) end
+	if restored > 0 and session.world ~= nil then refresh_physics(session) end
 	return restored
 end
 
@@ -2795,7 +2801,7 @@ function M.update(session, dt, maxWrite)
 	-- 代价说明：world 为 nil 时**必须不调**——update_unit(nil, unit) 是一次 AV 崩溃，
 	-- 而不是能靠 pcall 拦住的 Lua 错误（2026-10-31 实测踩过）。
 	if written > 0 and session.world ~= nil then
-		pcall(function() S.World.update_unit(session.world, unit) end)
+		refresh_physics(session)
 	end
 	return written
 end
@@ -2848,7 +2854,7 @@ function M.release(session)
 		end
 	end
 	if restored > 0 and session.world ~= nil then
-		pcall(function() S.World.update_unit(session.world, unit) end)
+		refresh_physics(session)
 	end
 	return restored
 end
@@ -2915,6 +2921,31 @@ local function write_pose(S, unit, node, rotation, base)
 	return S.Unit.set_local_pose(unit, node, pose) ~= false
 end
 
+-- IAS R:2360–2387, 2640–2661. Use the pose the renderer will receive,
+-- including presentation interpolation. A reset by animation must be repaired.
+local function physics_write(session, node, rotation, base, writer, parent)
+	local cost = M._fastWrite and 2 or 5
+	local world
+	if session.iasPose then
+		local before, reads = M.contact_math.local_pose(session.S, session.unit, node)
+		if not before then return false, false, reads end
+		local q = { q_axis_angle(rotation[1], rotation[2], rotation[3], rotation[4]) }
+		local position = not M._fastWrite and { base.px,base.py,base.pz } or nil
+		if parent and before then world = M.independent_fk(parent, q, position or before.p) end
+		if before and M.contact_math.unchanged(before, q, position) then
+			if session.iasCommit then session.iasCommit.rows[node+1] = world end
+			return true, false, reads, world
+		end
+		if session.iasCommit then session.iasCommit.before[node] = session.iasCommit.before[node] or before end
+		cost = cost + reads
+	end
+	local ok = writer(session.S, session.unit, node, rotation, base)
+	if session.iasCommit then
+		if ok then session.iasCommit.rows[node+1] = world else session.iasCommit.failed = true end
+	end
+	return ok, ok, cost, world
+end
+
 local function physics_between(from, to, fraction)
 	local ax, ay, az, aw = q_axis_angle(from[1], from[2], from[3], from[4])
 	local bx, by, bz, bw = q_axis_angle(to[1], to[2], to[3], to[4])
@@ -2935,16 +2966,16 @@ function M.present_independent_physics(session, fraction)
 	local complete = true
 	for node, row in pairs(presentation.rows) do
 		local rotation = fraction == 1 and row.to or physics_between(row.from, row.to, fraction)
-		local ok, result = pcall(write_pose, session.S, session.unit, node, rotation, row.base)
-		calls = calls + (M._fastWrite and 2 or 5)
+		local ok, result, changed, cost = pcall(physics_write, session, node, rotation, row.base, write_pose)
+		calls = calls + (cost or 0)
 		if ok and result then
-			written = written + 1
+			if changed then written = written + 1 end
 		else
 			complete = false
 		end
 	end
 	if written > 0 then
-		local ok, result = pcall(session.S.World.update_unit, session.world, session.unit)
+		local ok, result = refresh_physics(session)
 		complete = complete and ok and result ~= false
 		calls = calls + 1
 	end
@@ -3204,7 +3235,7 @@ function M.update_tip(session, dt, maxWrite)
 	-- `os.clock()` 又会把引擎其它线程的占用算进来（实测同工作量 1.58 ms vs 5.21 ms）。
 	-- 调用次数是唯一不会被环境噪声污染的口径。
 	local calls = 1
-	local perWrite = (M._fastWrite == true) and 2 or 5
+
 
 	for si = 1, itemCount do
 		local item = items[si]
@@ -3217,8 +3248,18 @@ function M.update_tip(session, dt, maxWrite)
 				anchors[anchorNode] = cached
 			end
 			if cached[8] ~= epoch then
-				local apx, apy, apz = read_vec3(S, S.Unit.world_position(unit, anchorNode))
-				local qx, qy, qz, qw = read_quat4(S, unit, anchorNode)
+				local apx, apy, apz, qx, qy, qz, qw
+				local group = session.iasCommit
+				if group and next(group.rows) then
+					local anchor = M.contact_math.projected(S, unit, anchorNode, group.rows, session.nodeCount)
+					if anchor then
+						apx, apy, apz = anchor.p[1], anchor.p[2], anchor.p[3]
+						qx, qy, qz, qw = anchor.q[1], anchor.q[2], anchor.q[3], anchor.q[4]
+					end
+				else
+					apx, apy, apz = read_vec3(S, S.Unit.world_position(unit, anchorNode))
+					qx, qy, qz, qw = read_quat4(S, unit, anchorNode)
+				end
 				if apx ~= nil and qx ~= nil then
 					cached[1], cached[2], cached[3] = apx, apy, apz
 					cached[4], cached[5], cached[6], cached[7] = qx, qy, qz, qw
@@ -3255,7 +3296,7 @@ function M.update_tip(session, dt, maxWrite)
 						item.guardLoggedAt = now
 						logger("[physbone][护栏] 尖端链数值异常或超出静止长度，已恢复基准姿态（链 %s）", tostring(item.name or si))
 					end
-				elseif static then
+				elseif static and not session.iasPose then
 					item.staticFrames = (item.staticFrames or 0) + 1
 					-- 这些骨这帧"处理过但没写"，计入 handled，否则上层会误判成"驱动失效"。
 					skippedSame = skippedSame + #tip.bones
@@ -3327,7 +3368,15 @@ function M.update_tip(session, dt, maxWrite)
 				if lastWritten == nil then lastWritten = {}; item.lastWritten = lastWritten end
 				local basePoses, nodeIds = item.basePoses, item.nodes
 				local boneCount = #tip.bones
+				local parentPose = session.iasCommit and { p = { apx,apy,apz }, q = { qx,qy,qz,qw } }
 				for index = 1, boneCount do
+					local parent = parentPose
+					parentPose = nil -- a missing or rejected node breaks the solved chain
+					if parent then
+						local expected = index == 1 and anchorNode or nodeIds[index-1]
+						if S.Unit.scene_graph_parent(unit, nodeIds[index]) ~= expected then parent = nil end
+						calls = calls + 1
+					end
 					if maxWrite and written >= maxWrite then break end
 					local base = basePoses[index]
 					local rotation = rotations[index]
@@ -3359,7 +3408,7 @@ function M.update_tip(session, dt, maxWrite)
 							-- 用两次比较代替 math.abs（省一次标准库 C 调用）。
 							local prev = lastWritten[index]
 							local same = false
-							if prev ~= nil then
+							if prev ~= nil and not session.iasPose then
 								local d = prev[4] - rotation[4]
 								if d >= writeEpsilonNeg and d <= epsilon then
 									same = (prev[1] * rotation[1] + prev[2] * rotation[2]
@@ -3376,15 +3425,17 @@ function M.update_tip(session, dt, maxWrite)
 									row = { from = { prev[1], prev[2], prev[3], prev[4] }, to = rotation, base = base }
 									displayed = physics_between(row.from, rotation, presentation.lead)
 								end
-								local okWrite, didWrite = pcall(writePose, S, unit, node, displayed, base)
+								local okWrite, didWrite, changed, cost, world = pcall(physics_write, session, node, displayed, base, writePose, parent)
+								if okWrite and didWrite then parentPose = world end
+								calls = calls + (cost or 0)
 								if okWrite and didWrite == true then
 									if row then presentation.rows[node] = row end
-									written = written + 1
-									calls = calls + perWrite
+									if changed then written = written + 1 else skippedSame = skippedSame + 1 end
 									if prev == nil then prev = {}; lastWritten[index] = prev end
 									prev[1], prev[2], prev[3], prev[4] =
 										rotation[1], rotation[2], rotation[3], rotation[4]
 								else
+									if session.iasCommit then session.iasCommit.failed = true end
 									session.skippedWrites = (session.skippedWrites or 0) + 1
 									if session.firstFailReason == nil then
 										session.firstFailReason = string.format("tip node#%d %s", index, tostring(didWrite))
@@ -3422,7 +3473,7 @@ function M.update_tip(session, dt, maxWrite)
 	end
 
 	if written > 0 and session.world ~= nil then
-		pcall(function() S.World.update_unit(session.world, unit) end)
+		refresh_physics(session)
 		calls = calls + 1
 	end
 	session.engineCalls = calls
@@ -3836,6 +3887,57 @@ do
 		local valid, xx, yx, zx, xy, yy, zy, xz, yz, zz, x, y, z = pcall(S.Matrix4x4.to_elements, value)
 		if valid then return V.matrix_pose({ xx, xy, xz, x, yx, yy, yz, y, zx, zy, zz, z }), 2 end
 		return nil, 2
+	end
+	-- IAS R:376–415, 2360–2387: compare in the current local frame, including
+	-- animation or another writer moving the node since the previous callback.
+	function V.local_pose(S, unit, node)
+		local reads = 0
+		if S.Unit.local_pose and S.Matrix4x4.to_elements then
+			reads = 1
+			local ok, matrix = pcall(S.Unit.local_pose, unit, node)
+			if ok and matrix then
+				reads = 2
+				local valid,a,d,g,b,e,h,c,f,i,x,y,z = pcall(S.Matrix4x4.to_elements,matrix)
+				local pose = valid and V.matrix_pose({ a,b,c,x,d,e,f,y,g,h,i,z })
+				if pose then return pose, reads end
+			end
+		end
+		local q = M.independent_quaternion(S.Quaternion.to_elements(S.Unit.local_rotation(unit, node)))
+		local px,py,pz = S.Vector3.to_elements(S.Unit.local_position(unit, node))
+		if q and finite_arm_number(px) and finite_arm_number(py) and finite_arm_number(pz) then
+			return { q = q, p = { px,py,pz } }, reads+4
+		end
+		return nil, reads+4
+	end
+	function V.unchanged(before, q, p)
+		local a = before.q
+		local dot = a[1]*q[1]+a[2]*q[2]+a[3]*q[3]+a[4]*q[4]
+		local norm = q[1]*q[1]+q[2]*q[2]+q[3]*q[3]+q[4]*q[4]
+		if norm < 1e-16 or not (dot*dot >= norm * math.cos(math.rad(0.0001)*0.5)^2) then return false end
+		if not p then return true end
+		local dx,dy,dz = before.p[1]-p[1], before.p[2]-p[2], before.p[3]-p[3]
+		return dx*dx+dy*dy+dz*dz <= 1e-14
+	end
+	-- R:2191–2214: follow the actual parent chain to a solved world row.
+	-- An unrelated branch keeps its engine world transform (including the Unit root).
+	function V.projected(S, unit, node, explicit, count)
+		local trail, seen, current = {}, {}, node
+		local parentPose
+		while type(current) == "number" and current >= 1 and current <= count and current == math.floor(current) do
+			if seen[current] then return nil end
+			parentPose = explicit[current + 1]
+			if parentPose then break end
+			seen[current] = true
+			trail[#trail + 1] = current
+			current = S.Unit.scene_graph_parent(unit, current)
+		end
+		if not parentPose then return V.world_pose(S, unit, node) end
+		for index = #trail,1,-1 do
+			local pose = V.local_pose(S, unit, trail[index])
+			if not pose then return nil end
+			parentPose = M.independent_fk(parentPose, pose.q, pose.p)
+		end
+		return parentPose
 	end
 	function V.inverse(pose)
 		local p, q = M.independent_relative(pose, { p = { 0, 0, 0 }, q = { 0, 0, 0, 1 } })

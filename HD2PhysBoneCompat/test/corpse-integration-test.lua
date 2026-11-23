@@ -258,7 +258,8 @@ local function scene(opts)
 	local runtime = Runtime_.install(S, {
 		compat = Compat, perfCounters = false, log = false, tunePath = "nonexistent-hd2pbx-tune.txt",
 		identityPollSeconds = 0, rosterNegativeSeconds = 0,
-		profileHashes = HASHES, independentPieces = pieces, independentBones = bones,
+		profileHashes = HASHES, corpseProfiles = { [HASHES[1]] = true, [HASHES[2]] = true, [HASHES[3]] = true },
+		independentPieces = pieces, independentBones = bones,
 		corpseFreeze = opts.enabled ~= false,
 	})
 	local logs = {}

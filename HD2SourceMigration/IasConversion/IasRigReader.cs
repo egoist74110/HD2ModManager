@@ -12,6 +12,10 @@ internal sealed record IasRigProfile(IReadOnlyList<string> SourceNames, IReadOnl
 {
 	internal IReadOnlyDictionary<string, IasGrip> Grips { get; init; } = new Dictionary<string, IasGrip>();
 	internal byte[]? PoseDigest { get; init; }
+	internal uint ProfileFlags { get; init; }
+	// IAS R:764–771, 798–800, 5452–5458. Route selection supplies active status at deployment.
+	internal bool AllowsCorpseFreeze => ProfileFlags <= ushort.MaxValue && ((ProfileFlags >> 2) & 3) is 1 or 2
+		&& (ProfileFlags & 2) == 0 && Nodes.Any(node => (node.Flags & 1024) != 0);
 
 	internal int ResolveSemanticNode(int node)
 	{
@@ -91,7 +95,7 @@ internal static class IasRigReader
 			using var digest = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
 			digest.AppendData(profileHeader);
 			digest.AppendData(data.GetBuffer().AsSpan(nodeStart, nodeEnd - nodeStart));
-			profiles.Add(unit, new(sourceNames, nodes) { PoseDigest = digest.GetHashAndReset() });
+			profiles.Add(unit, new(sourceNames, nodes) { ProfileFlags = flagsForProfile, PoseDigest = digest.GetHashAndReset() });
 		}
 		if ((extensions & 1) != 0)
 		{
