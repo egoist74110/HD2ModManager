@@ -100,13 +100,14 @@ local M = {}
 --        flags=0x35（yawCon + angleCon，没有 pitchCon）的长发链：pitch 区间留着初值 [0, 0]，
 --        而求解器在 axisLimits 打开时两个分量都夹 ⇒ 前后甩被锁在 0°，长发看着像一根焊丝。
 --        现在没约束的轴按"不限"处理，总偏角仍由锥兜住。
-M.VERSION = "2.1.59"
+M.VERSION = "2.1.60"
 
 --- 安装标记用的全局键。只写这一个全局，且值就是模块本身（便于外部检查是否已装）。
 local INSTALL_KEY = "__hd2physbone_runtime"
 
 local tune_values     -- 调参文件读数（定义在后面，tryAttach 也要用 ⇒ 必须先声明）
 local Compat          -- physbone_compat 模块（require 或注入）
+local Roster = {}     -- IAS 式每帧枚举（见 Roster 段）
 local S               -- stingray 命名空间
 local state = nil     -- 运行状态；nil = 未安装
 local originalRender  -- 挂载前的 render（链式调用，不吞掉别人）
@@ -1800,6 +1801,7 @@ end
 --- 会话的 unit 是否仍在活体列表里（**只做指针比较**）。
 --- `runtime.liveUnits == nil` 表示"没有可信列表"⇒ 不据此判死（保持旧行为）。
 local function session_unit_live(runtime, unit)
+	if Roster.isLive(runtime, unit) then return true end
 	local units = runtime.liveUnits
 	if units == nil then return true end
 	Perf.count("F2")
@@ -3833,48 +3835,16 @@ local function arm_pose_options(runtime)
 end
 
 local function resolve_local_avatar_for_arm(runtime)
-	if runtime.sessions ~= nil and runtime.avatars ~= nil and #runtime.avatars > 0 then
-		runtime.avatar = runtime.avatars[1].unit
-		runtime.avatarTag = runtime.avatars[1].tag
-		return runtime.avatar
+	-- E12d：本人 = IAS 的 role 1（Network/GameSession 身份，每帧 Roster 给出）。
+	-- 没有网络身份可用时没有本人（IAS 同样没有回退）；测试/外部直接设置的 `runtime.avatar` 原样保留。
+	local roster = runtime.roster
+	if roster ~= nil and roster.identity then
+		local unit, world = Roster.localAvatar(runtime)
+		runtime.avatar = unit
+		if unit ~= nil then runtime.cache.world, runtime.world = world, world end
+		return unit
 	end
-	if runtime.avatar ~= nil then return runtime.avatar end
-	local frame = runtime.frame or 0
-	if runtime.armScanAt ~= nil and frame < runtime.armScanAt then return nil end
-	local options = runtime.options or {}
-	runtime.armScanAt = frame + (options.armDiscoverFrames or 30)
-
-	local world, units = pickWorld(S, runtime.cache)
-	if world == nil or units == nil then return nil end
-	runtime.cache.world = world
-	runtime.world = world
-	local list = findAvatars(S, world, units, #units, SUPPORT_MG_NAME,
-		options.minNodes or 90, options, runtime.cache, runtime)
-	if list == nil or #list == 0 then return nil end
-
-	local chosen = list[1].unit
-	if #list > 1 then
-		local cx, cy, cz = cameraPosition(S, world, runtime.cache)
-		if cx ~= nil then
-			local bestD2 = math.huge
-			for index = 1, #list do
-				-- readVector 返回 x, y, z 三个数，不是表（2026-11-23 实机：多个 avatar 时这里 index 数字报错，驱动整个停掉）。
-				local px, py, pz = readVector(S, try(S.Unit.world_position, list[index].unit, 1))
-				if px ~= nil then
-					local dx, dy, dz = px - cx, py - cy, pz - cz
-					local d2 = dx * dx + dy * dy + dz * dz
-					if d2 < bestD2 then
-						bestD2 = d2
-						chosen = list[index].unit
-					end
-				end
-			end
-		end
-	end
-	local tag = unit_tag(S, chosen)
-	runtime.avatar = chosen
-	runtime.avatarTag = tag
-	return chosen
+	return runtime.avatar
 end
 
 -- ---------------------------------------------------------------------------
@@ -3887,7 +3857,389 @@ end
 -- 选项 `independentBones = { { "ias_l_shoulder", "l_shoulder" }, ... }`（父骨在前）。
 -- `independentTranslations` 按件给出平移骨的潜兵/模型静止局部位置。
 -- ---------------------------------------------------------------------------
-local INDEPENDENT_RESCAN_FRAMES = 1800
+-- ---------------------------------------------------------------------------
+-- IAS 1.6.4 生命周期（E12d）：每帧枚举 avatar 和装甲件，当帧按距离绑定，不保存跨帧结论。
+-- 行为对照 docs/agent/ias-runtime-lifecycle-map-20261123.md：
+--   avatar 枚举          IAS runtime.lua 1344–1360   每回调 World.units_by_resource(world, AVATAR_RESOURCE)
+--   装甲件发现           IAS 1500–1620               每个 profile 一次 units_by_resource(Id64.from_hex(哈希))，
+--                                                    全量 World.units 只在 60 帧 / 战斗世界 avatar 集合变化或每 2 s /
+--                                                    某 profile 命中数下降时兜底；空结果只缓存 0.25 s
+--   归属                 IAS 6690–6830               根探针 {1,0} 离最近 avatar，d2 < 9.0，次近比最近远出 0.20 才绑
+--   本人/队友/死亡       IAS 4718–5100 physics_identity（Network/GameSession，4 Hz；先清缺席再节流）
+-- 本模块是 IAS 这些做法的行为复刻（代码自己写）；没有 IAS 没有的缓存、额度、退避。
+-- ---------------------------------------------------------------------------
+Roster.INTERVAL = 60
+Roster.AMBIGUITY = 0.20
+Roster.worlds = {}
+Roster.states = setmetatable({}, { __mode = "k" })
+Roster.known, Roster.session, Roster.epoch = {}, nil, 0
+Roster.nextPoll, Roster.ownedCursor, Roster.cursor = 0, 0, 0
+Roster.extendedCursor, Roster.nearCursor, Roster.observedHigh = 4096, 0, 4095
+
+local function roster_hashes(runtime)
+	local cached = runtime.rosterHashes
+	if cached ~= nil then return cached end
+	local list, seen = {}, {}
+	for tag in pairs((runtime.options or {}).independentPieces or {}) do
+		local hash = tostring(tag):match("^#ID%[(%x+)%]$")
+		if hash ~= nil then
+			hash = hash:lower()
+			if not seen[hash] then seen[hash] = true; list[#list + 1] = hash end
+		end
+	end
+	table.sort(list)
+	runtime.rosterHashes = list
+	return list
+end
+
+local function roster_key(hash)
+	local space = S.IdString64
+	if type(space) ~= "table" or type(space.from_hex) ~= "function" then return nil end
+	return try(space.from_hex, hash)
+end
+
+local function roster_point(unit, node)
+	local x, y, z = readVector(S, try(S.Unit.world_position, unit, node))
+	if x ~= nil then return { x, y, z } end
+end
+
+local function roster_distance(a, b)
+	if not a or not b then return math.huge end
+	local dx, dy, dz = a[1] - b[1], a[2] - b[2], a[3] - b[3]
+	return math.sqrt(dx * dx + dy * dy + dz * dz)
+end
+
+--- IAS discover_armour_units：返回本世界当前的装甲件 { unit, hash }。
+local function roster_discover(runtime, world, frame, unitCount, signature, gameplay)
+	local hashes = roster_hashes(runtime)
+	local record = Roster.worlds[world]
+	if record == nil then
+		record = { last = -1000000, counts = {}, negative = { signature = nil, untilTime = {}, nextFull = 0 } }
+		Roster.worlds[world] = record
+	end
+	local now = os.clock()
+	local previous = record.counts or {}
+	local negative = record.negative
+	local actorChanged = negative.signature ~= signature
+	if actorChanged then negative = { signature = signature, untilTime = {}, nextFull = 0 }; record.negative = negative end
+	local validCount = type(unitCount) == "number" and unitCount == unitCount and unitCount >= 0
+	local populationChanged = not gameplay and validCount and unitCount <= 512 and unitCount ~= previous.__unit_count
+	local needScan = frame - record.last >= Roster.INTERVAL
+	if gameplay then needScan = actorChanged or now >= (negative.nextFull or 0) end
+	if populationChanged then needScan = true end
+	local discovered, seen, fast = {}, {}, {}
+	for _, hash in ipairs(hashes) do
+		local due = needScan or populationChanged or not signature or (previous[hash] or 0) > 0
+			or now >= (negative.untilTime[hash] or 0)
+		local units = {}
+		if due then
+			local key = roster_key(hash)
+			units = key ~= nil and try(S.World.units_by_resource, world, key) or nil
+			negative.untilTime[hash] = (type(units) == "table" and #units == 0) and now + (Roster.negativeSeconds or 0.25) or nil
+			if type(units) ~= "table" then units = {} end
+		end
+		local count = 0
+		for index = 1, #units do
+			local unit = units[index]
+			local name = try(S.Unit.debug_name, unit)
+			if type(name) == "string" and name:find(hash, 1, true) and not seen[unit] then
+				seen[unit] = true
+				count = count + 1
+				discovered[#discovered + 1] = { unit = unit, hash = hash }
+			end
+		end
+		fast[hash] = count
+		if count < (previous[hash] or 0) then needScan = true end
+	end
+	if needScan then
+		local all = try(S.World.units, world)
+		if type(all) == "table" then
+			local wanted = {}
+			for _, hash in ipairs(hashes) do wanted[hash] = true end
+			local names = {}
+			for index = 1, #all do
+				local unit = all[index]
+				local name = try(S.Unit.debug_name, unit)
+				if type(name) == "string" then
+					local matched = names[name]
+					if matched == nil then
+						matched = false
+						for run in name:gmatch("%x+") do
+							for start = 1, #run - 15 do
+								local piece = run:sub(start, start + 15):lower()
+								if wanted[piece] then matched = piece break end
+							end
+							if matched then break end
+						end
+						names[name] = matched
+					end
+					if matched and not seen[unit] then
+						seen[unit] = true
+						discovered[#discovered + 1] = { unit = unit, hash = matched }
+					end
+				end
+			end
+			local counts = {}
+			for _, row in ipairs(discovered) do counts[row.hash] = (counts[row.hash] or 0) + 1 end
+			if validCount then counts.__unit_count = unitCount end
+			record.counts = counts
+			if gameplay then negative.nextFull = now + 2.0 end
+		end
+		record.last = frame
+	else
+		fast.__unit_count = previous.__unit_count
+		record.counts = fast
+	end
+	return discovered
+end
+
+--- IAS physics_identity.update：本人 / 队友 / 死亡（Network + GameSession，4 Hz）。
+local function roster_identity(runtime, avatars)
+	local Net, GS = S.Network, S.GameSession
+	local states = Roster.states
+	local present = {}
+	for _, avatar in ipairs(avatars) do present[avatar.unit] = avatar.world end
+	-- 先作废缺席再节流：拒绝快速指针复用（IAS 行 4745–4747）
+	for unit, state in pairs(states) do if present[unit] ~= state.world then states[unit] = nil end end
+	local now = os.clock()
+	if now < Roster.nextPoll then return end
+	Roster.nextPoll = now + (Roster.pollInterval or 0.25)
+	for _, state in pairs(states) do state.role = 0 end
+	if type(Net) ~= "table" or type(GS) ~= "table" then return end
+	local session = try(Net.game_session)
+	if not session or try(GS.in_session, session) ~= true then
+		Roster.known, Roster.session = {}, nil
+		Roster.extendedCursor, Roster.nearCursor, Roster.observedHigh = 4096, 0, 4095
+		Roster.states = setmetatable({}, { __mode = "k" })
+		return
+	end
+	if Roster.session ~= session then
+		Roster.epoch = Roster.epoch + 1
+		Roster.known, Roster.session = {}, session
+		Roster.extendedCursor, Roster.nearCursor, Roster.observedHigh = 4096, 0, 4095
+		Roster.states = setmetatable({}, { __mode = "k" })
+		states = Roster.states
+	end
+	local peer = try(Net.peer_id)
+	local owned, complete, ownedIds = {}, false, {}
+	local list = try(GS.objects_owned_by, session, peer)
+	if type(list) == "table" then
+		complete = true
+		local count = 0
+		for _, id in pairs(list) do
+			count = count + 1
+			if count > 8192 then complete = false break end
+			if type(id) == "number" and id >= 0 and id <= 4294967295 and id == math.floor(id) then
+				if not owned[id] then owned[id] = true; ownedIds[#ownedIds + 1] = id end
+			else complete = false end
+		end
+	end
+	table.sort(ownedIds, function(a, b) return a > b end)
+	local considered = {}
+	local known = Roster.known
+	local function consider(id, refresh)
+		if not refresh and considered[id] ~= nil then return end
+		considered[id] = true
+		if try(GS.game_object_exists, session, id) == true and try(GS.game_object_is_type, session, id, "gl7xl2w") == true then
+			known[id] = true
+		else
+			known[id] = nil
+		end
+	end
+	for index = 1, math.min(16, #ownedIds) do consider(ownedIds[index]) end
+	for _ = 1, math.min(64, #ownedIds) do
+		Roster.ownedCursor = Roster.ownedCursor % #ownedIds + 1
+		consider(ownedIds[Roster.ownedCursor])
+	end
+	for _ = 1, 64 do consider(Roster.cursor); Roster.cursor = (Roster.cursor + 1) % 4096 end
+	local unresolved = false
+	for _, avatar in ipairs(avatars) do
+		local state = states[avatar.unit]
+		if not state or not state.network then unresolved = true break end
+	end
+	Roster.observedHigh = math.max(Roster.observedHigh, ownedIds[1] or 0)
+	if #avatars > 1 and unresolved and Roster.observedHigh >= 4096 then
+		local upper = math.min(4294967295, Roster.observedHigh + 256)
+		local lower = math.max(4096, Roster.observedHigh - 512)
+		for _ = 1, 16 do consider(lower + Roster.nearCursor % (upper - lower + 1)); Roster.nearCursor = Roster.nearCursor + 1 end
+		for _ = 1, 16 do
+			if Roster.extendedCursor > upper then Roster.extendedCursor = 4096 end
+			consider(Roster.extendedCursor); Roster.extendedCursor = Roster.extendedCursor + 1
+		end
+	end
+	local ids = {}
+	for id in pairs(known) do ids[#ids + 1] = id end
+	if #ids > 32 then Roster.known, known, ids = {}, {}, {} end
+	local objects = {}
+	for _, id in ipairs(ids) do
+		consider(id, true)
+		if known[id] then
+			local x, y, z = readVector(S, try(GS.game_object_field, session, id, "position"))
+			local health = try(GS.game_object_field, session, id, "health")
+			if x ~= nil and type(health) == "number" and health == health and math.abs(health) < 1e9 then
+				objects[id] = { p = { x, y, z }, health = health, owned = owned[id] == true, complete = complete }
+			end
+		end
+	end
+	local live = {}
+	for _, avatar in ipairs(avatars) do
+		if try(S.Unit.alive, avatar.unit) == true then
+			local state = states[avatar.unit]
+			if not state or state.world ~= avatar.world then state = { role = 0 } end
+			states[avatar.unit] = state
+			state.world = avatar.world
+			local machine = try(S.Unit.has_animation_state_machine, avatar.unit)
+			live[#live + 1] = { a = avatar, s = state, machine = machine }
+			local object = state.network and objects[state.network]
+			if object and object.health <= 0 then state.dead = true; state.deadSince = state.deadSince or now end
+		end
+	end
+	for id, object in pairs(objects) do
+		if object.health > 0 then
+			local chosen, best, second = nil, math.huge, math.huge
+			for _, item in ipairs(live) do
+				if not item.s.dead and item.machine == true then
+					local d = roster_distance(item.a.p, object.p)
+					if d < best then second, best, chosen = best, d, item elseif d < second then second = d end
+				end
+			end
+			if chosen then
+				local state = chosen.s
+				local threshold = state.network == id and 1.0 or 0.05
+				if best <= threshold and second - best > 0.25 and (not state.network or state.network == id) then
+					state.network = id
+					if object.owned then state.owner = true
+					elseif object.complete and state.owner ~= true then state.owner = false end
+				end
+			end
+		end
+	end
+	local localCount = {}
+	for _, item in ipairs(live) do
+		local state = item.s
+		if state.owner == true and not state.dead and item.machine == true then
+			localCount[state.world] = (localCount[state.world] or 0) + 1
+		end
+	end
+	for _, item in ipairs(live) do
+		local state = item.s
+		state.role = 0
+		if state.dead then state.role = 3
+		elseif item.machine == true then
+			if state.owner == true and localCount[state.world] == 1 then state.role = 1
+			elseif state.owner == false and (localCount[state.world] == 1 or (localCount[state.world] == nil and state.friendly == true)) then
+				local object = state.network and objects[state.network]
+				if object and object.health > 0 and object.complete and not object.owned
+					and roster_distance(item.a.p, object.p) <= 1.0 then state.role = 2; state.friendly = true end
+			end
+		end
+	end
+end
+
+function Roster.role(unit)
+	local state = Roster.states[unit]
+	return state and state.role or 0
+end
+
+function Roster.dead(unit)
+	local state = Roster.states[unit]
+	return state ~= nil and state.dead == true
+end
+
+--- 每帧：枚举 avatar、装甲件，求当帧归属。结果只保留到下一帧。
+function Roster.update(runtime)
+	local worlds = try(S.Application.worlds)
+	if type(worlds) ~= "table" then runtime.roster = nil return end
+	local frame = runtime.frame or 0
+	local resource = (runtime.options or {}).avatarResource or DEFAULT_AVATAR_RESOURCE
+	local roster = { frame = frame, byWorld = {}, live = {}, localAvatar = nil,
+		identity = type(S.Network) == "table" and type(S.GameSession) == "table" }
+	local allAvatars = {}
+	local perWorld = {}
+	for _, world in ipairs(worlds) do
+		local units = try(S.World.units_by_resource, world, resource)
+		local avatars = {}
+		if type(units) == "table" then
+			for index = 1, #units do
+				local unit = units[index]
+				local count = try(S.Unit.num_scene_graph_items, unit)
+				if type(count) == "number" and count > 1 then
+					local p = roster_point(unit, 1)
+					if p ~= nil then
+						local item = { unit = unit, world = world, p = p }
+						avatars[#avatars + 1] = item
+						allAvatars[#allAvatars + 1] = item
+						roster.live[unit] = true
+					end
+				end
+			end
+		end
+		perWorld[world] = avatars
+	end
+	local okIdentity, identityError = pcall(roster_identity, runtime, allAvatars)
+	if not okIdentity and not runtime.identityErrorLogged then
+		runtime.identityErrorLogged = true
+		runtime.logger('[physbone][错误] 身份判定失败：%s', tostring(identityError))
+	end
+	for _, world in ipairs(worlds) do
+		local avatars = perWorld[world]
+		local slots, gameplay = {}, false
+		for _, item in ipairs(avatars) do
+			slots[#slots + 1] = tostring(item.unit)
+			local role = Roster.role(item.unit)
+			if role == 1 or role == 2 then gameplay = true end
+			if role == 1 and roster.localAvatar == nil then roster.localAvatar = item.unit; roster.localWorld = world end
+		end
+		table.sort(slots)
+		local count = try(S.World.num_units, world)
+		local armour = roster_discover(runtime, world, frame, count, table.concat(slots, ":"), gameplay)
+		local owner = {}
+		for _, row in ipairs(armour) do
+			roster.live[row.unit] = true
+			local best, second, bestD = nil, math.huge, math.huge
+			local nodes = try(S.Unit.num_scene_graph_items, row.unit)
+			for _, probe in ipairs({ 1, 0 }) do
+				if type(nodes) == "number" and probe < nodes then
+					local p = roster_point(row.unit, probe)
+					if p ~= nil then
+						for _, item in ipairs(avatars) do
+							local d = roster_distance(p, item.p)
+							if d < bestD then second, bestD, best = bestD, d, item
+							elseif d < second then second = d end
+						end
+					end
+				end
+				if best ~= nil then break end
+			end
+			if best ~= nil and bestD < 3.0 and second - bestD > Roster.AMBIGUITY then owner[row.unit] = best.unit end
+		end
+		roster.byWorld[world] = { avatars = avatars, armour = armour, owner = owner }
+	end
+	runtime.roster = roster
+	return roster
+end
+
+function Roster.reset()
+	Roster.worlds = {}
+	Roster.states = setmetatable({}, { __mode = "k" })
+	Roster.known, Roster.session = {}, nil
+	Roster.nextPoll, Roster.ownedCursor, Roster.cursor = 0, 0, 0
+	Roster.extendedCursor, Roster.nearCursor, Roster.observedHigh = 4096, 0, 4095
+end
+
+--- 本回调枚举里存在的 unit（含 avatar 与装甲件）。
+function Roster.isLive(runtime, unit)
+	local roster = runtime.roster
+	return roster ~= nil and roster.frame == (runtime.frame or 0) and roster.live[unit] == true
+end
+
+--- IAS 的"本人"：role == 1。没有网络身份可用时没有本人（IAS 同样没有回退）。
+function Roster.localAvatar(runtime)
+	local roster = runtime.roster
+	if roster == nil then return nil end
+	return roster.localAvatar, roster.localWorld
+end
+
 local INDEPENDENT_LOG_FRAMES = { [1] = true, [600] = true }
 
 local function safe_node(S_, unit, name)
@@ -5182,85 +5534,29 @@ function IndependentLink.release_all(runtime)
 end
 
 local function independent_scan(runtime, state, avatar, world, list)
+	-- E12d：照 IAS 每帧枚举 + 当帧归属（IAS runtime.lua 1500–1620、6690–6830）。
+	-- 件来自本帧 Roster 的装甲件枚举，归属 = 离最近 avatar（3 m、歧义裕度），不保存跨帧结论、
+	-- 没有扫描间隔 / 退避 / 缓存 / 额度。
+	local roster = runtime.roster and runtime.roster.frame == (runtime.frame or 0) and runtime.roster.byWorld[world]
+	if not roster then return false end
 	local options = runtime.options
 	local manifest, slots = options.independentPieces, options.independentPieceSlots or {}
-	local units = runtime.liveUnitsWorld == world and runtime.liveUnits or try(S.World.units, world)
-	if type(units) ~= "table" then return false end
-	local frame = runtime.frame or 0
-	local owners = runtime.avatars or findAvatars(S, world, units, #units, SUPPORT_MG_NAME, options.minNodes or 90, options, {}, runtime)
-	state.owners = owners
-	local nearby = {}
-	local function add_owner(unit)
-		if Compat.unit_alive(S, unit) then nearby[#nearby + 1] = { unit = unit, at = {} } end
-	end
-	add_owner(avatar)
-	for _, owner in ipairs(owners) do
-		if owner.unit ~= avatar then add_owner(owner.unit) end
-	end
-	if #nearby == 0 then return false end
+	state.owners = roster.avatars
 
-	-- 件上的 ias_ 肩骨和各 avatar 的**同名源肩骨**比（不是和根节点比：肩离脚底约 1.4 m，
-	-- 队友贴身站时他的根可能比自己的根更近，件会被误判给队友而不驱动）。每个 avatar 每根肩只读一次。
-	local function owner_point(owner, b)
-		local cached = owner.at[b]
-		if cached == nil then
-			cached = false
-			local node = safe_node(S, owner.unit, list[b][2])
-			if node ~= nil then
-				local x, y, z = readVector(S, try(S.Unit.world_position, owner.unit, node))
-				if x ~= nil then cached = { x, y, z } end
-			end
-			owner.at[b] = cached
-		end
-		return cached or nil
-	end
-
-	local function owned(unit)
-		-- 必须先用 has_node 命中肩骨，禁止读取任意小物件的世界位置。
-		local probe, probeBone
-		for _, b in ipairs(state.probes) do
-			probe = safe_node(S, unit, list[b][1])
-			if probe then probeBone = b break end
-		end
-		if not probe then return false end
-		local x, y, z = readVector(S, try(S.Unit.world_position, unit, probe))
-		local closest, distance = nil, math.huge
-		for _, owner in ipairs(nearby) do
-			local p = owner_point(owner, probeBone)
-			local d = p and vec_dist(x, y, z, p[1], p[2], p[3])
-			if d and d < distance then closest, distance = owner.unit, d end
-		end
-		return closest == avatar and distance <= 2
-	end
-
-	local present, seen, claimed = {}, {}, {}
-	local dropReasons = { gone = 0, dead = 0, nodes = 0 }
-	for _, unit in ipairs(units) do present[unit] = true end
+	-- 本帧不再属于本 avatar 的件：放掉（原件仍活着才恢复）。
+	local present, claimed, seen = {}, {}, {}
+	for _, row in ipairs(roster.armour) do present[row.unit] = row end
 	for i = #state.pieces, 1, -1 do
 		local piece = state.pieces[i]
-		local alive = present[piece.unit] and Compat.unit_alive(S, piece.unit)
-		local valid = alive
-		if valid then
-			for _, b in ipairs(piece.bones) do
-				if safe_node(S, piece.unit, list[b][1]) ~= piece.nodes[b] then valid = false break end
-			end
-		end
-		if valid then
+		local row = present[piece.unit]
+		if row ~= nil and roster.owner[piece.unit] == avatar then
 			seen[piece.unit], claimed[piece.slot] = true, true
 		else
-			if not present[piece.unit] then dropReasons.gone = dropReasons.gone + 1
-			elseif not alive then dropReasons.dead = dropReasons.dead + 1
-			else dropReasons.nodes = dropReasons.nodes + 1 end
-			if alive and piece.link then IndependentLink.restore(state, piece, true) end
-			if alive then IndependentLink.restore_clothing(state, piece) end
-			if alive and piece.hidden then independent_visibility(piece, true) end
+			if row ~= nil and piece.link then IndependentLink.restore(state, piece, true) end
+			if row ~= nil then IndependentLink.restore_clothing(state, piece) end
+			if row ~= nil and piece.hidden then independent_visibility(piece, true) end
 			table.remove(state.pieces, i)
 		end
-	end
-	-- E12c 诊断：实机 19:43:43 八件同时"找不到"，日志里看不出是句柄没了、判死还是节点 id 变了。
-	if dropReasons.gone + dropReasons.dead + dropReasons.nodes > 0 then
-		runtime.logger("[physbone][独立骨] 摘掉 %d 件（不在世界列表 %d / 判死 %d / 节点 id 变了 %d）；世界 unit %d",
-			dropReasons.gone + dropReasons.dead + dropReasons.nodes, dropReasons.gone, dropReasons.dead, dropReasons.nodes, #units)
 	end
 	local expected = {}
 	for tag in pairs(manifest or {}) do
@@ -5271,14 +5567,14 @@ local function independent_scan(runtime, state, avatar, world, list)
 	end
 	local missing = {}
 	for slot in pairs(expected) do if not claimed[slot] then missing[slot] = true end end
-	if not manifest or next(missing) ~= nil then
-		for _, unit in ipairs(units) do
-			if not manifest and #state.pieces >= 16 then break end
-			if unit ~= avatar and not seen[unit] and Compat.unit_alive(S, unit) and owned(unit) then
-				local tag = unit_tag(S, unit)
-				local slot = slots[tag] or tag
-				local names = manifest and manifest[tag]
-				if not manifest or (names and missing[slot]) then
+	for _, row in ipairs(roster.armour) do
+		local unit = row.unit
+		if not seen[unit] and unit ~= avatar and roster.owner[unit] == avatar then
+			local tag = "#ID[" .. row.hash .. "]"
+			local slot = slots[tag] or tag
+			local names = manifest and manifest[tag]
+			if names and missing[slot] then
+				do
 					local nodes, bones, selected = {}, {}, {}
 					for _, name in ipairs(names or {}) do selected[name] = true end
 					local complete = true
@@ -5318,13 +5614,12 @@ local function independent_scan(runtime, state, avatar, world, list)
 		end
 	end
 
-	-- 有源骨暂时读不到时，保留件缓存，待下一次扫描重新解析源节点。
+	-- 有源骨暂时读不到时，保留件缓存，待下一帧重新解析源节点。
 	local sourceMissing = false
 	for b, bone in ipairs(list) do
 		state.sources[b] = safe_node(S, avatar, bone[2])
 		if state.sources[b] == nil then sourceMissing = true end
 	end
-
 	local tags, absent, total = {}, {}, 0
 	for _, piece in ipairs(state.pieces) do tags[#tags + 1] = piece.tag end
 	for slot, alternatives in pairs(expected) do
@@ -5336,42 +5631,14 @@ local function independent_scan(runtime, state, avatar, world, list)
 	end
 	table.sort(absent)
 	local detail = #absent > 0 and table.concat(absent, "、") or "无"
-	-- 只在结果变化时落盘（原来缺件时每次扫描都写一行，30 帧一次）。
 	local signature = total .. "|" .. #tags .. "|" .. detail
 	if state.lastScanSignature ~= signature then
 		state.lastScanSignature = signature
 		runtime.logger("[physbone][独立骨] 清单 %d 件 / 找到 %d 件 / 缺 %s ｜ %s",
 			total, #tags, detail, table.concat(tags, "、"))
 	end
-	local now = runtime.lastTime or os.time()
-	if #absent > 0 then
-		state.missingSince = state.missingSince or now
-		if not state.missingLogged and now - state.missingSince > 2 then
-			state.missingLogged = true
-			runtime.logger("[physbone][独立骨][警告] 缺件超过 2 秒：%s", detail)
-		end
-	else
-		state.missingSince, state.missingLogged = nil, nil
-	end
-	-- P3：缺件时的重扫间隔。IAS 的资源发现是每 60 帧一次（报告：资源发现每 60 帧扫一次）；
-	-- 原来这里 30 帧一次且永不放缓。现在：基准 60 帧，结果（缺哪些件）不变就翻倍退避，封顶 300 帧，
-	-- 结果一变（来了新件 / 件被拿走）立即回到 60。
-	if #absent > 0 or sourceMissing then
-		-- E12c：死亡/空投重生后新件是一件件冒出来的，2.1.58 把间隔拉到 60 帧起、最长 300 帧，
-		-- 实机里件迟迟挂不上（"找到 0 件/2 件"来回，约 18 秒）。现在：结果一变就进入 15 帧间隔的"快扫窗口"
-		-- （900 帧），窗口内每次扫描结果不变也只在 60 帧后才开始退避。
-		local fast = math.floor(tonumber(runtime.options.independentMissRescanFrames) or 15)
-		if #tags == 0 then fast = math.min(fast, 5) end
-		if state.missingSignature ~= signature then
-			state.missingSignature, state.missBackoff, state.missFastUntil = signature, fast, frame + 900
-		elseif frame >= (state.missFastUntil or 0) then
-			state.missBackoff = math.min(300, math.max(60, (state.missBackoff or 30) * 2))
-		end
-		state.rescanAt = frame + state.missBackoff
-	else
-		state.missingSignature, state.missBackoff = nil, nil
-		state.rescanAt = frame + (#tags == 0 and 300 or INDEPENDENT_RESCAN_FRAMES)
-	end
+	local frame = runtime.frame or 0
+	state.rescanAt = frame + 1   -- 每帧枚举（IAS 每回调都做）
 	return true
 end
 
@@ -5873,6 +6140,11 @@ end
 
 local function apply_arm_pose_frame(runtime)
 	if type(Compat.apply_arm_pose) ~= "function" then return 0, 0 end
+	-- 本帧枚举（drive 已做则同帧复用）：本帧用到的句柄都来自这一次枚举。
+	if runtime.roster == nil or runtime.roster.frame ~= (runtime.frame or 0) then
+		local okRoster = pcall(Roster.update, runtime)
+		if okRoster and runtime.roster ~= nil and runtime.roster.identity then resolve_local_avatar_for_arm(runtime) end
+	end
 	local unit = runtime.avatar
 	if unit ~= nil and not session_unit_live(runtime, unit) then
 		runtime.avatar, unit = nil, nil
@@ -5994,6 +6266,19 @@ local function drive(runtime)
 	end
 
 	Compat.begin_frame(frame)
+	-- E12d：IAS 式每帧枚举（avatar / 装甲件 / 本人身份）。本帧用到的独立骨句柄都来自这一次枚举。
+	local rosterOk = false
+	if arm_pose_enabled(runtime) then
+		local okRoster, rosterError = pcall(Roster.update, runtime)
+		rosterOk = okRoster and runtime.roster ~= nil
+		if not okRoster and not runtime.rosterErrorLogged then
+			runtime.rosterErrorLogged = true
+			logger("[physbone][错误] 每帧枚举失败：%s", tostring(rosterError))
+		end
+		if rosterOk and runtime.roster.identity then resolve_local_avatar_for_arm(runtime) end
+	else
+		runtime.roster = nil
+	end
 	if runtime.independent and not arm_pose_enabled(runtime) then IndependentLink.release_all(runtime) end
 	local driveClock = os.clock()   -- 这一拍驱动块占用的 CPU 时间（心跳里报出来）
 
@@ -6008,7 +6293,7 @@ local function drive(runtime)
 	-- 所以会话**和** avatar 两套句柄都要过同一道闸。
 	local haveSessions = runtime.sessions ~= nil and #runtime.sessions > 0
 	local haveAvatars = (runtime.avatars ~= nil and #runtime.avatars > 0) or runtime.avatar ~= nil
-	if haveSessions or haveAvatars then
+	if haveSessions or (haveAvatars and not rosterOk) then
 		local live = refresh_live_units(runtime, S)
 		if live == "world-gone" then
 			-- 我们那个世界已经不在了：整组丢弃，一个句柄都不碰（下一帧重扫）。
@@ -6678,6 +6963,9 @@ function M.install(stingray, options)
 
 	local logger, logContext = makeLogger(options)
 	-- 分项计数：默认开（用户下次实机要一次拿全分项）；`perfCounters = false` 关。
+	Roster.reset()
+	Roster.negativeSeconds = tonumber(options.rosterNegativeSeconds) or 0.25   -- IAS 行 1553；仅测试用选项可调
+	Roster.pollInterval = tonumber(options.identityPollSeconds) or 0.25   -- IAS：4 Hz（行 4747）；仅测试用选项可调
 	Perf.reset()
 	Perf.on = options.perfCounters ~= false
 	if Perf.on then
@@ -6815,6 +7103,8 @@ end
 
 M.install_ = M.install
 M.perf_ = Perf
+M.roster_ = Roster
+M.set_engine_ = function(engine) S = engine end   -- 仅测试：不经 install 直接给 Roster 一个引擎
 
 -- 测试钩子：抬升探针的两块纯逻辑（读调参文件 / 给一个 unit 加偏移）。
 -- 单独暴露出来，是因为"不累加、引擎重设后能重写、关掉时能还原"这三条

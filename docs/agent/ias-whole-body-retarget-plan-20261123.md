@@ -496,3 +496,39 @@ F4 585–904 次/帧不是膨胀：单人 1 人时 321–372，4 人局低帧率
 ### 19.6 验收
 
 假引擎战斗场景（`perf-combat-test.lua`，15 000 unit、4 人、物理全开的**假求解器**）：稳态每帧引擎调用 2.1.58 为 20.87，2.1.59 为 38.47，其中 25.2/帧来自负缓存每 600 帧整体重建一次的摊销扫描（2.1.58 在真实战斗里这类扫描每 20 帧一次且无缓存），其余固定项相同；OTHER 0.0；找武器稳态 debug_name 125/帧（15 000 个 unit 每 180 帧重建标识缓存，摊销）。该场景的假求解器不发引擎调用，所以**每帧物理/姿势驱动调用数无法在离线对比**，以实机 PERF 行为准。Lua 回归 708 通过 / 0 失败；C# Debug 构建 0 警告 0 错误，全量测试 6 个程序集全绿；无 MSBuild/dotnet 残留。
+
+
+## 20. E12d 照 IAS 的生命周期替换（运行时 2.1.60）
+
+对照表：`ias-runtime-lifecycle-map-20261123.md`。用户裁定：本人/队友/死亡判据、崩溃安全、按哈希取件、尸体全部照 IAS，白名单外的 API 照用，不加 IAS 没有的机制。
+
+### 20.1 已做（独立骨路径，T 字空档的直接修复）
+
+- **新增 `Roster`（`physbone_runtime.lua`，注释里逐项标 IAS 行号）**，每帧在 `drive` 开头运行：
+  - avatar 枚举：`World.units_by_resource(world, AVATAR_RESOURCE)`（IAS 1344–1360）；
+  - 装甲件发现：每个 profile 一次 `units_by_resource(world, IdString64.from_hex(哈希))`，到期才查、空结果缓存 0.25 s；全量 `World.units` 只在 60 帧一次 / 战斗世界 avatar 集合变化或每 2 s / 某 profile 命中数下降时兜底，名字哈希匹配（IAS 1500–1620）；
+  - 归属：根探针 `{1,0}`、最近 avatar、3 m（`d2 < 9`）、次近比最近远出 0.20 才绑，当帧重算不保存（IAS 6690–6830）；
+  - 身份：`Network` + `GameSession` 的 owner / health / 位置匹配（5 cm、25 cm 裕度、已链接 1 m），4 Hz，先清缺席再节流，角色 0/1/2/3，`health<=0` = 死亡（IAS 4718–5100）。
+- 独立骨 `independent_scan` 改为消费 Roster：件 = 本帧装甲件枚举里归属本人的那些；删除了重扫间隔、缺件退避、快扫窗口、2 m 肩骨归属判据、"无清单按骨名找"路径。`resolve_local_avatar_for_arm` 不再从物理名单取 `avatars[1]`，也不再自己 `findAvatars`；本人 = 角色 1，没有网络身份就没有本人（IAS 同样无回退）。
+- 活体判定：`session_unit_live` 先认本帧 Roster 枚举；没有物理会话时不再每帧拉全量 `World.units`（F1 对独立骨路径消失）。
+- 新用例 `ias-roster-test.lua`（9 项）：死亡（health<=0）→ avatar 被销毁 → 新 avatar 与同 ID 8 件出现，旧件留在尸体上，世界里另有 70 个同 ID 干扰件和 3000 个无关 unit：新 avatar 的 8 件 ≤ 2 帧被绑定，旧件与干扰件不被误选，稳定后 30 帧内全量 `World.units` ≤ 1 次。
+
+### 20.2 白名单外、照 IAS 使用的 API（逐个列出）
+
+`Network.game_session`、`Network.peer_id`、`GameSession.in_session`、`GameSession.objects_owned_by`、`GameSession.game_object_exists`、`GameSession.game_object_is_type`、`GameSession.game_object_field`（字段 `position`、`health`）、`IdString64.from_hex`。`World.units_by_resource`、`World.num_units`、`Unit.debug_name` 等已在白名单。**未验证**：`IdString64.from_hex` 作为 `units_by_resource` 键在本游戏版本是否可用；它不可用时发现退回 IAS 的兜底路径（全量扫描 + 名字哈希，60 帧 / 战斗世界 2 s），新件最长等 2 秒。
+
+### 20.3 删掉的旧用例（逐条）
+
+- `清单：未到 30 帧不重扫`、`清单：30 帧补齐…`：测的是我们自己的重扫间隔，IAS 没有；改为"小世界总数变化新件下一帧被发现"（IAS 1519）。
+- `E11 动作：状态机消失清除分类`：IAS 角色 1 要求状态机，没有状态机的 avatar 不再是本人，件整体停止驱动，不存在"留着本人却清分类"的状态。
+- 其余改动属于适配而非删除：用例安装统一 `identityPollSeconds=0`、`rosterNegativeSeconds=0`（IAS 默认 0.25 s，只是测试里帧间隔几毫秒）；`make_env` 加 `Network/GameSession/IdString64` 桩；无清单的旧数据用例补了清单；动作日志用例关闭身份桩以保持逐次数 `Unit.alive`；多人用例把"avatar 切换"改成旧 avatar 从枚举消失；`同帧补扫…` 的状态机读取次数 1 → 2（身份轮询自己读一次）。
+
+### 20.4 没做（停下来写明，未自己发明）
+
+1. **物理会话路径没替换**：`discover`、打分额度、负缓存、`dropAllOnDeath`、`reconcile`、"跳过尸体/人台 5 m"、兜底归属仍在。IAS 的物理在原生 DLL 里按"实例槽位 + profile id"每帧 `bind_unit`，Lua 侧没有对应做法，把我们的 Lua 物理会话改成这样需要重做 attach/会话生命周期，并重写 `mp_harness`、`runtime-harness`、`lifecycle`、`schedule` 等用例，本批没有做。因此 **F1（每帧 `World.units` 指针闸）在有物理会话时仍在**，只对独立骨路径去掉了。
+2. **尸体视觉副本冻结没做**：IAS 的做法（`corpse_freeze`，行 5236–5990）依赖存活时每 0.25 s 采集每件相对核心的形状缓存、`spawn_unit` 复制、隐藏原件、4 秒 Verlet 下落后冻结，并与它的原生管线（`corpse_freeze_context`、`freeze_corpse_physics`）耦合。本批没有对应实现，所以**死亡后尸体仍会回到绑定姿势**（`release_all`）。这一项不是"IAS 没有"，是没来得及做。
+3. 队友身份：已实现 IAS 的角色 2 判定的主干，但没有移植 IAS 的"稳定互斥回退"与远端 peer 逐个枚举（行 5000–5060 与 4880–4930）。
+
+### 20.5 验收
+
+Lua 回归 715 通过 / 0 失败；C# Debug 构建 0 警告 0 错误，全量测试 6 个程序集全绿；无 MSBuild/dotnet 残留。以上都是假引擎结果，**没有实机验证**。

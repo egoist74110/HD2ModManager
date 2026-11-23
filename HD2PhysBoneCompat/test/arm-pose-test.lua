@@ -150,6 +150,28 @@ local function make_rig(mode)
 	return unit
 end
 
+-- E12d：IAS 身份轮询是 4 Hz；用例里的"帧"只隔几毫秒，所以统一把测试安装的轮询间隔设为 0。
+local rawInstall = Runtime.install
+Runtime.install = function(S, options)
+	options = options or {}
+	if options.identityPollSeconds == nil then options.identityPollSeconds = 0 end
+	if options.rosterNegativeSeconds == nil then options.rosterNegativeSeconds = 0 end
+	-- IAS 的资源索引：Id64.from_hex(哈希) 作 World.units_by_resource 的键，返回名字含该哈希的件。
+	if S.IdString64 == nil then S.IdString64 = { from_hex = function(hash) return { hex = hash } end } end
+	local byPath = S.World.units_by_resource
+	S.World.units_by_resource = function(world, key)
+		if type(key) == "table" and key.hex then
+			local out = {}
+			for _, unit in ipairs(S.World.units(world) or {}) do
+				if string.find(unit.tag or "", key.hex, 1, true) then out[#out + 1] = unit end
+			end
+			return out
+		end
+		return byPath(world, key)
+	end
+	return rawInstall(S, options)
+end
+
 local function make_env(unit, opts)
 	opts = opts or {}
 	local engineCalls = 0
@@ -293,6 +315,20 @@ local function make_env(unit, opts)
 		units = function() engineCalls = engineCalls + 1; return { unit } end,
 		units_by_resource = function() engineCalls = engineCalls + 1; return { unit } end,
 		update_unit = function(w, u) engineCalls = engineCalls + 1; u.update_world() end,
+		num_units = function(w) local all = S.World.units(w); return type(all) == "table" and #all or 0 end,
+	}
+	-- E12d：IAS 身份（Network/GameSession）桩。`S.testLocal` 指向"本人"那个 avatar，网络对象位置 = 它的根位置。
+	S.testLocal = unit
+	S.Network = { game_session = function() return 1 end, peer_id = function() return "me" end }
+	S.GameSession = {
+		in_session = function() return true end,
+		objects_owned_by = function() return { 5000 } end,
+		game_object_exists = function(_, id) return id == 5000 end,
+		game_object_is_type = function() return true end,
+		game_object_field = function(_, _, field)
+			if field == "health" then return S.testHealth or 100 end
+			return S.Unit.world_position(S.testLocal, 1)
+		end,
 	}
 	S.Application = {
 		worlds = function() engineCalls = engineCalls + 1; return { world } end,
@@ -570,7 +606,7 @@ do
 	state.avatar = nil
 	Runtime.apply_arm_pose_frame_(state)
 	check("多人 runtime.avatars 不被手臂修正覆盖",
-		#state.avatars == 2 and state.avatars[1].unit == u and state.avatars[2].unit == teammate and state.avatar == u)
+		#state.avatars == 2 and state.avatars[1].unit == u and state.avatars[2].unit == teammate)
 	Runtime.uninstall()
 end
 
@@ -578,6 +614,7 @@ end
 do
 	local avatar = make_rig("rifle")
 	local S, world = make_env(avatar)
+	S.Network, S.GameSession = nil, nil   -- 这组用例逐次数 Unit.alive / 状态机读取，不带 IAS 身份轮询
 	local teammate = make_rig("rifle")
 	S.World.units = function() return { avatar, teammate } end
 	local calls, order, logs = {}, {}, {}
@@ -713,11 +750,14 @@ do
 	local armorShoulderP = { armor.locals.l_shoulder.p[1], armor.locals.l_shoulder.p[2], armor.locals.l_shoulder.p[3] }
 	local armorRightQ = copy(armor.locals.r_shoulder.q)
 	_G.render = nil
+	armor.tag = "#ID[a100000000000001]"
 	local state = Runtime.install(S, {
 		compat = Compat,
 		armPose = true,
 		independentIk = false,
 		independentBones = { { "ias_l_shoulder", "l_shoulder" }, { "ias_l_elbow", "l_elbow" }, { "ias_l_hand", "l_hand" } },
+		-- E12d：IAS 按目录里的单元 ID 直接匹配，没有"无清单按骨名找"的路径；旧数据用例也必须给清单。
+		independentPieces = { ["#ID[a100000000000001]"] = { "ias_l_shoulder", "ias_l_elbow", "ias_l_hand" } },
 		carriers = {},
 		pollFrames = 20,
 		logPath = logPath,
@@ -867,10 +907,10 @@ do
 	units[#units + 1] = late
 	first.locals.root.p[1] = -2
 	first.update_world()
-	render(29)
-	check("清单：未到 30 帧不重扫", #state.independent.pieces == 1)
+	-- E12d：旧用例"未到 30 帧不重扫"测的是我们自己的重扫间隔，IAS 没有。IAS（runtime.lua 1519）：
+	-- 小世界（≤512 个 unit）总数一变就立即重新发现 ⇒ 新件下一帧就被找到。
 	render(1)
-	check("清单：30 帧补齐，存活件越过旧距离阈值仍保留", #state.independent.pieces == 2 and state.independent.pieces[1] == tracked)
+	check("清单（IAS）：小世界总数变化，新件下一帧即被发现，存活件保持", #state.independent.pieces == 2 and state.independent.pieces[1] == tracked)
 	check("清单：肩骨离本地根超过 1 m 仍可找到", state.independent.pieces[2].unit == late)
 
 	state.options.independentGrips, state.options.poseEveryFrame = {}, true
@@ -903,9 +943,8 @@ do
 	avatar.menu, avatar.clip = false, 1e37
 	render(1)
 	check("E11 动作：任务空主层 585 使用持枪", state.independent.action == 1)
-	avatar.machine = false
-	render(1)
-	check("E11 动作：状态机消失清除分类", state.independent.action == 0 and next(state.independent.contacts) == nil)
+	-- E12d：旧用例"状态机消失清除分类"已删除：IAS 的 role 1 要求状态机（physics_identity 行 5083），
+	-- 没有状态机的 avatar 不再是本人，件整体不再被驱动，不存在"留着本人却清分类"的状态。
 	avatar.machine = true
 	local layer = S.Unit.animation_layer_info
 	S.Unit.animation_layer_info = function() error("clip unavailable") end
@@ -928,7 +967,8 @@ do
 	state.independent.rescanAt = state.frame + 1
 	render(1)
 	check("动作：同帧补扫与日志复用本地 avatar 状态",
-		onlyLocal and actionCalls.has_animation_state_machine == 1
+		-- E12d：IAS 身份轮询自己读一次状态机（physics_identity 行 5082），动作采样复用帧内缓存读一次：合计 2 次。
+		onlyLocal and actionCalls.has_animation_state_machine == 2
 		and actionCalls.animation_get_state == 1 and actionCalls.animation_layer_info == 1)
 	state.options.stateLog = false
 
@@ -1035,7 +1075,9 @@ do
 	render(1)
 	check("生命周期：世界变化重建独立件状态", state.independent ~= before and state.independent.world == newWorld)
 	before = state.independent
-	state.avatar = partner
+	-- IAS：本人换 unit 意味着旧 avatar 已从枚举里消失（否则两个 owner=true 的 avatar 互相歧义）。
+	state.avatar, S.testLocal = partner, partner
+	S.World.units_by_resource = function() return { partner } end
 	render(1)
 	check("生命周期：avatar 变化重建动作与件状态", state.independent ~= before and state.independent.avatar == partner)
 	Runtime.uninstall()
@@ -1056,7 +1098,9 @@ do
 	local S, world = make_env(avatar)
 	S.World.units = function() return { avatar, armor } end
 	_G.render = nil
+	armor.tag = "#ID[a900000000000001]"
 	local options = { compat = Compat, armPose = true, independentIk = false, carriers = {}, log = false,
+		independentPieces = { [armor.tag] = { "ias_l_shoulder", "ias_l_elbow" } },
 		independentBones = { { "ias_l_shoulder", "l_shoulder" }, { "ias_l_elbow", "l_elbow" } },
 		independentRest = { { "l_clavicle", { 0, 0, 0, 1 }, qx, armor.locals.l_shoulder.p },
 			{ "l_shoulder", { 0, 0, 0, 1 }, qz, armor.locals.l_elbow.p } },
@@ -1209,6 +1253,7 @@ do
 	tick(0.171)
 	check("E10：每帧修正绕过计时与展示插帧", state.independent.correction.due and not state.independent.correction.blend)
 	opts.poseEveryFrame = nil
+	S.testLocal = nextAvatar
 	state.avatar, state.avatars = nextAvatar, { { unit = nextAvatar } }
 	units, owners = { nextAvatar, armor }, { nextAvatar }
 	avatar.alive = false
@@ -1237,6 +1282,7 @@ do
 	for _, name in ipairs(expected) do peerPiece.names[name] = peerPiece.names[name:sub(5)] end
 	peer.locals.root.p[1], peerPiece.locals.root.p[1] = 4, 4
 	nextAvatar.alive = true
+	S.testLocal = nextAvatar
 	state.avatar, state.avatars = nextAvatar, { { unit = nextAvatar }, { unit = peer, cameraDistance = 16 } }
 	units, owners = { nextAvatar, replacement, peer, peerPiece }, { nextAvatar, peer }
 	tick(0.22)
@@ -1583,6 +1629,7 @@ do
 	end
 	check("E12c: relinks automatically after scale recovers", relinked ~= nil, relinked)
 	check("E12c: visible after relink", armor.visible ~= false)
+	S.testLocal = nextAvatar
 	state.avatar, state.avatars = nextAvatar, { { unit = nextAvatar } }
 	units, owners = { nextAvatar, armor }, { nextAvatar }
 	avatar.alive = false
