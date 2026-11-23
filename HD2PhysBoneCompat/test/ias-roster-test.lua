@@ -242,5 +242,75 @@ check(Roster.states[mate2].network == nil and Roster.states[mate2].fallbackHits 
 step()
 check(Roster.states[mate2].network == 7000002 and Roster.states[mate2].matchMethod == "stable-mutual", "清零后连续第 4 次才认定")
 
+-- ===================================================================== E12e-B2b solo / squad 发现捷径（IAS 行 4756–4905）
+io.stdout:write("\n[E12e 捷径] solo / squad 验证后跳过低位扫描与远端枚举；条件破坏后恢复\n")
+local cnt = { exists = 0, owned = 0 }
+local realExists, realOwned = GSm.game_object_exists, GSm.objects_owned_by
+GSm.game_object_exists = function(...) cnt.exists = cnt.exists + 1; return realExists(...) end
+GSm.objects_owned_by = function(...) cnt.owned = cnt.owned + 1; return realOwned(...) end
+GSm.game_object_owner = function(_, id)
+	for peerName, ids in pairs(ownership) do for _, v in ipairs(ids) do if v == id then return peerName end end end
+end
+local function poll()
+	cnt.exists, cnt.owned = 0, 0
+	step()
+	return cnt.exists, cnt.owned
+end
+
+-- solo：poll1 未验证（全量扫描 1+64+刷新1），poll2 起验证通过（捷径 1 + 刷新 1）
+hardReset()
+objs = { [5000] = { x = 0, y = 0, z = 0, health = 100 } }
+ownership = { me = { 5000 } }
+peersList, otherPeersList = { "me" }, { "me" }
+local solo = newUnit("solo", 0, "avatar")
+local e1, o1 = poll()
+check(e1 == 66 and o1 == 1, "solo 验证前：存在性查询 66（1 个已有 + 64 游标 + 1 刷新），自己的 owned 列表 1 次", e1)
+check(Roster.role(solo) == 1, "solo 已识别为本人")
+local cursorAfter1 = Roster.cursor
+local e2 = poll()
+check(e2 == 2, "solo 验证后：存在性查询 2（捷径 1 + 已知对象刷新 1），不再扫低位", e2)
+check(Roster.cursor == cursorAfter1, "solo 验证后：低位游标不再前进", Roster.cursor)
+poll()
+check(Roster.role(solo) == 1, "solo 捷径下角色保持 1")
+peersList = { "me", "peer9" }
+local e3 = poll()
+check(e3 > 64, "solo 条件破坏（peers 里出现别人）：恢复低位扫描", e3)
+peersList = { "me" }
+local e4 = poll()
+check(e4 == 2, "名单恢复干净：捷径重新生效", e4)
+local extra = newUnit("extra", 40, "avatar")
+local e5 = poll()
+check(e5 > 64, "第二个 avatar 出现：不再是 solo，恢复低位扫描", e5)
+
+-- squad：poll1 未验证（全量扫描 + 远端枚举），poll2 起验证通过（每人 1 次捷径 + 1 次刷新，不枚举远端）
+hardReset()
+objs = { [5000] = { x = 0, y = 0, z = 0, health = 100 }, [7000001] = { x = 10, y = 0, z = 0, health = 100 } }
+ownership = { me = { 5000 }, peer2 = { 7000001 } }
+peersList, otherPeersList = { "me", "peer2" }, { "me", "peer2" }
+local sa = newUnit("sa", 0, "avatar")
+local sb = newUnit("sb", 10, "avatar")
+local se1, so1 = poll()
+check(se1 > 64 and so1 == 2, "squad 验证前：低位扫描 + 远端枚举（owned 列表 2 次：自己 + peer2）", se1 .. "/" .. so1)
+check(Roster.role(sa) == 1 and Roster.role(sb) == 2, "squad 两人角色 1 / 2", Roster.role(sa) .. "/" .. Roster.role(sb))
+local sc1 = Roster.cursor
+local se2, so2 = poll()
+check(se2 == 4 and so2 == 1, "squad 验证后：存在性查询 4（2 人 x（捷径 1 + 刷新 1）），owned 列表仅自己 1 次", se2 .. "/" .. so2)
+check(Roster.cursor == sc1, "squad 验证后：低位游标不再前进")
+check(Roster.role(sa) == 1 and Roster.role(sb) == 2, "squad 捷径下角色保持")
+otherPeersList = { "me" }
+local se3 = poll()
+check(se3 > 64, "squad 条件破坏（两份名单不一致）：恢复扫描", se3)
+otherPeersList = { "me", "peer2" }
+local se4, so4 = poll()
+check(se4 == 4 and so4 == 1, "名单一致：捷径重新生效", se4 .. "/" .. so4)
+local sc = newUnit("sc", 50, "avatar")
+local se5, so5 = poll()
+check(se5 > 64 and so5 == 2, "新 avatar 出现（尚无网络对象）：恢复扫描与远端枚举", se5 .. "/" .. so5)
+destroy(sc)
+poll()
+objs[7000001].x = 12
+local se6 = poll()
+check(se6 > 64, "队友对象与 avatar 位置偏差 > 1 m：捷径失效，恢复扫描", se6)
+
 io.stdout:write(string.format("\n检查 %d 项，失败 %d\n", checks, failures))
 os.exit(failures == 0 and 0 or 1)
