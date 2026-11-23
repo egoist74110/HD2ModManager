@@ -28,7 +28,18 @@ local FILLER = 2400
 local engine = { alive = {}, nodes = {}, anim = {}, pos = {}, time = 10.0, writes = 0 }
 local world = { name = "w" }
 
+-- IAS 的 profile 表只认 16 位十六进制资源 id：装甲件的 id 一律是 16 位 hex，名单是装载时就定死的静态池。
+-- （旧写法 "#ID[t6a1]" 这类名字不是资源 id，每帧枚举按 hash 找就永远找不到它们。）
+local HEX_ID = "^#ID%[%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%]$"
+local PROFILE_POOL, nextProfile = {}, 0
+for index = 1, 160 do PROFILE_POOL[index] = string.format("%016x", 0xd0000000 + index) end
+
 local function newUnit(tag, nodeCount, animated, resource)
+	if not animated and resource ~= nil and not resource:match(HEX_ID) then
+		nextProfile = nextProfile + 1
+		assert(nextProfile <= #PROFILE_POOL, "profile 池不够用")
+		resource = "#ID[" .. PROFILE_POOL[nextProfile] .. "]"
+	end
 	local unit = { tag = tag, resource = resource or ("#ID[" .. tag .. "]"), ids = {}, nodeOf = {} }
 	engine.alive[unit] = true
 	engine.nodes[unit] = nodeCount
@@ -147,8 +158,9 @@ engine.hidden = {}
 function engine.unitsArray()
 	local list = {}
 	if avatar ~= nil and engine.hidden[avatar] ~= true then list[#list + 1] = avatar end
+	-- 被销毁的 unit（alive=false）不会再出现在真引擎的枚举里；IAS 的每帧枚举也没有"先判活"这一步。
 	for _, unit in ipairs(armors) do
-		if engine.hidden[unit] ~= true then list[#list + 1] = unit end
+		if engine.hidden[unit] ~= true and engine.alive[unit] ~= false then list[#list + 1] = unit end
 	end
 	for _, unit in ipairs(fillers) do
 		if engine.hidden[unit] ~= true then list[#list + 1] = unit end
@@ -166,12 +178,17 @@ S.IdString64 = { from_hex = function(hash) return { hex = hash } end }
 S.World.num_units = function() return #engine.unitsArray() end
 S.World.units_by_resource = function(_, key)
 	local out = {}
-	for _, unit in ipairs(engine.unitsArray()) do
-		if type(key) == "table" then
-			if unit.resource:find(key.hex, 1, true) then out[#out + 1] = unit end
-		elseif engine.anim[unit] == true and unit.ids[SUPPORT_MG] then
-			out[#out + 1] = unit
+	if type(key) == "table" then
+		-- 资源索引：只列还活着、引擎还认的 unit（被销毁的不会再出现，和真引擎一样）。
+		for _, unit in ipairs(armors) do
+			if engine.alive[unit] == true and engine.hidden[unit] ~= true and unit.resource:find(key.hex, 1, true) then
+				out[#out + 1] = unit
+			end
 		end
+		return out
+	end
+	for _, unit in ipairs(engine.unitsArray()) do
+		if engine.anim[unit] == true and unit.ids[SUPPORT_MG] then out[#out + 1] = unit end
 	end
 	return out
 end
@@ -183,6 +200,7 @@ do
 			options.independentPieces = {}
 			for index = 1, #ARMOR_NODES do options.independentPieces[string.format("#ID[c%015x]", index)] = { "x" } end
 		end
+		if options.profileHashes == nil then options.profileHashes = PROFILE_POOL end
 		if options.identityPollSeconds == nil then options.identityPollSeconds = 0 end
 		if options.rosterNegativeSeconds == nil then options.rosterNegativeSeconds = 0 end
 		return rawInstall(stingray, options)
@@ -1039,10 +1057,11 @@ do
 	for _, session in ipairs(runtime.sessions or {}) do
 		byTag[tostring(session.unitTag)] = #session.sessions
 	end
-	check("T22 只带 5% 骨的小件也挂上了", byTag["#ID[t22small]"] == 1,
-		string.format("链=%s", tostring(byTag["#ID[t22small]"])))
-	check("T22 带 20% 骨的大件挂上了它自己那 4 条链", byTag["#ID[t22big]"] == 4,
-		string.format("链=%s", tostring(byTag["#ID[t22big]"])))
+	-- unitTag 现在就是资源 id（IAS 的 profile 哈希），不再是测试里随手起的名字。
+	check("T22 只带 5% 骨的小件也挂上了", byTag[small.resource] == 1,
+		string.format("链=%s", tostring(byTag[small.resource])))
+	check("T22 带 20% 骨的大件挂上了它自己那 4 条链", byTag[big.resource] == 4,
+		string.format("链=%s", tostring(byTag[big.resource])))
 	local total = 0
 	for _, count in pairs(byTag) do total = total + count end
 	check("T22 合计链数远小于「两件都带全量」（5 ≪ 40）", total == 5, string.format("合计=%d", total))

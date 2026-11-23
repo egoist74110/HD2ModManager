@@ -3876,20 +3876,45 @@ Roster.known, Roster.session, Roster.epoch = {}, nil, 0
 Roster.nextPoll, Roster.ownedCursor, Roster.cursor = 0, 0, 0
 Roster.extendedCursor, Roster.nearCursor, Roster.observedHigh = 4096, 0, 4095
 
+--- IAS profile 表：一件转换后的护甲 = 一个 profile，哈希 = 16 位十六进制资源 id（IAS 行 757–844，启动时装载一次）。
+--- 转换器写出 `profileHashes`（独立骨件与物理件都在内）；retarget 与物理共用这一份名单。
+--- 兼容垫片（不是 IAS 机制）：旧版 joint-pose 数据没有 `profileHashes`，退回 `independentPieces` 的键。
 local function roster_hashes(runtime)
 	local cached = runtime.rosterHashes
 	if cached ~= nil then return cached end
 	local list, seen = {}, {}
-	for tag in pairs((runtime.options or {}).independentPieces or {}) do
-		local hash = tostring(tag):match("^#ID%[(%x+)%]$")
-		if hash ~= nil then
-			hash = hash:lower()
-			if not seen[hash] then seen[hash] = true; list[#list + 1] = hash end
-		end
+	local function add(hash)
+		if type(hash) ~= "string" then return end
+		hash = hash:lower()
+		if #hash == 16 and hash:match("^%x+$") and not seen[hash] then seen[hash] = true; list[#list + 1] = hash end
 	end
+	local options = runtime.options or {}
+	for _, hash in ipairs(options.profileHashes or {}) do add(hash) end
+	for tag in pairs(options.independentPieces or {}) do add(tostring(tag):match("^#ID%[(%x+)%]$")) end
 	table.sort(list)
 	runtime.rosterHashes = list
 	return list
+end
+
+--- IAS `__hd2ir_unit_instance_slot`（行 925–945）：句柄 → 稳定小整数，隔 120 帧清掉 2 帧没见过的。
+--- 只用来当"身份"，从不拿它去调引擎。
+Roster.slots, Roster.slotSeen, Roster.nextSlot, Roster.slotPruned = {}, {}, 1, -1
+function Roster.instanceSlot(unit, frame)
+	if unit == nil then return 0 end
+	if frame % 120 == 0 and Roster.slotPruned ~= frame then
+		Roster.slotPruned = frame
+		for key, last in pairs(Roster.slotSeen) do
+			if frame - last > 2 then Roster.slots[key], Roster.slotSeen[key] = nil, nil end
+		end
+	end
+	local slot = Roster.slots[unit]
+	if slot == nil then
+		slot = Roster.nextSlot
+		Roster.nextSlot = slot + 1
+		Roster.slots[unit] = slot
+	end
+	Roster.slotSeen[unit] = frame
+	return slot
 end
 
 local function roster_key(hash)
@@ -3912,6 +3937,8 @@ end
 --- IAS discover_armour_units：返回本世界当前的装甲件 { unit, hash }。
 local function roster_discover(runtime, world, frame, unitCount, signature, gameplay)
 	local hashes = roster_hashes(runtime)
+	-- IAS 没有 profile 表就不会有任何发现（也就没有全量扫描）。
+	if #hashes == 0 then return {} end
 	local record = Roster.worlds[world]
 	if record == nil then
 		record = { last = -1000000, counts = {}, negative = { signature = nil, untilTime = {}, nextFull = 0 } }
@@ -3989,6 +4016,10 @@ local function roster_discover(runtime, world, frame, unitCount, signature, game
 	else
 		fast.__unit_count = previous.__unit_count
 		record.counts = fast
+	end
+	-- IAS 行 1651–1656：600 帧没扫过的世界记录清掉。
+	for key, other in pairs(Roster.worlds) do
+		if frame - other.last > 600 then Roster.worlds[key] = nil end
 	end
 	return discovered
 end
@@ -4185,33 +4216,45 @@ function Roster.update(runtime)
 		local avatars = perWorld[world]
 		local slots, gameplay = {}, false
 		for _, item in ipairs(avatars) do
-			slots[#slots + 1] = tostring(item.unit)
+			slots[#slots + 1] = Roster.instanceSlot(item.unit, frame)
 			local role = Roster.role(item.unit)
 			if role == 1 or role == 2 then gameplay = true end
 			if role == 1 and roster.localAvatar == nil then roster.localAvatar = item.unit; roster.localWorld = world end
 		end
 		table.sort(slots)
 		local count = try(S.World.num_units, world)
-		local armour = roster_discover(runtime, world, frame, count, table.concat(slots, ":"), gameplay)
+		-- IAS 行 1386–1392：只扫 active 世界。我们能判的只有"有 avatar 且单位数 > 0"
+		-- （IAS 另有 scene_sources / 第一人称图两个条件，本运行时没有对应数据）。
+		local active = #avatars > 0 and not (type(count) == "number" and count <= 0)
+		local armour = active and roster_discover(runtime, world, frame, count, table.concat(slots, ":"), gameplay) or {}
 		local owner = {}
 		for _, row in ipairs(armour) do
 			roster.live[row.unit] = true
-			local best, second, bestD = nil, math.huge, math.huge
 			local nodes = try(S.Unit.num_scene_graph_items, row.unit)
-			for _, probe in ipairs({ 1, 0 }) do
-				if type(nodes) == "number" and probe < nodes then
-					local p = roster_point(row.unit, probe)
-					if p ~= nil then
-						for _, item in ipairs(avatars) do
-							local d = roster_distance(p, item.p)
-							if d < bestD then second, bestD, best = bestD, d, item
-							elseif d < second then second = d end
+			if type(nodes) == "number" and nodes > 1 then
+				-- IAS 行 6702–6725：每个探针 {1,0} 都算，每个 avatar 取各探针里的最小距离，再比 avatar。
+				local distance = {}
+				for _, probe in ipairs({ 1, 0 }) do
+					if probe < nodes then
+						local p = roster_point(row.unit, probe)
+						if p ~= nil then
+							for index, item in ipairs(avatars) do
+								local d = roster_distance(p, item.p)
+								if distance[index] == nil or d < distance[index] then distance[index] = d end
+							end
 						end
 					end
 				end
-				if best ~= nil then break end
+				local best, second, bestD = nil, math.huge, math.huge
+				for index, item in ipairs(avatars) do
+					local d = distance[index]
+					if d ~= nil then
+						if d < bestD then second, bestD, best = bestD, d, item
+						elseif d < second then second = d end
+					end
+				end
+				if best ~= nil and bestD < 3.0 and second - bestD > Roster.AMBIGUITY then owner[row.unit] = best.unit end
 			end
-			if best ~= nil and bestD < 3.0 and second - bestD > Roster.AMBIGUITY then owner[row.unit] = best.unit end
 		end
 		roster.byWorld[world] = { avatars = avatars, armour = armour, owner = owner }
 	end
@@ -4225,6 +4268,7 @@ function Roster.reset()
 	Roster.known, Roster.session = {}, nil
 	Roster.nextPoll, Roster.ownedCursor, Roster.cursor = 0, 0, 0
 	Roster.extendedCursor, Roster.nearCursor, Roster.observedHigh = 4096, 0, 4095
+	Roster.slots, Roster.slotSeen, Roster.nextSlot, Roster.slotPruned = {}, {}, 1, -1
 end
 
 --- 本回调枚举里存在的 unit（含 avatar 与装甲件）。
@@ -6256,7 +6300,8 @@ local function physics_rig(runtime, hash, unit, carriers)
 	-- profile 表：哈希 → 容器，每个哈希只匹配一次（IAS 的 profile 是启动时装载的静态数据）。
 	local best = Compat.select_rig(S, { unit }, carriers)
 	local allowPartial = runtime.options.allowPartial == true
-	if best ~= nil and (best.full or (allowPartial and best.score > 0)) then
+	-- 与 2.1.60 一致：按件切骨的转换器产物只带容器的一部分骨，部分命中（score >= 1）是正常情形。
+	if best ~= nil and (best.full or allowPartial or (best.score or 0) >= 1) then
 		row = { rig = best.rig, path = best.path }
 		rows[hash] = row
 		return row
@@ -6375,8 +6420,12 @@ local function physics_sync(runtime)
 	end
 	if attached > 0 then
 		local chains = 0
-		for _, session in ipairs(sessions) do chains = chains + #session.sessions end
-		runtime.logger("[physbone] 已挂载 %d 个 unit / %d 条链（玩家 %d 个）；本帧新挂 %d", #sessions, chains, #list, attached)
+		local counts = {}
+		for _, session in ipairs(sessions) do chains = chains + #session.sessions; counts[#counts + 1] = #session.sessions end
+		table.sort(counts, function(a, b) return a > b end)
+		-- 每件的链数（降序）：多于一件时才附带，用来确认"按件切骨"生效（各件不同、合计远小于全量）。
+		runtime.logger("[physbone] 已挂载 %d 个 unit / %d 条链（玩家 %d 个）；本帧新挂 %d%s", #sessions, chains, #list, attached,
+			#counts > 1 and ("；每件链数 " .. table.concat(counts, ",")) or "")
 		if runtime.attachedFrame == nil then
 			runtime.attachedFrame, runtime.driveFrames, runtime.callsAccum = frame, 0, 0
 			runtime.peakAngle, runtime.repeatCalls, runtime.zeroFrames = 0, 0, 0

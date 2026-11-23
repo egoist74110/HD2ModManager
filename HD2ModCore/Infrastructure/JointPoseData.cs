@@ -33,7 +33,25 @@ public static class JointPoseData
 					entries.Add(side + "_" + bone + " = " + Vector(legs, side + "_" + bone));
 			parts.Add("legJointTarget = { " + string.Join(", ", entries) + " }");
 		}
-		if (root.TryGetProperty("independentBones", out var independent))
+		// IAS 的 profile 表：全部转换件（独立骨件与物理件）的哈希，retarget 与物理共用。
+		if (root.TryGetProperty("profileHashes", out var profiles) && profiles.ValueKind != JsonValueKind.Null)
+		{
+			try
+			{
+				var hashes = ProfileHashes(profiles, activeOptions);
+				if (hashes.Count > 0)
+					parts.Add("profileHashes = { " + string.Join(", ", hashes.Select(hash => $"\"{hash}\"")) + " }");
+			}
+			catch (Exception error) when (error is KeyNotFoundException or FormatException or InvalidOperationException)
+			{
+				throw new InvalidDataException($"{FileName} contains malformed profile hash data.", error);
+			}
+		}
+		// 只有物理件的 Mod 没有独立骨：空数组在有 profile 表时放行（旧数据里空数组仍是错误）。
+		var physicsOnly = parts.Exists(part => part.StartsWith("profileHashes", StringComparison.Ordinal))
+			&& root.TryGetProperty("independentBones", out var emptyBones) && emptyBones.ValueKind == JsonValueKind.Array
+			&& emptyBones.GetArrayLength() == 0;
+		if (!physicsOnly && root.TryGetProperty("independentBones", out var independent))
 		{
 			parts.Add("independentBones = " + IndependentBones(independent));
 			if (root.TryGetProperty("independentRest", out var rest) && rest.ValueKind != JsonValueKind.Null)
@@ -60,6 +78,27 @@ public static class JointPoseData
 		if (parts.Count == 0)
 			throw new InvalidDataException($"{FileName} 里没有 armShoulderTarget、legJointTarget 或 independentBones。");
 		return string.Join(", ", parts);
+	}
+
+	/// <summary>
+	/// <c>[{ "hash": "0123456789abcdef", "option": null | "coat/on" }, ...]</c>：基础件总是参与，选项件只在该选项启用时参与。
+	/// </summary>
+	private static List<string> ProfileHashes(JsonElement value, IReadOnlySet<string>? activeOptions)
+	{
+		if (value.ValueKind != JsonValueKind.Array)
+			throw new InvalidDataException($"{FileName} 的 profileHashes 必须是数组。");
+		var result = new SortedSet<string>(StringComparer.Ordinal);
+		foreach (var item in value.EnumerateArray())
+		{
+			var hash = item.GetProperty("hash").GetString();
+			if (hash is null || hash.Length != 16 || !hash.All(c => c is >= '0' and <= '9' or >= 'a' and <= 'f'))
+				throw new InvalidDataException($"Invalid profile hash: {hash}");
+			if (item.TryGetProperty("option", out var option) && option.ValueKind != JsonValueKind.Null
+				&& activeOptions is not null && !activeOptions.Contains(option.GetString()!))
+				continue;
+			result.Add(hash);
+		}
+		return [.. result];
 	}
 
 	/// <summary>

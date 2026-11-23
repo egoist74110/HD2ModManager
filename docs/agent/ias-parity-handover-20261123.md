@@ -23,6 +23,15 @@ GPT 的 5 小时额度剩下约 34%，任务随时可能中途停下。本文写
 
 E6–E11 已提交为一个检查点（见 `git log`，提交信息以"E6–E11 检查点"开头）。注意：`tmp/` 不进 git，所以 E9 真值工具（`tmp/ias-to-patch/e9/`）、各批的对照脚本和产物都只存在本机，不能删。
 
+### 2.1 E12e-B1：Roster 枚举全部转换件（分支 `wip/ias-e12e-roster`）
+
+- 转换器 `IasDp8Converter` 新写 `profileHashes`（`[{hash, option}]`，含有独立骨的件和有物理的件），`JointPoseData` 转成 Lua 选项 `profileHashes`。`independentPieces` 语义不变。
+- 运行时 `roster_hashes` 枚举这份名单（IAS 的单一 profile 表）；物理按"发现的件 → 哈希 → 容器（`physics_rig`，每个哈希只匹配一次）"绑定。兼容垫片：旧数据没有 `profileHashes` 时退回 `independentPieces` 的键（不是 IAS 机制）。
+- 发现对齐：没有名单就不扫（连 60 帧全量也不做）；归属取 `{1,0}` 全部探针、每个 avatar 取最小距离、`num_scene_graph_items > 1`；signature 用实例槽位（`Roster.instanceSlot`，IAS 行 925–945）；600 帧没扫的世界记录清掉（行 1651–1656）；只扫"有 avatar 且单位数 > 0"的世界。
+- `physics_rig` 的部分命中条件恢复为 2.1.60 的 `full or allowPartial or score >= 1`（按件切骨的产物只带容器的一部分骨）。
+- 仍缺的 IAS 做法：家族过滤、authored 归属证明、租约、marker、第一人称门控、scene_sources / 第一人称图的 active 世界判据。
+- 仍红的旧用例（等后续批次改写）：runtime-harness 的 T7（尸体/释放）、T8（停写窗口）、T11 discoverOnly、T20/T21（人台/距离）、T24/T26（指针判死日志）；perf-combat 的 "< 40 次/帧" 门槛（测得 328.95，其中 Unit.debug_name 254）。
+
 ## 3. 判断一个批次是不是半成品
 
 1. 看 `tmp/ias-to-patch/eN/eN.log` 的末尾：

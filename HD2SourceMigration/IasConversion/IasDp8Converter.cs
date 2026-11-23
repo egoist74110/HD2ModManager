@@ -99,6 +99,8 @@ public sealed class IasDp8Converter(Func<string, uint> boneHash, Func<ulong, boo
 		var skinRig = avatar with { NameHashes = candidateHashes };
 		var packagedIndependentNames = new HashSet<string>(StringComparer.Ordinal);
 		var independentPieces = new Dictionary<string, IndependentPiece>();
+		// IAS 的 profile 表：每件转换后的护甲（有独立骨或有物理）一条，哈希 = 游戏 Unit ID。运行时的每帧枚举只按这份表找件。
+		var profileHashes = new HashSet<(string Hash, string? Option)>();
 		var vanilla = new GameDataUnitMeshReader(resolver);
 		var units = new Dictionary<ulong, GameDataUnitMesh>();
 		var usedMaterials = new HashSet<ulong>();
@@ -130,7 +132,7 @@ public sealed class IasDp8Converter(Func<string, uint> boneHash, Func<ulong, boo
 			await File.WriteAllTextAsync(Path.Combine(package, "joint-pose.json"),
 				SerializeIndependentBones(candidates.Where(packagedIndependentNames.Contains).ToArray(),
 					targetRig, IasIndependentBones.Apply(avatar, targetRig, profiles[sourceTorso.Published].Nodes,
-						candidates.Where(packagedIndependentNames.Contains).ToArray(), boneHash), independentPieces),
+						candidates.Where(packagedIndependentNames.Contains).ToArray(), boneHash), independentPieces, profileHashes),
 				cancellationToken).ConfigureAwait(false);
 			Directory.Move(package, mod);
 			return new(mod, plan.Base.Count, plan.Groups.SelectMany(group => group.Options).Sum(option => option.Routes.Count),
@@ -190,6 +192,8 @@ public sealed class IasDp8Converter(Func<string, uint> boneHash, Func<ulong, boo
 								.Concat(profile.Nodes.Where(node => IasIndependentBones.ModelAttachments.Contains(node.Name))
 									.Select(node => targetRig.Find(node.Name)!.Index)));
 						packagedIndependentNames.UnionWith(independentNames);
+						if (independentNames.Count > 0 || physics is not null)
+							profileHashes.Add((key.FileId.ToString("x16"), option));
 						var unitSkinRig = IasIndependentBones.Apply(avatar, targetRig, profile.Nodes, independentNames, boneHash);
 						if (independentNames.Count > 0)
 						{
@@ -269,8 +273,12 @@ public sealed class IasDp8Converter(Func<string, uint> boneHash, Func<ulong, boo
 	/// 部署时由 HD2ModCore <c>JointPoseData</c> 转成 Lua 选项 <c>independentBones</c>。
 	/// </summary>
 	internal static string SerializeIndependentBones(IReadOnlyList<string> bones, Hd2Rig? avatar = null,
-		UnitTransformInfo? model = null, IReadOnlyDictionary<string, IndependentPiece>? pieces = null) => JsonSerializer.Serialize(new
+		UnitTransformInfo? model = null, IReadOnlyDictionary<string, IndependentPiece>? pieces = null,
+		IReadOnlyCollection<(string Hash, string? Option)>? profiles = null) => JsonSerializer.Serialize(new
 	{
+		// 全部转换件的哈希（独立骨件 + 物理件）。option 为空表示基础件；有值时只在该选项启用时参与枚举。
+		profileHashes = profiles?.OrderBy(profile => profile.Hash, StringComparer.Ordinal).ThenBy(profile => profile.Option, StringComparer.Ordinal)
+			.Select(profile => new { hash = profile.Hash, option = profile.Option }),
 		independentBones = bones.Select(name => new { bone = IasIndependentBones.Prefix + name, source = name }),
 		independentPieces = pieces?.ToDictionary(pair => pair.Key,
 			pair => pair.Value.Bones.Select(name => IasIndependentBones.Prefix + name).ToArray()),

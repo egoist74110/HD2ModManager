@@ -109,6 +109,38 @@ public sealed class PhysBoneArmPoseTests
 	}
 
 	[Fact]
+	public void JointPoseData_ProfileHashesCoverPhysicsOnlyPiecesAndFollowActiveOptions()
+	{
+		const string json = """
+			{
+			  "profileHashes": [
+			    { "hash": "0102030405060708", "option": null },
+			    { "hash": "aaaaaaaaaaaaaaaa", "option": "coat/on" },
+			    { "hash": "bbbbbbbbbbbbbbbb", "option": "coat/off" }
+			  ],
+			  "independentBones": []
+			}
+			""";
+		// 只有物理件（没有独立骨）也要把名单送进运行时；空 independentBones 在有 profile 表时放行。
+		Assert.Equal("""profileHashes = { "0102030405060708", "aaaaaaaaaaaaaaaa", "bbbbbbbbbbbbbbbb" }""", JointPoseData.ToLuaOptions(json));
+		Assert.Equal("""profileHashes = { "0102030405060708", "aaaaaaaaaaaaaaaa" }""",
+			JointPoseData.ToLuaOptions(json, new HashSet<string> { "coat/on" }));
+		Assert.Equal("""profileHashes = { "0102030405060708" }""", JointPoseData.ToLuaOptions(json, new HashSet<string>()));
+		// 与独立骨并存时 independentPieces 的语义不变。
+		var both = JointPoseData.ToLuaOptions("""
+			{
+			  "profileHashes": [{ "hash": "0102030405060708" }, { "hash": "cccccccccccccccc" }],
+			  "independentBones": [{ "bone": "ias_l_shoulder", "source": "l_shoulder" }],
+			  "independentPieces": { "#ID[0102030405060708]": ["ias_l_shoulder"] }
+			}
+			""");
+		Assert.Contains("""profileHashes = { "0102030405060708", "cccccccccccccccc" }""", both);
+		Assert.Contains("""independentPieces = { ["#ID[0102030405060708]"] = { "ias_l_shoulder" } }""", both);
+		Assert.Throws<InvalidDataException>(() => JointPoseData.ToLuaOptions(json.Replace("0102030405060708", "0102")));
+		Assert.Throws<InvalidDataException>(() => JointPoseData.ToLuaOptions(json.Replace("0102030405060708", "0102030405060ABC")));
+	}
+
+	[Fact]
 	public void JointPoseData_UsesTheActiveShoeBindForTheSharedUnitId()
 	{
 		const string json = """

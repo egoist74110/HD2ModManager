@@ -552,6 +552,20 @@ public sealed class IasConversionTests
 	}
 
 	[Fact]
+	public void ProfileHashesSerializeEveryConvertedPieceWithItsOption()
+	{
+		using var document = JsonDocument.Parse(IasDp8Converter.SerializeIndependentBones([], profiles:
+		[
+			("bbbbbbbbbbbbbbbb", "coat/on"), ("aaaaaaaaaaaaaaaa", null), ("bbbbbbbbbbbbbbbb", null),
+		]));
+		var items = document.RootElement.GetProperty("profileHashes");
+		Assert.Equal(3, items.GetArrayLength());
+		Assert.Equal("aaaaaaaaaaaaaaaa", items[0].GetProperty("hash").GetString());
+		Assert.Equal("bbbbbbbbbbbbbbbb", items[1].GetProperty("hash").GetString());
+		Assert.Equal("coat/on", items[2].GetProperty("option").GetString());
+	}
+
+	[Fact]
 	public void IndependentBonesSerializeParentFirst()
 	{
 		using var document = JsonDocument.Parse(IasDp8Converter.SerializeIndependentBones(["l_shoulder", "l_elbow", "l_hand"]));
