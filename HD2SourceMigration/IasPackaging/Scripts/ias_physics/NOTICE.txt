@@ -1,0 +1,4 @@
+format_v1.py and reference.py are unmodified files from Estecsky/HD2-PhysBoneTool,
+revision ebb91bc, under the GNU GPL v3. See the accompanying LICENSE.
+Source: https://github.com/Estecsky/HD2-PhysBoneTool/tree/ebb91bc/physbone/core
+The IAS packager uses these files only to encode HD2PHY1 data at conversion time.

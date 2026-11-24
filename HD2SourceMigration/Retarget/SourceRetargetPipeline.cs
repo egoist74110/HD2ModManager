@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using HD2ModAdaptation.PatchReconstruction.UnitMesh;
 using HD2SourceModel;
 
@@ -24,15 +25,25 @@ public static class SourceRetargetPipeline
 	/// <summary>读一个 VPK 里的源模型，并装配成骨架 + 几何。</summary>
 	/// <param name="modelStem">模型名片段；<c>null</c> 时取 VPK 里最大的那个 <c>.mdl</c>。</param>
 	public static RetargetInputs LoadSource(string vpkPath, string? modelStem = null)
+		=> LoadSource(vpkPath, modelStem, null);
+
+	internal static RetargetInputs LoadSource(string vpkPath, string? modelStem, Action<string, TimeSpan>? recordTiming)
 	{
 		ArgumentNullException.ThrowIfNull(vpkPath);
+		var start = Stopwatch.GetTimestamp();
 		using var archive = VpkArchive.Open(vpkPath);
 		var files = SourceModelLocator.Resolve(archive, modelStem);
 		var stem = files.Mdl.Path[..^4];
-		var model = SourceModelReader.Read(archive.Read(files.Mdl));
-		var vertices = SourceVertexReader.Read(archive.Read(files.Vvd), out _, out _);
-		var index = SourceIndexReader.Read(archive.Read(files.Vtx), out _, out _);
+		var mdl = archive.Read(files.Mdl);
+		var vvd = archive.Read(files.Vvd);
+		var vtx = archive.Read(files.Vtx);
+		recordTiming?.Invoke("识别与解包 VPK 模型", Stopwatch.GetElapsedTime(start));
+		start = Stopwatch.GetTimestamp();
+		var model = SourceModelReader.Read(mdl);
+		var vertices = SourceVertexReader.Read(vvd, out _, out _);
+		var index = SourceIndexReader.Read(vtx, out _, out _);
 		var geometry = SourceGeometryBuilder.Build(model, vertices, index);
+		recordTiming?.Invoke("解析源模型", Stopwatch.GetElapsedTime(start));
 		return new RetargetInputs(vpkPath, stem, files.Mdl.Path, model, geometry, Hd2Rig.Empty);
 	}
 

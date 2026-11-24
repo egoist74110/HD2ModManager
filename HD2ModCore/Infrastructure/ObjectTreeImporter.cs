@@ -162,6 +162,7 @@ public sealed class ObjectTreeImporter : IObjectTreeImporter
 
 	private static IEnumerable<DirectoryInfo> EnumerateDirectoriesDepthFirst(DirectoryInfo root)
 	{
+		if (ModNodePayloadLayout.IsInactiveOverwriteDirectoryName(root.Name)) yield break;
 		yield return root;
 		foreach (var child in SafeEnumerateDirectories(root))
 		{

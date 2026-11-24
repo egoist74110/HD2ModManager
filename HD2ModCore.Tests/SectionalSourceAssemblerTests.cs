@@ -56,6 +56,41 @@ public sealed class SectionalSourceAssemblerTests : IDisposable
 		SectionalSourceAssetKeys keys)
 		=> SectionalSourceAssembler.AssembleAsync(target, sources, armor, helmet, keys).AsTask();
 
+	[Theory]
+	[InlineData(true, 0, 0, 1)]
+	[InlineData(false, 1, 2, 3)]
+	public async Task IAS来源编号匹配导入器且普通来源沿用全局编号(
+		bool ias, int bodyIndex, int materialIndex, int optionIndex)
+	{
+		const string helmet = "59d238094a164c88";
+		const string material = "f000000000000000";
+		var source = Source("本体");
+		var option = Source("鞋子");
+		Touch(source.Directory, $"{helmet}.patch_0");
+		Touch(source.Directory, $"{material}.patch_0");
+		Touch(option.Directory, $"{Archive}.patch_0.gpu_resources", "option gpu");
+		Touch(source.Directory, "manifest.json", ias
+			? """{"name":"本体","sectionalPatchNumbering":"ias-per-archive-v1"}"""
+			: """{"name":"本体"}""");
+		var target = NewDir("target");
+
+		var result = await Assemble(target, [source, option], new(Archive, "护甲"), new(helmet, "头盔"), Keys());
+
+		Assert.True(result.Ok, result.Error);
+		// 模拟真实入库时对每个归档各自编号，包括侧车。依据文件仍须指向原内容。
+		if (ias)
+			new PatchFileNormalizer(new PatchFileNameParser()).NormalizeDirectory(target);
+		var document = await SectionalSourceFile.TryReadAsync(target);
+		Assert.NotNull(document);
+		Assert.Equal(ias ? 1 : 0, document!.IasSourceVersion);
+		Assert.Equal([$"{helmet}.patch_0", $"{Archive}.patch_{bodyIndex}", $"{material}.patch_{materialIndex}"],
+			document.Sources[0].PatchFiles);
+		Assert.Equal([$"{Archive}.patch_{optionIndex}"], document.Sources[1].PatchFiles);
+		Assert.All(document.Sources.SelectMany(entry => entry.PatchFiles!), file =>
+			Assert.True(File.Exists(Path.Combine(target, file)), file));
+		Assert.Equal("option gpu", File.ReadAllText(Path.Combine(target, $"{Archive}.patch_{optionIndex}.gpu_resources")));
+	}
+
 	[Fact]
 	public async Task 来源patch与sidecar一起平铺到条目根()
 	{

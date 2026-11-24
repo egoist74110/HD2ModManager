@@ -1,0 +1,404 @@
+<UserControl x:Class="HD2ModManager.Views.IasPageView"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:local="clr-namespace:HD2ModManager.Views"
+             xmlns:ias="clr-namespace:HD2ModCore.Ias;assembly=HD2ModCore"
+             xmlns:vm="clr-namespace:HD2ModManager.ViewModels"
+             xmlns:scroll="clr-namespace:HD2ModManager.Controls.Scrolling">
+    <UserControl.Resources>
+        <local:ImagePlaceholderConverter x:Key="IasImagePlaceholder"/>
+        <DataTemplate DataType="{x:Type vm:IasTargetPickerViewModel}">
+            <local:IasTargetPicker/>
+        </DataTemplate>
+        <SolidColorBrush x:Key="IasStatusGray" Color="#8B949E"/>
+        <Style x:Key="IasStatusDot" TargetType="Ellipse">
+            <Setter Property="Fill" Value="{StaticResource IasStatusGray}"/>
+            <Setter Property="Visibility" Value="Visible"/>
+            <Style.Triggers>
+                <DataTrigger Binding="{Binding StatusColor}" Value="Green">
+                    <Setter Property="Fill" Value="{StaticResource StatusSuccess}"/>
+                </DataTrigger>
+                <DataTrigger Binding="{Binding StatusColor}" Value="Blue">
+                    <Setter Property="Fill" Value="{StaticResource StatusInfo}"/>
+                </DataTrigger>
+                <DataTrigger Binding="{Binding StatusColor}" Value="Yellow">
+                    <Setter Property="Fill" Value="{StaticResource StatusWarning}"/>
+                </DataTrigger>
+                <DataTrigger Binding="{Binding StatusColor}" Value="Red">
+                    <Setter Property="Fill" Value="{StaticResource StatusDanger}"/>
+                </DataTrigger>
+                <DataTrigger Binding="{Binding ShowProgress}" Value="True">
+                    <Setter Property="Visibility" Value="Collapsed"/>
+                </DataTrigger>
+            </Style.Triggers>
+        </Style>
+        <Style x:Key="IasResultText" TargetType="TextBlock" BasedOn="{StaticResource AppSupportingText}">
+            <Setter Property="TextWrapping" Value="Wrap"/>
+            <Setter Property="Foreground" Value="{StaticResource StatusDanger}"/>
+            <Style.Triggers>
+                <DataTrigger Binding="{Binding ResultSuccess}" Value="True">
+                    <Setter Property="Foreground" Value="{StaticResource StatusSuccess}"/>
+                </DataTrigger>
+            </Style.Triggers>
+        </Style>
+    </UserControl.Resources>
+    <ScrollViewer Background="Transparent" scroll:SmoothScrollBehavior.IsEnabled="True" HorizontalScrollBarVisibility="Disabled">
+        <StackPanel>
+            <TextBlock Text="IAS 综合护甲系统" Style="{StaticResource AppPageTitle}"/>
+            <TextBlock Text="管理器帮你下载、安装和导入 IAS；穿什么外观，仍在游戏里按 F4 用 IAS 面板选。"
+                       Style="{StaticResource AppSupportingText}" TextWrapping="Wrap" Margin="0,4,0,12"/>
+            <TextBlock Text="{Binding GameRunningNotice}" Style="{StaticResource AppSupportingText}"
+                       Foreground="{StaticResource StatusWarning}" TextWrapping="Wrap" Margin="0,0,0,12"
+                       Visibility="{Binding GameRunning, Converter={StaticResource BoolToVis}}"/>
+
+            <Border Style="{StaticResource CardContainer}" Margin="{StaticResource CardStackMargin}"
+                    BorderBrush="{StaticResource StatusWarning}"
+                    Visibility="{Binding ShowConflictWarning, Converter={StaticResource BoolToVis}}">
+                <Grid>
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="*"/>
+                        <ColumnDefinition Width="Auto"/>
+                    </Grid.ColumnDefinitions>
+                    <StackPanel VerticalAlignment="Center">
+                        <TextBlock Text="IAS 已启用：潜兵身上的护甲由 IAS 接管，和护甲映射、带物理的普通 Mod 会冲突，请不要同时使用。NPC 不受影响。"
+                                   TextWrapping="Wrap" FontWeight="SemiBold"/>
+                        <TextBlock Text="当前有护甲映射规则在用，建议在护甲映射页停用（只影响潜兵，NPC 的映射可保留）。"
+                                   Style="{StaticResource AppSupportingText}" TextWrapping="Wrap" Margin="0,4,0,0"
+                                   Visibility="{Binding ShowMappingWarning, Converter={StaticResource BoolToVis}}"/>
+                        <TextBlock Text="也建议关掉管理器的内置 Lua。"
+                                   Style="{StaticResource AppSupportingText}" TextWrapping="Wrap" Margin="0,4,0,0"
+                                   Visibility="{Binding ShowTurnOffLua, Converter={StaticResource BoolToVis}}"/>
+                    </StackPanel>
+                    <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
+                        <Button Content="关掉管理器物理" Command="{Binding TurnOffPhysicsCommand}"
+                                Style="{StaticResource AppSecondaryButton}" Margin="12,0,0,0"
+                                Visibility="{Binding ShowTurnOffPhysics, Converter={StaticResource BoolToVis}}"/>
+                        <Button Content="关掉内置 Lua" Command="{Binding TurnOffLuaCommand}"
+                                Style="{StaticResource AppSecondaryButton}" Margin="8,0,0,0"
+                                Visibility="{Binding ShowTurnOffLua, Converter={StaticResource BoolToVis}}"/>
+                    </StackPanel>
+                </Grid>
+            </Border>
+
+            <Border Style="{StaticResource CardContainer}" Margin="{StaticResource CardStackMargin}">
+                <StackPanel>
+                    <TextBlock Text="IAS 本体" Style="{StaticResource AppCardTitle}"/>
+                    <Grid Margin="0,8,0,0">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="Auto"/>
+                            <ColumnDefinition Width="*"/>
+                            <ColumnDefinition Width="Auto"/>
+                        </Grid.ColumnDefinitions>
+                        <Grid Width="12" Height="12" VerticalAlignment="Center" Margin="0,0,8,0">
+                            <Ellipse Width="8" Height="8" Style="{StaticResource IasStatusDot}"/>
+                            <Path Data="M 6,1 A 5,5 0 1 1 1,6" Stroke="{StaticResource StatusInfo}"
+                                  StrokeThickness="1.5" RenderTransformOrigin="0.5,0.5">
+                                <Path.RenderTransform><RotateTransform/></Path.RenderTransform>
+                                <Path.Style>
+                                    <Style TargetType="Path">
+                                        <Setter Property="Visibility" Value="Collapsed"/>
+                                        <Style.Triggers>
+                                            <DataTrigger Binding="{Binding ShowProgress}" Value="True">
+                                                <Setter Property="Visibility" Value="Visible"/>
+                                                <DataTrigger.EnterActions>
+                                                    <BeginStoryboard x:Name="Spin">
+                                                        <Storyboard RepeatBehavior="Forever">
+                                                            <DoubleAnimation Storyboard.TargetProperty="(UIElement.RenderTransform).(RotateTransform.Angle)"
+                                                                             From="0" To="360" Duration="0:0:1"/>
+                                                        </Storyboard>
+                                                    </BeginStoryboard>
+                                                </DataTrigger.EnterActions>
+                                                <DataTrigger.ExitActions><RemoveStoryboard BeginStoryboardName="Spin"/></DataTrigger.ExitActions>
+                                            </DataTrigger>
+                                        </Style.Triggers>
+                                    </Style>
+                                </Path.Style>
+                            </Path>
+                        </Grid>
+                        <TextBlock Grid.Column="1" Text="{Binding StatusText}" FontWeight="SemiBold"
+                                   TextWrapping="Wrap" VerticalAlignment="Center"/>
+                        <StackPanel Grid.Column="2" Orientation="Horizontal" VerticalAlignment="Center">
+                            <CheckBox Content="启用 IAS" Style="{StaticResource AppToggleSwitch}" Margin="12,0,0,0"
+                                      IsChecked="{Binding IasEnabled, Mode=TwoWay}" IsEnabled="{Binding CanToggleIas}"
+                                      Visibility="{Binding ShowIasToggle, Converter={StaticResource BoolToVis}}"/>
+                            <Button Style="{StaticResource AppPrimaryButton}" Margin="12,0,0,0"
+                                    Content="{Binding PrimaryActionText}" Command="{Binding PrimaryCommand}"
+                                    Visibility="{Binding HasPrimaryAction, Converter={StaticResource BoolToVis}}"/>
+                        </StackPanel>
+                    </Grid>
+                    <TextBlock Text="{Binding StatusDetail}" Style="{StaticResource AppSupportingText}" TextWrapping="Wrap" Margin="20,4,0,0"
+                               Visibility="{Binding HasStatusDetail, Converter={StaticResource BoolToVis}}"/>
+                    <TextBlock Text="{Binding InstalledCompatibility}" Style="{StaticResource AppSupportingText}" Margin="20,4,0,0"
+                               Visibility="{Binding HasInstalledVersion, Converter={StaticResource BoolToVis}}"/>
+                    <TextBlock Text="下载来源与程序更新相同，可在设置里改。" Style="{StaticResource AppSupportingText}" TextWrapping="Wrap" Margin="20,4,0,0"
+                               Visibility="{Binding ShowDownloadSource, Converter={StaticResource BoolToVis}}"/>
+
+                    <Grid Margin="20,8,0,0" Visibility="{Binding ShowProgress, Converter={StaticResource BoolToVis}}">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="*"/>
+                            <ColumnDefinition Width="Auto"/>
+                        </Grid.ColumnDefinitions>
+                        <Grid.RowDefinitions>
+                            <RowDefinition Height="Auto"/>
+                            <RowDefinition Height="Auto"/>
+                        </Grid.RowDefinitions>
+                        <ProgressBar Height="6" Minimum="0" Maximum="100" Value="{Binding ProgressValue, Mode=OneWay}"
+                                     IsIndeterminate="{Binding IsIndeterminate}"/>
+                        <TextBlock Grid.Column="1" Text="{Binding ProgressText}" Style="{StaticResource AppSupportingText}" Margin="8,0,0,0"/>
+                        <TextBlock Grid.Row="1" Text="{Binding ProgressDetail}" Style="{StaticResource AppSupportingText}"
+                                   VerticalAlignment="Center" TextWrapping="Wrap" Margin="0,4,0,0"/>
+                        <Button Grid.Row="1" Grid.Column="1" Content="取消" Command="{Binding CancelCommand}" Margin="8,4,0,0"
+                                Style="{StaticResource AppSecondaryButton}" Visibility="{Binding CanCancel, Converter={StaticResource BoolToVis}}"/>
+                    </Grid>
+
+                    <StackPanel Margin="20,12,0,0" Visibility="{Binding HasWaitingQueue, Converter={StaticResource BoolToVis}}">
+                        <TextBlock Text="操作队列" FontWeight="SemiBold"/>
+                        <ItemsControl ItemsSource="{Binding WaitingQueue}">
+                            <ItemsControl.ItemTemplate>
+                                <DataTemplate>
+                                    <DockPanel Margin="0,4,0,0">
+                                        <Button DockPanel.Dock="Right" Content="取消等待" Margin="8,0,0,0"
+                                                Style="{StaticResource AppSecondaryButton}"
+                                                Command="{Binding DataContext.CancelWaitingCommand, RelativeSource={RelativeSource AncestorType=ItemsControl}}"
+                                                CommandParameter="{Binding}"/>
+                                        <TextBlock Style="{StaticResource AppSupportingText}" VerticalAlignment="Center" TextWrapping="Wrap">
+                                            <Run Text="{Binding Task.StatusText, Mode=OneWay}"/>
+                                            <Run Text=" · "/><Run Text="{Binding Task.Name, Mode=OneWay}"/>
+                                        </TextBlock>
+                                    </DockPanel>
+                                </DataTemplate>
+                            </ItemsControl.ItemTemplate>
+                        </ItemsControl>
+                    </StackPanel>
+
+                    <StackPanel Margin="20,6,0,0" Visibility="{Binding HasResult, Converter={StaticResource BoolToVis}}">
+                        <Grid>
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*"/>
+                                <ColumnDefinition Width="Auto"/>
+                            </Grid.ColumnDefinitions>
+                            <TextBlock Text="{Binding ResultText}">
+                                <TextBlock.Style>
+                                    <Style TargetType="TextBlock" BasedOn="{StaticResource IasResultText}">
+                                        <Style.Triggers>
+                                            <DataTrigger Binding="{Binding HasResultWarnings}" Value="True">
+                                                <Setter Property="Visibility" Value="Collapsed"/>
+                                            </DataTrigger>
+                                        </Style.Triggers>
+                                    </Style>
+                                </TextBlock.Style>
+                            </TextBlock>
+                            <Expander Visibility="{Binding HasResultWarnings, Converter={StaticResource BoolToVis}}"
+                                      IsExpanded="{Binding AreWarningsExpanded, Mode=TwoWay}"
+                                      IsEnabled="{Binding ElementName=OfficialButton, Path=IsEnabled}">
+                                <Expander.Header>
+                                    <TextBlock Text="{Binding ResultText}" Style="{StaticResource IasResultText}"/>
+                                </Expander.Header>
+                                <ItemsControl ItemsSource="{Binding ResultWarnings}" Margin="20,4,0,0">
+                                    <ItemsControl.ItemTemplate>
+                                        <DataTemplate>
+                                            <TextBlock Text="{Binding}" Style="{StaticResource AppSupportingText}" TextWrapping="Wrap"/>
+                                        </DataTemplate>
+                                    </ItemsControl.ItemTemplate>
+                                </ItemsControl>
+                            </Expander>
+                            <Button Grid.Column="1" Content="去看看" Style="{StaticResource AppQuietButton}"
+                                    Visibility="{Binding CanOpenCreatedMod, Converter={StaticResource BoolToVis}}" Command="{Binding OpenCreatedModCommand}"/>
+                        </Grid>
+                    </StackPanel>
+
+                    <Expander Header="查看更新说明" Margin="20,8,0,0" IsEnabled="{Binding ElementName=OfficialButton, Path=IsEnabled}"
+                              Visibility="{Binding HasReleaseNotes, Converter={StaticResource BoolToVis}}">
+                        <Border Background="{StaticResource AppSurfaceBrush}" CornerRadius="6" Padding="10" Margin="0,6,0,0">
+                            <ScrollViewer MaxHeight="220" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
+                                <TextBlock Text="{Binding ReleaseNotes}" TextWrapping="Wrap"/>
+                            </ScrollViewer>
+                        </Border>
+                    </Expander>
+                    <StackPanel Orientation="Horizontal" Margin="12,6,0,0">
+                        <Button x:Name="OfficialButton" Content="打开官方页面" Style="{StaticResource AppQuietButton}" Command="{Binding OpenOfficialPageCommand}"/>
+                        <TextBlock Text="·" VerticalAlignment="Center" Visibility="{Binding HasInstalledVersion, Converter={StaticResource BoolToVis}}"/>
+                        <Button Content="卸载 IAS" Style="{StaticResource AppQuietButton}" Command="{Binding UninstallCommand}"
+                                Visibility="{Binding HasInstalledVersion, Converter={StaticResource BoolToVis}}"/>
+                    </StackPanel>
+                </StackPanel>
+            </Border>
+
+            <Border Margin="{StaticResource CardStackMargin}">
+                <Border.Style>
+                    <Style TargetType="Border" BasedOn="{StaticResource CardContainer}">
+                        <Style.Triggers>
+                            <DataTrigger Binding="{Binding IsReady}" Value="False">
+                                <Setter Property="Opacity" Value="0.5"/>
+                            </DataTrigger>
+                        </Style.Triggers>
+                    </Style>
+                </Border.Style>
+                <StackPanel>
+                    <Grid>
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="*"/>
+                            <ColumnDefinition Width="Auto"/>
+                        </Grid.ColumnDefinitions>
+                        <TextBlock Text="{Binding CharacterTitle}" Style="{StaticResource AppCardTitle}" VerticalAlignment="Center"/>
+                        <Button Grid.Column="1" Content="从库里选 Mod 转 IAS" Style="{StaticResource AppSecondaryButton}" Command="{Binding ChooseLibraryModCommand}"/>
+                    </Grid>
+
+                    <Grid Height="{Binding DropHeight}" Margin="0,10,0,0">
+                        <Rectangle RadiusX="8" RadiusY="8" Stroke="{StaticResource AppControlBorderBrush}" StrokeDashArray="4 3" StrokeThickness="1"/>
+                        <Grid Visibility="{Binding IsWindowDropHighlighted, Converter={StaticResource BoolToVis}}" IsHitTestVisible="False">
+                            <Rectangle RadiusX="8" RadiusY="8" Fill="{StaticResource AppAccentBrush}" Opacity="0.08"/>
+                            <Rectangle RadiusX="8" RadiusY="8" Stroke="{StaticResource AppAccentBrush}" StrokeDashArray="4 3" StrokeThickness="1"/>
+                        </Grid>
+                        <StackPanel VerticalAlignment="Center" Margin="16">
+                            <TextBlock Text="{Binding DropText}" FontWeight="SemiBold" TextAlignment="Center" TextWrapping="Wrap"/>
+                            <TextBlock Text="IAS Mod 直接安装；另外两种先转成 IAS 再安装" Style="{StaticResource AppSupportingText}"
+                                       TextAlignment="Center" TextWrapping="Wrap" Margin="0,3,0,0"
+                                       Visibility="{Binding IsReady, Converter={StaticResource BoolToVis}}"/>
+                        </StackPanel>
+                    </Grid>
+
+                    <StackPanel Margin="0,8,0,0">
+                        <TextBlock Text="求生模型装到哪套装备上" FontWeight="SemiBold" TextWrapping="Wrap"/>
+                        <TextBlock Text="拖入求生 VPK 时，模型会装进这套护甲和头盔的位置；进游戏后仍可按 F4 换到其它护甲。选一次一直用。"
+                                   Style="{StaticResource AppSupportingText}" TextWrapping="Wrap" Margin="0,2,0,6"/>
+                        <WrapPanel>
+                            <StackPanel Orientation="Horizontal" Margin="0,0,16,6">
+                                <TextBlock Text="护甲" VerticalAlignment="Center" Margin="0,0,8,0"/>
+                                <ContentControl Content="{Binding VpkArmor}"/>
+                            </StackPanel>
+                            <StackPanel Orientation="Horizontal" Margin="0,0,0,6">
+                                <TextBlock Text="头盔" VerticalAlignment="Center" Margin="0,0,8,0"/>
+                                <ContentControl Content="{Binding VpkHelmet}"/>
+                            </StackPanel>
+                        </WrapPanel>
+                        <TextBlock Text="{Binding VpkTargetWarning}" Foreground="{StaticResource StatusWarning}" TextWrapping="Wrap"/>
+                    </StackPanel>
+
+                    <ItemsControl ItemsSource="{Binding Characters}">
+                        <ItemsControl.ItemTemplate>
+                            <DataTemplate>
+                                <StackPanel>
+                                    <Grid Margin="0,8,0,0">
+                                        <Grid.Style>
+                                            <Style TargetType="Grid">
+                                                <Style.Triggers>
+                                                    <DataTrigger Binding="{Binding IsDisabled}" Value="True">
+                                                        <Setter Property="Opacity" Value="0.6"/>
+                                                    </DataTrigger>
+                                                </Style.Triggers>
+                                            </Style>
+                                        </Grid.Style>
+                                        <Grid.ColumnDefinitions>
+                                            <ColumnDefinition Width="Auto"/>
+                                            <ColumnDefinition Width="*"/>
+                                            <ColumnDefinition Width="Auto"/>
+                                            <ColumnDefinition Width="Auto"/>
+                                            <ColumnDefinition Width="Auto"/>
+                                            <ColumnDefinition Width="Auto"/>
+                                        </Grid.ColumnDefinitions>
+                                        <Image Width="48" Height="48" Stretch="UniformToFill"
+                                               Source="{Binding IconPath, Converter={StaticResource IasImagePlaceholder}, ConverterParameter=48}"/>
+                                        <DockPanel Grid.Column="1" VerticalAlignment="Center" Margin="10,0">
+                                            <Border DockPanel.Dock="Right" Background="{StaticResource AppSurfaceBrush}" CornerRadius="10" Padding="8,2" Margin="6,0,0,0"
+                                                    Visibility="{Binding IsDisabled, Converter={StaticResource BoolToVis}}">
+                                                <TextBlock Text="已停用" Style="{StaticResource AppSupportingText}" FontSize="11"/>
+                                            </Border>
+                                            <TextBlock Text="{Binding Name}" ToolTip="{Binding Name}" TextTrimming="CharacterEllipsis"
+                                                       FontWeight="SemiBold" VerticalAlignment="Center"/>
+                                        </DockPanel>
+                                        <Border Grid.Column="2" Background="{StaticResource AppSurfaceBrush}" CornerRadius="10" Padding="8,2"
+                                                VerticalAlignment="Center" Margin="0,0,8,0">
+                                            <TextBlock Text="{Binding SourceText}" Style="{StaticResource AppSupportingText}" FontSize="11"/>
+                                        </Border>
+                                        <CheckBox Grid.Column="3" IsChecked="{Binding IsChecked, Mode=TwoWay}" VerticalAlignment="Center" Margin="0,0,8,0"
+                                                  AutomationProperties.Name="切换 IAS 角色" ToolTipService.ShowOnDisabled="True">
+                                            <CheckBox.Style>
+                                                <Style TargetType="CheckBox" BasedOn="{StaticResource AppToggleSwitch}">
+                                                    <Setter Property="IsEnabled" Value="{Binding DataContext.CanToggleCharacter, RelativeSource={RelativeSource AncestorType=ItemsControl}}"/>
+                                                    <Setter Property="ToolTip" Value="{Binding ToggleHint}"/>
+                                                    <Style.Triggers>
+                                                        <DataTrigger Binding="{Binding DataContext.IasEnabled, RelativeSource={RelativeSource AncestorType=ItemsControl}}" Value="False">
+                                                            <Setter Property="ToolTip" Value="先打开 IAS"/>
+                                                        </DataTrigger>
+                                                        <DataTrigger Binding="{Binding Enabled}" Value="{x:Null}">
+                                                            <Setter Property="IsEnabled" Value="False"/>
+                                                        </DataTrigger>
+                                                    </Style.Triggers>
+                                                </Style>
+                                            </CheckBox.Style>
+                                        </CheckBox>
+                                        <Button Grid.Column="4" Content="转为普通 Mod ▾" Style="{StaticResource AppSecondaryButton}" VerticalAlignment="Center"
+                                                Command="{Binding DataContext.ConvertCharacterCommand, RelativeSource={RelativeSource AncestorType=ItemsControl}}" CommandParameter="{Binding}"/>
+                                        <Button Grid.Column="5" Content="卸载" Style="{StaticResource AppSecondaryButton}" VerticalAlignment="Center" Margin="8,0,0,0"
+                                                Command="{Binding DataContext.RemoveCharacterCommand, RelativeSource={RelativeSource AncestorType=ItemsControl}}" CommandParameter="{Binding}"/>
+                                    </Grid>
+                                    <Border Margin="0,6,0,0" Padding="12" CornerRadius="6"
+                                            Background="{StaticResource AppSurfaceBrush}"
+                                            Visibility="{Binding IsConversionOpen, Converter={StaticResource BoolToVis}}">
+                                        <StackPanel>
+                                            <WrapPanel>
+                                                <StackPanel Margin="0,0,12,6" DataContext="{Binding Conversion}"
+                                                            Visibility="{Binding HasArmor, Converter={StaticResource BoolToVis}}">
+                                                    <TextBlock Text="目标护甲" Margin="0,0,0,4"/>
+                                                    <ContentControl Content="{Binding Armor}"/>
+                                                    <TextBlock Text="包里没写原来用哪套护甲，选一套再转" Foreground="{StaticResource StatusWarning}" TextWrapping="Wrap" MaxWidth="232"
+                                                               Visibility="{Binding Armor.NeedsSelection, Converter={StaticResource BoolToVis}}"/>
+                                                </StackPanel>
+                                                <StackPanel Margin="0,0,12,6" DataContext="{Binding Conversion}"
+                                                            Visibility="{Binding HasHelmet, Converter={StaticResource BoolToVis}}">
+                                                    <TextBlock Text="目标头盔" Margin="0,0,0,4"/>
+                                                    <ContentControl Content="{Binding Helmet}"/>
+                                                    <TextBlock Text="包里没写原来用哪顶头盔，选一顶再转" Foreground="{StaticResource StatusWarning}" TextWrapping="Wrap" MaxWidth="232"
+                                                               Visibility="{Binding Helmet.NeedsSelection, Converter={StaticResource BoolToVis}}"/>
+                                                </StackPanel>
+                                            </WrapPanel>
+                                            <CheckBox Content="头盔并进护甲（只占护甲位，不用穿头盔）" IsChecked="{Binding Conversion.MergeHelmet}"
+                                                      Visibility="{Binding Conversion.CanMerge, Converter={StaticResource BoolToVis}}"/>
+                                            <TextBlock Text="{Binding Conversion.Message}" Foreground="{StaticResource StatusWarning}" TextWrapping="Wrap"/>
+                                            <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
+                                                <Button Content="收起" Style="{StaticResource AppSecondaryButton}"
+                                                        Command="{Binding DataContext.CloseConversionCommand, RelativeSource={RelativeSource AncestorType=ItemsControl}}"/>
+                                                <Button Content="开始转换" Style="{StaticResource AppPrimaryButton}" Margin="8,0,0,0"
+                                                        Command="{Binding DataContext.StartConversionCommand, RelativeSource={RelativeSource AncestorType=ItemsControl}}"
+                                                        CommandParameter="{Binding}"/>
+                                            </StackPanel>
+                                        </StackPanel>
+                                    </Border>
+                                </StackPanel>
+                            </DataTemplate>
+                        </ItemsControl.ItemTemplate>
+                    </ItemsControl>
+                </StackPanel>
+            </Border>
+
+            <Border Style="{StaticResource CardContainer}" Margin="{StaticResource CardStackMargin}">
+                <StackPanel>
+                    <TextBlock Text="画面增强（可选）" Style="{StaticResource AppCardTitle}"/>
+                    <TextBlock Text="{Binding GraphicsError}" Style="{StaticResource AppSupportingText}" TextWrapping="Wrap"
+                               Margin="0,8,0,0" Visibility="{Binding HasGraphicsError, Converter={StaticResource BoolToVis}}"/>
+                    <Button Content="修复画面组件" Style="{StaticResource AppSecondaryButton}" Command="{Binding RepairGraphicsCommand}"
+                            HorizontalAlignment="Left" Margin="0,8,0,0"
+                            Visibility="{Binding ShowGraphicsRepair, Converter={StaticResource BoolToVis}}"/>
+                    <CheckBox Content="ReShade 滤镜" Style="{StaticResource AppToggleSwitch}" Margin="0,12,0,0"
+                              IsChecked="{Binding ReShadeEnabled, Mode=OneWay}" Command="{Binding ToggleReShadeCommand}"/>
+                    <TextBlock Text="游戏内按 Home 打开 ReShade 面板调整。" Style="{StaticResource AppSupportingText}"
+                               TextWrapping="Wrap" Margin="0,4,0,0"/>
+                    <TextBlock Text="DLSS" Style="{StaticResource AppCardTitle}" Margin="0,12,0,4"/>
+                    <StackPanel IsEnabled="{Binding CanToggleDlss}">
+                        <RadioButton Content="关" IsChecked="{Binding DlssOff, Mode=OneWay}" Command="{Binding SelectDlssCommand}"
+                                     CommandParameter="{x:Static ias:IasDlssMode.Off}"/>
+                        <RadioButton Content="插帧" Margin="0,6,0,0" IsChecked="{Binding DlssFrameGeneration, Mode=OneWay}"
+                                     Command="{Binding SelectDlssCommand}" CommandParameter="{x:Static ias:IasDlssMode.FrameGeneration}"/>
+                        <TextBlock Text="NVIDIA 30/40/50 系；游戏内抗锯齿用 TAA。" Style="{StaticResource AppSupportingText}"
+                                   TextWrapping="Wrap" Margin="18,3,0,0"/>
+                        <RadioButton Content="神经渲染" Margin="0,6,0,0" IsChecked="{Binding DlssNeuralRendering, Mode=OneWay}"
+                                     Command="{Binding SelectDlssCommand}" CommandParameter="{x:Static ias:IasDlssMode.NeuralRendering}"/>
+                        <TextBlock Text="NVIDIA 30/40/50 系；需 DX12，游戏内抗锯齿改为 DLSS。" Style="{StaticResource AppSupportingText}"
+                                   TextWrapping="Wrap" Margin="18,3,0,0"/>
+                    </StackPanel>
+                </StackPanel>
+            </Border>
+        </StackPanel>
+    </ScrollViewer>
+</UserControl>

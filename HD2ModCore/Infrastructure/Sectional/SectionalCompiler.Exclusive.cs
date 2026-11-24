@@ -256,7 +256,7 @@ public static partial class SectionalCompiler
 				.BakeAsync(staged, documented, translated, cancellationToken)
 				.ConfigureAwait(false);
 
-			var materialized = OverwriteMaterializer.Materialize(
+			var materialized = OverwriteMaterializer.MaterializeDuringCompile(
 				modDirectory, selection, staged, ManagedOverwriteMarkers.VpkRekey);
 			if (!materialized.Succeeded)
 				return SectionalCompileResult.Failure(materialized.Error ?? "物化生效层失败。", SectionalCompileKind.Armor);

@@ -1,22 +1,11 @@
-using System.Buffers.Binary;
-using System.Security.Cryptography;
 using System.Text;
 using HD2SourceModel;
 
 namespace HD2SourceMigration.IasConversion;
 
 internal sealed record IasRigNode(string Name, int Parent, int SourceIndex, int Slot, uint Flags, Mat4 World);
-internal sealed record IasGrip(int Slot, Mat4 HandToGrip);
-
 internal sealed record IasRigProfile(IReadOnlyList<string> SourceNames, IReadOnlyList<IasRigNode> Nodes)
 {
-	internal IReadOnlyDictionary<string, IasGrip> Grips { get; init; } = new Dictionary<string, IasGrip>();
-	internal byte[]? PoseDigest { get; init; }
-	internal uint ProfileFlags { get; init; }
-	// IAS R:764–771, 798–800, 5452–5458. Route selection supplies active status at deployment.
-	internal bool AllowsCorpseFreeze => ProfileFlags <= ushort.MaxValue && ((ProfileFlags >> 2) & 3) is 1 or 2
-		&& (ProfileFlags & 2) == 0 && Nodes.Any(node => (node.Flags & 1024) != 0);
-
 	internal int ResolveSemanticNode(int node)
 	{
 		for (var current = node; current >= 0; current = Nodes[current].Parent)
@@ -58,18 +47,14 @@ internal static class IasRigReader
 		}
 
 		var profiles = new Dictionary<ulong, IasRigProfile>();
-		var profileIds = new ulong[profileCount];
-		Span<byte> profileHeader = stackalloc byte[20];
 		for (var profileIndex = 0; profileIndex < profileCount; profileIndex++)
 		{
 			var unit = payload.ReadUInt64();
-			profileIds[profileIndex] = unit;
 			var count = ReadCount(payload, 256);
 			var needleLength = ReadCount(payload, checked((int)data.Length));
 			_ = payload.ReadInt32();
 			var slots = ReadCount(payload, 256);
-			var flagsForProfile = payload.ReadUInt32();
-			var nodeStart = checked((int)data.Position);
+			_ = payload.ReadUInt32();
 			var nodes = new IasRigNode[count];
 			var usedSlots = new HashSet<int>();
 			for (var i = 0; i < count; i++)
@@ -85,17 +70,9 @@ internal static class IasRigReader
 					throw new InvalidDataException($"Invalid IAS target node {name} in {unit:x16}.");
 				nodes[i] = new(name, parent, sourceIndex, slot, flags, parent < 0 ? local : nodes[parent].World * local);
 			}
-			var nodeEnd = checked((int)data.Position);
 			if (payload.ReadBytes(needleLength).Length != needleLength)
 				throw new EndOfStreamException("Truncated rig profile needle.");
-			BinaryPrimitives.WriteUInt64LittleEndian(profileHeader, unit);
-			BinaryPrimitives.WriteInt32LittleEndian(profileHeader[8..], slots);
-			BinaryPrimitives.WriteUInt32LittleEndian(profileHeader[12..], flagsForProfile);
-			BinaryPrimitives.WriteInt32LittleEndian(profileHeader[16..], count);
-			using var digest = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
-			digest.AppendData(profileHeader);
-			digest.AppendData(data.GetBuffer().AsSpan(nodeStart, nodeEnd - nodeStart));
-			profiles.Add(unit, new(sourceNames, nodes) { ProfileFlags = flagsForProfile, PoseDigest = digest.GetHashAndReset() });
+			profiles.Add(unit, new(sourceNames, nodes));
 		}
 		if ((extensions & 1) != 0)
 		{
@@ -103,22 +80,12 @@ internal static class IasRigReader
 				throw new InvalidDataException("Invalid HD2IRG1 grip extension.");
 			var count = ReadCount(payload, 4096);
 			_ = payload.ReadUInt32();
-			for (var i = 0; i < count; i++)
-			{
-				var profileId = profileIds[ReadCount(payload, profileIds.Length - 1)];
-				var profile = profiles[profileId];
-				var nodeIndex = ReadCount(payload, profile.Nodes.Count - 1);
-				var side = ReadCount(payload, 1) == 0 ? "r" : "l";
-				var node = profile.Nodes[nodeIndex];
-				if (payload.ReadUInt32() != 0 || node.Name != side + "_hand" || (node.Flags & 1024) == 0)
-					throw new InvalidDataException($"Invalid IAS grip for {profileId:x16} ({side}, {nodeIndex}).");
-				var grips = new Dictionary<string, IasGrip>(profile.Grips);
-				if (!grips.TryAdd(side, new IasGrip(node.Slot, ReadMatrix(payload))))
-					throw new InvalidDataException($"Duplicate IAS grip for {profileId:x16} ({side}).");
-				profiles[profileId] = profile with { Grips = grips };
-			}
+			// 输入可能带握把扩展，每条记录 64 字节。标准蒙皮只读节点表。
+			var bytes = count * 64;
+			if (payload.ReadBytes(bytes).Length != bytes)
+				throw new EndOfStreamException("Truncated HD2IRG1 grip extension.");
 		}
-		// Bit 1 identifies a shared-v3 consumer rig and adds no bytes to HD2IRG1.
+		// 位 1 表示 shared-v3 消费者骨架，在文件中不占额外字节。
 		if ((extensions & ~3u) != 0 || data.Position != data.Length)
 			throw new InvalidDataException("Unexpected HD2IRG1 extension or trailing data.");
 		return profiles;
@@ -155,7 +122,7 @@ internal static class IasRigReader
 		return name.Length == 64 && end > 0 ? Encoding.UTF8.GetString(name, 0, end) : throw new InvalidDataException("Invalid rig bone name.");
 	}
 
-	internal static Mat4 ReadMatrix(BinaryReader input)
+	private static Mat4 ReadMatrix(BinaryReader input)
 	{
 		var m = new float[12];
 		for (var i = 0; i < m.Length; i++)

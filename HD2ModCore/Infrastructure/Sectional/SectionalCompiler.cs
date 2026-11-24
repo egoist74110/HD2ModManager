@@ -70,6 +70,7 @@ public sealed record SectionalCompileResult(
 	/// 当编译期间用户通过 128 MiB 超限弹窗一键关闭了多余组件时，返回合并后的最新 <c>disabled</c> 集合；未改动时为 <c>null</c>。
 	/// </summary>
 	public IReadOnlyDictionary<string, IReadOnlyCollection<int>>? UpdatedDisabledSections { get; init; }
+
 }
 
 /// <summary>
@@ -81,8 +82,7 @@ public delegate ValueTask<bool> SectionalTargetFailureHandler(IReadOnlyList<Sect
 /// <summary>
 /// <b>sectional 编译器</b>：<c>sectional/</c> + 四个条件 ⇒ <c>Overwrite/</c>。
 /// <para>
-/// <b>它是纯函数。</b>每次调用都从 <c>sectional/</c> 完整重算，不增量、不缓存、不看盘上现有产物。
-/// 这样"开关翻了、产物没变"这类不一致从结构上就不可能发生。
+/// 默认从 <c>sectional/</c> 完整重算。护甲映射准备可以复用已校验的素体产物。
 /// </para>
 /// <para>
 /// <b>它只写 <c>Overwrite/</c>。</b><c>sectional/</c> 是权威事实，一个字节都不动。
@@ -126,6 +126,28 @@ public static partial class SectionalCompiler
 		bool lowPollution = false)
 	{
 		ArgumentException.ThrowIfNullOrWhiteSpace(modDirectory);
+		var gate = LowPollutionArtifactCache.Gate(modDirectory);
+		await gate.WaitAsync(cancellationToken).ConfigureAwait(false);
+		try
+		{
+			return await CompileUnderGateAsync(modDirectory, context, targetArchiveId, disabledSections, headMergeIntoBody,
+				enabledMaterialPatches, onStage, cancellationToken, exclusiveItemId, exclusiveItemIds,
+				autoSkipFailedTargets, onTargetFailures, lowPollution).ConfigureAwait(false);
+		}
+		finally
+		{
+			gate.Release();
+		}
+	}
+
+	private static async ValueTask<SectionalCompileResult> CompileUnderGateAsync(
+		string modDirectory, VpkHostContext context, string? targetArchiveId,
+		IReadOnlyDictionary<string, IReadOnlyCollection<int>>? disabledSections, bool headMergeIntoBody,
+		IReadOnlyList<string>? enabledMaterialPatches, Action<string>? onStage, CancellationToken cancellationToken,
+		uint? exclusiveItemId, IReadOnlyList<uint>? exclusiveItemIds, bool autoSkipFailedTargets,
+		SectionalTargetFailureHandler? onTargetFailures, bool lowPollution)
+	{
+		ArgumentException.ThrowIfNullOrWhiteSpace(modDirectory);
 		ArgumentNullException.ThrowIfNull(context);
 
 		if (!Directory.Exists(modDirectory))
@@ -154,30 +176,8 @@ public static partial class SectionalCompiler
 		var selection = new OverwriteSelection(enabledMaterialPatches);
 
 		if (ownModel)
-		{
-			onStage?.Invoke("正在按当前条件编译生效层…");
-			string? notCompressedReason = null;
-			if (lowPollution)
-			{
-				onStage?.Invoke("低污染模式：正在把素体压缩成少量 unit…");
-				var squeezed = await CompileLowPollutionOwnModelAsync(
-					modDirectory, context, payload, sourcePatch, sourceMap, disabledSections, headMergeIntoBody, selection, cancellationToken)
-					.ConfigureAwait(false);
-				if (squeezed.Result is not null) return squeezed.Result;
-				notCompressedReason = squeezed.NotCompressedReason;
-			}
-
-			var own = await CompileOwnModelAsync(
-				modDirectory, payload, sourcePatch, sourceMap, disabledSections, headMergeIntoBody, selection, cancellationToken)
-				.ConfigureAwait(false);
-			// 不能压缩时照常编译，但要让用户看见：否则打开开关、进游戏发现没变化，就再也信不过它。
-			// 不能压缩：留一个带指纹的标记，下次「应用」不再对它重编（规划 §12.1）。
-			if (notCompressedReason is not null && own.Ok)
-				LowPollutionFreshness.WriteUnsupportedMarker(modDirectory, payload, disabledSections, headMergeIntoBody, notCompressedReason);
-			return notCompressedReason is null || !own.Ok
-				? own
-				: own with { Warnings = [.. own.Warnings, $"低污染模式没有压缩这个素体：{notCompressedReason}，已按普通素体编译。"] };
-		}
+			return await PrepareOwnModelAsync(modDirectory, context, payload, sourcePatch, sourceMap,
+				disabledSections, headMergeIntoBody, selection, onStage, cancellationToken, lowPollution).ConfigureAwait(false);
 
 		var exclusiveTargets = exclusiveItemIds is { Count: > 0 }
 			? exclusiveItemIds
@@ -197,10 +197,74 @@ public static partial class SectionalCompiler
 			.ConfigureAwait(false);
 	}
 
+	private static async ValueTask<SectionalCompileResult> PrepareOwnModelAsync(
+		string modDirectory, VpkHostContext context, string payload, string sourcePatch, WardrobeSectionMapDocument sourceMap,
+		IReadOnlyDictionary<string, IReadOnlyCollection<int>>? disabledSections, bool headMergeIntoBody,
+		OverwriteSelection selection, Action<string>? onStage, CancellationToken cancellationToken,
+		bool lowPollution)
+	{
+		var overwrite = ModNodePayloadLayout.GetOverwriteDirectory(modDirectory);
+		var prepared = overwrite + ".stage-" + Guid.NewGuid().ToString("N");
+		try
+		{
+			var track = lowPollution || LowPollutionArtifactCache.Participates(modDirectory);
+			var inputs = track ? await LowPollutionArtifactCache.CaptureAsync(modDirectory, payload, sourcePatch, sourceMap,
+				disabledSections, headMergeIntoBody, lowPollution, context, selection, cancellationToken).ConfigureAwait(false) : null;
+			onStage?.Invoke("正在按当前条件编译生效层…");
+			SectionalCompileResult? result = null;
+			string? notCompressedReason = null;
+			if (lowPollution)
+			{
+				onStage?.Invoke("低污染模式：正在把素体压缩成少量 unit…");
+				var squeezed = await CompileLowPollutionOwnModelAsync(
+					modDirectory, prepared, context, payload, sourcePatch, sourceMap, disabledSections, headMergeIntoBody, selection, cancellationToken)
+					.ConfigureAwait(false);
+				result = squeezed.Result;
+				notCompressedReason = squeezed.NotCompressedReason;
+			}
+
+			result ??= await CompileOwnModelAsync(
+				modDirectory, prepared, payload, sourcePatch, sourceMap, disabledSections, headMergeIntoBody, selection, cancellationToken)
+				.ConfigureAwait(false);
+			if (!result.Ok) return result;
+			var effectiveDisabled = result.UpdatedDisabledSections ?? disabledSections;
+			if (notCompressedReason is not null)
+			{
+				LowPollutionFreshness.WriteUnsupportedMarker(modDirectory, payload, effectiveDisabled, headMergeIntoBody, notCompressedReason, prepared);
+				result = result with { Warnings = [.. result.Warnings, $"低污染模式没有压缩这个素体：{notCompressedReason}，已按普通素体编译。"] };
+			}
+
+			if (inputs is not null)
+			{
+				var currentPatch = await ResolveUnitPatchAsync(payload, cancellationToken).ConfigureAwait(false);
+				var currentMap = await WardrobeSectionMapFile.ReadAsync(Path.Combine(payload, WardrobeSectionMapFile.FileName), cancellationToken)
+					.ConfigureAwait(false);
+				var current = currentPatch is null ? null : await LowPollutionArtifactCache.CaptureAsync(modDirectory, payload, currentPatch,
+					currentMap, effectiveDisabled, headMergeIntoBody, lowPollution, context, selection, cancellationToken).ConfigureAwait(false);
+				inputs = inputs with { Components = LowPollutionArtifactCache.ComponentKey(effectiveDisabled) };
+				if (current is null || inputs.GeometryKey != current.GeometryKey || inputs.Materials != current.Materials)
+					return SectionalCompileResult.Failure("编译期间素体的来源、游戏数据或材质发生变化，请重新应用。");
+				LowPollutionArtifactCache.Seal(prepared, lowPollution, inputs, cancellationToken);
+			}
+			ManagedOverwriteDirectory.AdoptIfUnitLayer(overwrite, SectionalPatchManifestFile.ReadArchiveHex16(payload), ManagedOverwriteMarkers.VpkRekey);
+			LowPollutionArtifactCache.Publish(modDirectory, prepared, lowPollution, inputs, cancellationToken);
+			return result;
+		}
+		catch (Exception exception) when (IsExpected(exception) || LowPollutionArtifactCache.IsCacheReadFailure(exception))
+		{
+			return SectionalCompileResult.Failure("准备素体生效层失败：" + exception.Message);
+		}
+		finally
+		{
+			ManagedOverwriteDirectory.DiscardPrepared(prepared);
+		}
+	}
+
 	// ── 自身素体：键不变，只重算 section 与（可选的）注册表 ─────────────────────
 
 	private static async ValueTask<SectionalCompileResult> CompileOwnModelAsync(
 		string modDirectory,
+		string prepared,
 		string payload,
 		string sourcePatch,
 		WardrobeSectionMapDocument sourceMap,
@@ -231,33 +295,22 @@ public static partial class SectionalCompiler
 			if (baked.SectionsDisabled != 0)
 				info.Add($"已把 {baked.SectionsDisabled} 个 section 烘成关闭状态。");
 
-			var materialized = OverwriteMaterializer.Materialize(
-				modDirectory, selection, staged, ManagedOverwriteMarkers.VpkRekey);
+			var materialized = OverwriteMaterializer.StageOwnModel(modDirectory, selection, staged, prepared);
 			if (!materialized.Succeeded)
 				return SectionalCompileResult.Failure(materialized.Error ?? "物化生效层失败。");
 			warnings.AddRange(materialized.Warnings);
 
 			// 结构文件只能写在物化**之后**：物化器会重开目录。
 			var components = await SectionGroupFile.TryReadAsync(payload, cancellationToken).ConfigureAwait(false);
-			await WriteStructureAsync(modDirectory, documented, components, cancellationToken).ConfigureAwait(false);
+			await WriteStructureToDirectoryAsync(prepared, documented, components, cancellationToken).ConfigureAwait(false);
 
-			DeleteStaleLowPollutionLayout(modDirectory);
 			var merge = SectionalHeadMergeOutcome.Off;
-			var effectiveRegistry = Path.Combine(
-				ModNodePayloadLayout.GetOverwriteDirectory(modDirectory), VpkCustomModelFile.FileName);
 			if (headMergeIntoBody)
 			{
-				var message = ModCompileService.WriteMergedCustomModel(modDirectory, info, out var applied);
+				var message = ModCompileService.WriteMergedCustomModel(modDirectory, info, out var applied, prepared);
 				if (message is not null)
 					(applied ? info : warnings).Add(message);
 				merge = applied ? SectionalHeadMergeOutcome.AppliedOwnModel : SectionalHeadMergeOutcome.SkippedNoFreeTorsoLayer;
-			}
-			else if (File.Exists(effectiveRegistry))
-			{
-				// 关掉合并时必须删掉派生那份，否则生效层永远读上一次的合并布局。
-				VpkPayloadSwap.ClearReadOnlyForWrite(effectiveRegistry);
-				File.Delete(effectiveRegistry);
-				info.Add("已清掉上一次编译留在生效层里的素体注册表。");
 			}
 
 			return new SectionalCompileResult(
@@ -397,7 +450,7 @@ public static partial class SectionalCompiler
 				.BakeAsync(staged, documented, translated, cancellationToken)
 				.ConfigureAwait(false);
 
-			var materialized = OverwriteMaterializer.Materialize(
+			var materialized = OverwriteMaterializer.MaterializeDuringCompile(
 				modDirectory, selection, staged, ManagedOverwriteMarkers.VpkRekey);
 			if (!materialized.Succeeded)
 				return SectionalCompileResult.Failure(materialized.Error ?? "物化生效层失败。", SectionalCompileKind.Armor);
@@ -490,7 +543,7 @@ public static partial class SectionalCompiler
 	}
 
 	/// <summary>定位 unit patch：优先按 <c>patches.json</c> 的角色，再退回固定序号。</summary>
-	private static async ValueTask<string?> ResolveUnitPatchAsync(string payload, CancellationToken cancellationToken)
+	internal static async ValueTask<string?> ResolveUnitPatchAsync(string payload, CancellationToken cancellationToken)
 	{
 		var manifest = await SectionalPatchManifestFile.TryReadAsync(payload, cancellationToken).ConfigureAwait(false);
 		var entry = manifest?.Patches
@@ -660,13 +713,16 @@ public static partial class SectionalCompiler
 	}
 
 	/// <summary>写生效层的结构文件（表 + 组表）。必须在物化**之后**调用：物化器会重开目录。</summary>
-	private static async ValueTask WriteStructureAsync(
+	private static ValueTask WriteStructureAsync(
 		string modDirectory,
 		WardrobeSectionMapDocument sections,
 		SectionGroupDocument? components,
 		CancellationToken cancellationToken)
+		=> WriteStructureToDirectoryAsync(ModNodePayloadLayout.GetOverwriteDirectory(modDirectory), sections, components, cancellationToken);
+
+	private static async ValueTask WriteStructureToDirectoryAsync(
+		string overwrite, WardrobeSectionMapDocument sections, SectionGroupDocument? components, CancellationToken cancellationToken)
 	{
-		var overwrite = ModNodePayloadLayout.GetOverwriteDirectory(modDirectory);
 		Directory.CreateDirectory(overwrite);
 		await WardrobeSectionMapFile
 			.WriteAsync(Path.Combine(overwrite, WardrobeSectionMapFile.FileName), sections, cancellationToken)

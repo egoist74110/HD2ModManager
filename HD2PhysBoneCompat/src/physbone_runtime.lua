@@ -100,32 +100,13 @@ local M = {}
 --        flags=0x35（yawCon + angleCon，没有 pitchCon）的长发链：pitch 区间留着初值 [0, 0]，
 --        而求解器在 axisLimits 打开时两个分量都夹 ⇒ 前后甩被锁在 0°，长发看着像一根焊丝。
 --        现在没约束的轴按"不限"处理，总偏角仍由锥兜住。
--- 2.1.62：E12e-B4。持枪找武器/跟随件改成 IAS 的逐资源 `units_by_resource`（修好 2.1.61 里"liveUnits 无人赋值 ⇒ 持枪路径静默失效"）；
---        删除"驱动失效"看门狗与 `zeroLimit`；删除 `refresh_live_units` / `session_unit_live` 全世界活体表（判活改用本帧 `Roster.isLive`）；
---        物理会话不再按"avatar 有无动画状态机"冻结 / 重置（IAS 没有这道闸，R:6975-6976、R:7004）。
--- 2.1.63：E12e-B5。删 IAS 没有的残留判活与死条件：写骨前的逐会话 `Unit.alive`（改 `Roster.isLive`，零引擎调用）、
---        piece / 远端 avatar 循环里紧跟 `Roster.isLive` 的 `Compat.unit_alive`、永远不会被置位的 `item.disabled`。
--- 2.1.65：E12f-D2。尸体定格成本对账（按 IAS 逐项，见 perf-combat-test / corpse-integration-test）：StingrayEntityRoot 节点号按实例槽缓存
---        （采样帧不再每件多付 2 次查询）；死者撕裂估计（IAS 由原生快照免费给）改为摊到连续几帧、每帧至多 10 次调用，
---        已死未满 4 s 阶段的每帧峰值不再超过 IAS 的 core 开销。
--- 2.1.66：P1 实机卡顿（2026-11-23 真实日志）。① 尸体定格的活体采样（观察 R:5602-5634 的 0.25 s 桶）在实机一个桶里要读 ~10000 个节点
---        （4 人 x 14 件 x ~180 节点 x 2 次调用 ≈ 20000 次/帧，每 0.25 s 一帧）：F9 从 ~500 次跳到 ~2880 次/帧、峰值 20034。
---        IAS 的同一读取由 retarget 求解结果（`explicit`，R:4705）供给、几乎免费；我们没有那份数据，必须自己读。
---        所以只改"谁在哪一帧采"：桶翻转后每帧只采一个主人的整组（桶号最旧的先），每桶每主人仍恰好一次、样本新鲜度不变（铰接下落要求 <= 0.8 s）；
---        单帧峰值从 ~20000 降到一个主人的一组（~5000），平均不变。
---        ② PERF 行补 F3 / F4p / F9 的逐 API 明细，F9 拆成 F9d 发现 / F9i 身份 / F9c 尸体 / F9s 物理同步。
---        ③ 独立骨（retarget）不再等本人身份：IAS 对每个绑定的 avatar 每帧 retarget（R:6860-7010，role 只喂物理类别），
---        我们原来只给 role 1 的本人做、队友默认关 ⇒ 身份没解出来前站 T 字、队友永远 T 字。
--- 2.1.67：IAS profile 定格资格、显式与缺行采样、同帧写骨比较和合并刷新（规划 §26）。
-M.VERSION = "2.1.67"
+M.VERSION = "2.1.45"
 
 --- 安装标记用的全局键。只写这一个全局，且值就是模块本身（便于外部检查是否已装）。
 local INSTALL_KEY = "__hd2physbone_runtime"
 
 local tune_values     -- 调参文件读数（定义在后面，tryAttach 也要用 ⇒ 必须先声明）
 local Compat          -- physbone_compat 模块（require 或注入）
-local Roster = {}     -- IAS 式每帧枚举（见 Roster 段）
-local CorpseMotion = {} -- E12f-C1：尸体关节倒地纯数值模块（见 CorpseMotion 段）
 local S               -- stingray 命名空间
 local state = nil     -- 运行状态；nil = 未安装
 local originalRender  -- 挂载前的 render（链式调用，不吞掉别人）
@@ -155,7 +136,7 @@ local DEFAULT_LOG_ROTATE_BYTES = 512 * 1024
 --- 只留这几类，是因为它们本身就是"出事了"的证据；心跳、等待、预算、逐链明细
 --- 这类常规行才是吃字节的大头，也是最没必要的长期留存。
 --- </para>
-local ALWAYS_LOG_TAGS = { "[错误]", "[失败]", "[警告]", "[快照]", "[裙摆]" }
+local ALWAYS_LOG_TAGS = { "[错误]", "[失败]", "[警告]", "[驱动失效]", "[快照]", "[裙摆]" }
 
 --- 造一个 logger。返回 `log, context`。
 --- <para>
@@ -186,7 +167,7 @@ local function makeLogger(options)
 	-- 不影响运行期性能。产品环境不设它 ⇒ 行为与之前完全一致。
 	if (options and options.devLog == true) or os.getenv("HD2_PHYSBONE_DEV") == "1" then
 		maxBytes = math.huge
-	elseif io and type(io.open) == "function" then
+	else
 		local tunePath = (options and options.tunePath) or ((os.getenv("LOCALAPPDATA") or "") .. "\\hd2pbx_tune.txt")
 		local ok, handle = pcall(io.open, tunePath, "r")
 		if ok and handle ~= nil then
@@ -198,7 +179,7 @@ local function makeLogger(options)
 		end
 	end
 	local rotateBytes = (options and options.logRotateBytes) or DEFAULT_LOG_ROTATE_BYTES
-	if path and io and type(io.open) == "function" then
+	if path then
 		-- 轮转：先量旧文件，超阈值就挪到 `.1`（覆盖上一次的 `.1`）。
 		pcall(function()
 			local probe = io.open(path, "r")
@@ -262,113 +243,21 @@ local function try(...)
 	return nil, tostring(a)
 end
 
--- ---------------------------------------------------------------------------
--- 分项计数（E12，开销全清单 §5）：每项记"引擎调用数 + os.clock 相对耗时"，每 600 帧一行汇总。
--- 调用数按**最内层**分项归属（排他），耗时同样排他（减去子分项）。os.clock 只能看相对量。
--- 关掉：调参文件 `perfCounters = 0` 或 install 选项 `perfCounters = false`（关掉后不包装任何引擎函数）。
--- ---------------------------------------------------------------------------
-local Perf = { on = false, active = false, api = {}, cur = nil, n = {}, calls = {}, clock = {}, events = {}, frames = 0, totalCalls = 0, window = 600,
-	order = { "F1", "F2", "F3", "F4", "F4p", "F4a", "F5", "F6", "F7", "F8", "F9", "F9d", "F9i", "F9c", "F9s", "P1", "P2", "P3", "P4", "P5", "P6", "P7", "P8", "OTHER" } }
-
-function Perf.reset()
-	Perf.n, Perf.calls, Perf.clock, Perf.events, Perf.frames, Perf.totalCalls, Perf.api = {}, {}, {}, {}, 0, 0, {}
-	Perf.firstAttachCalls = nil
-end
-Perf.reset()
-
-function Perf.count(name) -- 计一次"发生"（F2 的查找次数、P4/P5/P6 的日志事件）
-	if Perf.on then Perf.n[name] = (Perf.n[name] or 0) + 1 end
-end
-
-function Perf.event(name, amount)
-	Perf.events[name] = (Perf.events[name] or 0) + (amount or 1)
-end
-
---- 包装一个函数：进入时压栈，退出时按排他口径记账。错误穿过去时栈会错位，drive 入口会重置。
-function Perf.wrap(name, fn)
-	if type(fn) ~= "function" then return fn end
-	local function leave(frame, ...)
-		local spent = os.clock() - frame.t0
-		Perf.n[name] = (Perf.n[name] or 0) + 1
-		Perf.clock[name] = (Perf.clock[name] or 0) + spent - frame.child
-		if frame.prev then frame.prev.child = frame.prev.child + spent end
-		Perf.cur = frame.prev
-		return ...
-	end
-	return function(...)
-		if not Perf.on then return fn(...) end
-		local frame = { name = name, t0 = os.clock(), child = 0, prev = Perf.cur }
-		Perf.cur = frame
-		return leave(frame, fn(...))
-	end
-end
-
---- 给引擎命名空间里的函数套计数壳（原地替换；只替换一次）。
-function Perf.instrument(stingray)
-	for _, space in ipairs({ "Unit", "World", "Application", "Matrix4x4", "Quaternion", "Vector3", "Keyboard" }) do
-		local table_ = type(stingray) == "table" and stingray[space] or nil
-		if type(table_) == "table" and rawget(table_, "__perfWrapped") == nil then
-			local entries = {}
-			for key, value in pairs(table_) do
-				if type(value) == "function" then entries[key] = value end
-			end
-			for key, fn in pairs(entries) do
-				table_[key] = function(...)
-					-- 只数**我们自己的回调**里发出的调用（Perf.active）：引擎命名空间是全局共享的，
-					-- 其他 mod 的调用也会经过这里。2.1.58 没有这个门，OTHER≈1750 次/帧其实是别人的调用。
-					if Perf.on and Perf.active then
-						local current = Perf.cur
-						local bucket = current and current.name or "OTHER"
-						Perf.calls[bucket] = (Perf.calls[bucket] or 0) + 1
-						Perf.totalCalls = Perf.totalCalls + 1
-						local per = Perf.api[bucket]
-						if per == nil then per = {}; Perf.api[bucket] = per end
-						local name = space .. "." .. key
-						per[name] = (per[name] or 0) + 1
-					end
-					return fn(...)
-				end
-			end
-			rawset(table_, "__perfWrapped", true)
-		end
-	end
-end
-
-function Perf.summary(runtime, extra)
-	local frames = math.max(1, Perf.frames)
-	local parts = {}
-	for _, name in ipairs(Perf.order) do
-		local calls, spent, count = Perf.calls[name] or 0, Perf.clock[name] or 0, Perf.n[name] or 0
-		if calls > 0 or spent > 0 or count > 0 then
-			parts[#parts + 1] = string.format("%s=%.1f次/%.3fms(调%d)", name, calls / frames, spent * 1000 / frames, count)
-		end
-	end
-	local events = {}
-	for key, value in pairs(Perf.events) do events[#events + 1] = key .. "=" .. tostring(value) end
-	table.sort(events)
-	for _, bucket in ipairs({ "F3", "F4", "F4p", "F6", "F7", "F9", "F9d", "F9i", "F9c", "F9s", "P2", "OTHER" }) do
-		local per = Perf.api[bucket]
-		if per ~= nil then
-			local rows = {}
-			for name, count in pairs(per) do rows[#rows + 1] = { name, count } end
-			table.sort(rows, function(a, b) return a[2] > b[2] end)
-			local text = {}
-			for index = 1, math.min(5, #rows) do text[#text + 1] = string.format("%s=%.1f", rows[index][1], rows[index][2] / frames) end
-			parts[#parts + 1] = bucket .. "明细[" .. table.concat(text, " ") .. "]"
-		end
-	end
-	runtime.logger("[physbone][PERF] 窗口=%d帧 总引擎调用=%.1f/帧 ｜ %s ｜ 事件 %s",
-		Perf.frames, Perf.totalCalls / frames, table.concat(parts, " "),
-		#events > 0 and table.concat(events, " ") or "无")
-end
-
 local function readVector(S_, vector)
 	if vector == nil then return nil end
 	local ok, x, y, z = pcall(function() return S_.Vector3.to_elements(vector) end)
-	if ok and type(x) == "number" and type(y) == "number" and type(z) == "number"
-		and math.abs(x) < math.huge and math.abs(y) < math.huge and math.abs(z) < math.huge then return x, y, z end
+	if ok and type(x) == "number" and x == x then return x, y, z end
 	return nil
 end
+
+--- 找玩家用的挂点名。**传名字，不传 id。**
+---
+--- 教训（2026-11-12，代价三轮实机）：`Application.string_to_id32` 返回的是
+--- `IdString32` userdata，而且**会失效**（我们自己的 snapshot 探针里印出过
+--- `[Stale IdString32]`）。把这个值存起来、或者跨帧拿去做 `has_node`，
+--- 结果是一律 false / 直接抛错 —— 于是匹配全 0，日志还长得像"骨头不在"。
+--- 名字字符串没有这个问题（`has_node(unit, "hips")` 稳定为 true），而且更便宜。
+local SUPPORT_MG_NAME = "support_mg"
 
 local function id32(S_, text)
 	local ok, value = pcall(function() return S_.Application.string_to_id32(text) end)
@@ -385,9 +274,43 @@ local function unit_tag(S_, unit)
 	return text
 end
 
+--- 记一条"还没挂上"的原因。
+--- 只在**原因变化**时落盘，重复次数留给心跳报——这样"一直卡在同一步"和"来回变"能区分开。
+--- `detail` 里的数字会变（分数、节点数…），所以只在变化时打一次，不参与去重键。
+local function note_wait(runtime, reason, detail)
+	if runtime.waitReason == reason then
+		runtime.waitRepeat = (runtime.waitRepeat or 0) + 1
+		return
+	end
+	runtime.logger("[physbone][等待] %s%s", reason, detail ~= nil and ("：" .. detail) or "")
+	runtime.waitReason = reason
+	runtime.waitRepeat = 0
+end
+
 -- ---------------------------------------------------------------------------
 -- 世界发现
 -- ---------------------------------------------------------------------------
+
+--- 主世界 + 它的 unit 列表。优先用上次记住的下标（省掉遍历所有世界）。
+local function pickWorld(S_, cache)
+	local worlds = try(S_.Application.worlds)
+	if type(worlds) ~= "table" or #worlds == 0 then return nil, nil end
+	local cached = cache.worldIndex
+	if cached ~= nil and worlds[cached] ~= nil then
+		local units = try(S_.World.units, worlds[cached])
+		if type(units) == "table" and #units >= 64 then return worlds[cached], units end
+	end
+	local bestWorld, bestUnits, bestCount, bestIndex = nil, nil, -1, nil
+	for index = 1, #worlds do
+		local units = try(S_.World.units, worlds[index])
+		local count = type(units) == "table" and #units or -1
+		if count > bestCount then
+			bestWorld, bestUnits, bestCount, bestIndex = worlds[index], units, count, index
+		end
+	end
+	cache.worldIndex = bestIndex
+	return bestWorld, bestUnits
+end
 
 --- 玩家 avatar 的资源路径。同一个角色的所有玩家共用这一个资源，所以
 --- `World.units_by_resource(world, 路径)` **一次调用**就能把场上所有玩家列出来，
@@ -426,27 +349,198 @@ local function cameraPosition(S_, world, cache)
 	return x, y, z
 end
 
---- 本帧的相机位置：physics_sync 已经读过就直接用（IAS 每帧只读一次相机，R:1335），否则才问引擎。
-local function frameCamera(S_, runtime)
-	local cached = runtime.poseCamera
-	if cached ~= nil and cached.frame == runtime.frame and cached.z ~= nil and runtime.world == cached.world then
-		return cached.x, cached.y, cached.z
+--- 场上**所有**玩家 avatar。判据两级：
+---   ① `World.units_by_resource(world, avatar 资源路径)` —— 精确、一次调用。
+---   ② 拿不到（老版本没这个函数 / 资源路径变了）才退回全量扫描"有动画状态机 + 带 support_mg"。
+--- 两种都要求"带 support_mg"：那是玩家 avatar 的挂点骨，人台/敌人没有。
+local function findAvatars(S_, world, units, count, supportMg, minNodes, options, cache)
+	local resource = options.avatarResource or DEFAULT_AVATAR_RESOURCE
+	local byResource = nil
+	if type(S_.World) == "table" and type(S_.World.units_by_resource) == "function" then
+		byResource = try(S_.World.units_by_resource, world, resource)
 	end
-	return cameraPosition(S_, runtime.world, runtime.cache or {})
+
+	local function collect(candidates, requireAnim)
+		local list, seen, noAnim = {}, {}, 0
+		for index = 1, #candidates do
+			local unit = candidates[index]
+			if unit ~= nil and seen[unit] == nil then
+				seen[unit] = true
+				if Compat.unit_alive(S_, unit) then
+					local nodes = try(S_.Unit.num_scene_graph_items, unit)
+					local animated = try(S_.Unit.has_animation_state_machine, unit) == true
+					if type(nodes) == "number" and nodes >= minNodes
+						and (supportMg == nil or try(S_.Unit.has_node, unit, supportMg) == true) then
+						if requireAnim and not animated then
+							noAnim = noAnim + 1
+						else
+							list[#list + 1] = { unit = unit, nodes = nodes }
+						end
+					end
+				end
+			end
+		end
+		return list, noAnim
+	end
+
+	local list, dropped = nil, 0
+	if type(byResource) == "table" and #byResource > 0 then
+		cache.avatarSource = "units_by_resource"
+		-- 先要求"有动画状态机"：载具/人台这类同资源的东西通常没有状态机，这一条把它们挡在外面。
+		list, dropped = collect(byResource, true)
+		-- 但绝不因为这一条把所有人都挡掉：退回"只要有 support_mg 就算"。
+		if #list == 0 then list, dropped = collect(byResource, false) end
+	else
+		cache.avatarSource = "scan"
+		local scanned = {}
+		for index = 1, count do
+			local unit = units[index]
+			if try(S_.Unit.has_animation_state_machine, unit) == true then
+				scanned[#scanned + 1] = unit
+			end
+		end
+		list = collect(scanned, true)
+	end
+	-- 把"同资源但没有动画状态机"的数量报出来：实机里"某个队友没挂上"到底是没找到、
+	-- 还是被这一条挡掉了，只有这个数字能分辨。
+	cache.avatarDroppedNoAnim = dropped
+	return list
 end
 
---- 本帧内缓存的"有没有动画状态机"（每个 unit 每帧至多问一次）。
-local function frame_animation_machine(runtime, unit)
-	local cache = runtime.frameAnimation
-	if not cache then
-		cache = {}
-		runtime.frameAnimation = cache
+--- 一趟扫完：**所有**玩家 avatar + 候选护甲件（存活、节点数够），
+--- 每个护甲件归属到"离它最近的那个玩家"，按玩家顺序排序。
+--- 返回 nil + 原因 表示"还没准备好"（场景在变 / 找不到目标），调用方下一拍再来。
+local function discover(S_, cache, options, logger)
+	local world, units = pickWorld(S_, cache)
+	if world == nil or units == nil then return nil, "读不到世界或 unit 列表" end
+	local count = #units
+	local previous = cache.lastUnitCount
+	cache.lastUnitCount = count
+	-- 场景还在加载/切换（unit 总数在变）⇒ 不做全量扫描，下一拍再来。
+	if previous ~= count then
+		return nil, "unit 总数在变（加载/切场景中）"
 	end
-	local animation = cache[unit]
-	if animation then return animation, 0 end
-	animation = { active = try(S.Unit.has_animation_state_machine, unit) == true }
-	cache[unit] = animation
-	return animation, 1
+
+	-- 挂点按**名字**问（`IdString32` 会失效，见 compat 里 `rig_bone_names` 的说明）。
+	local supportMg = SUPPORT_MG_NAME
+	local minNodes = options.minNodes or 90
+	-- 候选上限。**曾经是 64**，而实机在任务里"近距 29 + 远端 35 = 64"正好顶满 ——
+	-- 也就是说候选表被截断在 64，真护甲有可能压根没进表（谁进表取决于引擎枚举顺序）。
+	-- 现在打分是按拍额度的（`scoreUnitsPerFrame`），列表长一点也不多花每拍的钱，
+	-- 所以放宽到 128：多花的只是 discover 里每件 2 次调用（节点数 + support_mg）。
+	local maxUnits = options.maxUnits or 128
+	local maxAvatars = options.maxAvatars or 4
+
+	-- ① 找全所有玩家。
+	local avatars = findAvatars(S_, world, units, count, supportMg, minNodes, options, cache)
+	if #avatars == 0 then
+		cache.worldIndex = nil   -- 可能选错了世界，下一拍重新挑
+		return nil, string.format("没找到玩家 avatar（%d 个 unit，判据=%s%s）",
+			count, tostring(cache.avatarSource),
+			(cache.avatarDroppedNoAnim or 0) > 0
+				and string.format("，另有 %d 个同资源 unit 因没有动画状态机被跳过", cache.avatarDroppedNoAnim)
+				or "")
+	end
+	if (cache.avatarDroppedNoAnim or 0) > 0 and cache.avatarDroppedLogged ~= true then
+		cache.avatarDroppedLogged = true
+		logger(string.format(
+			"[physbone][玩家] 找到 %d 个玩家；另有 %d 个同资源 unit 没有动画状态机，按载具/人台处理（跳过）",
+			#avatars, cache.avatarDroppedNoAnim))
+	end
+
+	-- ② 位置 + 排序。相机距离最近的那个＝自己（第一人称时相机就在自己头上）。
+	local camX, camY, camZ = cameraPosition(S_, world, cache)
+	if cache.cameraLogged ~= true then
+		cache.cameraLogged = true
+		-- 这条只打一次：实机排查时"第一个到底是不是我"完全取决于它，
+		-- 而 debug_camera_pose 在某些版本上返回的是开发自由相机，那种情况下排序会退化。
+		logger(string.format("[physbone] 玩家排序依据：%s",
+			camX ~= nil and "相机位置（最近的那个＝自己）" or "读不到相机 ⇒ 只按节点数排（功能不受影响）"))
+	end
+	for index = 1, #avatars do
+		local avatar = avatars[index]
+		local ax, ay, az = readVector(S_, try(S_.Unit.world_position, avatar.unit, 1))
+		avatar.x, avatar.y, avatar.z = ax, ay, az
+		if camX ~= nil and ax ~= nil then
+			local dx, dy, dz = ax - camX, ay - camY, az - camZ
+			avatar.cameraDistance = dx * dx + dy * dy + dz * dz
+		end
+	end
+	table.sort(avatars, function(a, b)
+		local da, db = a.cameraDistance, b.cameraDistance
+		if da ~= nil and db ~= nil then return da < db end
+		if da ~= nil then return true end
+		if db ~= nil then return false end
+		return (a.nodes or 0) > (b.nodes or 0)
+	end)
+	if #avatars > maxAvatars then
+		-- 上限只防"某个场景里有几十个 avatar 资源实例"把预算吃光；正常对局是 1~4。
+		for index = #avatars, maxAvatars + 1, -1 do table.remove(avatars, index) end
+	end
+	for index = 1, #avatars do
+		avatars[index].order = index
+		avatars[index].tag = nil   -- 实例名等真要挂载时再读（每个 unit 一次引擎调用）
+	end
+
+	-- ③ 护甲候选：扫一遍 unit。avatar 自己不进候选（它们是骨架，不是护甲件）。
+	local avatarUnits = {}
+	for index = 1, #avatars do avatarUnits[avatars[index].unit] = avatars[index] end
+
+	local withMg, withoutMg = {}, {}
+	for index = 1, count do
+		local unit = units[index]
+		if avatarUnits[unit] == nil and Compat.unit_alive(S_, unit) then
+			local nodes = try(S_.Unit.num_scene_graph_items, unit)
+			if type(nodes) == "number" and nodes >= minNodes then
+				if try(S_.Unit.has_node, unit, supportMg) == true then
+					if #withMg < maxUnits then
+						withMg[#withMg + 1] = { unit = unit, nodes = nodes, mg = true }
+					end
+				elseif #withoutMg < maxUnits then
+					withoutMg[#withoutMg + 1] = { unit = unit, nodes = nodes, mg = false }
+				end
+			end
+		end
+	end
+	local armorList = withMg
+	for _, candidate in ipairs(withoutMg) do
+		if #armorList >= maxUnits then break end
+		armorList[#armorList + 1] = candidate
+	end
+	if #armorList == 0 then
+		return nil, string.format("没有候选护甲件（%d 个 unit，节点数门槛 %d）", count, minNodes)
+	end
+
+	-- ④ 归属：每个候选件属于**离它最近的那个玩家**。
+	--    玩家那套护甲挂在 avatar 骨架上，位置几乎重合；队友的在队友身上；尸体/人台离谁都远。
+	--    这一个不等式就是全部事实来源——不需要问"谁是主件"，也不会因为"多出来一个候选"就误判换人。
+	for _, candidate in ipairs(armorList) do
+		local ux, uy, uz = readVector(S_, try(S_.Unit.world_position, candidate.unit, 1))
+		if ux ~= nil then
+			local best, bestDistance = avatars[1], math.huge
+			for index = 1, #avatars do
+				local avatar = avatars[index]
+				if avatar.x ~= nil then
+					local dx, dy, dz = ux - avatar.x, uy - avatar.y, uz - avatar.z
+					local distance = dx * dx + dy * dy + dz * dz
+					if distance < bestDistance then best, bestDistance = avatar, distance end
+				end
+			end
+			candidate.owner = best
+			candidate.distance = bestDistance
+		else
+			candidate.owner = avatars[1]
+			candidate.distance = math.huge
+		end
+	end
+	table.sort(armorList, function(a, b)
+		local oa = a.owner ~= nil and a.owner.order or 99
+		local ob = b.owner ~= nil and b.owner.order or 99
+		if oa ~= ob then return oa < ob end
+		if a.mg ~= b.mg then return a.mg end
+		return (a.distance or math.huge) < (b.distance or math.huge)
+	end)
+	return world, units, avatars, armorList
 end
 
 --- 从部署后的 patch 尾部读物理容器。返回 { { rig = ..., path = ... }, ... }。
@@ -461,9 +555,7 @@ end
 --- 那 +5 是余量：万一部署序列中间出现空洞（理论上不会，管理器每次从 0 连续重编），
 --- 二分可能低估，多探五格兜住。
 local function loadCarriers(S_, cache, options, logger)
-	if not io or type(io.open) ~= "function" then return {} end
-	local archives = options.archiveId and { options.archiveId }
-		or { "9ba626afa44a3aa3", "59d238094a164c88", "d2fde496226be96f" }
+	local archive = options.archiveId or "9ba626afa44a3aa3"
 	local carriers = {}
 	local seen = {}
 
@@ -475,7 +567,6 @@ local function loadCarriers(S_, cache, options, logger)
 	local prefixes = { "data/", "data\\", "./data/", "../data/", "..\\data\\" }
 	local poked = {}
 	local scannedTo = -1
-	for _, archive in ipairs(archives) do
 	for _, prefix in ipairs(prefixes) do
 		if not canProbe or Compat.detect_prefix(archive, { prefix }) ~= nil then
 			local maxIndex = options.maxPatchIndex
@@ -506,7 +597,6 @@ local function loadCarriers(S_, cache, options, logger)
 			end
 		end
 	end
-	end
 
 	if #carriers > 0 then
 		logger(string.format("[physbone] 读到 %d 份物理容器（扫了 patch 0..%d）", #carriers, scannedTo))
@@ -522,25 +612,198 @@ local function loadCarriers(S_, cache, options, logger)
 	return carriers
 end
 
--- Both discovery paths must filter before scoring or resolving any nodes.
-local function filterCarriers(carriers, mask)
-	local filtered, removed = {}, 0
-	for _, carrier in ipairs(carriers) do
-		local rig, count = Compat.filter_ias_groups(carrier.rig, mask)
-		removed = removed + count
-		if #rig.bones > 0 then
-			local entry = {}
-			for key, value in pairs(carrier) do entry[key] = value end
-			entry.rig = rig
-			filtered[#filtered + 1] = entry
-		end
-	end
-	return filtered, removed
-end
-
 -- ---------------------------------------------------------------------------
 -- 挂载 / 卸载
 -- ---------------------------------------------------------------------------
+
+-- ---------------------------------------------------------------------------
+-- 身份判据：**哪个 unit 是玩家真正在操作的那几件**
+--
+-- 为什么这是这个功能的核心难题（2026-11-12，用户点出来的）：
+-- 算力根本不是瓶颈 —— 4 个玩家 × 每人数件 × 39 条链，全拉满也远在 5 ms 以内。
+-- 真正的浪费全来自"驱动了不该驱动的 unit"：军械库里几十件**同资源、同骨名**的
+-- 人台/预览/克隆，`has_node` 全命中，和玩家身上那套**无法用骨头区分**。
+--
+-- 那就别看骨头了，看**行为**：玩家身上那件是挂在玩家骨架上的，玩家一动它就动；
+-- 人台/预览固定在房间里，永远不动。这条判据不需要任何新的引擎能力，也无法被
+-- "同资源同骨名"骗过去。
+-- ---------------------------------------------------------------------------
+
+--- 累计一个 unit 的位移（米）。每拍采一次 `world_position(unit, 1)`。
+--- 存的是**累计量**而不是瞬时速度：两次尝试可能隔几十帧，累计量对采样间隔不敏感。
+---
+--- ⚠️ 必须先过 `unit_alive`：销毁后再读 world_position 是**原生 AV**（转储 0xc0000005 / 参数 0x0 0x0），
+--- `pcall` 拦不住。identity_watch 每 20 帧都会对会话采一次，而这期间 unit 完全可能已经被销毁
+--- （换甲 / 阵亡 / 场景拆解）—— 这是本函数唯一真正的危险点，别省这一个调用。
+local function motion_sample(runtime, S_, unit)
+	local track = runtime.motion
+	if track == nil then
+		track = setmetatable({}, { __mode = "k" })
+		runtime.motion = track
+	end
+	if Compat.unit_alive(S_, unit) ~= true then return nil end
+	local entry = track[unit]
+	if entry == nil then
+		entry = { moved = 0 }
+		track[unit] = entry
+	end
+	local x, y, z = readVector(S_, try(S_.Unit.world_position, unit, 1))
+	if x ~= nil then
+		local last = entry.pos
+		if last ~= nil then
+			local dx, dy, dz = x - last[1], y - last[2], z - last[3]
+			entry.moved = entry.moved + math.sqrt(dx * dx + dy * dy + dz * dz)
+		end
+		entry.pos = { x, y, z }
+	end
+	return entry
+end
+
+--- 这个 unit 是不是"跟着那个玩家走"的那一件。
+--- 返回 follows（true/false/nil=还没数据）、自身位移、主人位移。
+---
+--- 判据：主人的累计位移足够大（>5 cm，说明玩家真的动过）时，
+--- 候选自己的累计位移**至少要有主人的一半**才算"跟着"。人台是 0，直接出局。
+local function motion_follows(runtime, ownerUnit, unit)
+	local track = runtime.motion
+	if track == nil or ownerUnit == nil then return nil, 0, 0 end
+	local selfEntry, ownerEntry = track[unit], track[ownerUnit]
+	if selfEntry == nil or ownerEntry == nil then return nil, 0, 0 end
+	local ownerMoved = ownerEntry.moved or 0
+	if ownerMoved < 0.05 then return nil, selfEntry.moved or 0, ownerMoved end
+	return (selfEntry.moved or 0) >= ownerMoved * 0.5, selfEntry.moved or 0, ownerMoved
+end
+
+--- 身份监视：定期采"谁在动"，并把"玩家动它不动"的件放掉。
+---
+--- 为什么放在每帧入口而不是 `tryAttach`（T21 抓到的）：`tryAttach` 只在"需要补挂"时才跑；
+--- 一旦挂好了就不再调用，于是那些在**有活动量数据之前**挂上去的人台会一直挂着。
+--- 身份纠正必须持续跑到分类稳定，所以在 drive 里按固定间隔跑。
+--- 成本：每 20 帧一次，每个玩家/会话各 1 次 `world_position`（纯读）。
+local function identity_watch(S_, runtime)
+	local options = runtime.options or {}
+	if options.identityWatch == false then return end
+	local every = math.max(2, math.floor(options.identityPollFrames or 20))
+	local frame = runtime.frame or 0
+	if (frame % every) ~= 0 then return end
+	for index = 1, #(runtime.avatars or {}) do
+		motion_sample(runtime, S_, runtime.avatars[index].unit)
+	end
+	local sessions = runtime.sessions or {}
+	for index = 1, #sessions do motion_sample(runtime, S_, sessions[index].unit) end
+	if #sessions == 0 then return end
+
+	local followCount = {}
+	for _, session in ipairs(sessions) do
+		if motion_follows(runtime, session.owner, session.unit) == true then
+			local key = session.owner or false
+			followCount[key] = (followCount[key] or 0) + 1
+		end
+	end
+	local survivors, released, tags = {}, 0, nil
+	for _, session in ipairs(sessions) do
+		local key = session.owner or false
+		-- 只在"这个主人确实有跟着动的件"时才放掉静止的那些 —— 玩家还没动过时一件都不放。
+		if motion_follows(runtime, session.owner, session.unit) == false and (followCount[key] or 0) > 0 then
+			released = released + 1
+			if tags == nil then tags = {} end
+			if #tags < 4 then tags[#tags + 1] = tostring(session.unitTag) end
+			if Compat.unit_alive(S_, session.unit) then pcall(Compat.release, session) end
+		else
+			survivors[#survivors + 1] = session
+		end
+	end
+	if released > 0 then
+		runtime.sessions = survivors
+		runtime.logger("[physbone][识别] 放掉 %d 件「玩家动它不动」的件（人台/预览），剩 %d 件（%s）",
+			released, #survivors, tags ~= nil and table.concat(tags, ",") or "")
+	end
+end
+
+--- 身份类 API 探针：**成组执行 + 断点续测**（`probeIdentity = 1` 时才跑）。
+---
+--- 为什么要"成组 + 断点续测"（2026-11-12 用户的原话）：一次只测一个是低效率的，
+--- 而崩溃本身不是坏事 —— 坏的是"崩了但不知道为什么"。
+--- 所以这里：
+---   ① 一个进程里把候选接口**全跑一遍**（不是一次一个）；
+---   ② **每次调用前**先落一行日志、并先把进度写盘（`next = N+1`）；
+---   ③ 万一某个调用把进程打死（原生 AV，pcall 拦不住），进度已经落盘 ⇒
+---      下次启动自动从下一个继续，**不需要改任何东西**；
+---   ④ 于是"最坏情况崩 N 次"就换来 N 个接口的确定答案，而且每次崩溃都自带名字。
+---
+--- 进度文件：`%LOCALAPPDATA%\hd2pbx_probe.txt`。写 `next = 0` 表示全部跑完。
+--- ⚠️ 默认**关闭**：这些签名从没验证过，且已知能崩（2.1.34 事故，见 docs/agent 的 §13）。
+local function probe_identity_api(runtime, S_, candidate, owner)
+	if runtime.apiProbed == true or candidate == nil or candidate.unit == nil then return end
+	runtime.apiProbed = true
+	local logger = runtime.logger
+	local unit = candidate.unit
+	local ownerUnit = owner ~= nil and owner.unit or nil
+	local base = os.getenv("LOCALAPPDATA") or "."
+	local markerPath = base .. "\\hd2pbx_probe.txt"
+
+	local function readNext()
+		local handle = io.open(markerPath, "r")
+		if handle == nil then return 1 end
+		local text = handle:read("*a") or ""
+		handle:close()
+		local value = tonumber(text:match("next%s*=%s*(%-?%d+)"))
+		return value or 1
+	end
+	local function writeNext(value)
+		local handle = io.open(markerPath, "w")
+		if handle == nil then return end
+		handle:write(string.format("next = %d\n", value))
+		handle:close()
+	end
+	local function repr(value)
+		if type(value) == "table" or type(value) == "userdata" then
+			local okName, name = pcall(function() return S_.Unit.debug_name(value) end)
+			if okName and name ~= nil then return tostring(name) end
+			return type(value)
+		end
+		return tostring(value)
+	end
+
+	local tag = unit_tag(S_, unit)
+	local ownerTag = ownerUnit ~= nil and unit_tag(S_, ownerUnit) or "?"
+	-- 第 1 条是**已知可用**的对照（debug_name）：如果连它都没落下来，
+	-- 说明问题在探针本身（或者日志没刷），不是在被探的 API 上。
+	local steps = {
+		{ "debug_name（对照，已知可用）", function() return S_.Unit.debug_name(unit) end },
+		{ "is_a(unit,'Unit')", function() return S_.Unit.is_a(unit, "Unit") end },
+		{ "has_mesh(unit)", function() return S_.Unit.has_mesh(unit) end },
+		{ "num_meshes(unit)", function() return S_.Unit.num_meshes(unit) end },
+		{ "bones(unit)", function() return S_.Unit.bones(unit) end },
+		{ "scene_graph_parent(unit,1)", function() return S_.Unit.scene_graph_parent(unit, 1) end },
+		{ "scene_graph_link(unit,1)", function() return S_.Unit.scene_graph_link(unit, 1) end },
+		{ "is_child(unit,owner)", function() return S_.Unit.is_child(unit, ownerUnit) end },
+		{ "is_child(owner,unit)", function() return S_.Unit.is_child(ownerUnit, unit) end },
+		{ "Application.main_world()", function() return S_.Application.main_world() end },
+		{ "World.entities(world)", function() return S_.World.entities(runtime.world) end },
+	}
+	local startAt = readNext()
+	if startAt < 1 or startAt > #steps then
+		if startAt > #steps then logger("[physbone][识别API] 全部跑完（%d 项），不再探", #steps) end
+		return
+	end
+	logger("[physbone][识别API] 共 %d 项，从 #%d 开始（目标 %s，归属 %s）", #steps, startAt, tag, ownerTag)
+	for index = startAt, #steps do
+		local step = steps[index]
+		-- 写前落盘：这一行是"断点"。崩在下面那行之后，下次就会从 index+1 继续。
+		writeNext(index + 1)
+		logger("[physbone][识别API] #%d 开始 %s", index, step[1])
+		local ok, value = pcall(step[2])
+		if not ok then
+			local text = tostring(value):gsub("^.*:%d+: ", "")
+			logger("[physbone][识别API] #%d ⇒ 抛错(%s)", index, text:sub(1, 70))
+		else
+			logger("[physbone][识别API] #%d ⇒ %s %s", index, type(value), repr(value):sub(1, 40))
+		end
+	end
+	writeNext(#steps + 1)
+	logger("[physbone][识别API] 全部 %d 项跑完", #steps)
+end
 
 --- 身份链探针：**这件护甲 unit 与玩家 avatar 在场景图里有没有结构关系**。
 ---
@@ -644,6 +907,100 @@ local function probe_identity_link(runtime, S_)
 	logger("[physbone][身份链] 全部 %d 项跑完", #steps)
 end
 
+--- 一次性"候选普查 + has_node / node 交叉验证"（**只在异常态触发**）。
+local function dump_census(runtime, S_, nearCandidates, farCount, carriers)
+	local firstTag = nearCandidates[1] ~= nil and unit_tag(S_, nearCandidates[1].unit) or "?"
+	local key = tostring(#nearCandidates) .. "|" .. firstTag .. "|" .. tostring(farCount)
+	local seen = runtime.censusSeen
+	if seen == nil then
+		seen = {}
+		runtime.censusSeen = seen
+	end
+	if seen[key] == true or (runtime.censusCount or 0) >= 6 then return end
+	seen[key] = true
+	runtime.censusCount = (runtime.censusCount or 0) + 1
+
+	-- ① 候选是谁：把 resource_name 去重 + 节点数直方图（一行的字节数要可控）
+	local byResource, order, nodes = {}, {}, {}
+	for index = 1, #nearCandidates do
+		local candidate = nearCandidates[index]
+		local resource = tostring(try(S_.Unit.resource_name, candidate.unit) or "?")
+		if byResource[resource] == nil then
+			byResource[resource] = 0
+			order[#order + 1] = resource
+		end
+		byResource[resource] = byResource[resource] + 1
+		local count = candidate.nodes or 0
+		nodes[count] = (nodes[count] or 0) + 1
+	end
+	local resourceParts = {}
+	for index = 1, #order do
+		resourceParts[#resourceParts + 1] = string.format("%s×%d",
+			(tostring(order[index]):gsub(".*[\\/]", "")), byResource[order[index]])
+	end
+	local nodeParts = {}
+	for _, count in ipairs({ 171, 148, 132, 121, 108, 96 }) do
+		if nodes[count] ~= nil then nodeParts[#nodeParts + 1] = string.format("%d节×%d", count, nodes[count]) end
+	end
+	runtime.logger("[physbone][普查] 近距 %d 件 / 远端 %d 件 · 资源：%s · 节点：%s",
+		#nearCandidates, farCount,
+		#resourceParts > 0 and table.concat(resourceParts, "、") or "?",
+		#nodeParts > 0 and table.concat(nodeParts, " ") or "?")
+
+	-- ② 交叉验证：容器 #1 的首骨 vs 一个绝不存在的名字。
+	-- **一律按名字问**（`has_node(unit, "骨名")`），并按 id 问一次做对照 ——
+	-- 我们自己的 snapshot 探针早有结论：`string_to_id32` 返回的 `IdString32` 会失效，
+	-- 拿它做 `has_node` 会全 false / 抛错。这一行就是用来把这两种情况分开的。
+	local probeUnit = nearCandidates[1] ~= nil and nearCandidates[1].unit or nil
+	local carrier = carriers[1]
+	local firstBone = carrier ~= nil and carrier.rig ~= nil and type(carrier.rig.bones) == "table"
+		and carrier.rig.bones[1] or nil
+	if probeUnit == nil or firstBone == nil then return end
+
+	local function errText(ok, value)
+		if ok then return tostring(value) end
+		return "抛错(" .. tostring(value):gsub("^.*:%d+: ", "") .. ")"
+	end
+	local function describe(label, name)
+		local aliases = Compat.bone_name_aliases(name) or { name }
+		local okHas, has = pcall(S_.Unit.has_node, probeUnit, aliases[1])
+		local okNode, node = pcall(S_.Unit.node, probeUnit, aliases[1])
+		-- 再按 id 问一次（对照）：如果名字为 true 而 id 抛错/false，就证明"存 id"这条路是坏的。
+		local okId, id = pcall(function() return S_.Application.string_to_id32(aliases[1]) end)
+		local idText = "id=?"
+		if okId and id ~= nil then
+			local okHasId, hasId = pcall(S_.Unit.has_node, probeUnit, id)
+			idText = "has_node(id)=" .. errText(okHasId, hasId) .. " type(id)=" .. type(id)
+		end
+		return string.format("%s has_node(名)=%s node=%s %s", label,
+			errText(okHas, has), errText(okNode, node), idText)
+	end
+	runtime.logger("[physbone][普查] %s（%d 节）对 %s（%d 骨）：%s ；%s ；%s",
+		unit_tag(S_, probeUnit), nearCandidates[1].nodes or 0,
+		(tostring(carrier.path):gsub(".*[\\/]", "")), #carrier.rig.bones,
+		describe("首骨", firstBone.name),
+		describe("末骨", carrier.rig.bones[#carrier.rig.bones].name),
+		describe("对照组", "__hd2pbx_absent__"))
+
+	-- ③ 对这一件做一次完整打分（只做一次）：直接看出"差几根骨"
+	local best, scored = Compat.select_rig(S_, { probeUnit }, carriers)
+	local top = {}
+	for index = 1, math.min(#(scored or {}), 3) do
+		top[#top + 1] = string.format("%d/%d",
+			scored[index].score, scored[index].total)
+	end
+	runtime.logger("[physbone][普查] 该件完整打分：%s ⇒ %s",
+		#top > 0 and table.concat(top, " ") or "无容器",
+		best ~= nil and (best.full and "全命中" or "未全命中") or "无 best")
+end
+
+--- 就绪采样 + 增量挂载。
+---
+--- "增量"是这一版的核心：**只补新 unit、只释放主人已经不在的会话**。
+--- 以前是"一有变化就把全部会话丢掉重挂"，多人局里那等于每次有人加入/复活都让所有人
+--- 短暂失去物理（而且会把会话挂到错误的玩家身上）。
+---
+--- 返回 true 表示这一趟真的跑完了（不论有没有新挂上的），false 表示还在等场景稳定。
 --- 相位标记（诊断）：调参文件 `phaseLog = 1` 打开。
 --- 只在排查崩溃时开 —— 打开后每帧会多出十来行（attach/写骨/裙摆各一段）。
 --- 用途：崩了之后看最后一条 `[相位]` 就知道死在**哪个阶段**，不用猜。
@@ -652,11 +1009,747 @@ local function phase(runtime, name)
 	runtime.logger("[physbone][相位] %s", name)
 end
 
--- E12e-B4：这里原来有 `refresh_live_units` / `session_unit_live`（每帧或释放时问引擎要 `World.units` 全表，
--- 在 Lua 里按指针建索引判活）。IAS 没有"全世界活体表"：判活只用本回调的枚举结果，句柄不跨帧
--- （R:894-896、R:1417-1428）。对应物是 `Roster.isLive(runtime, unit)`（本帧 `units_by_resource` 枚举），
--- 所有判活处都改用它；`runtime.liveUnits / liveIndex / liveStamp / liveBuilt / liveIndexUnits / liveUnitsWorld /
--- liveUnitCount` 全部删除。
+--- 取某个 bone 名的世界坐标（读不到返回 nil，绝不抛）。
+local function ident_node_pos(S_, unit, name)
+	if S_.Unit == nil or unit == nil then return nil end
+	local okHas, has = pcall(S_.Unit.has_node, unit, name)
+	if not okHas or has ~= true then return nil end
+	local okNode, node = pcall(function() return S_.Unit.node(unit, name) end)
+	if not okNode or type(node) ~= "number" or node < 1 then return nil end
+	local ok, x, y, z = pcall(function()
+		return S_.Vector3.to_elements(S_.Unit.world_position(unit, node))
+	end)
+	if ok and type(x) == "number" then return x, y, z end
+	return nil
+end
+
+--- 身份位置诊断（`identLog = 1`）：护甲 hips 与主人 hips 的世界坐标差（米）。
+--- 依据：真正**穿在身上**的护甲，hips 与 avatar 的 hips 几乎同点（同一副骨架、被骨架驱动）；
+--- 展台件站在台子上，哪怕离你很近，hips 也会差出几十厘米到几米。
+--- 只写日志，不参与任何判定。
+local function ident_log_positions(runtime, S_, entry, session)
+	local ux, uy, uz = ident_node_pos(S_, entry.unit, "hips")
+	local ox, oy, oz = ident_node_pos(S_, entry.owner.unit, "hips")
+	if ux == nil or ox == nil then
+		runtime.logger("[physbone][识别·位置] unit=%s 读不到 hips（护甲=%s 主人=%s）",
+			tostring(entry.tag), tostring(ux ~= nil), tostring(ox ~= nil))
+		return
+	end
+	local dx, dy, dz = ux - ox, uy - oy, uz - oz
+	local metres = math.sqrt(dx * dx + dy * dy + dz * dz)
+	runtime.logger("[physbone][识别·位置] unit=%s 链=%d hipsΔ=%.3f m（护甲 %.2f,%.2f,%.2f / 主人 %.2f,%.2f,%.2f）",
+		tostring(entry.tag), #(session.sessions or {}), metres, ux, uy, uz, ox, oy, oz)
+end
+
+local function tryAttach(runtime)
+	local options, cache = runtime.options, runtime.cache
+	local frame = runtime.frame
+	local world, units, avatars, armorList, reason = discover(S, cache, options, runtime.logger)
+	if world == nil or armorList == nil or avatars == nil then
+		note_wait(runtime, reason or "发现目标失败（未给出原因）")
+		return false
+	end
+	local armor = armorList[1]
+
+	-- 诊断开关（`discoverOnly = 1`）：只做发现，**不挂载、不持有任何 unit 句柄**。
+	-- 用途（2026-11-11）：已确认"写骨"不是触发点（writeOff=1 仍崩）。
+	-- 于是要把"扫描 unit"与"挂载并持有句柄"分开：
+	--   不崩 ⇒ 触发点是挂载/持有句柄；
+	--   还崩 ⇒ 连扫描都不能做（那就是更底层的事）。
+	if (tune_values(runtime).discoverOnly or 0) ~= 0 then
+		if not runtime.discoverOnlyLogged then
+			runtime.discoverOnlyLogged = true
+			runtime.logger("[physbone][诊断] discoverOnly=1 ⇒ 只扫描不挂载（找到 %d 个 avatar、%d 个护甲候选）",
+				#avatars, #armorList)
+		end
+		return false
+	end
+
+	local nodeCount = try(S.Unit.num_scene_graph_items, armor.unit)
+	if type(nodeCount) ~= "number" or nodeCount < 10 then
+		note_wait(runtime, "主件节点数异常", tostring(nodeCount))
+		return false
+	end
+	local sample = readVector(S, try(S.Unit.world_position, armor.unit, 1))
+	if sample == nil then
+		note_wait(runtime, "主件世界坐标读不到")
+		return false
+	end
+
+	-- 两次采样一致 ⇒ 加载/传送/换装已经结束。间隔太短容易在动画还没落位时就 attach。
+	-- ⚠️ 采样一旦记下就**不要每帧覆盖**，否则 (frame - previous.frame) 永远是 1，永远等不到。
+	-- 这一步是正常路径（10 帧内必然过去），所以不记等待原因，免得盖掉真正的卡点。
+	local settleFrames = options.settleFrames or 10
+	local previous = cache.settle
+	if previous == nil or previous.nodes ~= nodeCount then
+		cache.settle = { x = sample, frame = frame, nodes = nodeCount }
+		return false
+	end
+	if (frame - previous.frame) < settleFrames then return false end
+	cache.settle = nil
+
+	-- 逐 unit 选容器：每个 unit 只认"全命中"的那一份，没有就跳过（宁可不驱动也不写错参数）。
+	-- `options.carriers` 可以直接注入（测试 / 由管理器把容器内容传进来时用），省掉扫盘。
+	local carriers = runtime.carriers or {}
+	if #carriers == 0 and options.carriers ~= nil then
+		carriers = options.carriers
+		runtime.carriers = carriers
+	end
+	if #carriers == 0 then carriers = loadCarriers(S, cache, options, runtime.logger); runtime.carriers = carriers end
+	local allowPartial = options.allowPartial == true
+	-- 只挂**离它那个玩家**近的护甲件。为什么必须过滤：阵亡后尸体留在原地、unit 一直活着，
+	-- 而复活点常在别处 ⇒ 不过滤的话会把尸体也一起挂上（既浪费，也让"给尸体关物理"落空）。
+	-- 注意距离是"到**它自己那个玩家**"的：队友的护甲离队友近，不该因为离我远就被丢掉。
+	local maxDist = options.maxArmorDistance == nil and 5.0 or options.maxArmorDistance
+	local maxDist2 = maxDist > 0 and (maxDist * maxDist) or nil
+	local nearCandidates, farCount = {}, 0
+	for _, candidate in ipairs(armorList) do
+		if maxDist2 == nil or candidate.distance == nil or candidate.distance <= maxDist2 then
+			nearCandidates[#nearCandidates + 1] = candidate
+		else
+			farCount = farCount + 1
+		end
+	end
+	if farCount > 0 then
+		-- 节流：这个数会随玩家走动每拍都变（83/95/97…），逐拍打会把日志冲成一片噪音
+		-- （2026-11-12 实机：一局里几千行全是这句）。只在"数字变了"或每 300 帧打一次。
+		local last = runtime.farLog
+		if last == nil or last.count ~= farCount or (frame - last.frame) >= 300 then
+			runtime.farLog = { count = farCount, frame = frame }
+			runtime.logger("[physbone] 跳过 %d 个离它所属玩家超过 %.1f m 的护甲件（尸体/人台）", farCount, maxDist)
+		end
+	end
+	-- ---------- 活动量采样（身份判据的原料） ----------
+	-- 每件候选 + 每个玩家各 1 次 `world_position`：便宜，而且只在"重扫"时才跑。
+	for index = 1, #avatars do motion_sample(runtime, S, avatars[index].unit) end
+	for index = 1, #nearCandidates do motion_sample(runtime, S, nearCandidates[index].unit) end
+	-- ---------- 一次性诊断在"异常态"触发（见下面 fill 循环之后的调用） ----------
+	-- 给候选打分是这里最贵的一步（每份容器 × 每根骨一次 has_node）。
+	--
+	-- 2026-11-12 改法：**去掉"固定件数额度"**，换成"按 unit 缓存 + 每帧只新打分 N 件"。
+	--   为什么去额度：原来 `max(12, 4×玩家数)` 的额度让**自己**的件先占满（候选按 owner.order
+	--   排序），实测 2 人局 12 件里自己 9 件、队友只剩 3 件 —— 这就是"队友没物理"的直接原因。
+	--   为什么能去：匹配结果按 unit 记住以后，打过的下一拍成本≈0，所以进度是**单调**的，
+	--   不会再出现"每拍都从头打同一批"；跨拍装填时"这一拍打到哪"由下面的每帧上限控制。
+	local rigMatches = runtime.rigMatches
+	-- 容器集合变了（重新加载 boot / 换了物理包）⇒ 缓存必须整份失效，
+	-- 否则旧容器下"没命中"的结论会被继续沿用，那批件永远挂不上（T5 就是这么暴露的）。
+	local carrierKey = #carriers .. "|" .. tostring(carriers[1] ~= nil and carriers[1].path or "")
+	if runtime.rigMatchKey ~= carrierKey then
+		runtime.rigMatchKey = carrierKey
+		rigMatches = nil
+		runtime.bestScoredEver = nil
+		runtime.scoreAttemptAt = nil   -- 重试门也一起失效：否则新容器下要白等一轮 retryFrames
+		runtime.rigProbe = nil         -- 预筛结论同理（容器变了，"能不能全命中"要重算）
+		runtime.probeRejected = nil
+	end
+	if rigMatches == nil then
+		rigMatches = setmetatable({}, { __mode = "k" })   -- 弱键：unit 销毁后自动释放
+		runtime.rigMatches = rigMatches
+	end
+	local scoreUnitsPerFrame = options.scoreUnitsPerFrame or 2
+	-- 预筛（每份容器只问第 1 根骨，用来提前否掉"不可能全命中"的件）。
+	--
+	-- **默认关闭**（2026-11-12 实机教训）：它的前提是"`has_node` 说没有就真的没有"，
+	-- 而这个前提在任务里被证伪了 —— 同一份代码在舰船过 8 件、进任务后 5 分钟过 0 件，
+	-- 而用户明确说同一版本在任务里**本来是有物理的**（v1.5.14）。
+	-- 也就是说：这个"优化"会把真护甲挡在真打分之外，一个字节的收益都没有，风险却是全盘的。
+	-- 需要它时显式给 `probeUnitsPerFrame`（>0）即可，代价见下面那条注释。
+	--
+	-- 成本对比（用来决定要不要开）：预筛 = 每份容器 1 次调用（10 次）；
+	-- 真打分 = 骨数 × 容器数（57 × 10 ≈ 570 次，≈3 ms）。
+	local probeUnitsPerFrame = options.probeUnitsPerFrame or 0
+	-- 预筛只在"全命中才算数"时成立（`allowPartial` 时部分命中是合法的，不能筛）；
+	-- 外置包可能只更新了 runtime、没更新 compat ⇒ 没有这个函数就退回纯真打分。
+	local canProbe = not allowPartial
+		and type(Compat.probe_carriers) == "function"
+		and probeUnitsPerFrame > 0          -- 0 = 关掉预筛（默认）
+	-- 重试间隔（帧）。**只缓存正匹配**，没命中的件不写缓存、只记"上次打分帧"，到点再试。
+	-- 为什么不缓存负结论（2026-11-12 实机踩到）：unit 刚生成时骨骼可能还没就绪，第一拍
+	-- 打分得到"0 命中"；把它当永久结论的话这个 unit 再也不会被重试 —— 现象正是
+	-- "只有先就绪的头盔有物理、护甲的件永远没有"，换护甲后连头盔也没了。
+	local retryFrames = options.negativeRetryFrames or 30
+	local scoreAttemptAt = runtime.scoreAttemptAt
+	if scoreAttemptAt == nil then
+		scoreAttemptAt = setmetatable({}, { __mode = "k" })
+		runtime.scoreAttemptAt = scoreAttemptAt
+	end
+	-- 预筛结论（unit → true 表示"至少含一份容器的第 1 根骨 ⇒ 有可能全命中"）。
+	-- 弱键：unit 销毁后自动释放。
+	local rigProbe = runtime.rigProbe
+	if rigProbe == nil then
+		rigProbe = setmetatable({}, { __mode = "k" })
+		runtime.rigProbe = rigProbe
+	end
+	-- ---------- 处理顺序：**游标轮转**，不依赖任何"单位身份" ----------
+	--
+	-- 为什么不用"按上次处理帧排序"（那是 2.1.28 的做法）：那个排序依赖
+	-- `scoreAttemptAt[unit]` 能命中 —— 也就是依赖 unit 句柄在 Lua 侧**跨帧同一**。
+	-- 一旦这个假设不成立（弱键表里的 userdata 被回收、或引擎每次枚举都新建包装），
+	-- 排序就退化成"永远 index 序"，队首那几件被反复处理，后面的件永远轮不到 ——
+	-- 正是 2.1.27 那个"已打分 2 件、未轮到 15 件"一动不动的死结。
+	--
+	-- 游标只依赖一个整数，随便怎么变都能保证：**ceil(件数 / 每拍额度) 拍之内覆盖全部候选**。
+	local candidateCount = #nearCandidates
+	local cursor = candidateCount > 0 and ((runtime.fillCursor or 0) % candidateCount) or 0
+
+	local plan, bestScored = {}, nil
+	local scoredNow, probedNow, probedOpen, deferred = 0, 0, 0, 0
+	local lastWork = nil   -- 这一拍处理的最后一件是谁、结果如何（写进"装填中"那行，便于看游标在动）
+	local scoreClock = os.clock()
+	for step = 0, candidateCount - 1 do
+		local index = ((cursor + step) % candidateCount) + 1
+		local candidate = nearCandidates[index]
+		local match = rigMatches[candidate.unit]
+		local needsScore = false
+		if match == nil then
+			local last = scoreAttemptAt[candidate.unit]
+			needsScore = last == nil or (frame - last) >= retryFrames
+		end
+		-- ① 便宜预筛：连容器第 1 根骨都没有 ⇒ 一定不可能全命中，不必花真打分的钱。
+		--    只在"全命中才算数"时成立，所以 allowPartial 时整段跳过。
+		if needsScore and canProbe and rigProbe[candidate.unit] ~= true then
+			if probedNow >= probeUnitsPerFrame then
+				deferred = deferred + 1
+				needsScore = false
+			else
+				probedNow = probedNow + 1
+				local okProbe = Compat.probe_carriers(S, candidate.unit, carriers)
+				lastWork = string.format("%s·%d节·预筛%s", unit_tag(S, candidate.unit),
+					candidate.nodes or 0, okProbe and "过" or "挂")
+				if okProbe then
+					probedOpen = probedOpen + 1
+					rigProbe[candidate.unit] = true
+					-- 通过了就别记"打过分"：让它留在队首，下一拍直接真打分。
+				else
+					-- 记一次"处理过"，让它沉到队尾；到点再探（骨骼可能只是还没就绪）。
+					scoreAttemptAt[candidate.unit] = frame
+					runtime.probeRejected = (runtime.probeRejected or 0) + 1
+					if runtime.negativeRetryAt == nil or (frame + retryFrames) < runtime.negativeRetryAt then
+						runtime.negativeRetryAt = frame + retryFrames
+					end
+					needsScore = false
+				end
+			end
+		end
+		-- ② 真打分（贵）：只有"有可能全命中"的件才走到这里。
+		if needsScore then
+			if scoredNow >= scoreUnitsPerFrame then
+				deferred = deferred + 1
+			else
+				local best, scored = Compat.select_rig(S, { candidate.unit }, carriers)
+				scoredNow = scoredNow + 1
+				runtime.fillScoredTotal = (runtime.fillScoredTotal or 0) + 1
+				scoreAttemptAt[candidate.unit] = frame
+				lastWork = string.format("%s·%d节·打分%d/%d", unit_tag(S, candidate.unit),
+					candidate.nodes or 0,
+					scored ~= nil and scored[1] ~= nil and scored[1].score or 0,
+					scored ~= nil and scored[1] ~= nil and scored[1].total or 0)
+				-- ⚠️ `select_rig` 在**0 命中时也会返回非 nil 的 best**（它返回排序后的第一名）。
+				-- 所以"有 best"不等于"可用"。**0 命中必须当"不可用"**，否则这件既不挂载、也永不重试
+				-- （2026-11-12 实机：只有先就绪的头盔有物理，护甲的件全没有）。
+				--
+				-- 可用判据（2026-11-12 定稿）：
+				--   ① 不再要求**全命中** —— 转换器已经改成"每个 unit 只带自己用得到的那几根物理骨"
+				--      （`ExtraBoneSubset`），全命中永远不成立；
+				--   ② 也不再要求"覆盖 10% 的骨" —— 一件只带腿上两条缎带的 unit 在 57 骨的容器上只有
+				--      4 根（7%），按百分比门槛会被直接丢掉，实机表现就是"那块布没有物理"。
+				--      **这正是"限制掩盖真问题"的又一例**：门槛在防"撞上 1 根同名骨的垃圾件"，
+				--      代价却是把真目标判死。
+				-- ⇒ 判据只剩"命中 ≥1 根骨"，该不该挂、能驱动几条链交给 `Compat.attach` 说话：
+				--   它逐链解析节点，缺节点的链跳过，产不出任何链就当场放弃（日志会留一行）。
+				--   换来的成本是偶尔对一件垃圾件发一轮 attach（~骨数 次调用），值。
+				local usable = best ~= nil and (best.full or allowPartial or (best.score or 0) >= 1)
+				if usable then
+					match = { rig = best.rig, path = best.path, full = best.full == true }
+					rigMatches[candidate.unit] = match
+				else
+					match = nil
+					-- 判过"不可能全命中"的，允许下次重新探（骨骼可能只是还没就绪）。
+					rigProbe[candidate.unit] = nil
+				end
+				-- 无论可不可用都记下"最接近的那一份"：没挂上时它是唯一能指出"差几根骨"的线索。
+				-- 记到 runtime 上是因为跨拍装填的最后一拍可能全是缓存命中（本地 bestScored 为 nil）。
+				if not usable and scored ~= nil and scored[1] ~= nil then
+					if bestScored == nil or scored[1].score > bestScored.score then bestScored = scored[1] end
+					if runtime.bestScoredEver == nil or scored[1].score > runtime.bestScoredEver.score then
+						runtime.bestScoredEver = scored[1]
+					end
+				end
+				-- 不可用 ⇒ 不写缓存，只排一次重试（到点后再打）。
+				if not usable then
+					local retryAt = frame + retryFrames
+					if runtime.negativeRetryAt == nil or retryAt < runtime.negativeRetryAt then
+						runtime.negativeRetryAt = retryAt
+					end
+				end
+			end
+		end
+		-- 匹配可用即挂（可能是部分命中：attach 会逐链跳过缺节点的链，见上面 usable 那段说明）。
+		if match ~= nil and match.rig ~= nil then
+			plan[#plan + 1] = {
+				unit = candidate.unit, rig = match.rig, path = match.path, mg = candidate.mg,
+				tag = unit_tag(S, candidate.unit),
+				owner = candidate.owner,
+				distance2 = candidate.distance,   -- 到它主人的距离平方（用于"只留最近的几件"）
+			}
+		end
+	end
+	-- 打分的实测耗时（`os.clock` 是 CPU 时间，正是我们要守的那 5 ms 口径）。
+	-- 不单独打行：逐拍打会把日志预算吃光、反而把驱动心跳挤掉（mp_harness 的 900 字节
+	-- 预算就是这么发现的）。耗时并进下面那一条"已挂载"行。
+	runtime.lastScoreMs = (os.clock() - scoreClock) * 1000
+
+	-- ---------- 身份分流：只认"跟着玩家走"的件 ----------
+	--
+	-- 2026-11-12 用户定调（原话大意）：这些限制卵用没有，反而掩盖了真正的问题 —— **目标错了**。
+	-- 复盘确实如此：预筛把真护甲挡在外面、件数闸/距离闸掩盖"26 件同款全命中"、
+	-- 自己分帧直接造成闪烁。真正要解决的只有一件：**哪几件是玩家在操作的模型**。
+	--
+	-- 所以这里不再有"上限"，只有一条语义规则：
+	--   · 玩家动过之后 —— 跟着一起动的（`follows == true`）留下，不动的人台/预览（false）丢掉；
+	--   · 还没有活动量数据时（刚进场景 / 玩家还没走动）—— **先全收**，等数据到了由
+	--     `identity_watch` 把不跟随的放掉。宁可短暂多驱动几件，也不要用猜测去否决目标。
+	-- 代价是一次性尖峰（军械库里那几秒），换来的是"稳态只剩真目标"，而且没有任何会闪烁的节流。
+	local matchedCount = #plan
+	if matchedCount > 0 then
+		table.sort(plan, function(a, b)
+			local da = a.distance2 or math.huge
+			local db = b.distance2 or math.huge
+			if da ~= db then return da < db end
+			return tostring(a.tag) < tostring(b.tag)
+		end)
+		local kept, followed, static, unknown, followedTags = {}, 0, 0, 0, {}
+		local acceptedByOwner = {}
+		for _, entry in ipairs(plan) do
+			local key = entry.owner ~= nil and entry.owner.unit or nil
+			local follows = motion_follows(runtime, key, entry.unit)
+			local accept = follows ~= false        -- true 或"未知"都先收
+			if follows == true then
+				followed = followed + 1
+				if #followedTags < 6 then
+					followedTags[#followedTags + 1] = string.format("%s@%.2fm", tostring(entry.tag),
+						entry.distance2 ~= nil and math.sqrt(entry.distance2) or 0)
+				end
+			elseif follows == false then
+				static = static + 1
+			else
+				unknown = unknown + 1
+			end
+			entry.__accept = accept
+			if accept and key ~= nil then acceptedByOwner[key] = (acceptedByOwner[key] or 0) + 1 end
+		end
+		-- 兜底：某个玩家一件都没被接受 ⇒ 留他最近的一件（绝不挂零）。
+		for _, entry in ipairs(plan) do
+			local key = entry.owner ~= nil and entry.owner.unit or nil
+			if key ~= nil and (acceptedByOwner[key] or 0) == 0 and entry.__accept == false then
+				entry.__accept = true
+				acceptedByOwner[key] = 1
+				runtime.logger("[physbone][识别] 玩家 %s 没有「跟着动」的件 ⇒ 兜底留最近的一件 %s",
+					tostring(entry.owner ~= nil and entry.owner.tag or "?"), tostring(entry.tag))
+			end
+		end
+		for _, entry in ipairs(plan) do
+			if entry.__accept ~= false then kept[#kept + 1] = entry end
+			entry.__accept = nil
+		end
+		local dropped = matchedCount - #kept
+		if dropped > 0 then
+			plan = kept
+			if runtime.perOwnerLogged ~= true then
+				runtime.perOwnerLogged = true
+				runtime.logger("[physbone][识别] 命中 %d 件 ⇒ 挂 %d 件（跟随=%d 静止=%d 未知=%d）%s",
+					matchedCount, #plan, followed, static, unknown,
+					#followedTags > 0 and ("｜" .. table.concat(followedTags, " ")) or "")
+			end
+		end
+		-- 身份类 API 探针：**成组执行 + 断点续测**，**默认关闭**（调参文件写 `probeIdentity = 1` 才跑）。
+		-- 一个进程把 11 个接口全跑，进度落盘，崩了下次自动从下一个继续。
+		-- 不能默认开：这些签名没验证过，原生 AV 时 pcall 拦不住 —— 实机上普通玩家一进舰船
+		-- （有人台 ⇒ 同款命中多件）就会被连崩数次，探针结果却只写日志、不参与任何判定。
+		-- 放在"同款模型命中多件"的现场跑，因为那正是"分不清哪个是玩家模型"的地方。
+		if matchedCount > 1 and plan[1] ~= nil then
+			local probeSwitch = tune_values(runtime).probeIdentity
+			if probeSwitch ~= nil and probeSwitch ~= 0 then
+				pcall(probe_identity_api, runtime, S, plan[1], plan[1].owner)
+			end
+		end
+	end
+	-- **游标必须每拍前进。** 这是"覆盖全部候选"的唯一保证（不依赖 unit 句柄是否跨帧同一）：
+	-- 前进量 = 这一拍实际处理的件数（至少 1），于是 n 件候选在 ceil(n/额度) 拍内被覆盖一遍。
+	if candidateCount > 0 then
+		local advanced = math.max(1, scoredNow + probedNow)
+		runtime.fillCursor = (cursor + advanced) % candidateCount
+	end
+	-- 异常态：**一件都没挂上、而且这一拍真打分了却一件都没命中** ⇒ 打一次普查。
+	-- ⚠️ 判据里必须带 `#plan == 0`：只看"当前没有会话"的话，第一次成功挂载的那一拍也会中
+	-- （会话是在本函数后半段才建立的），于是在 mp_harness 的 900 字节预算用例里白花掉一大半。
+	if #plan == 0 and scoredNow > 0 and (#(runtime.sessions or {}) == 0) then
+		pcall(dump_census, runtime, S, nearCandidates, farCount, carriers)
+	end
+	if #plan == 0 then
+		if deferred > 0 then
+			-- 这拍额度用完了、还没轮到能命中的那件：不是失败，下一拍继续。
+			-- `fillPending` 也要立起来：等待期那套"等久了就放慢轮询"的退避**必须让位**给装填，
+			-- 否则额度 2 件/拍 + 1 秒一拍 = 十几件候选要十几秒才轮完（实机观感就是"进图后
+			-- 十几秒完全没物理，然后突然出现"）。
+			runtime.fillPending = true
+			note_wait(runtime, "装填中（本拍额度用完）",
+				string.format("真打分 %d 件 / 预筛 %d 件、还剩 %d 件%s",
+					scoredNow, probedNow, deferred,
+					lastWork ~= nil and ("；最近 " .. lastWork) or ""))
+			return false
+		end
+		runtime.fillPending = false
+		local detail
+		if #carriers == 0 then
+			detail = "没有物理容器可匹配"
+		else
+			local closest = bestScored or runtime.bestScoredEver
+			if closest ~= nil then
+				detail = string.format("%d 个候选 unit × %d 份容器，最高命中 %d/%d 根骨（%s）",
+					#nearCandidates, #carriers, closest.score, closest.total, tostring(closest.path))
+			elseif (runtime.probeRejected or 0) > 0 then
+				-- 预筛把它们全挡在真打分之前了：这比"最高命中 0/68"更具体 ——
+				-- 说明这些 unit 连任何一份容器的第 1 根骨都没有（不是同一套模型）。
+				detail = string.format("%d 个候选 unit × %d 份容器，预筛全挂（连容器的第 1 根骨都没有）",
+					#nearCandidates, #carriers)
+			else
+				detail = string.format("%d 个候选 unit × %d 份容器，全部 0 命中", #nearCandidates, #carriers)
+			end
+		end
+		note_wait(runtime, "没有 unit 命中任何物理容器", detail)
+		return false
+	end
+	table.sort(plan, function(a, b)
+		local oa = a.owner ~= nil and a.owner.order or 99
+		local ob = b.owner ~= nil and b.owner.order or 99
+		if oa ~= ob then return oa < ob end
+		if a.mg ~= b.mg then return a.mg end
+		return false
+	end)
+
+	-- ① 先收掉"主人已经不在了"的会话（玩家退出 / 阵亡后尸体不再算玩家）。
+	--
+	-- 这一步取代了老版本那个 `playerChanged`：老版本把"出现一个新的 avatar 候选"当成
+	-- "玩家换人了"，于是**队友一进房间就把我的会话全丢掉、重挂到队友身上**。
+	-- 现在每个会话都记着自己的主人，主人还在就一律不动。
+	local aliveOwners = {}
+	for index = 1, #avatars do aliveOwners[avatars[index].unit] = true end
+	local kept, released = {}, 0
+	for _, session in ipairs(runtime.sessions or {}) do
+		if session.owner ~= nil and aliveOwners[session.owner] == nil then
+			released = released + 1
+			if Compat.unit_alive(S, session.unit) then
+				local ok, restored = pcall(Compat.release, session)
+				runtime.logger("[physbone][玩家] 主人已不在，释放 unit=%s（%s）%s",
+					tostring(session.unitTag or "?"), tostring(session.ownerTag or "?"),
+					ok and ("已交还 " .. tostring(restored) .. " 节基准姿态") or "交还失败")
+			end
+		else
+			kept[#kept + 1] = session
+		end
+	end
+	if released > 0 then
+		runtime.sessions = kept
+		runtime.logger("[physbone][玩家] 释放了 %d 个会话（主人已离开/阵亡），剩 %d 个", released, #kept)
+	end
+
+	-- ①b 身份纠正（"玩家动它不动"的件要放掉）已移到 `identity_watch`：
+	-- 它必须持续跑到分类稳定，而 tryAttach 只在"需要补挂"时才跑（T21 抓到的）。
+
+	-- ② 再补上还没挂的 unit。已有会话的 unit 直接跳过 —— 这是增量的关键：
+	--    队友加入时，我自己的会话一个字节都不该被碰。
+	local attachedUnits = {}
+	for _, session in ipairs(runtime.sessions or {}) do attachedUnits[session.unit] = true end
+
+	local attachOptions = {
+		logger = runtime.logger,
+		world = world,
+		strictIdentity = options.strictIdentity == true,
+		fastWrite = options.fastWrite ~= false,
+		-- `solver` 现在只用于那条**已废弃的角度振子核**（`"angle"`，仅 A/B）。
+		-- 粒子链（`chain`）与碰撞层已在 2026-11-03 移除，不再往下传。
+		solver = options.solver,
+		bendBlend = options.bendBlend,
+	}
+	local attached, emptyUnits, already = 0, 0, 0
+	for index = 1, #plan do
+		local entry = plan[index]
+		if attachedUnits[entry.unit] then
+			already = already + 1
+		elseif Compat.unit_alive(S, entry.unit) then
+			phase(runtime, "attach 前 " .. tostring(entry.tag))
+			local session = Compat.attach(S, entry.unit, entry.rig, attachOptions)
+			phase(runtime, "attach 后 " .. tostring(entry.tag))
+			session.rigSource = entry.path
+			session.unitTag = entry.tag
+			session.attachFrame = frame
+			session.owner = entry.owner ~= nil and entry.owner.unit or nil
+			session.ownerOrder = entry.owner ~= nil and entry.owner.order or 99
+			if entry.owner ~= nil then
+				-- 实例名只在这里读一次：unit 一旦销毁再读就是 AV，而日志里全是 `?` 等于没有信息。
+				entry.owner.tag = entry.owner.tag or unit_tag(S, entry.owner.unit)
+			end
+			session.ownerTag = entry.owner ~= nil and entry.owner.tag or nil
+			-- 身份诊断（`identLog = 1`）：把"这件护甲的 hips 离它主人的 hips 有多远"打出来。
+			-- 依据：真正**穿在身上**的护甲，其 hips 骨和 avatar 的 hips 骨几乎是同一个点（同一副骨架）；
+			-- 而军械库/债券页的**展台件**站在台子上，哪怕离你很近，hips 也会差出几十厘米到几米。
+			-- 这条比"离谁最近"锐利得多，而且用的全是我们已经在读的世界坐标。
+			if (tune_values(runtime).identLog or 0) ~= 0 and entry.owner ~= nil and entry.owner.unit ~= nil then
+				ident_log_positions(runtime, S, entry, session)
+			end
+			if #session.sessions > 0 then
+				if runtime.sessions == nil then runtime.sessions = {} end
+				runtime.sessions[#runtime.sessions + 1] = session
+				attached = attached + 1
+			else
+				-- attach 走完了却一条链都没产出：容器骨名和这个 unit 的节点名对不上，
+				-- 或者锚点全缺。以前这里完全静默，等于"挂上了"和"挂出 0 条"从日志上看一样。
+				--
+				-- 每件只打一次：判据放宽到"命中 ≥1 根骨"之后，偶尔会有"撞上一根同名骨"的垃圾件
+				-- 进来试一轮（它必然产出 0 条链），而它每 30 帧就会被重试一次 —— 逐次打会把日志刷满，
+				-- 反而盖掉真正要看的那几行。
+				emptyUnits = emptyUnits + 1
+				runtime.emptyLogged = runtime.emptyLogged or setmetatable({}, { __mode = "k" })
+				if runtime.emptyLogged[entry.unit] == nil then
+					runtime.emptyLogged[entry.unit] = true
+					runtime.logger("[physbone][失败] unit=%s 挂载完成但产出 0 条链（容器 %s）",
+						entry.tag, tostring(entry.path))
+				end
+			end
+		else
+			runtime.logger("[physbone][失败] unit=%s 在挂载前一刻已销毁（跳过）", tostring(entry.tag))
+		end
+	end
+	if (runtime.sessions == nil or #runtime.sessions == 0) then
+		note_wait(runtime, "attach 没有产出任何链", string.format("%d 个 unit 通过容器匹配、%d 个产出 0 条链", #plan, emptyUnits))
+		return false
+	end
+
+	-- 记下"这次场上有哪些玩家"。下一拍比对它的**实例同一性**（userdata，不是 debug_name：
+	-- 实测那个 id 是按资源算的，拿它比"是不是同一个人"永远为真）。
+	runtime.avatars = avatars
+	runtime.world = world
+	local first = avatars[1]
+	runtime.avatar = first.unit
+	runtime.avatarTag = first.tag
+	runtime.attachedFrame = frame
+	runtime.reArm = 0
+	runtime.rearmAt = nil
+	runtime.waitReason, runtime.waitRepeat = nil, nil
+	runtime.zeroFrames = 0
+	runtime.driveFrames = 0
+	runtime.callsAccum = 0
+	runtime.peakAngle = 0
+	runtime.repeatCalls = 0
+
+	local chains, tags = 0, {}
+	local chainCounts = {}
+	local perOwner = {}
+	for _, session in ipairs(runtime.sessions) do
+		chains = chains + #session.sessions
+		tags[#tags + 1] = tostring(session.unitTag or "?")
+		chainCounts[#chainCounts + 1] = #session.sessions
+		local key = session.ownerOrder or 99
+		perOwner[key] = (perOwner[key] or 0) + 1
+	end
+	local ownerText = {}
+	for _, order in ipairs({ 1, 2, 3, 4, 99 }) do
+		if perOwner[order] ~= nil then ownerText[#ownerText + 1] = string.format("玩家%d=%d件", order, perOwner[order]) end
+	end
+	table.sort(chainCounts, function(a, b) return a > b end)
+	-- 还有候选没轮到打分 ⇒ 排下一拍继续装填。
+	-- 不留这一条的话，剩下的件要等下一次"名单变化/死亡"才会被想起 —— 那正好就是
+	-- "队友的物理要等第三个玩家进来才出现"那个老现象。
+	runtime.fillPending = deferred > 0
+	if runtime.fillPending then
+		runtime.reconcile = frame + (options.reconcilePollFrames or options.pollFrames or 2)
+	end
+	-- 装填期间**不打这条汇总**：跨拍装填会打好几条，把日志预算吃光、连驱动心跳都挤掉
+	-- （mp_harness 的 900 字节预算闸门抓到的）。等装填结束再一次性给出结论。
+	if not runtime.fillPending then
+		-- **每件的链数**（降序）。这一行是"转换器按件切骨"是否真的生效的唯一直接证据：
+		-- 改前每件都是容器全量（Lunalice：7 件 × 39 条 = 273），改后各件各不相同、加起来远小于它。
+		-- 少了它，"273 条链"和"49 条链"在日志里都只是同一句"已挂载 N 个 unit"，看不出区别。
+		--
+		-- 只在**多于一件**时附带：一件的时候这两个数必然相等，纯占字节 ——
+		-- 而日志是有字节预算的（mp_harness 的 900 字节闸门就抓过"噪声把心跳挤掉"）。
+		local perUnit = ""
+		if #runtime.sessions > 1 then
+			local chainTotal = runtime.sessions[1].chainTotal or 0
+			perUnit = string.format("；每件链数 %s（全量会是 %d）",
+				table.concat(chainCounts, ","), #runtime.sessions * chainTotal)
+		end
+		runtime.logger("[physbone] 已挂载 %d 个 unit / %d 条链（%d 份容器，玩家 %d 个%s）；本次新挂 %d、已挂过 %d；打分 %.2f ms（本轮新打分 %d 件）%s；unit=%s",
+			#runtime.sessions, chains, #carriers, #avatars,
+			#ownerText > 0 and ("：" .. table.concat(ownerText, " ")) or "",
+			attached, already, runtime.lastScoreMs or 0, runtime.fillScoredTotal or 0,
+			perUnit, table.concat(tags, ","))
+		runtime.fillScoredTotal = nil
+	end
+	return true
+end
+
+--- 用**指针相等**判断"会话的 unit 还在不在"，全程**不 deref 句柄**。
+---
+--- 为什么必须这样（2026-11-12 债券页快切必崩，转储 `0x3e564b` / 参数 `0x0 0x0`）：
+--- 句柄被销毁之后，**任何**引擎调用都会 deref 那块已经还回去的内存 —— `Unit.alive` 也一样，
+--- 而 `pcall` 拦不住原生 AV。过去的写法是"每帧对每个会话问一次 `Unit.alive`"，
+--- 于是"引擎刚刚销毁这批 unit"的那一帧就是必死：慢速切页还能被"加载空档"那道闸（整组丢弃、
+--- 一条都不查）救下来，快速切页没有空档，直接踩中。
+---
+--- 这里的判据换了方向：**问引擎要"当前活体列表"，然后在 Lua 里按指针比**。
+--- `World.units(world)` 返回的是引擎自己现存的对象，拿它做**相等比较**不 deref 任何东西。
+---@return string "ok"（拿到可信列表，`runtime.liveUnits` 有效）| "world-gone"（我们那个世界没了）
+---          | "unavailable"（引擎没这两个 API ⇒ 不据此判死，退回旧行为）
+local function refresh_live_units(runtime, S_)
+	local worlds = try(S_.Application.worlds)
+	if type(worlds) ~= "table" or #worlds == 0 then return "unavailable" end
+	local found = false
+	for index = 1, #worlds do
+		if worlds[index] == runtime.world then found = true break end
+	end
+	if not found then return "world-gone" end
+	local units = try(S_.World.units, runtime.world)
+	if type(units) ~= "table" then
+		runtime.liveUnits = nil
+		return "unavailable"
+	end
+	runtime.liveUnits = units
+	runtime.liveUnitCount = #units
+	return "ok"
+end
+
+--- 会话的 unit 是否仍在活体列表里（**只做指针比较**）。
+--- `runtime.liveUnits == nil` 表示"没有可信列表"⇒ 不据此判死（保持旧行为）。
+local function session_unit_live(runtime, unit)
+	local units = runtime.liveUnits
+	if units == nil then return true end
+	for index = 1, #units do
+		if units[index] == unit then return true end
+	end
+	return false
+end
+
+--- 丢掉失效会话。任何一个失效都意味着场景变了 ⇒ 必须重扫（不能"还剩几个就继续开"）。
+--- 返回丢弃总数；dead / rebuilt 分开计数并各自落日志。
+local function pruneSessions(runtime)
+	local kept, dead, rebuilt, gone = {}, 0, 0, 0
+	for _, session in ipairs(runtime.sessions or {}) do
+		-- **先做"不碰句柄"的成员检查**：不在当前活体列表里 ⇒ 直接判死，
+		-- 连 `Unit.alive` 都不调（那个调用本身就是 deref，见 refresh_live_units 的注释）。
+		if session.unit ~= nil and not session_unit_live(runtime, session.unit) then
+			session.dead = "gone"
+			gone = gone + 1
+		else
+			local health = Compat.session_health(session, runtime.frame)
+			if health == "ok" then
+				kept[#kept + 1] = session
+			else
+				session.dead = health
+				if health == "rebuilt" then rebuilt = rebuilt + 1 else dead = dead + 1 end
+				-- `unitTag` 是**挂载时**记下的实例名：unit 已经死了，现在再读 debug_name 就是 AV。
+				-- 这条名字是 P0.5 判"换实例（军械库 churn）还是同实例被销毁"的唯一依据。
+				runtime.logger("[physbone][LIFECYCLE] 会话失效（%s）：unit=%s 存活 %d 帧 链=%d%s",
+					health, tostring(session.unitTag or "?"),
+					runtime.frame - (session.attachFrame or runtime.frame),
+					#(session.sessions or {}),
+					session.deadReason ~= nil and (" 判死原因=" .. session.deadReason) or "")
+			end
+		end
+	end
+	runtime.sessions = kept
+	if gone > 0 then
+		-- 这一类是"指针已经不在活体列表里"——它**没有**调过任何引擎 API，所以值得单独计数：
+		-- 这个数字涨得越快，说明场景 churn 越猛（军械库/债券页快切就是这个形状）。
+		runtime.logger("[physbone][LIFECYCLE] %d 个会话的 unit 已不在活体列表里（指针判死，未调用任何 Unit API）",
+			gone)
+	end
+	local dropped = dead + rebuilt + gone
+	if dropped > 0 then
+		runtime.logger("[physbone] 丢弃 %d 个已销毁 / %d 个已重建 / %d 个指针判死，剩 %d 个会话",
+			dead, rebuilt, gone, #kept)
+		-- **死亡之后先停写一小段，等场景拆解落定。**
+		-- 场景拆解是**连续**发生的：一批 unit 死掉之后，同一场景里其余 unit 往往在接下来几帧
+		-- 继续被引擎释放。此时若继续驱动"刚才还活着"的会话，就会把骨写到已释放的对象上——
+		-- 表现为访问违例、崩在引擎内部，而 Lua 层 pcall 抓不到（2026-11-11 实机：
+		-- 多人局换场景必崩、单人必不崩；因为单人的护甲件是一起死的，直接走
+		-- "场景已变"那条分支停手，根本不会有"剩几个继续跑"）。
+		-- 时间照常累积到 pendingDt，所以物理速度不变，只是这几帧不写骨。
+		local grace = runtime.options and runtime.options.deathGraceFrames or 20
+		local holdUntil = runtime.frame + grace
+		if (runtime.driveHoldUntil or 0) < holdUntil then runtime.driveHoldUntil = holdUntil end
+	end
+	return dropped
+end
+
+--- 便宜的"场上有哪些玩家"扫描，供驱动中定期比对。
+--- 返回 avatar unit 列表；`nil` 表示"这次扫不了"（世界/单位列表取不到）。
+---
+--- 现在几乎免费：`World.units_by_resource` 一次调用就列出所有玩家 avatar，
+--- 之后每个候选只要 1 次 `Unit.alive`。以前这里要遍历 2000+ unit、每个两次引擎调用，
+--- 所以只能 1.2 秒跑一次 —— 队友中途加入要多等一拍才接得上。
+local function scanAvatars(runtime)
+	local world, units = pickWorld(S, runtime.cache)
+	if world == nil or units == nil then return nil end
+	local supportMg = SUPPORT_MG_NAME
+	local options = runtime.options or {}
+	local list = findAvatars(S, world, units, #units, supportMg,
+		options.minNodes or 90, options, runtime.cache)
+	local found = {}
+	for index = 1, #list do
+		if Compat.unit_alive(S, list[index].unit) then found[#found + 1] = list[index].unit end
+	end
+	return found
+end
+
+--- 玩家人数有没有变化（有人加入 / 有人退出 / 阵亡后尸体不再算玩家）。
+---
+--- 取代了旧版的 `playerChanged`。旧版把"出现了一个新的 avatar 候选"当成"玩家换人了"，
+--- 在多人局里这是致命的：队友一进房间，我们就把**自己的**会话全丢掉、重新挂到队友身上，
+--- 而自己身上从此没有物理。现在"多出一个玩家"只是一个**新玩家**，谁的会话都不该动。
+---
+--- ⚠️ 判据用 **userdata 同一性**（`rawequal`），不是 `debug_name`：
+--- 2026-11-01 实测：丢掉 7 个 unit 之后重新挂上的还是**同一批 `#ID[...]`**，
+--- 说明那个 id 是按资源/描述符算的，不是按实例 —— 拿它比"是不是同一个人"永远为真。
+---@return boolean changed 需要补挂/收尾
+local function avatarSetChanged(runtime)
+	local live = scanAvatars(runtime)
+	if live == nil then return false end
+	local known = runtime.avatars or {}
+	local knownSet, liveSet = {}, {}
+	for index = 1, #known do knownSet[known[index].unit] = true end
+	local maxAvatars = (runtime.options or {}).maxAvatars or 4
+	for index = 1, #live do
+		local unit = live[index]
+		liveSet[unit] = true
+		if knownSet[unit] == nil then
+			if #known >= maxAvatars then
+				-- 已经到上限了（正常对局 4 人；观战/人台可能更多）。再补会一直"发现新玩家"→
+				-- 每 60 帧白跑一趟 discover，所以这里明确放弃，并留一条日志。
+				if runtime.extraAvatarLogged ~= true then
+					runtime.extraAvatarLogged = true
+					runtime.logger("[physbone][玩家] 场上还有第 %d 个 avatar（%s），超过上限 %d，不挂它的物理",
+						#known + 1, tostring(unit_tag(S, unit)), maxAvatars)
+				end
+			else
+				runtime.logger("[physbone][玩家] 有新玩家（%s）⇒ 补挂它的护甲",
+					tostring(unit_tag(S, unit)))
+				return true
+			end
+		end
+	end
+	for index = 1, #known do
+		if liveSet[known[index].unit] == nil then
+			runtime.logger("[physbone][玩家] 有玩家离开/阵亡（%s）⇒ 收掉它的会话",
+				tostring(known[index].tag or "?"))
+			return true
+		end
+	end
+	return false
+end
+
 
 -- ---------------------------------------------------------------------------
 -- 抬升诊断（默认关闭，靠一个外部文本文件打开）
@@ -705,7 +1798,7 @@ tune_values = function(runtime)
 		local base = os.getenv("LOCALAPPDATA")
 		if type(base) == "string" and #base > 0 then path = base .. "\\hd2pbx_tune.txt" end
 	end
-	if path ~= nil and io and type(io.open) == "function" then
+	if path ~= nil then
 		local ok, handle = pcall(io.open, path, "r")
 		if ok and handle ~= nil then
 			local okRead, text = pcall(handle.read, handle, "*a")
@@ -1167,7 +2260,7 @@ local function fp_lock_watch(S_, runtime)
 	if not settings.fpLock then return end
 	local avatars = runtime.avatars
 	if avatars == nil or #avatars == 0 then return end
-	local camX, camY = frameCamera(S_, runtime)
+	local camX, camY = cameraPosition(S_, runtime.world, runtime.cache or {})
 	if camX == nil then return end
 	local lockAvatar, lockH = nil, nil
 	for index = 1, #avatars do
@@ -1224,12 +2317,9 @@ local function scheduler_watch(S_, runtime, dt)
 	if avatars == nil or #avatars == 0 then return end
 	local primary = avatars[1]
 	if primary == nil or primary.unit == nil then return end
-	local camX, camY, camZ = frameCamera(S_, runtime)
+	local camX, camY, camZ = cameraPosition(S_, runtime.world, runtime.cache or {})
 	if camX == nil then return end
-	-- 位置同样优先取本帧 Roster 已读到的（physics_sync 填进 runtime.avatars）。
-	local ax, ay, az
-	if primary.positionFrame == runtime.frame and primary.x ~= nil then ax, ay, az = primary.x, primary.y, primary.z end
-	if ax == nil then ax, ay, az = readVector(S_, try(S_.Unit.world_position, primary.unit, 1)) end
+	local ax, ay, az = readVector(S_, try(S_.Unit.world_position, primary.unit, 1))
 	if ax == nil then return end
 	local dx, dy, dz = ax - camX, ay - camY, az - camZ
 	local distance = math.sqrt(dx * dx + dy * dy + dz * dz)
@@ -1272,18 +2362,15 @@ end
 local function refresh_avatar_distances(S_, runtime)
 	local avatars = runtime.avatars
 	if avatars == nil or #avatars == 0 then return end
-	-- physics_sync 本帧已经按 Roster 的枚举结果填好位置与到相机的距离：不再重读。
-	if runtime.avatarsFreshFrame == runtime.frame then return end
 	local camX, camY, camZ = cameraPosition(S_, runtime.world, runtime.cache or {})
-	runtime.poseCamera = { frame = runtime.frame, x = camX, y = camY, z = camZ, world = runtime.world }
 	if camX == nil then return end
 	for index = 1, #avatars do
 		local avatar = avatars[index]
-		-- 防御：名单可能被别处复用；这里再按指针确认一次。
-		if avatar.unit ~= nil and Roster.isLive(runtime, avatar.unit) then
+		-- 防御：名单可能来自 `tryAttach`（同一帧），也可能被别处复用；这里再按指针确认一次。
+		if avatar.unit ~= nil and session_unit_live(runtime, avatar.unit) then
 			local ax, ay, az = readVector(S_, try(S_.Unit.world_position, avatar.unit, 1))
 			if ax ~= nil then
-				avatar.x, avatar.y, avatar.z, avatar.positionFrame = ax, ay, az, runtime.frame
+				avatar.x, avatar.y, avatar.z = ax, ay, az
 				local dx, dy, dz = ax - camX, ay - camY, az - camZ
 				avatar.cameraDistance = dx * dx + dy * dy + dz * dz
 			end
@@ -1428,8 +2515,16 @@ local function sched_key_poll(S_, runtime)
 	runtime.logger("[physbone][热键] %s 按下 ⇒ 重排（玩家 %d 个，会话 %d 个）",
 		settings.hotkeyName, #(runtime.avatars or {}), #(runtime.sessions or {}))
 	redistribute(S_, runtime, "手动重设（热键 " .. settings.hotkeyName .. "）")
-	-- E12e：发现/补挂/退避重试（reconcile、scoreAttemptAt、negativeRetryAt）都已按 IAS 删除——
-	-- 每帧枚举本来就每帧重新发现并绑定，热键只需要重排一次。
+	-- **热键同时重新发现并补挂**（2026-11-12）。
+	-- 原来这里只重排：而"队友的件压根没挂上"时，重排多少次都没用（它只换已挂会话的主人），
+	-- 这正是"按 F8 几乎无效"的根因。现在下一拍会跑一次完整的 discover + 增量 attach，
+	-- 有匹配缓存兜底，成本很低。
+	runtime.reconcile = runtime.frame
+	if runtime.sessions == nil then runtime.rearmAt = nil end   -- 正在退避就直接重试
+		-- 顺手把"重试门"清掉（保留已命中的正缓存）：用户按 F8 就是想让它**真的再试一次**。
+	-- 不清的话，那些"打过但没命中"的件还在退避期里，F8 会被它挡住，表现仍是"按了没用"。
+	runtime.scoreAttemptAt = setmetatable({}, { __mode = "k" })
+	runtime.negativeRetryAt = nil
 	runtime.schedNoop = 0
 	runtime.schedBackoffUntil = nil
 end
@@ -1553,8 +2648,8 @@ end
 local function parse_snapshot_request(text)
 	if type(text) ~= "string" or #text == 0 then return nil end
 	local request = { frames = 8, stride = 2, limit = 0, nodes = {}, names = {}, seq = nil }
-	for rawLine in text:gmatch("[^\r\n]+") do
-		local line = rawLine:gsub("^%s+", ""):gsub("%s+$", "")
+	for line in text:gmatch("[^\r\n]+") do
+		line = line:gsub("^%s+", ""):gsub("%s+$", "")
 		if #line > 0 and line:sub(1, 1) ~= "#" then
 			local key, value = line:match("^([%w_]+)%s*=%s*(.-)$")
 			if key ~= nil then
@@ -1795,7 +2890,6 @@ end
 
 --- 轮询一次请求。只有目录存在、请求内容变了才动手；平时每 30 帧一次 io.open，成本可忽略。
 local function snapshot_poll(S_, runtime, options)
-	if not io or type(io.open) ~= "function" then return end
 	local dir = snapshot_dir(options)
 	if dir == nil then return end
 	local state = runtime.snapshotState
@@ -2313,13 +3407,10 @@ local function skirt_apply(S_, runtime)
 		-- 为什么裙摆这条路特别容易踩到（2026-11-12 军械库/债券页崩溃）：开页面时引擎会
 		-- **连续创建/销毁**一大堆展示用的护甲件，而裙摆是**每帧遍历所有会话**的、并且在
 		-- `drive` 的最末尾跑（pruneSessions 之后）——一帧之内被销毁的件就落在这条路上。
-		--
-		-- E12f-C3：判活改本帧枚举查表（`Roster.isLive`，零引擎调用）。会话的 unit 是本帧 physics_sync 从本帧 Roster 建出来的，
-		-- 句柄只来自本帧枚举、不跨帧（IAS R:894-896、R:1417-1422）；IAS 没有逐帧 `Unit.alive` 复查，也没有裙摆这一层（无对应物）。
-		-- 本帧枚举失败 / 没跑时 `Roster.isLive` 为假 ⇒ 本帧不碰这些句柄，比单点 `Unit.alive` 更严。
 		local alive = session.unit ~= nil
 			and session.dead == nil
-			and Roster.isLive(runtime, session.unit)
+			and type(Compat.unit_alive) == "function"
+			and Compat.unit_alive(S_, session.unit) == true
 		if alive then
 			-- 会话级准备：① 骨盆速度 → 运动斜坡；② "正后方"轴（世界坐标）。
 			local refs = skirt_refs(S_, session)
@@ -2531,4032 +3622,6 @@ local function dump_api_surface(runtime)
 	logger("[physbone][诊断] 引擎 API 清单已写到 %s（共 %d 个命名空间）", path, #namespaces)
 end
 
-local function arm_pose_enabled(runtime)
-	local tune = tune_values(runtime)
-	if tune.armPose ~= nil then return tune.armPose ~= 0 end
-	if tune.text ~= nil and tune.text.armPose ~= nil then
-		return tune.text.armPose == "true" or tune.text.armPose == "1"
-	end
-	return runtime.options ~= nil and runtime.options.armPose == true
-end
-
-local function arm_pose_options(runtime)
-	local opts = runtime.options or {}
-	local tune = tune_values(runtime)
-	local mode = (tune.text and tune.text.armMode) or opts.armMode or "auto"
-	return {
-		armMode = mode,
-		-- 不在这里填默认值：有没有肩关节目标会改变默认（见 Compat.apply_arm_pose）。
-		armAdductionDeg = tune.armAdductionDeg or opts.armAdductionDeg,
-		armForearmCompDeg = tune.armForearmCompDeg or opts.armForearmCompDeg,
-		armShoulderTarget = opts.armShoulderTarget,
-		legJointTarget = opts.legJointTarget,
-		armShoulderNarrow = tune.armShoulderNarrow or opts.armShoulderNarrow or 0.025,
-		armIkPull = tune.armIkPull or opts.armIkPull or 0.09,
-		armBlendTime = tune.armBlendTime or opts.armBlendTime or 0.12,
-	}
-end
-
-local function resolve_local_avatar_for_arm(runtime)
-	-- E12d：本人 = IAS 的 role 1（Network/GameSession 身份，每帧 Roster 给出）。
-	-- 没有网络身份可用时没有本人（IAS 同样没有回退）；测试/外部直接设置的 `runtime.avatar` 原样保留。
-	local roster = runtime.roster
-	if roster ~= nil and roster.identity then
-		local unit, world = Roster.localAvatar(runtime)
-		runtime.avatar = unit
-		if unit ~= nil then runtime.cache.world, runtime.world = world, world end
-		return unit
-	end
-	return runtime.avatar
-end
-
--- ---------------------------------------------------------------------------
--- 独立骨（2026-11-22，实验 1，见 docs/agent/ias-independent-bones-plan-20261122.md）
---
--- 实机证实（护甲探针 1、2）：护甲网格里和 avatar 同名的骨，画面直接用角色动画，
--- 运行时写 avatar 或护甲上的同名骨都不认。转换器把要换转轴的骨改了名（`ias_` + 原名），
--- 它们就成了普通场景节点。以模型关节为转轴，复制同父链的 avatar 局部旋转。
---
--- 选项 `independentBones = { { "ias_l_shoulder", "l_shoulder" }, ... }`（父骨在前）。
--- `independentTranslations` 按件给出平移骨的潜兵/模型静止局部位置。
--- ---------------------------------------------------------------------------
--- ---------------------------------------------------------------------------
--- IAS 1.6.4 生命周期（E12d）：每帧枚举 avatar 和装甲件，当帧按距离绑定，不保存跨帧结论。
--- 行为对照 docs/agent/ias-runtime-lifecycle-map-20261123.md：
---   avatar 枚举          IAS runtime.lua 1344–1360   每回调 World.units_by_resource(world, AVATAR_RESOURCE)
---   装甲件发现           IAS 1500–1620               每个 profile 一次 units_by_resource(Id64.from_hex(哈希))，
---                                                    全量 World.units 只在 60 帧 / 战斗世界 avatar 集合变化或每 2 s /
---                                                    某 profile 命中数下降时兜底；空结果只缓存 0.25 s
---   归属                 IAS 6690–6830               根探针 {1,0} 离最近 avatar，d2 < 9.0，次近比最近远出 0.20 才绑
---   本人/队友/死亡       IAS 4718–5100 physics_identity（Network/GameSession，4 Hz；先清缺席再节流）
--- 本模块是 IAS 这些做法的行为复刻（代码自己写）；没有 IAS 没有的缓存、额度、退避。
--- ---------------------------------------------------------------------------
-Roster.INTERVAL = 60
-Roster.AMBIGUITY = 0.20
-Roster.worlds = {}
-Roster.states = setmetatable({}, { __mode = "k" })
-Roster.known, Roster.session, Roster.epoch = {}, nil, 0
-Roster.nextPoll, Roster.ownedCursor, Roster.cursor = 0, 0, 0
-Roster.extendedCursor, Roster.nearCursor, Roster.observedHigh = 4096, 0, 4095
-Roster.remoteCursors, Roster.poll = {}, 0
--- E12f-C2：尸体副本（CorpseFreeze，定义在 physics_rig 之前的独立段）。这里只放两个表字段，
--- 让 Roster 在自己的段里就能调到它，而不必在文件顶部再加局部变量。
-Roster.freeze = {}
-Roster.corpsePins = {}   -- IAS `__hd2ir_corpse_slots`（R:5436）：副本 / 原件 / 世界 / 主人的实例槽，槽位表清理时不删
-
---- IAS profile 表：一件转换后的护甲 = 一个 profile，哈希 = 16 位十六进制资源 id（IAS 行 757–844，启动时装载一次）。
---- 转换器写出 `profileHashes`（独立骨件与物理件都在内）；retarget 与物理共用这一份名单。
---- 兼容垫片（不是 IAS 机制）：旧版 joint-pose 数据没有 `profileHashes`，退回 `independentPieces` 的键。
-local function roster_hashes(runtime)
-	local cached = runtime.rosterHashes
-	if cached ~= nil then return cached end
-	local list, seen = {}, {}
-	local function add(hash)
-		if type(hash) ~= "string" then return end
-		hash = hash:lower()
-		if #hash == 16 and hash:match("^%x+$") and not seen[hash] then seen[hash] = true; list[#list + 1] = hash end
-	end
-	local options = runtime.options or {}
-	for _, hash in ipairs(options.profileHashes or {}) do add(hash) end
-	for tag in pairs(options.independentPieces or {}) do add(tostring(tag):match("^#ID%[(%x+)%]$")) end
-	table.sort(list)
-	runtime.rosterHashes = list
-	return list
-end
-
---- IAS `__hd2ir_unit_instance_slot`（行 925–945）：句柄 → 稳定小整数，隔 120 帧清掉 2 帧没见过的。
---- 只用来当"身份"，从不拿它去调引擎。
-Roster.slots, Roster.slotSeen, Roster.nextSlot, Roster.slotPruned = {}, {}, 1, -1
-function Roster.instanceSlot(unit, frame)
-	if unit == nil then return 0 end
-	if frame % 120 == 0 and Roster.slotPruned ~= frame then
-		Roster.slotPruned = frame
-		for key, last in pairs(Roster.slotSeen) do
-			-- IAS R:930：尸体副本相关的槽位（Roster.corpsePins）不清，否则副本的身份会被"换发"。
-			if frame - last > 2 and not Roster.corpsePins[Roster.slots[key]] then Roster.slots[key], Roster.slotSeen[key] = nil, nil end
-		end
-	end
-	local slot = Roster.slots[unit]
-	if slot == nil then
-		slot = Roster.nextSlot
-		Roster.nextSlot = slot + 1
-		Roster.slots[unit] = slot
-	end
-	Roster.slotSeen[unit] = frame
-	return slot
-end
-
-local function roster_key(hash)
-	local space = S.IdString64
-	if type(space) ~= "table" or type(space.from_hex) ~= "function" then return nil end
-	return try(space.from_hex, hash)
-end
-
-local function roster_point(unit, node)
-	local x, y, z = readVector(S, try(S.Unit.world_position, unit, node))
-	if x ~= nil then return { x, y, z } end
-end
-
-local function roster_distance(a, b)
-	if not a or not b then return math.huge end
-	local dx, dy, dz = a[1] - b[1], a[2] - b[2], a[3] - b[3]
-	return math.sqrt(dx * dx + dy * dy + dz * dz)
-end
-
---- IAS discover_armour_units：返回本世界当前的装甲件 { unit, hash }。
-local function roster_discover(runtime, world, frame, unitCount, signature, gameplay)
-	local hashes = roster_hashes(runtime)
-	-- IAS 没有 profile 表就不会有任何发现（也就没有全量扫描）。
-	if #hashes == 0 then return {} end
-	local record = Roster.worlds[world]
-	if record == nil then
-		record = { last = -1000000, counts = {}, negative = { signature = nil, untilTime = {}, nextFull = 0 } }
-		Roster.worlds[world] = record
-	end
-	local now = os.clock()
-	local previous = record.counts or {}
-	local negative = record.negative
-	local actorChanged = negative.signature ~= signature
-	if actorChanged then negative = { signature = signature, untilTime = {}, nextFull = 0 }; record.negative = negative end
-	local validCount = type(unitCount) == "number" and unitCount == unitCount and unitCount >= 0
-	local populationChanged = not gameplay and validCount and unitCount <= 512 and unitCount ~= previous.__unit_count
-	local needScan = frame - record.last >= Roster.INTERVAL
-	if gameplay then needScan = actorChanged or now >= (negative.nextFull or 0) end
-	if populationChanged then needScan = true end
-	local discovered, seen, fast = {}, {}, {}
-	for _, hash in ipairs(hashes) do
-		local due = needScan or populationChanged or not signature or (previous[hash] or 0) > 0
-			or now >= (negative.untilTime[hash] or 0)
-		local units = {}
-		if due then
-			local key = roster_key(hash)
-			units = key ~= nil and try(S.World.units_by_resource, world, key) or nil
-			negative.untilTime[hash] = (type(units) == "table" and #units == 0) and now + (Roster.negativeSeconds or 0.25) or nil
-			if type(units) ~= "table" then units = {} end
-		end
-		local count = 0
-		for index = 1, #units do
-			local unit = units[index]
-			local name = try(S.Unit.debug_name, unit)
-			if type(name) == "string" and name:find(hash, 1, true) and not seen[unit] then
-				seen[unit] = true
-				count = count + 1
-				discovered[#discovered + 1] = { unit = unit, hash = hash }
-			end
-		end
-		fast[hash] = count
-		if count < (previous[hash] or 0) then needScan = true end
-	end
-	if needScan then
-		local all = try(S.World.units, world)
-		if type(all) == "table" then
-			local wanted = {}
-			for _, hash in ipairs(hashes) do wanted[hash] = true end
-			local names = {}
-			for index = 1, #all do
-				local unit = all[index]
-				local name = try(S.Unit.debug_name, unit)
-				if type(name) == "string" then
-					local matched = names[name]
-					if matched == nil then
-						matched = false
-						for run in name:gmatch("%x+") do
-							for start = 1, #run - 15 do
-								local piece = run:sub(start, start + 15):lower()
-								if wanted[piece] then matched = piece break end
-							end
-							if matched then break end
-						end
-						names[name] = matched
-					end
-					if matched and not seen[unit] then
-						seen[unit] = true
-						discovered[#discovered + 1] = { unit = unit, hash = matched }
-					end
-				end
-			end
-			local counts = {}
-			for _, row in ipairs(discovered) do counts[row.hash] = (counts[row.hash] or 0) + 1 end
-			if validCount then counts.__unit_count = unitCount end
-			record.counts = counts
-			if gameplay then negative.nextFull = now + 2.0 end
-		end
-		record.last = frame
-	else
-		fast.__unit_count = previous.__unit_count
-		record.counts = fast
-	end
-	-- IAS 行 1651–1656：600 帧没扫过的世界记录清掉。
-	for key, other in pairs(Roster.worlds) do
-		if frame - other.last > 600 then Roster.worlds[key] = nil end
-	end
-	return discovered
-end
-
---- IAS physics_identity.update：本人 / 队友 / 死亡（Network + GameSession，4 Hz）。
---- IAS __hd2ir_unit_instance_slot：同一个 unit 值映射到单调递增的槽号；超过 2 帧没出现的键每 120 帧清一次。
---- 只做表查询，不调引擎；必须每帧对在场 avatar 调用，否则 4 Hz 的判定轮询会把键清掉造成假“换实例”。
-local function roster_instance_slot(value, frame)
-	-- 与 Roster.instanceSlot 共用同一张槽位表（IAS 只有一张）。
-	return Roster.instanceSlot(value, frame)
-end
-
---- IAS solo_discovery_allowed（行 4756–4789）：只跳过"猜测式"发现（低位扫描）；已知对象刷新照常。
---- 独自一人且已验证：唯一 avatar 的网络对象仍存在、类型对、血量与位置吻合；两份成员名单（peers / other_peers）都只含自己。
-local function roster_solo_allowed(S, GS, Net, states, known, slots, avatars, session, peer, owned, complete)
-	if #avatars ~= 1 or not complete or type(peer) ~= "string" or #peer == 0 or #peer > 128 then return false end
-	local avatar = avatars[1]
-	if type(avatar) ~= "table" or not avatar.unit or not avatar.world then return false end
-	local state = states[avatar.unit]
-	if not state or state.owner ~= true or state.dead or not state.network or state.world ~= avatar.world
-		or not known[state.network] or not owned[state.network] or Roster.session ~= session then return false end
-	for _, name in ipairs({ "peers", "other_peers" }) do
-		if type(GS[name]) ~= "function" then return false end
-		local rows = try(GS[name], session)
-		if type(rows) ~= "table" then return false end
-		local count = 0
-		for _, member in pairs(rows) do
-			count = count + 1
-			if count > 32 or type(member) ~= "string" or #member == 0 or #member > 128 or member ~= peer then return false end
-		end
-	end
-	if try(Net.game_session) ~= session or try(Net.peer_id) ~= peer or try(GS.in_session, session) ~= true
-		or try(GS.game_object_exists, session, state.network) ~= true
-		or try(GS.game_object_is_type, session, state.network, "gl7xl2w") ~= true
-		or try(S.Unit.alive, avatar.unit) ~= true
-		or try(S.Unit.has_animation_state_machine, avatar.unit) ~= true then return false end
-	local health = try(GS.game_object_field, session, state.network, "health")
-	local x, y, z = readVector(S, try(GS.game_object_field, session, state.network, "position"))
-	return type(health) == "number" and health == health and health > 0 and health < 1e9
-		and x ~= nil and roster_distance(avatar.p, { x, y, z }) <= 1.0
-end
-
---- IAS squad_discovery_allowed（行 4794–4846）：2–4 个 avatar 各有新鲜、唯一的网络 / owner 证明，
---- 且两份成员名单一致、与可见 avatar 的 owner 集合完全吻合。只跳过猜测式 id 发现与远端枚举。
-local function roster_squad_allowed(S, GS, Net, states, known, slots, avatars, session, peer, owned, complete)
-	if #avatars < 2 or #avatars > 4 or not complete or type(peer) ~= "string" or #peer == 0 or #peer > 128
-		or type(GS.game_object_owner) ~= "function" then return false end
-	local members
-	for _, name in ipairs({ "peers", "other_peers" }) do
-		if type(GS[name]) ~= "function" then return false end
-		local list = try(GS[name], session)
-		if type(list) ~= "table" then return false end
-		local found, count = {}, 0
-		for _, owner in pairs(list) do
-			count = count + 1
-			if count > 4 or type(owner) ~= "string" or #owner == 0 or #owner > 128 then return false end
-			if owner ~= peer then
-				if found[owner] then return false end
-				found[owner] = true
-			end
-		end
-		if members then
-			for owner in pairs(found) do if not members[owner] then return false end end
-			for owner in pairs(members) do if not found[owner] then return false end end
-		else members = found end
-	end
-	local seen, networks, world, selfCount = {}, {}, nil, 0
-	for _, avatar in ipairs(avatars) do
-		local state = states[avatar.unit]
-		if not state or state.dead or not state.network or not known[state.network] or state.world ~= avatar.world
-			or state.instance ~= slots[avatar.unit] or networks[state.network] or (world and world ~= avatar.world)
-			or try(S.Unit.alive, avatar.unit) ~= true
-			or try(S.Unit.has_animation_state_machine, avatar.unit) ~= true then return false end
-		world = avatar.world; networks[state.network] = true
-		if try(GS.game_object_exists, session, state.network) ~= true
-			or try(GS.game_object_is_type, session, state.network, "gl7xl2w") ~= true then return false end
-		local owner = try(GS.game_object_owner, session, state.network)
-		if type(owner) ~= "string" or #owner == 0 or #owner > 128 or seen[owner] then return false end
-		seen[owner] = true
-		if owner == peer then
-			if state.owner ~= true or not owned[state.network] then return false end
-			selfCount = selfCount + 1
-		elseif not members[owner] or state.owner ~= false or state.friendly ~= true or owned[state.network] then return false end
-		local health = try(GS.game_object_field, session, state.network, "health")
-		local x, y, z = readVector(S, try(GS.game_object_field, session, state.network, "position"))
-		if type(health) ~= "number" or health ~= health or health <= 0 or health >= 1e9 or x == nil
-			or roster_distance(avatar.p, { x, y, z }) > 1.0 then return false end
-	end
-	for owner in pairs(members) do if not seen[owner] then return false end end
-	return selfCount == 1 and try(Net.game_session) == session and try(Net.peer_id) == peer
-		and try(GS.in_session, session) == true
-end
-
-local function roster_identity(runtime, avatars)
-	local Net, GS = S.Network, S.GameSession
-	if type(avatars) ~= "table" or #avatars > 32 then return end   -- IAS 行 4841
-	local states = Roster.states
-	local frame = runtime.frame or 0
-	local slots = {}
-	for _, avatar in ipairs(avatars) do slots[avatar.unit] = roster_instance_slot(avatar.unit, frame) end
-	local present = {}
-	for _, avatar in ipairs(avatars) do present[avatar.unit] = avatar.world end
-	-- 先作废缺席再节流：拒绝快速指针复用（IAS 行 4745–4747）
-	for unit, state in pairs(states) do if present[unit] ~= state.world then states[unit] = nil end end
-	local now = os.clock()
-	if now < Roster.nextPoll then return end
-	Roster.nextPoll = now + (Roster.pollInterval or 0.25)
-	for _, state in pairs(states) do state.role = 0 end
-	if type(Net) ~= "table" or type(GS) ~= "table" then return end
-	local session = try(Net.game_session)
-	if not session or try(GS.in_session, session) ~= true then
-		Roster.known, Roster.session = {}, nil
-		Roster.extendedCursor, Roster.nearCursor, Roster.observedHigh, Roster.poll = 4096, 0, 4095, 0
-		Roster.remoteCursors = {}
-		Roster.states = setmetatable({}, { __mode = "k" })
-		return
-	end
-	if Roster.session ~= session then
-		Roster.epoch = Roster.epoch + 1
-		Roster.known, Roster.session = {}, session
-		Roster.extendedCursor, Roster.nearCursor, Roster.observedHigh, Roster.poll = 4096, 0, 4095, 0
-		Roster.remoteCursors = {}
-		Roster.states = setmetatable({}, { __mode = "k" })
-		states = Roster.states
-	end
-	local peer = try(Net.peer_id)
-	local owned, complete, ownedIds = {}, false, {}
-	local list = try(GS.objects_owned_by, session, peer)
-	if type(list) == "table" then
-		complete = true
-		local count = 0
-		for _, id in pairs(list) do
-			count = count + 1
-			if count > 8192 then complete = false break end
-			if type(id) == "number" and id >= 0 and id <= 4294967295 and id == math.floor(id) then
-				if not owned[id] then owned[id] = true; ownedIds[#ownedIds + 1] = id end
-			else complete = false end
-		end
-	end
-	table.sort(ownedIds, function(a, b) return a > b end)
-	local considered = {}
-	local known = Roster.known
-	local function consider(id, refresh)
-		if not refresh and considered[id] ~= nil then return end
-		considered[id] = true
-		if try(GS.game_object_exists, session, id) == true and try(GS.game_object_is_type, session, id, "gl7xl2w") == true then
-			known[id] = true
-		else
-			known[id] = nil
-		end
-	end
-	-- IAS 行 4879–4889：solo / squad 已验证时跳过本地低位扫描（只跳过发现，已知对象刷新照常）
-	local solo = roster_solo_allowed(S, GS, Net, states, known, slots, avatars, session, peer, owned, complete)
-	local squad = not solo and roster_squad_allowed(S, GS, Net, states, known, slots, avatars, session, peer, owned, complete)
-	if not solo and not squad then
-		for index = 1, math.min(16, #ownedIds) do consider(ownedIds[index]) end
-		for _ = 1, math.min(64, #ownedIds) do
-			Roster.ownedCursor = Roster.ownedCursor % #ownedIds + 1
-			consider(ownedIds[Roster.ownedCursor])
-		end
-		for _ = 1, 64 do consider(Roster.cursor); Roster.cursor = (Roster.cursor + 1) % 4096 end
-	end
-	-- IAS 行 4909–4951：枚举真实的远端 owner（GS.peers 与 GS.other_peers 合并，各读至多 32 个，去掉自己），
-	-- 排序后取前 4 个，每个 owner 考察前 8 个 id + 16 个游标 id。
-	if #avatars > 1 and not squad and type(peer) == "string" then
-		local members = {}
-		for _, name in ipairs({ "peers", "other_peers" }) do
-			local values = type(GS[name]) == "function" and try(GS[name], session)
-			if type(values) == "table" then
-				local count = 0
-				for _, member in pairs(values) do
-					count = count + 1
-					if count > 32 then break end
-					if type(member) == "string" and #member > 0 and #member <= 128 and member ~= peer then members[member] = true end
-				end
-			end
-		end
-		local order = {}
-		for member in pairs(members) do order[#order + 1] = member end
-		table.sort(order)
-		local active = {}
-		for index = 1, math.min(4, #order) do
-			local remote = order[index]
-			active[remote] = true
-			local values = try(GS.objects_owned_by, session, remote)
-			if type(values) == "table" then
-				local set, found, count = {}, {}, 0
-				for _, id in pairs(values) do
-					count = count + 1
-					if count > 8192 then break end
-					if type(id) == "number" and id >= 0 and id <= 4294967295 and id == math.floor(id) and not set[id] then
-						set[id] = true; found[#found + 1] = id
-					end
-				end
-				table.sort(found, function(a, b) return a > b end)
-				for j = 1, math.min(8, #found) do consider(found[j]) end
-				local cursor = Roster.remoteCursors[remote] or 0
-				for _ = 1, math.min(16, #found) do
-					cursor = cursor % #found + 1
-					consider(found[cursor])
-				end
-				Roster.remoteCursors[remote] = cursor
-			end
-		end
-		for member in pairs(Roster.remoteCursors) do if not active[member] then Roster.remoteCursors[member] = nil end end
-	end
-	local unresolved = false
-	for _, avatar in ipairs(avatars) do
-		local state = states[avatar.unit]
-		if not state or not state.network then unresolved = true break end
-	end
-	Roster.observedHigh = math.max(Roster.observedHigh, ownedIds[1] or 0)
-	if #avatars > 1 and unresolved and Roster.observedHigh >= 4096 then
-		local upper = math.min(4294967295, Roster.observedHigh + 256)
-		local lower = math.max(4096, Roster.observedHigh - 512)
-		for _ = 1, 16 do consider(lower + Roster.nearCursor % (upper - lower + 1)); Roster.nearCursor = Roster.nearCursor + 1 end
-		for _ = 1, 16 do
-			if Roster.extendedCursor > upper then Roster.extendedCursor = 4096 end
-			consider(Roster.extendedCursor); Roster.extendedCursor = Roster.extendedCursor + 1
-		end
-	end
-	local ids = {}
-	for id in pairs(known) do ids[#ids + 1] = id end
-	if #ids > 32 then Roster.known, known, ids = {}, {}, {} end
-	local objects = {}
-	for _, id in ipairs(ids) do
-		consider(id, true)
-		if known[id] then
-			local x, y, z = readVector(S, try(GS.game_object_field, session, id, "position"))
-			local health = try(GS.game_object_field, session, id, "health")
-			if x ~= nil and type(health) == "number" and health == health and math.abs(health) < 1e9 then
-				objects[id] = { p = { x, y, z }, health = health, owned = owned[id] == true, complete = complete }
-			end
-		end
-	end
-	local live = {}
-	for _, avatar in ipairs(avatars) do
-		if try(S.Unit.alive, avatar.unit) == true then
-			local state = states[avatar.unit]
-			local instance = slots[avatar.unit]
-			if not state or state.world ~= avatar.world or state.instance ~= instance then state = { role = 0, instance = instance } end
-			states[avatar.unit] = state
-			state.world = avatar.world
-			local machine = try(S.Unit.has_animation_state_machine, avatar.unit)
-			live[#live + 1] = { a = avatar, s = state, machine = machine }
-			local object = state.network and objects[state.network]
-			if object and object.health <= 0 then state.dead = true; state.deadSince = state.deadSince or now end
-		end
-	end
-	for id, object in pairs(objects) do
-		if object.health > 0 then
-			local chosen, best, second = nil, math.huge, math.huge
-			for _, item in ipairs(live) do
-				if not item.s.dead and item.machine == true then
-					local d = roster_distance(item.a.p, object.p)
-					if d < best then second, best, chosen = best, d, item elseif d < second then second = d end
-				end
-			end
-			if chosen then
-				local state = chosen.s
-				local threshold = state.network == id and 1.0 or 0.05
-				if best <= threshold and second - best > 0.25 and (not state.network or state.network == id) then
-					state.network = id
-					if object.owned then state.owner = true
-					elseif object.complete and state.owner ~= true then state.owner = false end
-				end
-			end
-		end
-	end
-	local localCount = {}
-	for _, item in ipairs(live) do
-		local state = item.s
-		if state.owner == true and not state.dead and item.machine == true then
-			localCount[state.world] = (localCount[state.world] or 0) + 1
-		end
-	end
-	-- IAS 行 5029–5060：稳定互斥回退。只给还没连上网络对象的远端 avatar；
-	-- 需连续 4 次轮询都是同一个对象、误差 <= 0.5 m、次近 - 最近 > 0.5 m、其他活体 avatar 的间隔 > 0.5 m。
-	Roster.poll = Roster.poll + 1
-	local poll = Roster.poll
-	local claimed = {}
-	for _, item in ipairs(live) do if item.s.network then claimed[item.s.network] = true end end
-	for _, item in ipairs(live) do
-		local state = item.s
-		if not state.network and not state.dead and item.machine == true and complete and localCount[state.world] == 1 then
-			local bestId, best, second = nil, math.huge, math.huge
-			for id, o in pairs(objects) do
-				if o.health > 0 then
-					local d = roster_distance(item.a.p, o.p)
-					if d < best then second, best, bestId = best, d, id elseif d < second then second = d end
-				end
-			end
-			local o = bestId and objects[bestId]
-			local margin = math.huge
-			if o then
-				for _, other in ipairs(live) do
-					if other ~= item and not other.s.dead and other.machine == true then
-						margin = math.min(margin, roster_distance(other.a.p, o.p) - best)
-					end
-				end
-			end
-			if o and not o.owned and not claimed[bestId] and best <= 0.5 and second - best > 0.5 and margin > 0.5 then
-				if state.fallbackId == bestId and state.fallbackPoll == poll - 1 and now - state.fallbackAt <= 0.75 then
-					state.fallbackHits = state.fallbackHits + 1
-				else state.fallbackHits = 1 end
-				state.fallbackId, state.fallbackPoll, state.fallbackAt = bestId, poll, now
-				if state.fallbackHits >= 4 then
-					state.network, state.owner, state.matchMethod = bestId, false, "stable-mutual"
-					claimed[bestId] = true
-				end
-			else state.fallbackHits = 0; state.fallbackId = nil end
-		else state.fallbackHits = 0; state.fallbackId = nil end
-	end
-	for _, item in ipairs(live) do
-		local state = item.s
-		state.role = 0
-		if state.dead then state.role = 3
-		elseif item.machine == true then
-			if state.owner == true and localCount[state.world] == 1 then state.role = 1
-			elseif state.owner == false and (localCount[state.world] == 1 or (localCount[state.world] == nil and state.friendly == true)) then
-				local object = state.network and objects[state.network]
-				if object and object.health > 0 and object.complete and not object.owned
-					and roster_distance(item.a.p, object.p) <= 1.0 then state.role = 2; state.friendly = true end
-			end
-		end
-	end
-end
-
-function Roster.role(unit)
-	local state = Roster.states[unit]
-	return state and state.role or 0
-end
-
-function Roster.dead(unit)
-	local state = Roster.states[unit]
-	return state ~= nil and state.dead == true
-end
-
---- IAS `dead_age`（R:5182-5185）：死亡角色（role 3）且记过 dead_since 才有；返回距今秒数。
-function Roster.deadAge(unit)
-	local state = Roster.states[unit]
-	if state and state.role == 3 and state.deadSince then return math.max(0, os.clock() - state.deadSince) end
-end
-
---- IAS `shared_life`（R:5097-5119）：本人 / 队友"当前这一条命"的证据；证据不全就什么都不返回。
---- 每次调用都重查网络（IAS 同样每回调重查），所以只在尸体副本开启时才被调用。
-function Roster.sharedLife(unit, world, frame)
-	local state = Roster.states[unit]
-	local Net, GS = S.Network, S.GameSession
-	if not state or (state.role ~= 1 and state.role ~= 2) or state.dead or not state.network or not Roster.session
-		or (world ~= nil and state.world ~= world) or try(S.Unit.alive, unit) ~= true then return end
-	if state.role == 2 and (state.friendly ~= true or try(S.Unit.has_animation_state_machine, unit) ~= true) then return end
-	if try(Net.game_session) ~= Roster.session or try(GS.in_session, Roster.session) ~= true
-		or try(GS.game_object_exists, Roster.session, state.network) ~= true then return end
-	local health = try(GS.game_object_field, Roster.session, state.network, "health")
-	if type(health) ~= "number" or health ~= health or health <= 0 or health >= 1e9 then return end
-	return { epoch = Roster.epoch, network = state.network, world = Roster.instanceSlot(world, frame or 0),
-		kind = state.role == 2 and "friendly" or nil }
-end
-
---- IAS `dead_life`（R:5121-5135）：死者自己的一条命（网络 id 被复用 / 单位复活都不继承）。
---- IAS 的 Lua 侧没有任何调用者（只导出，给原生侧用）；这里照样保留并有测试，但运行时不调用。
-function Roster.deadLife(unit, world, frame)
-	local state = Roster.states[unit]
-	local Net, GS = S.Network, S.GameSession
-	if not state or state.role ~= 3 or not state.dead or not state.deadSince or state.owner ~= false or state.friendly ~= true
-		or not state.network or not Roster.session or state.world ~= world or not state.instance
-		or Roster.instanceSlot(unit, frame or 0) ~= state.instance or try(S.Unit.alive, unit) ~= true
-		or try(Net.game_session) ~= Roster.session or try(GS.in_session, Roster.session) ~= true then return end
-	local exists = try(GS.game_object_exists, Roster.session, state.network)
-	local health = exists == true and try(GS.game_object_field, Roster.session, state.network, "health")
-	local stillDead = type(health) == "number" and health == health and health <= 0 and math.abs(health) < 1e9
-	if not stillDead and try(S.Unit.has_animation_state_machine, unit) ~= false then return end
-	return { epoch = Roster.epoch, network = state.network, world = Roster.instanceSlot(world, frame or 0),
-		kind = "friendly", instance = state.instance }
-end
-
---- 每帧：枚举 avatar、装甲件，求当帧归属。结果只保留到下一帧。
-function Roster.update(runtime)
-	local worlds = try(S.Application.worlds)
-	if type(worlds) ~= "table" then runtime.roster = nil return end
-	local frame = runtime.frame or 0
-	-- E12f-C2：IAS `__hd2ir_corpse_freeze.begin`（R:6502），每帧一次，先于任何枚举结果的使用。
-	local freeze = Roster.freeze
-	if freeze.begin then freeze.begin(runtime) end
-	local resource = (runtime.options or {}).avatarResource or DEFAULT_AVATAR_RESOURCE
-	local roster = { frame = frame, byWorld = {}, live = {}, localAvatar = nil,
-		identity = type(S.Network) == "table" and type(S.GameSession) == "table" }
-	local allAvatars = {}
-	local perWorld = {}
-	for _, world in ipairs(worlds) do
-		local units = try(S.World.units_by_resource, world, resource)
-		local avatars = {}
-		if type(units) == "table" then
-			for index = 1, #units do
-				local unit = units[index]
-				local count = try(S.Unit.num_scene_graph_items, unit)
-				if type(count) == "number" and count > 1 then
-					local p = roster_point(unit, 1)
-					if p ~= nil then
-						local item = { unit = unit, world = world, p = p }
-						avatars[#avatars + 1] = item
-						allAvatars[#allAvatars + 1] = item
-						roster.live[unit] = true
-					end
-				end
-			end
-		end
-		perWorld[world] = avatars
-	end
-	local okIdentity, identityError = pcall(roster_identity, runtime, allAvatars)
-	if not okIdentity and not runtime.identityErrorLogged then
-		runtime.identityErrorLogged = true
-		runtime.logger('[physbone][错误] 身份判定失败：%s', tostring(identityError))
-	end
-	-- E12f-C2：共享身体"化身号"簿记（IAS R:6917）。只在尸体副本开启时跑；它在我们的运行时里没有消费者。
-	if freeze.enabled and freeze.lifecycleObserve then pcall(freeze.lifecycleObserve, runtime, allAvatars) end
-	for _, world in ipairs(worlds) do
-		local avatars = perWorld[world]
-		local slots, gameplay = {}, false
-		for _, item in ipairs(avatars) do
-			slots[#slots + 1] = Roster.instanceSlot(item.unit, frame)
-			local role = Roster.role(item.unit)
-			if role == 1 or role == 2 then gameplay = true end
-			if role == 1 and roster.localAvatar == nil then roster.localAvatar = item.unit; roster.localWorld = world end
-		end
-		table.sort(slots)
-		local count = try(S.World.num_units, world)
-		-- IAS 行 1386–1392：只扫 active 世界。我们能判的只有"有 avatar 且单位数 > 0"
-		-- （IAS 另有 scene_sources / 第一人称图两个条件，本运行时没有对应数据）。
-		local active = #avatars > 0 and not (type(count) == "number" and count <= 0)
-		local armour = active and roster_discover(runtime, world, frame, count, table.concat(slots, ":"), gameplay) or {}
-		-- E12f-C2：IAS R:6681-6682，枚举之后、归属之前过滤：副本不进名单；已被副本替换的原件也不进名单。
-		if freeze.active then armour = freeze.filter(world, avatars, armour) end
-		local owner = {}
-		for _, row in ipairs(armour) do
-			roster.live[row.unit] = true
-			local nodes = try(S.Unit.num_scene_graph_items, row.unit)
-			row.nodes = nodes   -- 尸体副本用（IAS 的 armour.node_count）
-			if type(nodes) == "number" and nodes > 1 then
-				-- IAS 行 6702–6725：每个探针 {1,0} 都算，每个 avatar 取各探针里的最小距离，再比 avatar。
-				local distance = {}
-				for _, probe in ipairs({ 1, 0 }) do
-					if probe < nodes then
-						local p = roster_point(row.unit, probe)
-						if p ~= nil then
-							for index, item in ipairs(avatars) do
-								local d = roster_distance(p, item.p)
-								if distance[index] == nil or d < distance[index] then distance[index] = d end
-							end
-						end
-					end
-				end
-				local best, second, bestD = nil, math.huge, math.huge
-				for index, item in ipairs(avatars) do
-					local d = distance[index]
-					if d ~= nil then
-						if d < bestD then second, bestD, best = bestD, d, item
-						elseif d < second then second = d end
-					end
-				end
-				if best ~= nil and bestD < 3.0 and second - bestD > Roster.AMBIGUITY then owner[row.unit] = best.unit end
-			end
-		end
-		roster.byWorld[world] = { avatars = avatars, armour = armour, owner = owner }
-	end
-	runtime.roster = roster
-	return roster
-end
-
-function Roster.reset()
-	if Roster.freeze.reset then Roster.freeze.reset() end
-	Roster.worlds = {}
-	Roster.states = setmetatable({}, { __mode = "k" })
-	Roster.known, Roster.session = {}, nil
-	Roster.nextPoll, Roster.ownedCursor, Roster.cursor = 0, 0, 0
-	Roster.extendedCursor, Roster.nearCursor, Roster.observedHigh = 4096, 0, 4095
-	Roster.slots, Roster.slotSeen, Roster.nextSlot, Roster.slotPruned = {}, {}, 1, -1
-	Roster.remoteCursors, Roster.poll = {}, 0
-end
-
---- 本回调枚举里存在的 unit（含 avatar 与装甲件）。
-function Roster.isLive(runtime, unit)
-	local roster = runtime.roster
-	return roster ~= nil and roster.frame == (runtime.frame or 0) and roster.live[unit] == true
-end
-
---- IAS 的"本人"：role == 1。没有网络身份可用时没有本人（IAS 同样没有回退）。
-function Roster.localAvatar(runtime)
-	local roster = runtime.roster
-	-- 只认**本帧**枚举：枚举失败 / 没跑时 runtime.roster 可能还是上一帧的，里面的句柄不能再用
-	-- （IAS 句柄不跨帧、枚举不到就本帧没有这个人，R:894-896、R:1417-1422）。
-	if roster == nil or roster.frame ~= (runtime.frame or 0) then return nil end
-	return roster.localAvatar, roster.localWorld
-end
-
--- ---------------------------------------------------------------------------
--- E12f-C1：CorpseMotion（尸体四秒关节倒地的纯数值模块）。
--- 镜像 IAS `__hd2ir_corpse_motion`（R:5248-5429）：公开函数名 / 参数 / 返回值同 IAS
--- （new / advance / frames / deform / owner / names），常数逐个照抄。
--- 纯数学：不调任何引擎 API（IAS 的该模块同样不碰引擎）。支撑面是"最后一次完整活体双脚"的近似，
--- 不是地形查询（R:5250-5252）。前向声明 `local CorpseMotion = {}` 在文件顶部 Roster 之后。
-do
-	local M = CorpseMotion
-	local unpack_ = unpack or table.unpack
-	-- R:5255-5257：15 个节点，顺序即迭代顺序
-	local names = { 'hips', 'chest', 'head', 'l_shoulder', 'r_shoulder', 'l_elbow', 'r_elbow',
-		'l_hand', 'r_hand', 'l_thigh', 'r_thigh', 'l_knee', 'r_knee', 'l_foot', 'r_foot' }
-	M.names = names -- R:5257
-
-	local function finite(v) return type(v) == 'number' and v == v and math.abs(v) < 1e7 end -- R:5258
-	local function vec(v, n) -- R:5259-5262
-		assert(type(v) == 'table', 'numeric vector required')
-		for i = 1, n do assert(finite(v[i]), 'nonfinite vector') end
-	end
-	local function add(a, b) return { a[1] + b[1], a[2] + b[2], a[3] + b[3] } end -- R:5263
-	local function sub(a, b) return { a[1] - b[1], a[2] - b[2], a[3] - b[3] } end -- R:5264
-	local function scale(a, k) return { a[1] * k, a[2] * k, a[3] * k } end -- R:5265
-	local function dot(a, b) return a[1] * b[1] + a[2] * b[2] + a[3] * b[3] end -- R:5266
-	local function cross(a, b) -- R:5267
-		return { a[2] * b[3] - a[3] * b[2], a[3] * b[1] - a[1] * b[3], a[1] * b[2] - a[2] * b[1] }
-	end
-	local function length(a) return math.sqrt(dot(a, a)) end -- R:5268
-	local function unit(a) -- R:5269
-		local d = length(a); assert(d > 1e-8, 'degenerate direction'); return scale(a, 1 / d)
-	end
-	local function qm(a, b) -- R:5270-5275：四元数乘法 (x,y,z,w)
-		return { a[4] * b[1] + a[1] * b[4] + a[2] * b[3] - a[3] * b[2],
-			a[4] * b[2] - a[1] * b[3] + a[2] * b[4] + a[3] * b[1],
-			a[4] * b[3] + a[1] * b[2] - a[2] * b[1] + a[3] * b[4],
-			a[4] * b[4] - a[1] * b[1] - a[2] * b[2] - a[3] * b[3] }
-	end
-	local function qr(q, v) -- R:5276-5279：四元数旋转向量
-		local t = scale(cross(q, v), 2)
-		return add(v, add(scale(t, q[4]), cross(q, t)))
-	end
-	local function between(a, b) -- R:5280-5289：a 到 b 的最短弧四元数
-		a, b = unit(a), unit(b)
-		local d = math.max(-1, math.min(1, dot(a, b)))
-		if d < -.999999 then
-			local side = math.abs(a[1]) < .8 and { 1, 0, 0 } or { 0, 1, 0 }
-			local axis = unit(cross(a, side)); return { axis[1], axis[2], axis[3], 0 }
-		end
-		local v = cross(a, b); local w = 1 + d; local n = math.sqrt(dot(v, v) + w * w)
-		return { v[1] / n, v[2] / n, v[3] / n, w / n }
-	end
-	-- R:5290-5299：12 条躯干/交叉支撑 + 8 条肢段，共 20 条定长边（任务摘要说 15 条，以 IAS 为准）
-	local edges = { { 'hips', 'chest' }, { 'chest', 'head' },
-		{ 'chest', 'l_shoulder' }, { 'chest', 'r_shoulder' },
-		{ 'hips', 'l_thigh' }, { 'hips', 'r_thigh' },
-		{ 'l_shoulder', 'r_shoulder' }, { 'l_thigh', 'r_thigh' },
-		{ 'hips', 'l_shoulder' }, { 'hips', 'r_shoulder' },
-		{ 'chest', 'l_thigh' }, { 'chest', 'r_thigh' },
-		{ 'l_shoulder', 'l_elbow' }, { 'l_elbow', 'l_hand' },
-		{ 'r_shoulder', 'r_elbow' }, { 'r_elbow', 'r_hand' },
-		{ 'l_thigh', 'l_knee' }, { 'l_knee', 'l_foot' },
-		{ 'r_thigh', 'r_knee' }, { 'r_knee', 'r_foot' } }
-	-- R:5300-5303
-	local child = { hips = 'chest', chest = 'head', head = 'chest',
-		l_shoulder = 'l_elbow', r_shoulder = 'r_elbow', l_elbow = 'l_hand', r_elbow = 'r_hand',
-		l_thigh = 'l_knee', r_thigh = 'r_knee', l_knee = 'l_foot', r_knee = 'r_foot' }
-	local terminal = { l_hand = 'l_elbow', r_hand = 'r_elbow', l_foot = 'l_knee', r_foot = 'r_knee' }
-
-	--- R:5304-5346。anchors[name] = {p={x,y,z}, q={x,y,z,w}}；velocity 可空（核心位移速度，上限 4 m/s）。
-	function M.new(anchors, velocity)
-		local s = { points = {}, links = {}, steps = 0, initial = {} }
-		for _, name in ipairs(names) do
-			local row = assert(anchors[name], 'missing articulated anchor ' .. name)
-			vec(row.p, 3); vec(row.q, 4)
-			local norm = math.sqrt(row.q[1] ^ 2 + row.q[2] ^ 2 + row.q[3] ^ 2 + row.q[4] ^ 2)
-			assert(math.abs(norm - 1) < .001, 'invalid anchor quaternion')
-			s.initial[name] = { p = { unpack_(row.p) }, q = { unpack_(row.q) } }
-		end
-		local height = length(sub(anchors.head.p, anchors.hips.p)) +
-			.5 * (length(sub(anchors.l_foot.p, anchors.hips.p)) + length(sub(anchors.r_foot.p, anchors.hips.p))) -- R:5313-5314
-		assert(height > .35 and height < 3.5, 'unsupported articulated size')
-		s.floor = math.min(anchors.l_foot.p[3], anchors.r_foot.p[3]) - .025 * height -- R:5316
-		local v = velocity or { 0, 0, 0 }; vec(v, 3)
-		if length(v) > 4 then v = scale(unit(v), 4) end -- R:5318
-		-- R:5319-5320：确定性的小倾倒冲量，避免对称站姿保持平衡
-		local right = unit(sub(anchors.r_shoulder.p, anchors.l_shoulder.p))
-		local up = unit(sub(anchors.chest.p, anchors.hips.p))
-		local forward = unit(cross(right, up))
-		s.forward = forward
-		for _, name in ipairs(names) do
-			local p = s.initial[name].p
-			local radius = (name == 'hips' or name == 'chest') and .065 or name == 'head' and .047 or .019 -- R:5327
-			local angular = scale(cross(right, sub(p, anchors.hips.p)), 1.6) -- R:5328
-			local speed = add(v, add(angular, scale(forward, .3))) -- R:5329
-			local mass = (name == 'hips' or name == 'chest') and 4 or name == 'head' and 2 or 1 -- R:5330
-			s.points[name] = { p = { unpack_(p) }, previous = sub(p, scale(speed, 1 / 120)),
-				radius = radius * height, weight = 1 / mass } -- R:5331
-		end
-		for _, edge in ipairs(edges) do -- R:5333-5337
-			local d = length(sub(anchors[edge[1]].p, anchors[edge[2]].p))
-			assert(d > .005 and d < height * 1.2, 'degenerate body constraint')
-			s.links[#s.links + 1] = { a = edge[1], b = edge[2], min = d, max = d }
-		end
-		-- R:5338-5344：四肢首末端弦长界，防止完全折叠又不锁死初始弯曲
-		for _, chain in ipairs({ { 'l_shoulder', 'l_elbow', 'l_hand' }, { 'r_shoulder', 'r_elbow', 'r_hand' },
-			{ 'l_thigh', 'l_knee', 'l_foot' }, { 'r_thigh', 'r_knee', 'r_foot' } }) do
-			local a = length(sub(anchors[chain[1]].p, anchors[chain[2]].p))
-			local b = length(sub(anchors[chain[2]].p, anchors[chain[3]].p))
-			s.links[#s.links + 1] = { a = chain[1], b = chain[3], min = math.max(math.abs(a - b), .24 * (a + b)), max = a + b }
-		end
-		return s
-	end
-
-	-- R:5347-5381：一个固定步（1/120 s）
-	local function step(s)
-		local dt = 1 / 120
-		for _, name in ipairs(names) do -- Verlet，阻尼 .992，重力 9.82 沿 -z（R:5349-5354）
-			local r = s.points[name]; local p, b = r.p, r.previous
-			local x, y, z = p[1], p[2], p[3]
-			p[1] = x + (x - b[1]) * .992; p[2] = y + (y - b[2]) * .992; p[3] = z + (z - b[3]) * .992 - 9.82 * dt * dt
-			b[1], b[2], b[3] = x, y, z
-		end
-		for _ = 1, 16 do -- 16 次约束迭代（R:5355）
-			for _, link in ipairs(s.links) do
-				local a, b = s.points[link.a], s.points[link.b]
-				local ap, bp = a.p, b.p
-				local x, y, z = bp[1] - ap[1], bp[2] - ap[2], bp[3] - ap[3]
-				local d = math.sqrt(x * x + y * y + z * z)
-				assert(d > 1e-9, 'collapsed constraint')
-				local target = math.max(link.min, math.min(link.max, d))
-				local k = (d - target) / d / (a.weight + b.weight)
-				local ka, kb = k * a.weight, k * b.weight
-				ap[1] = ap[1] + x * ka; ap[2] = ap[2] + y * ka; ap[3] = ap[3] + z * ka
-				bp[1] = bp[1] - x * kb; bp[2] = bp[2] - y * kb; bp[3] = bp[3] - z * kb
-			end
-			for _, name in ipairs(names) do -- 地面接触（R:5368-5377）
-				local r = s.points[name]; local level = s.floor + r.radius
-				if r.p[3] < level then
-					r.p[3] = level
-					-- 仅在接触近似平面时做切向阻尼 .12
-					r.previous[1] = r.previous[1] + (r.p[1] - r.previous[1]) * .12
-					r.previous[2] = r.previous[2] + (r.p[2] - r.previous[2]) * .12
-					r.previous[3] = math.max(r.previous[3], level)
-				end
-			end
-		end
-		for _, name in ipairs(names) do vec(s.points[name].p, 3) end -- R:5379
-		s.steps = s.steps + 1
-	end
-
-	--- R:5382-5389。elapsed 秒；返回是否已走满 480 步。单次追赶最多 32 步（R:5387）。
-	function M.advance(s, elapsed)
-		assert(finite(elapsed) and elapsed >= 0, 'invalid elapsed time')
-		local wanted = math.min(480, math.floor(elapsed * 120 + 1e-6))
-		for _ = 1, math.min(32, math.max(0, wanted - s.steps)) do step(s) end
-		return s.steps == 480
-	end
-
-	--- R:5390-5409。返回 out[name] = {q, p, origin}；躯干扭转由肩线修正（R:5397-5404）。
-	function M.frames(s)
-		local out = {}
-		for name, next_name in pairs(child) do
-			local initial = sub(s.initial[next_name].p, s.initial[name].p)
-			local current = sub(s.points[next_name].p, s.points[name].p)
-			out[name] = { q = between(initial, current), p = s.points[name].p, origin = s.initial[name].p }
-		end
-		local a = sub(s.initial.r_shoulder.p, s.initial.l_shoulder.p)
-		local b = sub(s.points.r_shoulder.p, s.points.l_shoulder.p)
-		local q = out.hips.q
-		local up = unit(sub(s.points.chest.p, s.points.hips.p))
-		a = qr(q, a); a = sub(a, scale(up, dot(a, up))); b = sub(b, scale(up, dot(b, up)))
-		local twist = between(a, b); out.hips.q = qm(twist, q)
-		out.chest.q = out.hips.q
-		for name, parent in pairs(terminal) do
-			out[name] = { q = out[parent].q, p = s.points[name].p, origin = s.initial[name].p }
-		end
-		return out
-	end
-
-	--- R:5410-5413。frames[owner] 把原姿态 pose={q,p} 变形到倒地姿态。
-	function M.deform(frames, owner, pose)
-		local f = assert(frames[owner], 'unknown articulated owner')
-		return { q = qm(f.q, pose.q), p = add(f.p, qr(f.q, sub(pose.p, f.origin))) }
-	end
-
-	--- R:5414-5425：骨名 → 所属关节节点；无归属返回 nil。
-	function M.owner(name)
-		if child[name] or terminal[name] then return name end
-		if name == 'neck' then return 'head' end
-		if name == 'spine1' or name == 'spine2' or name == 'l_clavicle' or name == 'r_clavicle' then return 'chest' end
-		for _, side in ipairs({ 'l_', 'r_' }) do
-			if name == side .. 'shoulder_twist' then return side .. 'shoulder' end
-			if name == side .. 'hand_twist' then return side .. 'elbow' end
-			if name:sub(1, 2) == side and name:find('finger', 3, true) then return side .. 'hand' end
-			if name == side .. 'ball' or name == side .. 'toe' then return side .. 'foot' end
-		end
-		if name == 'hips' or name == 'boss' or name == 'root' then return 'hips' end
-	end
-end
-
-local INDEPENDENT_LOG_FRAMES = { [1] = true, [600] = true }
-
-local function safe_node(S_, unit, name)
-	if try(S_.Unit.has_node, unit, name) ~= true then return nil end
-	local id = try(S_.Unit.node, unit, name)
-	local count = try(S_.Unit.num_scene_graph_items, unit)
-	if type(id) ~= "number" or id < 1 or (type(count) == "number" and id > count) then return nil end
-	return id
-end
-
-local function vec_dist(ax, ay, az, bx, by, bz)
-	if ax == nil or bx == nil then return nil end
-	local dx, dy, dz = ax - bx, ay - by, az - bz
-	return math.sqrt(dx * dx + dy * dy + dz * dz)
-end
-
-local function format_mm(value)
-	if value == nil then return "?" end
-	return string.format("%.1fmm", value * 1000)
-end
-
-local function pack_animation_state(ok, ...)
-	if ok then return { n = select("#", ...), ... } end
-end
-
-local function frame_animation_state(animation, avatar)
-	if animation.readState then return animation.tuple, 0 end
-	animation.readState = true
-	animation.tuple = pack_animation_state(pcall(S.Unit.animation_get_state, avatar))
-	return animation.tuple, 1
-end
-
-local function frame_animation_layer(animation, avatar)
-	if animation.readLayer then return animation.time, animation.length, 0 end
-	animation.readLayer = true
-	animation.time, animation.length = try(S.Unit.animation_layer_info, avatar, 11)
-	return animation.time, animation.length, 1
-end
-
-local function independent_visibility(piece, show)
-	local ok, result = pcall(S.Unit.set_unit_visibility, piece.unit, show)
-	if ok and result ~= false then piece.hidden = not show end
-	return 1
-end
-
-local IndependentLink = {}
-
--- IAS 1.6.4 layer roles plus the locally observed ship/prone empty states.
--- Reload lengths are in 60 Hz clip ticks. The game clock reports seconds.
-IndependentLink.reloadClips = {
-	[159]=170, [168]=90, [446]=180, [475]=185, [476]=135, [477]=200, [478]=115, [479]=150,
-	[488]=185, [489]=185, [490]=135, [491]=135, [494]=90, [499]=200, [500]=200, [501]=130, [502]=130,
-	[510]=170, [511]=170, [573]=170, [586]=90, [592]=180, [593]=120, [594]=120, [595]=180,
-	[596]=220, [597]=220, [600]=299, [601]=250, [612]=60, [633]=180, [634]=215, [635]=175,
-	[636]=110, [637]=50, [638]=40, [639]=50, [640]=30, [665]=105, [666]=105, [681]=180,
-	[686]=40, [687]=50, [691]=154, [698]=190, [699]=135, [700]=90, [701]=70, [702]=90, [703]=70,
-	[704]=190, [705]=190, [706]=120, [707]=120, [725]=120, [732]=200, [733]=130, [744]=130,
-	[745]=90, [748]=130, [749]=90, [767]=190, [768]=135, [774]=210, [775]=125, [781]=150,
-	[799]=180, [800]=130, [865]=180,
-}
-IndependentLink.motionGrips = {
-	r = { p = { 0.051216014, -0.006265312, -0.055564534 }, q = { -0.579370737, -0.437321216, -0.442053050, 0.526942849 } },
-	l = { p = { 0.059206679, -0.001960278, -0.046801239 }, q = { 0.386549324, 0.487733185, -0.622131407, 0.475024790 } },
-}
-
--- Asset IDs, scene-graph sizes, root slots, parent signatures and sidearm
--- flags from the IAS 1.6.4 weapon catalogue. Optional bounds cover the
--- native moving left-control sweep in the right-control frame.
-IndependentLink.weaponGraphs = {
-	["03e67a19b07c6523"] = { 38, 2, 1819903690, false },
-	["05d8d8c073b9d502"] = { 51, 2, 274910700, false, { 0.2235870, 0.0559892, -0.2017267, 0.3600964, 0.0718231, -0.1779306 } },
-	["05e4e5c2db6e44a2"] = { 33, 2, 1561093617, true },
-	["076dd5d4f4360204"] = { 32, 2, 128809422, false, { 0.3606843, 0.0153683, -0.1502686, 0.4710091, 0.0159076, -0.1402258 } },
-	["0b882808c6f498e8"] = { 39, 2, 378417319, true },
-	["0f83639ab8c86165"] = { 50, 15, 787771201, false },
-	["11ec8e2296a3d662"] = { 74, 2, 870721566, false, { 0.2411331, 0.0333919, -0.1703917, 0.3778624, 0.0494076, -0.1465957 } },
-	["14d5d4506056c7a4"] = { 43, 2, 1117374565, true },
-	["186ea95de7306b1a"] = { 36, 2, 1978993991, false },
-	["1a437158e1b8d2a1"] = { 36, 2, 1710260533, true },
-	["1abbff60d26ba391"] = { 30, 2, 1247580091, false },
-	["27ee1ed8f6fb6356"] = { 40, 3, 1361605581, false },
-	["295beb26dc4f8ff1"] = { 39, 2, 1367166588, false },
-	["2b28e17ffed05f7c"] = { 43, 2, 858667509, true },
-	["30061f91af477f5e"] = { 36, 3, 476231973, false },
-	["3575aabc5f1f9326"] = { 35, 3, 1966170913, true },
-	["3c86e871923f3970"] = { 45, 2, 93729406, false },
-	["3f92ba65ef65cca9"] = { 33, 2, 83927365, true },
-	["416d053372c4e433"] = { 32, 2, 768516475, true },
-	["41eac4a03987faa0"] = { 75, 2, 787402567, false, { 0.2235870, 0.0559892, -0.2017267, 0.3603163, 0.0720048, -0.1779306 } },
-	["46183b50961d1328"] = { 37, 3, 1428336574, false },
-	["4ba41b6f9f405cc2"] = { 40, 3, 1310516119, false },
-	["4d58c77087b774c5"] = { 36, 2, 1710260535, true },
-	["4dbd74f49c8ffc13"] = { 36, 2, 171269624, false },
-	["4e4a613eb9bf5c24"] = { 38, 2, 1217661892, false },
-	["4fb0f8c02f55c82b"] = { 30, 2, 1839515245, false },
-	["52e4334e6a128caf"] = { 32, 2, 47759735, true },
-	["53eebe75cd6e26df"] = { 75, 2, 787402567, false, { 0.2235870, 0.0559892, -0.2017267, 0.3603163, 0.0720048, -0.1779306 } },
-	["5fecab819f96a3e8"] = { 37, 2, 1891200416, false },
-	["708ea298c82093d0"] = { 38, 2, 639684404, false },
-	["72170a55a1f37ff1"] = { 38, 2, 1646819641, false, { 0.2423786, 0.0466107, -0.1496554, 0.2506835, 0.0657484, -0.1487711 } },
-	["7b06196e90154c88"] = { 34, 3, 1302795119, true },
-	["7b75e5132ffd4ca6"] = { 42, 2, 450936345, false, { 0.2017704, 0.0965996, -0.1967479, 0.4060056, 0.1558298, -0.1227190 } },
-	["7e3145a5baa4b948"] = { 32, 2, 2116111373, false },
-	["80f1a156d9fa1e36"] = { 38, 3, 1105069466, false },
-	["84354339522c932d"] = { 36, 2, 1918168807, false },
-	["8645f167b3c813a2"] = { 37, 2, 389142160, false },
-	["8a307bd1811a5fe9"] = { 34, 2, 1407847902, false },
-	["8d3d52a3b2f19402"] = { 60, 3, 103015341, true },
-	["8dc91f277c6096ee"] = { 38, 3, 1276517676, false },
-	["90ddc374f4e3d756"] = { 38, 2, 1159570608, false, { 0.2740060, 0.0123188, -0.1606764, 0.3630209, 0.0226438, -0.1451595 } },
-	["94bd931b5fb4ee95"] = { 39, 2, 290697657, false },
-	["9571ca51f0daf35b"] = { 35, 2, 1244341504, false },
-	["968211c0033dce64"] = { 43, 2, 1365212662, false },
-	["9eb160830321bfd6"] = { 33, 3, 755676466, true },
-	["a6a735accb4a327f"] = { 41, 2, 2075574723, false },
-	["a7ee1ebf58fcdf1f"] = { 43, 2, 683329037, false },
-	["aa69a60d74a3ec54"] = { 43, 3, 338970381, true },
-	["bc29613666df696b"] = { 38, 2, 1601355231, false },
-	["be70ee0d8d44028e"] = { 35, 2, 80160173, false, { 0.1960675, 0.0005412, -0.1625393, 0.2044715, 0.0630153, -0.1589530 } },
-	["c12a34f375bd5a87"] = { 39, 3, 1246493056, false },
-	["c4232a0e62166d91"] = { 38, 2, 123780754, false },
-	["c780bcd79547da0f"] = { 44, 2, 934893741, true },
-	["cdf28be026bb7d84"] = { 44, 3, 393988844, false },
-	["ce063aa33d95a812"] = { 38, 2, 431026281, false },
-	["cf8934ff6567a42d"] = { 44, 2, 949681621, true },
-	["d323de60855898ac"] = { 75, 2, 787402567, false, { 0.2235870, 0.0559892, -0.2017267, 0.3603163, 0.0720048, -0.1779306 } },
-	["d6b1fb05b9109353"] = { 46, 2, 290653440, true },
-	["dbb6c961c59fadc1"] = { 32, 2, 758111369, true },
-	["dcd1c835407ef7ba"] = { 38, 2, 1437803423, false, { 0.2065672, -0.0005330, -0.1740642, 0.2848286, 0.0085447, -0.1604218 } },
-	["e5796355a8fd67e0"] = { 39, 2, 200464068, false },
-	["e6d932be83729076"] = { 41, 2, 508840821, false },
-	["eea5e3cef1e12c14"] = { 46, 2, 1830706571, false },
-	["efdcef306cea63fe"] = { 47, 2, 1030894062, false },
-	["f0338468dcdb6a6c"] = { 35, 2, 326188192, false },
-	["f49227a0630a3f7f"] = { 50, 2, 601786065, false },
-	["f992ce97577c8a7f"] = { 40, 2, 1567577924, false, { 0.3563594, 0.0170015, -0.1217884, 0.3817801, 0.0530078, -0.1166465 } },
-	["02eecd0b1fa49630"] = { 40, 2, 1575613387, false },
-	["11c27d3babb38956"] = { 46, 2, 696751716, false },
-	["2152d5147b0ac418"] = { 39, 2, 1326004856, false },
-	["25aa2fd4643cf4ee"] = { 32, 2, 1430532530, false },
-	["26e40437ea275296"] = { 38, 2, 1168239596, false },
-	["2e9d0bdc48b09e60"] = { 39, 3, 1270607482, false },
-	["35a61296619cc47e"] = { 41, 2, 503420083, false },
-	["3828e2051aa9e897"] = { 47, 2, 788655962, false },
-	["39ab99895147a3bf"] = { 33, 3, 1860855984, false },
-	["43a58cb89cfa197c"] = { 33, 2, 1185781154, false },
-	["52071f49263415e4"] = { 35, 2, 1460748206, false },
-	["5990123d142b16cb"] = { 42, 2, 1026156458, false },
-	["6cfcc7f8801a0266"] = { 36, 2, 290032866, false },
-	["7617642765ac38c7"] = { 32, 2, 263546244, false },
-	["78a8185f63a70795"] = { 31, 2, 1574060098, false },
-	["80932fa0ed6901d3"] = { 33, 2, 2072574442, false },
-	["88c2d09ad85a7c9f"] = { 38, 2, 848326378, false },
-	["89c5493e08ca4207"] = { 39, 2, 1602264935, false },
-	["96de9cd50f7306e6"] = { 44, 2, 1508873121, false },
-	["9f80d67a12a7e40f"] = { 42, 2, 1597238702, false },
-	["a8cffb316f0b5c5f"] = { 63, 3, 283677617, false },
-	["b16c9d490aa59b77"] = { 51, 2, 125009885, false },
-	["b2b5e0d185605f9e"] = { 40, 2, 1462781686, false },
-	["cc786f6491fe7e65"] = { 39, 2, 320010747, false },
-	["d54b9505c0f72873"] = { 37, 2, 1469459401, false },
-	["e8d5f49ad7780e54"] = { 37, 2, 1869403091, false },
-	["fe3b29b2cfa63f9b"] = { 55, 2, 511412428, false },
-	["a8a91eb54892b6b2"] = { 43, 2, 706204382, false },
-	["e91f569c2ad8af01"] = { 36, 2, 511394286, true },
-	["c85f576d5e086147"] = { 48, 2, 1019708248, false },
-}
-
--- Resource/count pairs identify candidate child Units for the optional root trial.
-IndependentLink.weaponMembers = {
-	["03e67a19b07c6523"] = "07d605bd50c98461:16 44a2a59ca08ac865:12 642f2be0417d0beb:15 6d54652ee217d712:12 6e68194b95d60145:38 7b153e02ad22d12c:12 7fdd884ecd57231b:6 9b30d4ac39ddff10:16 bd4245dcfd4b832f:11 bdbefa6543a75942:22 e5796355a8fd67e0:39",
-	["05d8d8c073b9d502"] = "0c7314742b88806c:13 aca180fc6f846411:12 f9df21c8e52cac95:13 fa6f926a77b78b55:12",
-	["05e4e5c2db6e44a2"] = "0ec5ef9ec5cbd1b2:5 309f7e645a8d2b56:14 4851d75853622a47:15 4e4a613eb9bf5c24:38 4f839e923046e631:15 52071f49263415e4:35 6b88fea13ec2d78e:12 6b9572ac0f687394:6 77c5d934407114f4:17 8d3d52a3b2f19402:60 9dbc8aa8702ac9e1:12 b5b4395852e871bc:6 b96cc3b704a76464:7 e6b6467135035059:13 e71dbcb6a50f321b:158",
-	["076dd5d4f4360204"] = "9dbc8aa8702ac9e1:12 e307b6e78b0a8573:3",
-	["0b882808c6f498e8"] = "45be635fb904f4dc:12 7441b048b94491fc:12 bb8e970248330bdb:12 e2177e205d9a7a55:26 e98a9be765e0e236:5",
-	["0f83639ab8c86165"] = "44a2a59ca08ac865:12 7fdd884ecd57231b:6 89cce4d15db88aa8:16 a9a19cffe985c468:12 bf9504e95c0103a1:12",
-	["11ec8e2296a3d662"] = "3d58ea61b2b485cc:12 7f19d05cd188c768:6",
-	["14d5d4506056c7a4"] = "350168e3fd02b325:9 6b9572ac0f687394:6",
-	["186ea95de7306b1a"] = "309f7e645a8d2b56:14 7b153e02ad22d12c:12 8f141212b0f6f515:13 9d5e0d88df992aa6:6 9dbc8aa8702ac9e1:12",
-	["1a437158e1b8d2a1"] = "005c2262f672caf4:18 309f7e645a8d2b56:14 6b9572ac0f687394:6",
-	["1abbff60d26ba391"] = "3a8ad42985c52dc7:14 8a7631bbb4f6f3d8:10",
-	["27ee1ed8f6fb6356"] = "129e5fb1b13c2018:12 309f7e645a8d2b56:14 50cd7e9f909fe5a1:12 cebd25f8778bfdee:14",
-	["295beb26dc4f8ff1"] = "129e5fb1b13c2018:12 80e8335ab4042fcf:12",
-	["2b28e17ffed05f7c"] = "7f19d05cd188c768:6",
-	["30061f91af477f5e"] = "7301b3dc5b1bffb8:17 dd8cbbac49f7c628:15",
-	["3575aabc5f1f9326"] = "78829731a0563576:13 9d5e0d88df992aa6:6 c891acf9e8dbda97:12 e6b6467135035059:13",
-	["3c86e871923f3970"] = "309f7e645a8d2b56:14 3d58ea61b2b485cc:12 b1bc2b7252ccbc03:12",
-	["3f92ba65ef65cca9"] = "a134e110ef4ef865:7",
-	["416d053372c4e433"] = "50cd7e9f909fe5a1:12 78829731a0563576:13 7b06196e90154c88:34 e53e4b0c20563d21:5 e6b6467135035059:13",
-	["41eac4a03987faa0"] = "7f19d05cd188c768:6 8f6f7c8c1e4b9b6d:11 9dbc8aa8702ac9e1:12",
-	["46183b50961d1328"] = "309f7e645a8d2b56:14 3ddb9d36da22555d:36 45be635fb904f4dc:12 6228d0242bde56b6:38 68b8d040421e8a49:25 8cd335a5f711bb59:12 9dbc8aa8702ac9e1:12 b7cd78c71e0a48ed:6 d8cf7fe059b4bf1e:12",
-	["4ba41b6f9f405cc2"] = "48d2ddc8e9a80b1e:14 6b9572ac0f687394:6",
-	["4d58c77087b774c5"] = "4ffb842ce1093f3f:17 6b9572ac0f687394:6 e69567209a83df39:11",
-	["4dbd74f49c8ffc13"] = "0040c16bd48573e2:10 7f49b46efdd850ef:16 7fdd884ecd57231b:6",
-	["4e4a613eb9bf5c24"] = "05e4e5c2db6e44a2:33 0ec5ef9ec5cbd1b2:5 309f7e645a8d2b56:14 4851d75853622a47:15 4f839e923046e631:15 52071f49263415e4:35 6b88fea13ec2d78e:12 6b9572ac0f687394:6 77c5d934407114f4:17 8d3d52a3b2f19402:60 9dbc8aa8702ac9e1:12 b5b4395852e871bc:6 b96cc3b704a76464:7 e6b6467135035059:13 e71dbcb6a50f321b:158",
-	["4fb0f8c02f55c82b"] = "511910c41a70122d:14",
-	["52e4334e6a128caf"] = "5f4b129d947d79d7:13 78829731a0563576:13",
-	["53eebe75cd6e26df"] = "3d58ea61b2b485cc:12 8f6f7c8c1e4b9b6d:11 e6caddc3ed05dd7e:4",
-	["5fecab819f96a3e8"] = "129e5fb1b13c2018:12 7fdd884ecd57231b:6 c245c696e80677ed:20 ffc18b2ce10ca381:11",
-	["708ea298c82093d0"] = "45be635fb904f4dc:12 7441b048b94491fc:12 7be1e04a7738e673:18 7fdd884ecd57231b:6",
-	["72170a55a1f37ff1"] = "91eb62e0a02302ba:5",
-	["7b06196e90154c88"] = "416d053372c4e433:32 50cd7e9f909fe5a1:12 78829731a0563576:13 e53e4b0c20563d21:5 e6b6467135035059:13",
-	["7b75e5132ffd4ca6"] = "206cb0dd1696ceaa:5 7fdd884ecd57231b:6 8a35c1dc19f41870:10 a9a19cffe985c468:12",
-	["7e3145a5baa4b948"] = "129e5fb1b13c2018:12 309f7e645a8d2b56:14 7dc6dda584cc5223:11 d44c25420aa3e2ff:26",
-	["80f1a156d9fa1e36"] = "1ec5f54265a91c83:16 309f7e645a8d2b56:14 3d58ea61b2b485cc:12 ab9e1ad1597d5d9e:6",
-	["84354339522c932d"] = "5d268a6f943792d4:10 963aca558cd906bc:17 cf907add37bfa9be:6",
-	["8645f167b3c813a2"] = "129e5fb1b13c2018:12 e3541de70b7ec1c0:13",
-	["8a307bd1811a5fe9"] = "1b1fcc0e025c1f7d:14 6b9572ac0f687394:6 72fe4b13f726c344:24 7b153e02ad22d12c:12 d5cb9b5401b261f9:11",
-	["8d3d52a3b2f19402"] = "05e4e5c2db6e44a2:33 0ec5ef9ec5cbd1b2:5 309f7e645a8d2b56:14 4851d75853622a47:15 4e4a613eb9bf5c24:38 4f839e923046e631:15 52071f49263415e4:35 6b88fea13ec2d78e:12 6b9572ac0f687394:6 77c5d934407114f4:17 9dbc8aa8702ac9e1:12 b5b4395852e871bc:6 b96cc3b704a76464:7 e6b6467135035059:13 e71dbcb6a50f321b:158",
-	["8dc91f277c6096ee"] = "029cfc4c193211c3:16 6d54652ee217d712:12 719f42b7d137789c:11 ab9e1ad1597d5d9e:6",
-	["90ddc374f4e3d756"] = "0040c16bd48573e2:10 36e235816805c17e:5",
-	["94bd931b5fb4ee95"] = "16051937941bb709:11 309f7e645a8d2b56:14 6b9572ac0f687394:6 7372947782b91123:17 fa6f926a77b78b55:12",
-	["9571ca51f0daf35b"] = "309f7e645a8d2b56:14 7b153e02ad22d12c:12 9d5e0d88df992aa6:6 9dbc8aa8702ac9e1:12 be4590c2f615c441:14",
-	["968211c0033dce64"] = "129e5fb1b13c2018:12 309f7e645a8d2b56:14 756e3fdaca41cfca:12 7be1e04a7738e673:18 7fdd884ecd57231b:6 a1a026c8bb37a96e:19 cb8d6dbe2ad74be4:58",
-	["9eb160830321bfd6"] = "9dbc8aa8702ac9e1:12 b3bf071f477fc155:3",
-	["a6a735accb4a327f"] = "028a1ed2394fb808:6 309f7e645a8d2b56:14 45be635fb904f4dc:12 73a5ecad32ba599b:35 756e3fdaca41cfca:12 7fdd884ecd57231b:6",
-	["a7ee1ebf58fcdf1f"] = "2d761a80bcbfe792:18 309f7e645a8d2b56:14 45be635fb904f4dc:12 756e3fdaca41cfca:12 7fdd884ecd57231b:6",
-	["aa69a60d74a3ec54"] = "aca180fc6f846411:12",
-	["bc29613666df696b"] = "16ab263bc03b4f96:18 309f7e645a8d2b56:14 756e3fdaca41cfca:12 7fdd884ecd57231b:6 9dbc8aa8702ac9e1:12 bfe35746f5084222:3",
-	["be70ee0d8d44028e"] = "0040c16bd48573e2:10 43639dc374b75c5f:15",
-	["c12a34f375bd5a87"] = "309f7e645a8d2b56:14 3ddb9d36da22555d:36 b7cd78c71e0a48ed:6 cdf733b0106a23c3:11 fa6f926a77b78b55:12",
-	["c4232a0e62166d91"] = "309f7e645a8d2b56:14 6b88fea13ec2d78e:12 6b9572ac0f687394:6 9dbc8aa8702ac9e1:12 fa6c1158a93b8ec4:17",
-	["c780bcd79547da0f"] = "6b9572ac0f687394:6 7441b048b94491fc:12 bcbbe9bb1a49c7fd:5",
-	["cdf28be026bb7d84"] = "7f0e355dedbdf3d5:17 7fdd884ecd57231b:6 83970097f3d997ad:12 e6b6467135035059:13",
-	["ce063aa33d95a812"] = "129e5fb1b13c2018:12 2383b0439f0bc465:11 309f7e645a8d2b56:14 7fdd884ecd57231b:6 89cce4d15db88aa8:16",
-	["cf8934ff6567a42d"] = "11eccafa4b56a49c:6 6b9572ac0f687394:6 fc1f0a3b3fc97238:15",
-	["d323de60855898ac"] = "9dbc8aa8702ac9e1:12 e0e097b347bdfe6c:11 f401191f6b5a7879:5",
-	["d6b1fb05b9109353"] = "4431931242cbcd54:5 7de84a343186671f:11 e98a9be765e0e236:5",
-	["dbb6c961c59fadc1"] = "20e05bca458a39e8:5 619795f79ceda1b3:15",
-	["dcd1c835407ef7ba"] = "36e235816805c17e:5 8a35c1dc19f41870:10 f40dea68b213b005:11",
-	["e5796355a8fd67e0"] = "03e67a19b07c6523:38 07d605bd50c98461:16 44a2a59ca08ac865:12 642f2be0417d0beb:15 6d54652ee217d712:12 6e68194b95d60145:38 7b153e02ad22d12c:12 7fdd884ecd57231b:6 9b30d4ac39ddff10:16 bd4245dcfd4b832f:11 bdbefa6543a75942:22",
-	["e6d932be83729076"] = "44a2a59ca08ac865:12 cda482684a202fd2:4",
-	["eea5e3cef1e12c14"] = "193becdf64aa66a9:12 309f7e645a8d2b56:14 3d58ea61b2b485cc:12 80f0a339e905d2d3:12 bc9182001d0312bd:13 efdcef306cea63fe:47",
-	["efdcef306cea63fe"] = "193becdf64aa66a9:12 309f7e645a8d2b56:14 3d58ea61b2b485cc:12 80f0a339e905d2d3:12 bc9182001d0312bd:13 eea5e3cef1e12c14:46",
-	["f0338468dcdb6a6c"] = "44a2a59ca08ac865:12 462fc89d4903b33d:18 7441b048b94491fc:12 7fdd884ecd57231b:6",
-	["f49227a0630a3f7f"] = "3d58ea61b2b485cc:12 820ac4b5db9b2585:20 8f063c5d3929316e:6",
-	["f992ce97577c8a7f"] = "129e5fb1b13c2018:12 618c00f2f115c1fe:26",
-	["02eecd0b1fa49630"] = "68513d59bafa8c7a:6 b98f2b3d1bde24b0:48 fa6f926a77b78b55:12",
-	["11c27d3babb38956"] = "3d58ea61b2b485cc:12 66cb402846eaaa31:6 7b153e02ad22d12c:12 7fdd884ecd57231b:6 9d81323b153dc429:43",
-	["2152d5147b0ac418"] = "085c1edb038ec24e:39 17c6e9bafcd646d2:6 45be635fb904f4dc:12 66cb402846eaaa31:6 b7cd35e0edc15cd7:38",
-	["25aa2fd4643cf4ee"] = "1f012c3a0fa74fe2:10 48fd06b465e8b681:15 8666e5f49f440d44:12 8ec3026b5f2e579a:47",
-	["26e40437ea275296"] = "2457b559aa341cc1:12 36ab9a3dcae3d562:7",
-	["2e9d0bdc48b09e60"] = "503c0e01fbafa86a:15 b2d5147255a12545:6 e8ffad77b73c221c:7 f5e1e4bd4ecdc192:13",
-	["35a61296619cc47e"] = "2457b559aa341cc1:12 612f7f6193fb1b2b:9 b2d5147255a12545:6 d54b9505c0f72873:37",
-	["3828e2051aa9e897"] = "3d58ea61b2b485cc:12 503c0e01fbafa86a:15 f21e8dd5e27fef7c:3",
-	["39ab99895147a3bf"] = "444880f62ca7eae8:40 9c22a90da9c79de3:11",
-	["43a58cb89cfa197c"] = "056de1c5e21e723e:27 66cb402846eaaa31:6 7fdd884ecd57231b:6 9ba9f700137c6325:26",
-	["52071f49263415e4"] = "0ec5ef9ec5cbd1b2:5",
-	["5990123d142b16cb"] = "2457b559aa341cc1:12 afd03c31434b6ee5:12",
-	["6cfcc7f8801a0266"] = "076692fd83a83c5c:10 2457b559aa341cc1:12",
-	["7617642765ac38c7"] = "0511db0bca94fa78:7",
-	["78a8185f63a70795"] = "23d09a05d1574ec9:27 43eb1c3c1a1860e0:26",
-	["80932fa0ed6901d3"] = "692eb345969d368e:5",
-	["88c2d09ad85a7c9f"] = "bb4b15b588f974fd:27 bf7082f0287c254f:27 cba5983612dace3f:5",
-	["89c5493e08ca4207"] = "17c6e9bafcd646d2:6 6d54652ee217d712:12 6e165f05a49233f6:14",
-	["96de9cd50f7306e6"] = "f5e1e4bd4ecdc192:13",
-	["9f80d67a12a7e40f"] = "2457b559aa341cc1:12 db50297b40133d12:13",
-	["a8cffb316f0b5c5f"] = "2457b559aa341cc1:12 9bc319730887bdd8:5 a91e4527859ada75:5",
-	["b2b5e0d185605f9e"] = "2457b559aa341cc1:12",
-	["cc786f6491fe7e65"] = "46427f2630a80d88:12 6a4c2138009b625e:18 b8feb0cc191c1ef3:30 be0ac4e655b2e19f:19 ffb0f21dcc7b5e15:10",
-	["d54b9505c0f72873"] = "2457b559aa341cc1:12 35a61296619cc47e:41 612f7f6193fb1b2b:9 b2d5147255a12545:6",
-	["e8d5f49ad7780e54"] = "2457b559aa341cc1:12 52ff81fcba0c059d:12",
-	["fe3b29b2cfa63f9b"] = "adc87d576c20ad57:6 b98f2b3d1bde24b0:48 fa6f926a77b78b55:12",
-	["a8a91eb54892b6b2"] = "129e5fb1b13c2018:12 20c03774d6e1d87f:13 7f19d05cd188c768:6 b9c209b4f99b5335:24",
-	["e91f569c2ad8af01"] = "6b9572ac0f687394:6 ccf18b6315a3d67f:7 fc1f0a3b3fc97238:15",
-	["c85f576d5e086147"] = "129e5fb1b13c2018:12 6600b5e755a21f1f:12 679e174bb3bcca68:10 a188cbb5913fbd63:10",
-}
-IndependentLink.weaponAccessories =
-	"07d605bd50c98461:16 0aae32c4479eaa26:12 129e5fb1b13c2018:12 13a5fc03ec21e8fb:14 16ab263bc03b4f96:18 1b1fcc0e025c1f7d:14 1ec5f54265a91c83:16 2383b0439f0bc465:11 " ..
-	"2457b559aa341cc1:12 26ec4f9513fc6525:12 28aee9c6a2282aa3:13 2d761a80bcbfe792:18 2e7f91374c0b471c:12 2ed76d29ce509a74:12 309f7e645a8d2b56:14 316a396d1939a997:12 " ..
-	"369b53e850e72ba9:18 37c2891774b38c87:18 3ae1f60c5efd2b43:14 3ae8ba6377efe3ae:12 3d58ea61b2b485cc:12 411c4fd07740a7dd:13 44a2a59ca08ac865:12 45be635fb904f4dc:12 " ..
-	"4851d75853622a47:15 4f839e923046e631:15 5c1e075cba68340b:12 6b88fea13ec2d78e:12 6b9572ac0f687394:6 6d54652ee217d712:12 6f5afa606a4400d1:17 7301b3dc5b1bffb8:17 " ..
-	"74b9289347cc3503:12 756e3fdaca41cfca:12 75713afac474d9c4:12 77c5d934407114f4:17 78829731a0563576:13 7b153e02ad22d12c:12 7be1e04a7738e673:18 8039834a4b7489b9:11 " ..
-	"8cd335a5f711bb59:12 9237ccec8fe86d22:14 9549ff64ba3fd5a1:14 963aca558cd906bc:17 990b06bf5c26bd01:12 9dbc8aa8702ac9e1:12 a0b52d203e689d18:13 a4fa3ef43a8cecaf:18 " ..
-	"a9a19cffe985c468:12 aca180fc6f846411:12 b191a4f26558a9cc:12 b1bc2b7252ccbc03:12 b571e0428ca83b9e:12 bd4245dcfd4b832f:11 be4590c2f615c441:14 bfe35746f5084222:3 " ..
-	"c70345c3342ca205:12 c891acf9e8dbda97:12 cc4cd9593abb87be:17 d8cf7fe059b4bf1e:12 e6b6467135035059:13 e8de5e95b9635c21:18 ec824b9d8b7f7b58:13 ee89d98cbe33e976:18 " ..
-	"f40dea68b213b005:11 f9c6092b665018b8:12 f9df21c8e52cac95:13 f9f37dcce764fad6:13 fa6f926a77b78b55:12 ffc18b2ce10ca381:11"
-
-function IndependentLink.action(avatar, animation)
-	if not animation.active or try(S.Unit.alive, avatar) ~= true then return 0, false, 1 end
-	local tuple, calls = frame_animation_state(animation, avatar)
-	if not tuple or tuple.n ~= 31 then return 0, false, calls + 1 end
-	local base, upper, main = tonumber(tuple[3]), tonumber(tuple[4]), tonumber(tuple[11])
-	if not base or not upper or not main or base%1 ~= 0 or upper%1 ~= 0 or main%1 ~= 0
-		or upper == 76 or upper == 77 then return 0, false, calls + 1 end
-	local time, length, clipCalls = frame_animation_layer(animation, avatar)
-	calls = calls + clipCalls + 1
-	local validClip = type(time) == "number" and type(length) == "number" and time >= 0
-		and length > 0 and length < math.huge and time <= length+0.025
-	local empty = main == 585 or ((main == 230 or main == 650) and validClip and length > 1000)
-	if (main == 230 or main == 650) and not empty then return 0, false, calls end
-	local expected = IndependentLink.reloadClips[main]
-	-- The captured ship catalogue also uses 640 and 681 for short transitions.
-	local observedTransition = (main == 636 and validClip and math.abs(length-0.500) <= 0.005)
-		or (main == 640 and validClip and math.abs(length-0.650) <= 0.005)
-		or (main == 681 and validClip and math.abs(length-29/60) <= 0.005)
-	if expected and not observedTransition then
-		if validClip and math.abs(length-expected/60) <= 0.005 then return 2, false, calls end
-		return 0, false, calls
-	end
-	local lowered = upper == 8 or upper == 18 or upper == 67
-	local raised = (upper >= 0 and upper <= 7) or upper == 11 or upper == 12 or upper == 17
-		or (upper >= 19 and upper <= 66) or upper == 70 or upper == 71
-	local weaponTree = (base >= 1 and base <= 7) or base == 10 or base == 11
-		or (base >= 13 and base <= 58) or (base >= 60 and base <= 71)
-		or (empty and (base == 8 or base == 72 or base == 73))
-	if not raised and not weaponTree then return 0, false, calls end
-	if try(S.Unit.animation_has_variable, avatar, "weapon_selected") ~= true then return 0, false, calls + 1 end
-	local id = try(S.Unit.animation_find_variable, avatar, "weapon_selected")
-	if type(id) ~= "number" or id < 0 or id%1 ~= 0 then return 0, false, calls + 2 end
-	local selected = tonumber(try(S.Unit.animation_get_variable, avatar, id))
-	if not selected or not (selected > 0 and selected < math.huge) then return 0, false, calls + 3 end
-	if empty and (raised or lowered) then return 1, true, calls + 3 end
-	return 2, false, calls + 3
-end
-
-function IndependentLink.contacts(action, readPose)
-	local V = Compat.contact_math
-	local contacts = {}
-	for _, side in ipairs({ "r", "l" }) do
-		local anchor = readPose("attach_hand_" .. side)
-		if anchor and (action == 2 or side == "r") then
-			local hand = readPose(side .. "_hand")
-			local grip = IndependentLink.motionGrips[side]
-			local native = hand and Compat.independent_fk(hand, grip.q, grip.p)
-			if action == 2 then
-				anchor = native
-			elseif native then
-				local r = V.length(grip.p)
-				local gap = V.length(V.sub(anchor.p, hand.p))
-				if gap > 3*r then anchor = V.blend(anchor, native, V.smooth((gap-3*r)/r)) end
-			end
-		end
-		contacts[side] = anchor
-	end
-	return contacts
-end
-
-function IndependentLink.pose_matches(a, b, metres, degrees)
-	if not a or not b then return false end
-	local x, y = a.q, b.q
-	local dot = math.abs(x[1]*y[1]+x[2]*y[2]+x[3]*y[3]+x[4]*y[4])
-	return dot >= math.cos(math.rad(degrees)*0.5)
-		and Compat.contact_math.length(Compat.contact_math.sub(a.p, b.p)) <= metres
-end
-
-function IndependentLink.local_pose(unit, node)
-	local x, y, z = readVector(S, try(S.Unit.local_position, unit, node))
-	local ok, qx, qy, qz, qw = pcall(S.Quaternion.to_elements, try(S.Unit.local_rotation, unit, node))
-	local q = ok and Compat.independent_quaternion(qx, qy, qz, qw)
-	if x and q then return { p = { x, y, z }, q = q } end
-end
-
-function IndependentLink.weapon_graph(unit, spec, attachment)
-	local U, V = S.Unit, Compat.contact_math
-	if try(U.num_scene_graph_items, unit) ~= spec[1] or try(U.has_node, unit, "StingrayEntityRoot") ~= true then return end
-	local base = try(U.node, unit, "StingrayEntityRoot")
-	if base ~= 0 and base ~= 1 then return end
-	local signature, owned = 0, false
-	for i = 0, spec[1]-1 do
-		local node = i+base
-		local ok, parent = pcall(U.scene_graph_parent, unit, node)
-		if not ok then return end
-		local external = parent == nil or parent == -1 or (base == 1 and parent == 0)
-		if not external and (type(parent) ~= "number" or parent%1 ~= 0 or parent < base or parent > node
-			or (i > 0 and parent == node)) then return end
-		local value = i == 0 and 0 or (external and 65535 or parent-base)
-		signature = (signature*257+value+1)%2147483647
-		if external or i == 0 then
-			local worldPose = Compat.independent_world_pose(S, unit, node)
-			local localPose = IndependentLink.local_pose(unit, node)
-			if worldPose and localPose then
-				local inv = V.inverse(localPose)
-				local projected = Compat.independent_fk(worldPose, inv.q, inv.p)
-				owned = owned or IndependentLink.pose_matches(projected, attachment, 0.002, 0.15)
-			end
-		end
-	end
-	if owned and signature == spec[3] then return spec[2]+base end
-end
-
--- E12e-B4：找手里的武器，照 IAS `trial.find_owned`（R:3649-3700）：
---   · 对武器目录里的每个资源 hash，各问一次 `World.units_by_resource(world, Id64.from_hex(hash))`（R:3669-3670），
---     不枚举全世界 unit、不读 debug_name、不调 `Unit.alive`（R:3671 起只对候选本身验图）；
---   · 一个资源的实例多于 16 个就整项跳过（R:3671）；
---   · 与当前原生右手挂点（2 mm / 0.15°）吻合的候选算"拥有者"，多于一个 ⇒ 歧义，返回 nil（R:3684）；
---   · 没有候选就立刻 nil，没有"过 N 帧再扫"的间隔；句柄只活在本次调用里，不跨帧缓存（R:894-896、R:1417-1422）。
--- IAS 的 `find_owned` 另按 epoch 缓存同一 avatar 本帧的结果（R:3649-3652）；本运行时每帧每 avatar 只调一次，缓存无用，不做。
--- 与 IAS 的唯一差别：IAS 的每个武器 spec 可带 `path`（R:3669），我们的目录只有 hash，所以恒用 hash。
-function IndependentLink.find_weapon(world, attachment, graphs)
-	local found
-	for hash, spec in pairs(graphs) do
-		local key = roster_key(hash)
-		local units = key ~= nil and try(S.World.units_by_resource, world, key) or nil
-		if type(units) == "table" and #units <= 16 then
-			for index = 1, #units do
-				local unit = units[index]
-				local root = IndependentLink.weapon_graph(unit, spec, attachment)
-				if root then
-					if found then return nil end
-					found = { unit = unit, node = root, sidearm = spec[4], envelope = spec[5], spec = spec, id = hash:lower() }
-				end
-			end
-		end
-	end
-	return found
-end
-
-function IndependentLink.support_weight(weapon, left, palm, right)
-	local V = Compat.contact_math
-	if not weapon.left or not left then return false, 0 end
-	local control = weapon.left.p
-	local gap = V.length(V.sub(left.p, control))
-	local near = gap < 0.03
-	if weapon.sidearm then return near, near and 1 or 0 end
-	local weight = V.smooth((0.06-gap)/0.04)
-	local function envelope_distance(p)
-		if not weapon.envelope or not right then return math.huge end
-		local relative = Compat.independent_relative(right, { p = p, q = right.q })
-		local box = weapon.envelope
-		local x = math.max(box[1]-relative[1], relative[1]-box[4], 0)
-		local y = math.max(box[2]-relative[2], relative[2]-box[5], 0)
-		local z = math.max(box[3]-relative[3], relative[3]-box[6], 0)
-		return math.sqrt(x*x+y*y+z*z)
-	end
-	local envelope = envelope_distance(left.p)
-	weight = math.max(weight, V.smooth((0.06-envelope)/0.04))
-	near = near or envelope < 0.03
-	if palm then
-		local reach = V.length(V.sub(palm[2].p, palm[1].p))
-		if reach >= 0.02 and reach <= 0.2 then
-			local distance = math.min(V.length(V.sub(palm[1].p, control)), envelope_distance(palm[1].p))
-			near = near or distance <= reach
-			weight = math.max(weight, V.smooth((reach+0.04-distance)/0.04))
-		end
-	end
-	return near, weight
-end
-
-function IndependentLink.held_weapon(runtime, state, readPose)
-	local root = readPose("root")
-	local camera = runtime.poseCamera
-	local right = state.contacts.r and readPose("attach_hand_r")
-	if not right or not root or not camera or not camera.z then return end
-	local V = Compat.contact_math
-	if V.length(V.sub(root.p, { camera.x, camera.y, camera.z })) <= 1 then return end
-	local weapon = IndependentLink.find_weapon(state.world, right, IndependentLink.weaponGraphs)
-	if not weapon then return end
-	local lnode = safe_node(S, weapon.unit, "IK_left")
-	local rnode = safe_node(S, weapon.unit, "IK_right")
-	weapon.left = lnode and Compat.independent_world_pose(S, weapon.unit, lnode)
-	if not weapon.sidearm and not (weapon.left and state.contacts.l) then return end
-	local hand, finger = readPose("l_hand"), readPose("l_middle_finger1")
-	local palm = hand and finger and { hand, finger }
-	local rightControl = rnode and Compat.independent_world_pose(S, weapon.unit, rnode)
-	weapon.support, weapon.weight = IndependentLink.support_weight(weapon, state.contacts.l, palm, rightControl)
-	return weapon
-end
-
-function IndependentLink.weapon_snapshot(unit, count)
-	local U, V = S.Unit, Compat.contact_math
-	if try(U.num_scene_graph_items, unit) ~= count or try(U.has_node, unit, "StingrayEntityRoot") ~= true then return end
-	local base = try(U.node, unit, "StingrayEntityRoot")
-	if base ~= 0 and base ~= 1 then return end
-	local nodes = {}
-	for node = base, base+count-1 do
-		local ok, parent = pcall(U.scene_graph_parent, unit, node)
-		if not ok then return end
-		local external = parent == nil or parent == -1 or node == base or (base == 1 and parent == 0)
-		if not external and not nodes[parent] then return end
-		local localPose = IndependentLink.local_pose(unit, node)
-		local worldPose = V.world_pose(S, unit, node)
-		if not localPose or not worldPose then return end
-		local row = { localPose = localPose, worldPose = worldPose }
-		if external then
-			local inv = V.inverse(localPose)
-			row.parentFrame = Compat.independent_fk(worldPose, inv.q, inv.p)
-		else
-			row.parent = parent
-		end
-		nodes[node] = row
-	end
-	return { unit = unit, count = count, base = base, nodes = nodes, tag = unit_tag(S, unit) }
-end
-
-function IndependentLink.mark_weapon_descendants(graph, roots)
-	graph.affected = roots
-	for node = graph.base, graph.base+graph.count-1 do
-		local parent = graph.nodes[node].parent
-		if parent and roots[parent] then roots[node] = true end
-	end
-end
-
--- E12e-B4：跟随件照 IAS `trial.discover_followers`（R:3721-3766）：候选资源 = 本武器成员 + 配件目录，同一 hash 数量冲突就放弃
--- （R:3724-3726）；每个资源各问一次 `World.units_by_resource`（R:3729-3731），查不到表 ⇒ 放弃，实例 > 16 ⇒ 放弃（R:3735-3738）；
--- 逐个候选要求 `Unit.alive` 且 debug_name（小写）含该 hash（R:3739-3743，debug_name 只在这里读）；图不合法 ⇒ 放弃；
--- 全场候选 > 48 ⇒ 放弃（R:3746-3749）。不再遍历全世界 unit。
-function IndependentLink.weapon_followers(world, weapon)
-	local members = IndependentLink.weaponMembers[weapon.id]
-	local wanted, candidates = {}, {}
-	for id, count in ((members or "") .. " " .. IndependentLink.weaponAccessories):gmatch("(%x+):(%d+)") do
-		count = tonumber(count)
-		if wanted[id] and wanted[id] ~= count then return end
-		if wanted[id] == nil then candidates[#candidates+1] = id end
-		wanted[id] = count
-	end
-	local root = IndependentLink.weapon_snapshot(weapon.unit, weapon.spec[1])
-	if not root or not root.nodes[weapon.node] then return end
-	IndependentLink.mark_weapon_descendants(root, { [weapon.node] = true })
-	local pending, ordered = {}, { root }
-	for _, id in ipairs(candidates) do
-		local key = roster_key(id)
-		local units = key ~= nil and try(S.World.units_by_resource, world, key) or nil
-		if type(units) ~= "table" or #units > 16 then return end
-		for index = 1, #units do
-			local unit = units[index]
-			if unit ~= weapon.unit and Compat.unit_alive(S, unit) then
-				local name = unit_tag(S, unit)
-				if type(name) == "string" and name:lower():find(id, 1, true) then
-					local graph = IndependentLink.weapon_snapshot(unit, wanted[id])
-					if not graph then return end
-					pending[#pending+1] = graph
-					if #pending > 48 then return end
-				end
-			end
-		end
-	end
-	for _ = 1, 8 do
-		local nextPending = {}
-		for _, child in ipairs(pending) do
-			local roots, owner, ambiguous = {}, nil, false
-			for node, row in pairs(child.nodes) do
-				if row.parentFrame then
-					for _, candidate in ipairs(ordered) do
-						for bone in pairs(candidate.affected) do
-							if IndependentLink.pose_matches(row.parentFrame, candidate.nodes[bone].worldPose, 0.0002, 0.05) then
-								ambiguous = ambiguous or (owner ~= nil and owner ~= candidate)
-								owner, roots[node] = candidate, true
-							end
-						end
-					end
-				end
-			end
-			if owner and not ambiguous then
-				IndependentLink.mark_weapon_descendants(child, roots)
-				ordered[#ordered+1] = child
-			else
-				nextPending[#nextPending+1] = child
-			end
-		end
-		if #nextPending == #pending then break end
-		pending = nextPending
-	end
-	if not members or #ordered > 1 then return ordered end
-end
-
-function IndependentLink.verify_weapon_shift(world, graphs, delta)
-	local V = Compat.contact_math
-	for index, graph in ipairs(graphs or {}) do
-		if index > 1 then
-			assert(Compat.unit_alive(S, graph.unit) and try(S.Unit.num_scene_graph_items, graph.unit) == graph.count)
-			assert(S.World.update_unit(world, graph.unit) ~= false)
-		end
-		for node, row in pairs(graph.nodes) do
-			local p = graph.affected[node] and V.add(row.worldPose.p, delta) or row.worldPose.p
-			assert(IndependentLink.pose_matches(V.world_pose(S, graph.unit, node), { p = p, q = row.worldPose.q }, 0.001, 0.05))
-			if index > 1 then
-				assert(IndependentLink.pose_matches(IndependentLink.local_pose(graph.unit, node), row.localPose, 0.00001, 0.001))
-			end
-		end
-	end
-end
-
-function IndependentLink.restore_weapon(runtime)
-	local shift = runtime.weaponShift
-	if not shift then return true end
-	local worlds = try(S.Application.worlds)
-	if type(worlds) ~= "table" then return false end
-	local worldLive = false
-	for _, world in ipairs(worlds) do if world == shift.world then worldLive = true; break end end
-	if not worldLive then runtime.weaponShift = nil; return true end
-	local units = try(S.World.units, shift.world)
-	if type(units) ~= "table" then return false end
-	local live = {}
-	for _, unit in ipairs(units) do live[unit] = true end
-	local unit = shift.unit
-	if live[unit] and Compat.unit_alive(S, unit) and unit_tag(S, unit) == shift.tag
-		and try(S.Unit.num_scene_graph_items, unit) == shift.count then
-		local pose = IndependentLink.local_pose(unit, shift.node)
-		if not pose then return false end
-		if IndependentLink.pose_matches(pose, shift.target, 0.00001, 0.001) then
-			local ok = Compat.write_independent_position(S, unit, shift.node, shift.original.p, 1)
-			if not ok then return false end
-			shift.refresh = true
-		end
-		if shift.refresh then
-			local ok, result = pcall(S.World.update_unit, shift.world, unit)
-			if not ok or result == false then return false end
-			shift.refresh = false
-		end
-	end
-	for _, child in ipairs(shift.followers) do
-		if live[child.unit] and Compat.unit_alive(S, child.unit) and unit_tag(S, child.unit) == child.tag
-			and try(S.Unit.num_scene_graph_items, child.unit) == child.count then
-			local ok, result = pcall(S.World.update_unit, shift.world, child.unit)
-			if not ok or result == false then return false end
-		end
-	end
-	runtime.weaponShift = nil
-	return true
-end
-
-function IndependentLink.enable_weapon_trial(runtime)
-	if runtime.weaponUpdate then return true end
-	local update = rawget(_G, "update")
-	if type(update) ~= "function" then return false end
-	runtime.originalWeaponUpdate = update
-	runtime.weaponUpdate = function(...)
-		if not IndependentLink.restore_weapon(runtime) and not runtime.weaponRestoreLogged then
-			runtime.weaponRestoreLogged = true
-			runtime.logger("[physbone][握枪] 武器根还原失败")
-		end
-		return update(...)
-	end
-	rawset(_G, "update", runtime.weaponUpdate)
-	return true
-end
-
-function IndependentLink.shift_weapon(runtime, world, weapon, delta, graphs)
-	local V = Compat.contact_math
-	if runtime.weaponShift or runtime.weaponTrialDisabled or not IndependentLink.enable_weapon_trial(runtime) then return false end
-	local localPose = IndependentLink.local_pose(weapon.unit, weapon.node)
-	local worldPose = Compat.independent_world_pose(S, weapon.unit, weapon.node)
-	if not localPose or not worldPose then return false end
-	local inv = V.inverse(localPose)
-	local parent = Compat.independent_fk(worldPose, inv.q, inv.p)
-	local shifted = V.add(localPose.p, V.rotate(V.inverse(parent).q, delta))
-	local followers = {}
-	for i = 2, #(graphs or {}) do
-		local child = graphs[i]
-		followers[#followers+1] = { unit = child.unit, count = child.count, tag = child.tag }
-	end
-	local saved = { world = world, unit = weapon.unit, node = weapon.node, count = weapon.spec[1],
-		tag = unit_tag(S, weapon.unit), original = localPose, target = { p = shifted, q = localPose.q }, followers = followers }
-	runtime.weaponShift = saved
-	local ok = pcall(function()
-		assert(Compat.write_independent_position(S, weapon.unit, weapon.node, shifted, 1))
-		assert(S.World.update_unit(world, weapon.unit) ~= false)
-		local desired = { q = worldPose.q, p = V.add(worldPose.p, delta) }
-		assert(IndependentLink.pose_matches(Compat.independent_world_pose(S, weapon.unit, weapon.node), desired, 0.001, 0.05))
-		IndependentLink.verify_weapon_shift(world, graphs, delta)
-	end)
-	if not ok then
-		local current = IndependentLink.local_pose(weapon.unit, weapon.node)
-		if current then saved.target = current end
-		IndependentLink.restore_weapon(runtime)
-		runtime.weaponTrialDisabled = true
-	end
-	return ok
-end
-
---- 缩放判定（E12c）。
---- 引擎会主动把某些骨（头盔/头，第一人称、死亡、空投期间）缩成 0 来"隐藏"它；那不是姿势异常。
---- 旧写法一律要求缩放 == 1：挂接断言失败 → 件被隔离并整件隐藏 ⇒ 实机截图里"角色整个透明，只剩武器挂件"。
---- 现在：全部分量 ≈ 1 → 正常；全部分量 ≈ 0（< 0.01）→ 引擎有意隐藏，放行（不隔离、不隐藏整件）；
---- 其余（非均匀 / 拉伸）才算异常。
-function IndependentLink.scale_state(x, y, z)
-	if x == nil then return "missing" end
-	if math.abs(x-1) <= 1e-6 and math.abs(y-1) <= 1e-6 and math.abs(z-1) <= 1e-6 then return "one" end
-	if math.abs(x) < 0.01 and math.abs(y) < 0.01 and math.abs(z) < 0.01 then return "hidden" end
-	return "fault"
-end
-
-function IndependentLink.restore(state, piece, layoutChanged)
-	local link = piece.link
-	if not link then return true end
-	if not link.changed then
-		piece.link = nil
-		return true
-	end
-	local ok = pcall(function()
-		local unit = piece.unit
-		assert(S.World.unlink_unit(state.world, unit) ~= false, "unlink_unit")
-		if layoutChanged then return end
-		for _, b in ipairs(link.order) do
-			local row, node = link.rows[b], piece.nodes[b]
-			if row.attempted then
-				if S.Unit.scene_graph_parent(unit, node) ~= row.parent then
-					assert(S.Unit.scene_graph_link(unit, node, row.parent) ~= false, "scene_graph_link")
-					assert(S.Unit.scene_graph_parent(unit, node) == row.parent, "restore parent")
-				end
-				assert(Compat.write_independent_position(S, unit, node, row.originalP, 1), "restore position")
-				assert(Compat.write_independent_rotation(S, unit, node, row.originalQ, true), "restore rotation")
-			end
-		end
-		assert(S.World.update_unit(state.world, unit) ~= false, "restore update")
-	end)
-	if ok then piece.link = nil end
-	return ok
-end
-
-function IndependentLink.fail(runtime, state, piece, reason)
-	if runtime.iasCommits then runtime.iasCommits[piece.unit] = nil end
-	if runtime.corpseExplicit then runtime.corpseExplicit[piece.unit] = false end
-	local restored = IndependentLink.restore(state, piece)
-	if not piece.linkFailed then
-		runtime.logger("[physbone][独立骨][警告][挂接回退] %s %s%s", piece.tag, tostring(reason),
-			restored and "" or "，待恢复原骨链")
-	end
-	piece.linkFailed = true
-	-- 瞬时原因（缩放异常 / 件或 avatar 刚消失 / 原父节点还在）不应让件永远停在 E6 回退路径：
-	-- 60 帧后清掉标记重试挂接（重试期间件仍可见、仍按旋转复制跟随）。
-	local text = tostring(reason)
-	if text:find("缩放", 1, true) or text:find("消失", 1, true) or text:find("原父节点", 1, true)
-		or text:find("缺少节点", 1, true) then
-		piece.linkRetryAt = (runtime.frame or 0) + 60
-	end
-	return restored
-end
-
-function IndependentLink.attach(runtime, state, piece)
-	local U, W = S.Unit, S.World
-	local unit, avatar = piece.unit, state.avatar
-	local link = { rows = {}, order = piece.bones, byNode = {} }
-	local ok, reason = pcall(function()
-		assert(type(W.link_unit) == "function" and type(W.unlink_unit) == "function"
-			and type(U.scene_graph_parent) == "function" and type(U.scene_graph_link) == "function", "挂接 API")
-		assert(Roster.isLive(runtime, unit) and Roster.isLive(runtime, avatar)
-			and U.alive(unit) == true and U.alive(avatar) == true, "件或 avatar 已消失")
-		for _, b in ipairs(piece.bones) do
-			local node, source = piece.nodes[b], state.sources[b]
-			assert(node and source and state.rest[b], "缺少节点 " .. state.list[b][1])
-			local x, y, z = readVector(S, U.local_scale(unit, node))
-			local scaleState = IndependentLink.scale_state(x, y, z)
-			assert(scaleState == "one" or scaleState == "hidden", "缩放 " .. state.list[b][1])
-			local px, py, pz = readVector(S, U.local_position(unit, node))
-			local q = Compat.independent_quaternion(S.Quaternion.to_elements(U.local_rotation(unit, node)))
-			local parent = U.scene_graph_parent(unit, node)
-			assert(px and q and type(parent) == "number" and parent >= 0 and parent ~= node,
-				"原骨链 " .. state.list[b][1])
-			link.rows[b] = { parent = parent, originalP = { px, py, pz }, originalQ = q }
-			link.byNode[node] = b
-		end
-		piece.link = link
-		for _, b in ipairs(piece.bones) do
-			local row, node = link.rows[b], piece.nodes[b]
-			local called, result = pcall(W.link_unit, state.world, unit, node, avatar, state.sources[b])
-			row.attempted = called and result ~= false
-			link.changed = link.changed or row.attempted
-			local parent = U.scene_graph_parent(unit, node)
-			row.attempted = row.attempted or parent ~= row.parent
-			link.changed = link.changed or row.attempted
-			assert(called and result ~= false, "link_unit " .. state.list[b][1])
-			assert(parent ~= row.parent and (parent == nil or parent == -1 or parent == 0),
-				"原父节点仍在 " .. state.list[b][1])
-			assert(Compat.independent_quaternion(S.Quaternion.to_elements(U.local_rotation(unit, node))), "挂接局部旋转")
-		end
-	end)
-	if not ok then
-		IndependentLink.fail(runtime, state, piece, reason)
-		return false
-	end
-	return true
-end
-
-function IndependentLink.same(a, b, rotation)
-	if not a or not b then return false end
-	local sign = rotation and (a[1]*b[1] + a[2]*b[2] + a[3]*b[3] + a[4]*b[4]) < 0 and -1 or 1
-	return math.abs(a[1]-sign*b[1]) <= 1e-6 and math.abs(a[2]-sign*b[2]) <= 1e-6
-		and math.abs(a[3]-sign*b[3]) <= 1e-6 and (not rotation or math.abs(a[4]-sign*b[4]) <= 1e-6)
-end
-
--- R:4560–4568: a successful Unit commit publishes all local changes together.
-function IndependentLink.refresh(runtime, world, unit)
-	local commits = runtime.iasCommits
-	if commits then
-		local group = commits[unit]
-		if not group then group = { rows = {}, before = {}, world = world }; commits[unit] = group end
-		group.dirty = true
-		return 0
-	end
-	assert(S.World.update_unit(world, unit) ~= false, "pose update")
-	return 1
-end
-
-function IndependentLink.flush(runtime)
-	local commits = runtime.iasCommits
-	runtime.iasCommits = nil
-	for unit, group in pairs(commits or {}) do
-		local ok, result = true, true
-		if group.dirty and not group.failed then ok, result = pcall(S.World.update_unit, group.world, unit) end
-		if group.failed or not ok or result == false then
-			-- IAS R:4556–4569: never publish a partly committed Unit.
-			if runtime.corpseExplicit then runtime.corpseExplicit[unit] = false end
-			local restored = true
-			for node, before in pairs(group.before or {}) do
-				local q = Compat.write_independent_rotation(S, unit, node, before.q, true)
-				local p = Compat.write_independent_position(S, unit, node, before.p, 1)
-				restored = restored and q and p
-			end
-			local updated, value = pcall(S.World.update_unit, group.world, unit)
-			runtime.logger("[physbone][错误] Unit pose commit failed; rollback=%s", tostring(restored and updated and value ~= false))
-		end
-	end
-end
-
-function IndependentLink.write(state, piece, values, group)
-	local written, calls = 0, 0
-	for b, value in pairs(values) do
-		local node = piece.nodes[b]
-		local before, cost = Compat.contact_math.local_pose(S, piece.unit, node)
-		calls = calls + cost
-		assert(before, "missing current local pose")
-		if not Compat.contact_math.unchanged(before, value.q, value.p) then
-			if group then group.before[node] = group.before[node] or before end
-			local ok, qcost = Compat.write_independent_rotation(S, piece.unit, node, value.q, true)
-			assert(ok, "offset rotation")
-			local positioned, pcost = Compat.write_independent_position(S, piece.unit, node, value.p, 1)
-			assert(positioned, "offset position")
-			written, calls = written + 2, calls + qcost + pcost
-		end
-	end
-	return written, calls
-end
-
-function IndependentLink.is_gait(name)
-	local suffix = name:match("^[lr]_(.+)$")
-	return name == "hips" or suffix == "thigh" or suffix == "knee" or suffix == "foot" or suffix == "ball" or suffix == "toe"
-end
-
-function IndependentLink.first_person(runtime, state)
-	local cache = runtime.poseCamera
-	if not cache or cache.frame ~= runtime.frame then
-		local x, y, z = cameraPosition(S, state.world, runtime.cache)
-		cache = { frame = runtime.frame, x = x, y = y, z = z }
-		runtime.poseCamera = cache
-	end
-	if cache.x == nil then return false end
-	local x, y
-	for _, owner in ipairs(runtime.avatars or {}) do
-		if owner.unit == state.avatar and owner.positionFrame == runtime.frame then
-			x, y = owner.x, owner.y
-			break
-		end
-	end
-	if x == nil then x, y = readVector(S, try(S.Unit.world_position, state.avatar, 1)) end
-	if x == nil then return false end
-	local dx, dy = x-cache.x, y-cache.y
-	local threshold = sched_settings(runtime).fpLockMetres
-	return dx*dx + dy*dy < threshold*threshold
-end
-
-function IndependentLink.first_person_action(runtime, state, readPose)
-	local graphs = try(S.World.units_by_resource, state.world, "content/fac_helldivers/fp_cha_avatar/fp_cha_avatar")
-	if type(graphs) ~= "table" or #graphs == 0 then return 0 end
-	for _, piece in ipairs(state.pieces) do
-		-- E12f-C3：件句柄只来自本帧枚举 ⇒ `Roster.isLive` 查表，不再 `Unit.alive`（R:894-896、R:1417-1422）。
-		if Roster.isLive(runtime, piece.unit) then
-			local native = {}
-			for _, side in ipairs({ "r_", "l_" }) do
-				local arm = {}
-				for _, joint in ipairs({ "shoulder", "elbow", "hand", "shoulder_twist", "hand_twist" }) do
-					local name = side .. joint
-					local node = safe_node(S, piece.unit, name)
-					arm[name] = node and Compat.independent_world_pose(S, piece.unit, node)
-				end
-				if arm[side.."shoulder"] and arm[side.."elbow"] and arm[side.."hand"] then
-					for name, pose in pairs(arm) do native[name] = pose end
-				end
-			end
-			if next(native) then
-				local function matches(read)
-					for name, pose in pairs(native) do
-						if not IndependentLink.pose_matches(pose, read(name), 0.002, 0.5) then return false end
-					end
-					return true
-				end
-				if not matches(readPose) then
-					local count = 0
-					for _, unit in ipairs(graphs) do
-						-- FP 图的句柄来自上面本帧的 units_by_resource：IAS 直接用、不再判活（R:441-445 fp_graphs）。
-						if matches(function(name)
-							local node = safe_node(S, unit, name)
-							return node and Compat.independent_world_pose(S, unit, node)
-						end) then count = count + 1 end
-					end
-					if count == 1 then return 3 end
-				end
-			end
-		end
-	end
-	return 0
-end
-
-function IndependentLink.move_subtree(piece, fk, bone, pose)
-	local prior = fk[bone]
-	local moved = { [bone] = true }
-	for _, b in ipairs(piece.bones) do
-		if moved[piece.link.byNode[piece.link.rows[b].parent]] then
-			local p, q = Compat.independent_relative(prior, fk[b])
-			fk[b] = Compat.independent_fk(pose, q, p)
-			moved[b] = true
-		end
-	end
-	fk[bone] = pose
-end
-
-function IndependentLink.rotate_about(pose, pivot, delta)
-	local V = Compat.contact_math
-	local p = V.add(pivot, V.rotate(delta, V.sub(pose.p, pivot)))
-	return Compat.independent_fk({ p = p, q = delta }, pose.q, { 0, 0, 0 })
-end
-
-function IndependentLink.calibrate_thumb(state, piece, fk, side, readPose)
-	local V = Compat.contact_math
-	local function bone(name) return state.boneBySource[side .. "_" .. name] end
-	local hand, index, pinky = bone("hand"), bone("index_finger1"), bone("pinky_finger1")
-	local thumb = { bone("thumb_finger1"), bone("thumb_finger2"), bone("thumb_finger3") }
-	if not (fk[hand] and fk[index] and fk[pinky] and fk[thumb[1]] and fk[thumb[2]] and fk[thumb[3]]) then return end
-	local function source(b) return readPose(state.list[b][2]) end
-	local srcHand, srcIndex, srcPinky = source(hand), source(index), source(pinky)
-	local srcThumb = { source(thumb[1]), source(thumb[2]), source(thumb[3]) }
-	if not (srcHand and srcIndex and srcPinky and srcThumb[1] and srcThumb[2] and srcThumb[3]) then return end
-	local modelPalm = Compat.contact_palm(fk[hand], fk[index], fk[pinky])
-	local sourcePalm = Compat.contact_palm(srcHand, srcIndex, srcPinky)
-	if not modelPalm or not sourcePalm then return end
-	local palmInverse = { -sourcePalm[1], -sourcePalm[2], -sourcePalm[3], sourcePalm[4] }
-	local normal = V.rotate(modelPalm, { 0, 0, 1 })
-	for i = 1, 3 do
-		local b, nextBone = thumb[i], thumb[i+1]
-		local from, to
-		if nextBone then
-			from = V.sub(fk[nextBone].p, fk[b].p)
-			to = V.sub(srcThumb[i+1].p, srcThumb[i].p)
-		else
-			local row = piece.link.rows[b]
-			local q = row.originalQ
-			local axis = V.rotate({ -q[1], -q[2], -q[3], q[4] }, piece.bind[b] or row.originalP)
-			from = V.rotate(fk[b].q, axis)
-			to = V.rotate(srcThumb[i].q, { 1, 0, 0 })
-		end
-		local delta = V.arc(from, V.rotate(modelPalm, V.rotate(palmInverse, to)), normal)
-		IndependentLink.move_subtree(piece, fk, b,
-			Compat.independent_fk({ p = fk[b].p, q = delta }, fk[b].q, { 0, 0, 0 }))
-	end
-end
-
-function IndependentLink.solve_contacts(runtime, state, piece, fk, readPose)
-	local grips = runtime.options.independentGrips and runtime.options.independentGrips[piece.tag]
-	if not grips then return end
-	local V = Compat.contact_math
-	for _, side in ipairs({ "r", "l" }) do
-		local grip = grips[side] and V.matrix_pose(grips[side])
-		local sh = state.boneBySource[side .. "_shoulder"]
-		local el = state.boneBySource[side .. "_elbow"]
-		local ha = state.boneBySource[side .. "_hand"]
-		if grip and fk[sh] and fk[el] and fk[ha] then
-			local source = { readPose(side .. "_shoulder"), readPose(side .. "_elbow"), readPose(side .. "_hand") }
-			if source[1] and source[2] and source[3] then
-				local contact = state.contacts[side]
-				local inverse = V.inverse(grip)
-				local wrist = contact and Compat.independent_fk(contact, inverse.q, inverse.p)
-					or { p = source[3].p, q = fk[ha].q }
-				local lengths = { V.length(piece.bind[el] or piece.link.rows[el].originalP),
-					V.length(piece.bind[ha] or piece.link.rows[ha].originalP) }
-				local single = state.singleHand and side == "r"
-				local factor = 1
-				local chest = fk[state.boneBySource.chest]
-				local clavicle = state.boneBySource[side .. "_clavicle"]
-				if contact and chest and fk[clavicle] and (single or (side == "l" and not state.singleHand)) then
-					local delta
-					delta, factor = Compat.contact_girdle(chest, fk[sh], wrist, lengths, source, single)
-					if delta then
-						IndependentLink.move_subtree(piece, fk, clavicle, IndependentLink.rotate_about(fk[clavicle], chest.p, delta))
-					end
-				end
-				local freeHand = side == "l" and state.action == 1 and state.contacts.r and not contact
-				local shoulder, elbow, hand = Compat.contact_arm({ fk[sh], fk[el], fk[ha] }, source, wrist, lengths, factor, freeHand)
-				if shoulder then
-					IndependentLink.move_subtree(piece, fk, sh, shoulder)
-					IndependentLink.move_subtree(piece, fk, el, elbow)
-					IndependentLink.move_subtree(piece, fk, ha, hand)
-					for _, suffix in ipairs({ "_shoulder_twist", "_hand_twist" }) do
-						local b = state.boneBySource[side .. suffix]
-						if fk[b] then
-							local row = piece.link.rows[b]
-							local parent = fk[piece.link.byNode[row.parent]]
-							local length = V.length(piece.bind[b] or row.originalP) * factor
-							local axis = parent and V.normal(V.sub(fk[b].p, parent.p))
-							if axis then
-								IndependentLink.move_subtree(piece, fk, b, { q = fk[b].q, p = V.add(parent.p, V.scale(axis, length)) })
-							end
-						end
-					end
-					if contact then IndependentLink.calibrate_thumb(state, piece, fk, side, readPose) end
-				end
-			end
-		end
-	end
-end
-
-function IndependentLink.targets(runtime, state, piece, sample, vectors)
-	local link = piece.link
-	local fk, roots = {}, {}
-	local function target(b)
-		if fk[b] then return fk[b] end
-		local row = link.rows[b]
-		local source = assert(sample(b), "源骨姿势 " .. state.list[b][2])
-		local parent = link.byNode[row.parent]
-		if parent then
-			parent = target(parent)
-		else
-			if not roots[row.parent] then
-				local pose, cost = Compat.independent_world_pose(S, piece.unit, row.parent)
-				vectors.calls = vectors.calls + cost
-				roots[row.parent] = assert(pose, "模型父节点")
-			end
-			parent = roots[row.parent]
-		end
-		local p = piece.bind[b] or state.rest[b][4] or row.originalP
-		local translation = not state.remote and piece.translations[b]
-		if translation then
-			local a, m, v = translation[1], translation[2], assert(sample(b, true).p, "源骨平移")
-			p = { m[1]+v[1]-a[1], m[2]+v[2]-a[2], m[3]+v[3]-a[3] }
-		end
-		fk[b] = Compat.independent_fk(parent, source.q, p)
-		return fk[b]
-	end
-	local legs = runtime.options.independentLegs and runtime.options.independentLegs[piece.tag]
-	if legs then
-		local hips = state.boneBySource.hips
-		for side, data in pairs(legs) do
-			local thigh = state.boneBySource[side .. "_thigh"]
-			local knee = state.boneBySource[side .. "_knee"]
-			local foot = state.boneBySource[side .. "_foot"]
-			if link.rows[hips] and link.rows[thigh] and link.rows[knee] and link.rows[foot] then
-				local a, b, c = Compat.calibrate_leg(target(hips), target(thigh), target(knee), target(foot),
-					sample(hips).world, sample(thigh).world, sample(foot).world, data[1], data[2])
-				if a then fk[thigh], fk[knee], fk[foot] = a, b, c end
-			end
-		end
-	end
-	for _, b in ipairs(piece.bones) do target(b) end
-	return fk
-end
-
-function IndependentLink.weapon_trial(runtime, state, weapon, sample, vectors, readPose)
-	if runtime.weaponShift or not state.contacts.r then return end
-	local V = Compat.contact_math
-	local sh, el, ha, chest = state.boneBySource.r_shoulder, state.boneBySource.r_elbow,
-		state.boneBySource.r_hand, state.boneBySource.chest
-	local sourceSh, sourceEl, sourceHa = readPose("r_shoulder"), readPose("r_elbow"), readPose("r_hand")
-	if not sourceSh or not sourceEl or not sourceHa then return end
-	local upper = V.normal(V.sub(sourceEl.p, sourceSh.p))
-	local lower = V.normal(V.sub(sourceHa.p, sourceEl.p))
-	if not upper or not lower then return end
-	local shared, chestAt
-	for _, piece in ipairs(state.pieces) do
-		local grips = runtime.options.independentGrips[piece.tag]
-		local grip = grips and grips.r and V.matrix_pose(grips.r)
-		if grip then
-			local link = piece.link
-			if not link or not link.rows[sh] or not link.rows[el] or not link.rows[ha] or not link.rows[chest] then return end
-			local ok, fk = pcall(IndependentLink.targets, runtime, state, piece, sample, vectors)
-			if not ok then return end
-			if chestAt and V.length(V.sub(chestAt, fk[chest].p)) > 0.0002 then return end
-			chestAt = chestAt or fk[chest].p
-			local inv = V.inverse(grip)
-			local contact = state.contacts.r
-			local wrist = Compat.independent_fk(contact, inv.q, inv.p)
-			local ray = V.sub(wrist.p, fk[sh].p)
-			local distance = V.length(ray)
-			local a = V.length(piece.bind[el] or link.rows[el].originalP)
-			local b = V.length(piece.bind[ha] or link.rows[ha].originalP)
-			local chord = math.sqrt(math.max(0, a*a+b*b+2*a*b*V.dot(upper, lower)))
-			if distance < 1e-6 or distance-chord > 0.75*(a+b) then return end
-			local delta = V.scale(ray, math.max(-0.18, math.min(0, 0.99999*(a+b)-distance))/distance)
-			if shared and V.length(V.sub(shared, delta)) > 0.0003 then return end
-			shared = shared or delta
-		end
-	end
-	if not shared or runtime.weaponTrialDisabled then return end
-	local graphs = IndependentLink.weapon_followers(state.world, weapon)
-	if not graphs then return end
-	if V.length(shared) > 1e-6 and not IndependentLink.shift_weapon(runtime, state.world, weapon, shared, graphs) then return end
-	local right, left = state.contacts.r, state.contacts.l
-	state.contacts.r = { q = right.q, p = V.add(right.p, shared) }
-	if left and weapon.left and (weapon.weight > 0 or not weapon.sidearm) then
-		state.contacts.l = { q = left.q, p = V.add(left.p, V.scale(shared, weapon.weight)) }
-	else
-		state.contacts.l = nil
-	end
-	state.singleHand = false
-end
-
-function IndependentLink.present(runtime, state, piece, due, now, blend, sample, vectors, readPose)
-	local link = piece.link
-	local group
-	if runtime.iasCommits then
-		group = { world = state.world, rows = {}, before = {} }
-		runtime.iasCommits[piece.unit] = group
-	end
-	if due then link.pending = nil end -- the new display supersedes the old interpolation endpoint
-	if link.pending and (not blend or now + (runtime.dt or 0)*0.5 + 1e-6 >= link.finishAt) then
-		local values = link.pending
-		local n, cost = IndependentLink.write(state, piece, values, group)
-		link.pending = nil
-		local rows = {}
-		for b, value in pairs(values) do
-			rows[piece.nodes[b]+1] = Compat.independent_fk(sample(b).world, value.q, value.p)
-		end
-		if group then group.rows = rows end
-		if runtime.corpseExplicit and runtime.options.corpseProfiles[piece.hash] then
-			runtime.corpseExplicit[piece.unit] = { owner = state.avatar, rows = rows }
-		end
-		if n > 0 then cost = cost + IndependentLink.refresh(runtime, state.world, piece.unit) end
-		return n, cost
-	end
-	if not due then return 0, 0 end
-
-	local fk = IndependentLink.targets(runtime, state, piece, sample, vectors)
-	local display, pending = {}, {}
-	if state.action == 1 or state.action == 2 then
-		IndependentLink.solve_contacts(runtime, state, piece, fk, readPose)
-	end
-	for _, b in ipairs(piece.bones) do
-		local row = link.rows[b]
-		local desired = fk[b]
-		local p, q = Compat.independent_relative(sample(b).world, desired)
-		local value, previous = { p = p, q = q }, row.endpoint
-		if blend and previous and IndependentLink.is_gait(state.list[b][2]) and
-			(not IndependentLink.same(p, previous.p) or not IndependentLink.same(q, previous.q, true)) then
-			local oldP, oldQ = previous.p, Compat.independent_hemisphere(previous.q, q)
-			display[b] = { p = { (p[1]+oldP[1])*0.5, (p[2]+oldP[2])*0.5, (p[3]+oldP[3])*0.5 },
-				q = Compat.independent_quaternion(q[1]+oldQ[1], q[2]+oldQ[2], q[3]+oldQ[3], q[4]+oldQ[4]) }
-			pending[b] = value
-		else
-			display[b] = value
-		end
-		row.endpoint = value
-	end
-	link.pending = next(pending) and pending or nil
-	link.finishAt = (now + state.nextCorrection)*0.5
-	local written, calls = IndependentLink.write(state, piece, display, group)
-	local rows = {}
-	for b, value in pairs(display) do
-		local pose = not pending[b] and fk[b] or Compat.independent_fk(sample(b).world, value.q, value.p)
-		rows[piece.nodes[b] + 1] = pose
-	end
-	if group then group.rows = rows end
-	local count, cost = IndependentLink.present_clothing(runtime, state, piece, fk)
-	if written + count > 0 then calls = calls + IndependentLink.refresh(runtime, state.world, piece.unit) end
-	-- IAS R:2384,4707: publish callback-local world poses after the successful write.
-	-- Blend frames display an intermediate local correction under the linked avatar node.
-	if runtime.corpseExplicit and runtime.options.corpseProfiles[piece.hash] then
-		runtime.corpseExplicit[piece.unit] = { owner = state.avatar, rows = rows }
-	end
-	return written + count, calls + cost
-end
-
-function IndependentLink.physics(runtime, session, schedule, operation, dt)
-	local presentation = session.independentPresentation
-	local written, presentationCalls = 0, 0
-	if presentation then
-		local fraction
-		if not schedule or schedule.due or not schedule.blend or schedule.paused then
-			fraction = 1
-		else
-			local elapsed = (schedule.now - presentation.start) / presentation.period
-			local step = math.min(4, 1 + math.floor(4*elapsed + 1e-8))
-			if step > presentation.step then
-				fraction = math.min(1, presentation.lead + elapsed)
-				if step == 4 or (fraction >= 0.75 and schedule.now + runtime.dt >= schedule.nextAt) then
-					fraction = 1
-				end
-				presentation.step = step
-			end
-		end
-		if fraction then
-			written = Compat.present_independent_physics(session, fraction)
-			presentationCalls = session.engineCalls or 0
-		end
-	end
-	if not operation or session.independentPresentation then
-		if not schedule or schedule.paused then session.independentHistory = nil end
-		return written, false
-	end
-	local sample
-	if schedule and schedule.blend and operation == Compat.update and session.solver ~= "angle" then
-		local period = schedule.nextAt - schedule.now
-		sample = { start = schedule.now, period = period, step = 1, rows = {},
-			lead = math.max(0.25, math.min(0.5, runtime.dt / period)), history = session.independentHistory }
-	end
-	session.independentSample = sample
-	session.engineCalls = 0
-	local ok, out = pcall(operation, session, dt)
-	session.independentSample = nil
-	session.engineCalls = presentationCalls + (session.engineCalls or 0)
-	session.independentHistory = ok and sample ~= nil or nil
-	if sample and next(sample.rows) then session.independentPresentation = sample end
-	if not ok then error(out, 0) end
-	return written + (type(out) == "number" and out or 0), true
-end
-
-function IndependentLink.present_clothing(runtime, state, piece, solved)
-	local rules = runtime.options.independentPoseRules and runtime.options.independentPoseRules[piece.tag]
-	if not rules then return 0, 0 end
-	local calls, written, poses, desired = 0, 0, {}, {}
-	local U = S.Unit
-	piece.clothingRest = piece.clothingRest or {}
-	local function world_rotation(name, offset)
-		if poses[name] == nil then
-			local node = safe_node(S, piece.unit, name)
-			local pose = solved and solved[piece.link.byNode[node]]
-			local group = runtime.iasCommits and runtime.iasCommits[piece.unit]
-			if group and node then
-				pose = Compat.contact_math.projected(S, piece.unit, node, group.rows, piece.nodeCount)
-			elseif not pose and node then
-				local cost
-				pose, cost = Compat.independent_world_pose(S, piece.unit, node)
-				calls = calls + cost
-			end
-			poses[name] = pose and pose.q or false
-		end
-		local q = poses[name]
-		return q and Compat.independent_fk({ p = { 0, 0, 0 }, q = q }, offset, { 0, 0, 0 }).q
-	end
-	local function driver_angles(driver)
-		local source = world_rotation(driver.bone, driver.offset)
-		local reference
-		if driver.reference then
-			reference = world_rotation(driver.reference, driver.referenceOffset)
-		else
-			reference = world_rotation("root", { -driver.referenceOffset[1], -driver.referenceOffset[2],
-				-driver.referenceOffset[3], driver.referenceOffset[4] })
-		end
-		if source and reference then return Compat.clothing_driver_angles(source, reference, driver.neutral) end
-	end
-	for _, rule in ipairs(rules) do
-		local node = safe_node(S, piece.unit, rule.target)
-		local primary = driver_angles(rule.primary)
-		local secondary = rule.secondary and driver_angles(rule.secondary)
-		if node and primary and (not rule.secondary or secondary) then
-			local rest = piece.clothingRest[rule.target]
-			if not rest or rest.node ~= node then
-				local raw = try(U.local_rotation, piece.unit, node)
-				local ok, x, y, z, w = pcall(S.Quaternion.to_elements, raw)
-				local q = ok and Compat.independent_quaternion(x, y, z, w)
-				calls = calls + 2
-				rest = q and { node = node, q = q }
-				piece.clothingRest[rule.target] = rest
-			end
-			if rest then desired[#desired + 1] = { node, Compat.clothing_rotation(rule, primary, secondary, rest.q) } end
-		end
-	end
-	for _, row in ipairs(desired) do
-		local node, rotation = row[1], row[2]
-		local before, reads = Compat.contact_math.local_pose(S, piece.unit, node)
-		calls = calls + reads
-		if before and not Compat.contact_math.unchanged(before, rotation) then
-			local group = runtime.iasCommits and runtime.iasCommits[piece.unit]
-			local parentWorld
-			if group then
-				group.before[node] = group.before[node] or before
-				-- IAS R:2191–2214,4291–4317: retain the world result for downstream drivers.
-				local current = Compat.contact_math.projected(S, piece.unit, node, group.rows, piece.nodeCount)
-				if current then
-					local inverse = Compat.contact_math.inverse(before)
-					parentWorld = Compat.independent_fk(current, inverse.q, inverse.p)
-				end
-			end
-			local ok, cost = Compat.write_independent_rotation(S, piece.unit, node, rotation, true)
-			calls = calls + cost
-			if ok then
-				written = written + 1
-				if group then group.rows[node+1] = parentWorld and Compat.independent_fk(parentWorld, rotation, before.p) end
-			elseif group then group.failed = true end
-		end
-	end
-	if written > 0 and not solved then calls = calls + IndependentLink.refresh(runtime, state.world, piece.unit) end
-	return written, calls
-end
-
-function IndependentLink.restore_clothing(state, piece)
-	if not piece.clothingRest then return end
-	for name, rest in pairs(piece.clothingRest) do
-		if safe_node(S, piece.unit, name) == rest.node then
-			Compat.write_independent_rotation(S, piece.unit, rest.node, rest.q, true)
-		end
-	end
-	try(S.World.update_unit, state.world, piece.unit)
-	piece.clothingRest = nil
-end
-
-local function independent_release(runtime, state)
-	if not state or state.world ~= runtime.world then return end
-	-- E12e-B4：原来先 `refresh_live_units`（World.units 全表）确认"世界还在、表可信"。IAS 口径是本回调枚举（R:1417-1428）：
-	-- 本帧还没枚举过就枚举一次（释放是低频事件），世界不在枚举里 ⇒ 这些句柄不再碰。
-	if runtime.roster == nil or runtime.roster.frame ~= (runtime.frame or 0) then
-		if not pcall(Roster.update, runtime) then return end
-	end
-	if runtime.roster == nil or runtime.roster.byWorld[state.world] == nil then return end
-	for _, piece in ipairs(state.pieces) do
-		if (piece.link or piece.hidden or piece.positionDirty or piece.clothingRest) and Roster.isLive(runtime, piece.unit) then
-			local restored = IndependentLink.restore(state, piece)
-			IndependentLink.restore_clothing(state, piece)
-			if restored and piece.positionDirty then
-				for b, translation in pairs(piece.translations) do
-					if safe_node(S, piece.unit, state.list[b][1]) == piece.nodes[b] then
-						Compat.write_independent_position(S, piece.unit, piece.nodes[b], translation[2], 1)
-					end
-				end
-				try(S.World.update_unit, state.world, piece.unit)
-			end
-			if piece.hidden then independent_visibility(piece, true) end
-		end
-	end
-end
-
-function IndependentLink.release_all(runtime)
-	independent_release(runtime, runtime.independent)
-	for _, state in pairs(runtime.independentRemotes or {}) do independent_release(runtime, state) end
-	runtime.independent, runtime.independentRemotes = nil, nil
-end
-
-local function independent_scan(runtime, state, avatar, world, list)
-	-- E12d：照 IAS 每帧枚举 + 当帧归属（IAS runtime.lua 1500–1620、6690–6830）。
-	-- 件来自本帧 Roster 的装甲件枚举，归属 = 离最近 avatar（3 m、歧义裕度），不保存跨帧结论、
-	-- 没有扫描间隔 / 退避 / 缓存 / 额度。
-	local roster = runtime.roster and runtime.roster.frame == (runtime.frame or 0) and runtime.roster.byWorld[world]
-	if not roster then return false end
-	local options = runtime.options
-	local manifest, slots = options.independentPieces, options.independentPieceSlots or {}
-	state.owners = roster.avatars
-
-	-- 本帧不再属于本 avatar 的件：放掉（原件仍活着才恢复）。
-	local present, claimed, seen = {}, {}, {}
-	for _, row in ipairs(roster.armour) do present[row.unit] = row end
-	for i = #state.pieces, 1, -1 do
-		local piece = state.pieces[i]
-		local row = present[piece.unit]
-		if row ~= nil and roster.owner[piece.unit] == avatar then
-			seen[piece.unit], claimed[piece.slot] = true, true
-		else
-			if row ~= nil and piece.link then IndependentLink.restore(state, piece, true) end
-			if row ~= nil then IndependentLink.restore_clothing(state, piece) end
-			if row ~= nil and piece.hidden then independent_visibility(piece, true) end
-			table.remove(state.pieces, i)
-		end
-	end
-	local expected = {}
-	for tag in pairs(manifest or {}) do
-		local slot = slots[tag] or tag
-		local alternatives = expected[slot] or {}
-		alternatives[#alternatives + 1] = tag
-		expected[slot] = alternatives
-	end
-	local missing = {}
-	for slot in pairs(expected) do if not claimed[slot] then missing[slot] = true end end
-	for _, row in ipairs(roster.armour) do
-		local unit = row.unit
-		if not seen[unit] and unit ~= avatar and roster.owner[unit] == avatar then
-			local tag = "#ID[" .. row.hash .. "]"
-			local slot = slots[tag] or tag
-			local names = manifest and manifest[tag]
-			if names and missing[slot] then
-				do
-					local nodes, bones, selected = {}, {}, {}
-					for _, name in ipairs(names or {}) do selected[name] = true end
-					local complete = true
-					for b, bone in ipairs(list) do
-						if not manifest or selected[bone[1]] then
-							local node = safe_node(S, unit, bone[1])
-							if node then
-								nodes[b], bones[#bones + 1] = node, b
-							elseif manifest then
-								complete = false
-							end
-						end
-					end
-					if complete and #bones > 0 then
-						local piece = { unit = unit, nodes = nodes, bones = bones, wrists = {}, parents = {},
-							hash = row.hash, nodeCount = row.nodes, tag = tag, slot = slot, translations = {}, bind = {} }
-						local translations = options.independentTranslations and options.independentTranslations[tag]
-						piece.bodyBind = translations ~= nil
-						for _, b in ipairs(bones) do
-							local source = list[b][2]
-							if translations then
-								piece.translations[b] = translations[list[b][1]]
-								local x, y, z = readVector(S, try(S.Unit.local_position, unit, nodes[b]))
-								if x ~= nil then piece.bind[b] = { x, y, z } end
-							end
-							if source == "l_hand" or source == "r_hand" then piece.wrists[#piece.wrists + 1] = b end
-							local parent = state.parents[b]
-							if parent and (not parent.bone or not nodes[parent.bone]) then
-								piece.parents[b] = safe_node(S, unit, parent.name)
-							end
-						end
-						state.pieces[#state.pieces + 1] = piece
-						missing[slot] = nil
-					end
-				end
-			end
-		end
-	end
-
-	-- 有源骨暂时读不到时，保留件缓存，待下一帧重新解析源节点。
-	local sourceMissing = false
-	for b, bone in ipairs(list) do
-		state.sources[b] = safe_node(S, avatar, bone[2])
-		if state.sources[b] == nil then sourceMissing = true end
-	end
-	local tags, absent, total = {}, {}, 0
-	for _, piece in ipairs(state.pieces) do tags[#tags + 1] = piece.tag end
-	for slot, alternatives in pairs(expected) do
-		total = total + 1
-		if missing[slot] then
-			table.sort(alternatives)
-			absent[#absent + 1] = table.concat(alternatives, "/")
-		end
-	end
-	table.sort(absent)
-	local detail = #absent > 0 and table.concat(absent, "、") or "无"
-	local signature = total .. "|" .. #tags .. "|" .. detail
-	if state.lastScanSignature ~= signature then
-		state.lastScanSignature = signature
-		runtime.logger("[physbone][独立骨] 清单 %d 件 / 找到 %d 件 / 缺 %s ｜ %s",
-			total, #tags, detail, table.concat(tags, "、"))
-	end
-	local frame = runtime.frame or 0
-	state.rescanAt = frame + 1   -- 每帧枚举（IAS 每回调都做）
-	return true
-end
-
-local function independent_state(runtime, avatar, world, list)
-	local rest = runtime.options.independentRest
-	local state = { avatar = avatar, world = world, rest = rest, list = list, pieces = {}, sources = {}, parents = {},
-		probes = {}, frames = 0, normals = {}, rescanAt = 0 }
-	local sources = {}
-	for b, bone in ipairs(list) do sources[bone[2]] = b end
-	state.boneBySource = sources
-	for b, data in ipairs(rest or {}) do
-		state.parents[b] = { name = data[1], bone = sources[data[1]] }
-	end
-	for _, side in ipairs({ "l", "r" }) do
-		local sh, el, ha = sources[side .. "_shoulder"], sources[side .. "_elbow"], sources[side .. "_hand"]
-		if sh then state.probes[#state.probes + 1] = sh end
-		if sh and el and ha then
-			if not rest then
-				state.parents[sh] = { name = side .. "_clavicle" }
-				state.parents[el] = { name = side .. "_shoulder", bone = sh }
-				state.parents[ha] = { name = side .. "_elbow", bone = el }
-			end
-		end
-	end
-	for _, source in ipairs({ "hips", "spine1" }) do
-		if sources[source] then table.insert(state.probes, 1, sources[source]) end
-	end
-	return state
-end
-
-local function independent_frame(runtime, avatar, world, list, state, remote)
-	if world == nil then return 0, 0, state end
-	local frame = runtime.frame or 0
-	if not state or state.avatar ~= avatar or state.world ~= world then
-		independent_release(runtime, state)
-		state = independent_state(runtime, avatar, world, list)
-	end
-	state.remote = remote
-	state.frame = frame
-	local tune = tune_values(runtime)
-	local linkOption = tune.independentLink
-	if linkOption == nil then linkOption = runtime.options.independentLink end
-	local linkEnabled = linkOption ~= 0 and linkOption ~= false
-	if state.linkEnabled ~= linkEnabled then
-		for _, piece in ipairs(state.pieces) do piece.linkFailed = nil end
-		state.linkEnabled, state.nextCorrection = linkEnabled, nil
-	end
-	if frame >= state.rescanAt and not independent_scan(runtime, state, avatar, world, list) then
-		state.rescanAt = frame + 30
-	end
-	if #state.pieces == 0 then
-		state.hasLinks, state.linkedUnits, state.nextCorrection = false, {}, nil
-		return 0, 0, state
-	end
-
-	local calls, written = 0, 0
-	local rotations, positions = {}, {}
-	local function rotation_components(raw)
-		local ok, x, y, z, w = pcall(S.Quaternion.to_elements, raw)
-		calls = calls + 1
-		return ok and Compat.independent_quaternion(x, y, z, w) or nil
-	end
-	local function read_rotation(node, numeric)
-		if node == nil then return nil end
-		if rotations[node] == nil then
-			local raw = try(S.Unit.local_rotation, avatar, node)
-			calls = calls + 1
-			local valid, q
-			if raw ~= nil then
-				if not numeric and type(S.Quaternion.is_valid) == "function" then
-					valid = try(S.Quaternion.is_valid, raw)
-					calls = calls + 1
-				else
-					q = rotation_components(raw)
-					valid = q ~= nil
-				end
-			end
-			rotations[node] = valid == true and { raw = raw, q = q } or false
-		end
-		return rotations[node] or nil
-	end
-	local function read_position(node)
-		if node == nil then return nil end
-		if positions[node] == nil then
-			local x, y, z = readVector(S, try(S.Unit.local_position, avatar, node))
-			calls = calls + (x ~= nil and 2 or 1)
-			positions[node] = x and x == x and y == y and z == z
-				and math.abs(x) < math.huge and math.abs(y) < math.huge and math.abs(z) < math.huge
-				and { x, y, z } or false
-		end
-		return positions[node] or nil
-	end
-
-	local hz = tonumber(tune.poseHz or runtime.options.poseHz) or 30
-	if hz ~= hz then hz = 30 end
-	-- IAS R:7015–7019 prepares every bound avatar on every successful callback.
-	local everyFrame = runtime.options.profileHashes ~= nil or (not remote and runtime.options.poseEveryFrame == true)
-	local period = 1 / (remote and 20 or math.max(15, math.min(60, hz)))
-	local blendOption = tune.poseBlend
-	if blendOption == nil then blendOption = runtime.options.poseBlend end
-	local blend = not remote and not everyFrame and blendOption ~= 0 and blendOption ~= false
-	local now = (state.poseTime or 0) + (runtime.dt or 1/60)
-	state.poseTime = now
-	-- Remote callbacks may be skipped by the distance stride. Use the same
-	-- engine clock as local callbacks when available, including across skips.
-	now = runtime.lastTime or now
-	if state.period ~= period then state.nextCorrection, state.period = nil, period end
-	local deadline = state.nextCorrection
-	local due = everyFrame or not deadline or now + 1e-6 >= deadline
-	local paused = false
-	local sourcePoses = {}
-	local function readPose(name)
-		if sourcePoses[name] == nil then
-			local node = state.sources[state.boneBySource[name]] or safe_node(S, avatar, name)
-			local pose, cost
-			if node then pose, cost = Compat.contact_math.world_pose(S, avatar, node) end
-			calls = calls + (cost or 0)
-			sourcePoses[name] = pose or false
-		end
-		return sourcePoses[name] or nil
-	end
-	local weapon, viewFirstPerson, presentationAction
-	if linkEnabled and state.rest and (state.hasLinks or due) then
-		local animation, cost = frame_animation_machine(runtime, avatar)
-		calls = calls + cost
-		paused = not animation.active
-		if not remote and not paused then
-			viewFirstPerson = IndependentLink.first_person(runtime, state)
-			if runtime.options.independentGrips and (due or viewFirstPerson) then
-				presentationAction = IndependentLink.first_person_action(runtime, state, readPose)
-			end
-			paused = viewFirstPerson or presentationAction == 3
-			if due then
-				local tuple, animationCost = frame_animation_state(animation, avatar)
-				calls = calls + animationCost
-				if not runtime.options.independentGrips then
-					paused = paused or tuple ~= nil and (tuple[4] == 76 or tuple[4] == 77)
-				end
-			end
-		end
-		if paused then
-			state.action, state.contacts, state.singleHand = presentationAction or 0, {}, false
-		elseif due and not remote and runtime.options.independentGrips then
-			local eligible, actionCost
-			state.action, eligible, actionCost = IndependentLink.action(avatar, animation)
-			calls = calls + actionCost
-			state.contacts = state.action > 0 and IndependentLink.contacts(state.action, readPose) or {}
-			state.singleHand = false
-			if eligible then
-				weapon = IndependentLink.held_weapon(runtime, state, readPose)
-				state.singleHand = weapon ~= nil and (weapon.sidearm or not weapon.support)
-				-- E12c：空主动作 + 武器姿势树但**找不到手里的武器**（没拿枪 / 武器未识别 / 复活后还没生成）：
-				-- 不能把双手拉去握点（那里没有枪）：双手改跟原生手轨迹（与 action=2 的接触同口径），手臂照抄动画。
-				if weapon == nil then
-					state.contacts, state.singleHand = IndependentLink.contacts(2, readPose), false
-				end
-			end
-		end
-	end
-	if paused then
-		due, state.nextCorrection = false, nil
-	elseif due then
-		if deadline and not everyFrame then
-			state.nextCorrection = deadline + (math.floor((now + 1e-6 - deadline) / period) + 1) * period
-		else
-			state.nextCorrection = now + period
-		end
-	end
-	local samples, sourceWorlds = {}, {}
-	local vectors = { calls = 0, written = 0 }
-	local function sample(b, position)
-		local node = state.sources[b]
-		local cached = samples[b]
-		if cached then
-			if position then cached.p = read_position(node) end
-			return cached
-		end
-		local rotation = read_rotation(node, true)
-		if not rotation then return nil end
-		rotation.q = rotation.q or rotation_components(rotation.raw)
-		if sourceWorlds[node] == nil then
-			local pose, cost = Compat.independent_world_pose(S, avatar, node)
-			sourceWorlds[node] = pose or false
-			calls = calls + cost
-		end
-		if rotation.q and sourceWorlds[node] then
-			local value = { q = rotation.q, world = sourceWorlds[node] }
-			samples[b] = value
-			return value
-		end
-	end
-	if weapon and (tune.weaponRootTrial == 1 or (tune.weaponRootTrial == nil and runtime.options.weaponRootTrial == true))
-		and type(rawget(_G, "update")) == "function" then
-		IndependentLink.weapon_trial(runtime, state, weapon, sample, vectors, readPose)
-	end
-
-	-- Each normal frame samples a bounded slice of one piece. An isolated piece
-	-- gets priority on intervening frames so the rest of the set is still checked.
-	if not state.sampleRound or (not state.samplePiece and state.frames >= state.sampleRound + 30) then
-		local bones = 0
-		for _, piece in ipairs(state.pieces) do bones = bones + #piece.bones end
-		state.sampleChunk = math.max(6, math.ceil(bones / math.max(1, 30 - #state.pieces)))
-		state.sampleRound, state.samplePiece, state.sampleBone = state.frames, 1, 1
-	end
-	local routine = state.pieces[state.samplePiece or 0]
-	local sampled, first, last, checkWrist
-	if not routine or state.frames % 2 == 0 then
-		for _, piece in ipairs(state.pieces) do
-			if piece.recheck and (not sampled or piece.lastSample < sampled.lastSample) then sampled = piece end
-		end
-	end
-	if sampled then
-		first = sampled.scaleFault
-		last, checkWrist = first, not remote
-	elseif routine then
-		sampled, first = routine, state.sampleBone
-		last = math.min(first + state.sampleChunk - 1, #routine.bones)
-		checkWrist = last == #routine.bones and not remote
-		if last == #routine.bones then
-			state.samplePiece, state.sampleBone = state.samplePiece + 1, 1
-		else
-			state.sampleBone = last + 1
-		end
-		if not state.pieces[state.samplePiece] then state.samplePiece = nil end
-	end
-
-	local function check_scale(piece, from, to)
-		for index = from, to do
-			local b = piece.bones[index]
-			local x, y, z = readVector(S, try(S.Unit.local_scale, piece.unit, piece.nodes[b]))
-			calls = calls + (x ~= nil and 2 or 1)
-			if x == nil then return index end
-			if not (math.abs(x-1) <= 0.0001 and math.abs(y-1) <= 0.0001 and math.abs(z-1) <= 0.0001) then
-				if IndependentLink.scale_state(x, y, z) ~= "hidden" then return index end
-			end
-		end
-	end
-
-	local function pose(piece)
-		local healthy, fallback, posed = true, true, {}
-		local translations = {}
-		for _, b in ipairs(piece.bones) do
-			local source = read_rotation(state.sources[b])
-			posed[b] = source
-			if source then
-				local ok, result = pcall(S.Unit.set_local_rotation, piece.unit, piece.nodes[b], source.raw)
-				calls = calls + 1
-				if ok and result ~= false then written = written + 1 else fallback = false end
-			else
-				fallback = false
-			end
-		end
-		if not remote and fallback and not piece.scaleFault then
-			for b, translation in pairs(piece.translations) do
-				local p = read_position(state.sources[b])
-				if p == nil then healthy = false break end
-				local a, m = translation[1], translation[2]
-				translations[b] = { m[1]+p[1]-a[1], m[2]+p[2]-a[2], m[3]+p[3]-a[3] }
-			end
-			if healthy then
-				for b, value in pairs(translations) do
-					piece.positionDirty = true
-					local ok, cost = Compat.write_independent_position(S, piece.unit, piece.nodes[b], value, 1)
-					calls = calls + cost
-					if not ok then healthy = false break end
-				end
-			end
-		end
-		if (not healthy or not fallback or piece.scaleFault or remote) and piece.positionDirty then
-			local restored = true
-			for b, translation in pairs(piece.translations) do
-				local ok, cost = Compat.write_independent_position(S, piece.unit, piece.nodes[b], translation[2], 1)
-				calls = calls + cost
-				restored = restored and ok
-			end
-			piece.positionDirty = not restored
-			fallback = fallback and restored
-			translations = {}
-		end
-		local ok, result = pcall(S.World.update_unit, world, piece.unit)
-		calls = calls + 1
-		fallback = fallback and ok and result ~= false and piece.scaleFault == nil
-		if piece == sampled and fallback and state.rest and (checkWrist or (last and piece.bodyBind and not remote)) then
-			local fk, roots = {}, {}
-			local function bone_pose(b)
-				if fk[b] then return fk[b] end
-				local parent = state.parents[b]
-				local parentPose
-				if parent.bone and piece.nodes[parent.bone] then
-					parentPose = bone_pose(parent.bone)
-				elseif piece.parents[b] then
-					local node = piece.parents[b]
-					if roots[node] == nil then
-						local cost
-						roots[node], cost = Compat.independent_world_pose(S, piece.unit, node)
-						calls = calls + cost
-						roots[node] = roots[node] or false
-					end
-					parentPose = roots[node]
-				end
-				local position = translations[b] or piece.bind[b] or state.rest[b][4]
-				local rotation = posed[b]
-				if parentPose and rotation then
-					-- Numeric components are only needed for the sampled FK check.
-					rotation.q = rotation.q or rotation_components(rotation.raw)
-					if rotation.q then fk[b] = Compat.independent_fk(parentPose, rotation.q, position) end
-				end
-				return fk[b]
-			end
-			local function check_position(b)
-				local expected = bone_pose(b)
-				local x, y, z = readVector(S, try(S.Unit.world_position, piece.unit, piece.nodes[b]))
-				calls = calls + (x ~= nil and 2 or 1)
-				local p = expected and expected.p
-				local distance = p and vec_dist(x, y, z, p[1], p[2], p[3])
-				return distance and distance <= 0.02
-			end
-			if last and piece.bodyBind and not remote then fallback = check_position(piece.bones[last]) end
-			if checkWrist and fallback then
-				for _, b in ipairs(piece.wrists) do
-					if not check_position(b) then fallback = false break end
-				end
-			end
-		end
-		return healthy and fallback, fallback
-	end
-
-	local function legacy_piece(piece)
-		local sampledNow = piece == sampled
-		if sampledNow then
-			if first then
-				local fault = check_scale(piece, first, last)
-				if fault or (piece.scaleFault and piece.scaleFault >= first and piece.scaleFault <= last) then
-					piece.scaleFault = fault
-				end
-			end
-			piece.lastSample = state.frames
-		end
-		local healthy, fallback = pose(piece)
-		if not healthy and piece.scaleFault == nil then
-			piece.scaleFault = check_scale(piece, 1, #piece.bones)
-			fallback = fallback and piece.scaleFault == nil
-		end
-		local checked = sampledNow and (checkWrist or piece.scaleFault ~= nil or remote)
-		if checked then piece.recheck = not healthy or piece.isolated end
-		if healthy and (checked or not piece.recheck) then
-			piece.failures = 0
-			piece.successes = (piece.successes or 0) + 1
-			if piece.isolated and piece.successes >= 3 then
-				piece.isolated, piece.recheck = false, nil
-				runtime.logger("[physbone][独立骨] 恢复 %s", piece.tag)
-			end
-		elseif not healthy and (piece.scaleFault == nil or checked) then
-			piece.successes = 0
-			piece.failures = (piece.failures or 0) + 1
-			if not piece.isolated and piece.failures >= 3 then
-				piece.isolated = true
-				runtime.logger("[physbone][独立骨][警告] 隔离 %s", piece.tag)
-			end
-		end
-		if piece.isolated and not fallback and not piece.hidden then calls = calls + independent_visibility(piece, false) end
-		if not piece.isolated and healthy and piece.hidden then calls = calls + independent_visibility(piece, true) end
-	end
-
-	state.hasLinks, state.linkedUnits = false, {}
-	state.correction = { due = due, now = now, nextAt = state.nextCorrection, blend = blend, paused = paused }
-	for index = #state.pieces, 1, -1 do
-		local piece = state.pieces[index]
-		if not Roster.isLive(runtime, piece.unit) then
-			table.remove(state.pieces, index)
-			state.samplePiece, state.sampleRound = nil, nil
-			state.rescanAt = frame + 1
-		else
-			if piece.linkFailed and not piece.link and piece.linkRetryAt and frame >= piece.linkRetryAt then
-				piece.linkFailed, piece.linkRetryAt = nil, nil
-			end
-			local linked = piece.link and not piece.linkFailed
-			local pieceDue = due or not piece.link
-			if piece.link and (not linkEnabled or piece.linkFailed) then
-				if not IndependentLink.restore(state, piece) then pieceDue = false end
-				linked = false
-			end
-			if linkEnabled and state.rest and pieceDue and not paused and not piece.link and not piece.linkFailed then
-				linked = IndependentLink.attach(runtime, state, piece)
-			end
-			if linked then
-				local ok, n, cost = pcall(IndependentLink.present, runtime, state, piece, pieceDue, now,
-					blend and not paused, sample, vectors, readPose)
-				if ok then
-					written, calls = written + n, calls + cost
-					state.hasLinks, state.linkedUnits[piece.unit] = true, true
-					if paused then
-						for _, row in pairs(piece.link.rows) do row.endpoint = nil end
-					end
-					if piece.hidden then calls = calls + independent_visibility(piece, true) end
-				else
-					IndependentLink.fail(runtime, state, piece, n)
-					if runtime.weaponShift then
-						IndependentLink.restore_weapon(runtime)
-						state.nextCorrection = nil
-					end
-					linked = false
-				end
-			end
-			if not linked and not piece.link and (not paused or piece.linkFailed) then
-				legacy_piece(piece)
-			end
-			if not linked and not piece.link and pieceDue and not paused and not piece.hidden then
-				local count, cost = IndependentLink.present_clothing(runtime, state, piece)
-				written, calls = written + count, calls + cost
-			end
-		end
-	end
-	written, calls = written + vectors.written, calls + vectors.calls
-	state.frames = state.frames + 1
-	if INDEPENDENT_LOG_FRAMES[state.frames] then
-		runtime.logger("[physbone][独立骨] 第%d帧 %d件 写入=%d 调用=%d", state.frames, #state.pieces, written, calls)
-	end
-	return written, calls, state
-end
-
-local function sample_action_state(runtime, avatar)
-	local tune = tune_values(runtime)
-	local enabled = tune.stateLog
-	local cache = runtime.actionStateLog
-	if enabled == nil and tune.text ~= nil then
-		if tune.text.stateLog == "false" then enabled = 0 end
-		if tune.text.stateLog == "true" then enabled = 1 end
-	end
-	if enabled == 0 or (enabled == nil and (runtime.options or {}).stateLog ~= true) then
-		if cache ~= nil then
-			cache.avatar, cache.world, cache.previous = nil, nil, nil
-		end
-		return
-	end
-
-	local log = runtime.logger
-	local second = os.time()
-	if cache == nil then
-		cache = { second = second, lines = 0, skipped = 0, starts = {} }
-		runtime.actionStateLog = cache
-	elseif cache.second ~= second then
-		if cache.skipped > 0 then log("[physbone][动作状态] 省略 %d 次变化", cache.skipped) end
-		cache.second, cache.lines, cache.skipped = second, 0, 0
-	end
-
-	local unit = S.Unit
-	if avatar == nil or try(unit.alive, avatar) ~= true then avatar = nil end
-	local world = runtime.world
-	if cache.avatar ~= avatar or cache.world ~= world then
-		cache.avatar, cache.world, cache.previous = avatar, world, nil
-		if avatar ~= nil then cache.starts[#cache.starts + 1] = tostring(avatar) end
-	end
-	-- 每个自然秒留一行给上一秒的省略汇总；换人通知也占本秒额度。
-	while cache.lines < 19 and #cache.starts > 0 do
-		log("[physbone][动作状态] 开始采集 avatar=%s", table.remove(cache.starts, 1))
-		cache.lines = cache.lines + 1
-	end
-
-	-- 缺少状态机时两个动画读取接口都不能进；pcall 无法拦住原生崩溃。
-	if avatar == nil then return end
-	local animation = frame_animation_machine(runtime, avatar)
-	if not animation.active then return end
-	local current = frame_animation_state(animation, avatar)
-	if current == nil then return end
-	local previous = cache.previous
-	local changed = previous == nil or previous.n ~= current.n
-	if not changed then
-		for index = 1, current.n do
-			if previous[index] ~= current[index] then changed = true; break end
-		end
-	end
-	cache.previous = current
-	if not changed then return end
-	if cache.lines >= 19 then
-		cache.skipped = cache.skipped + 1
-		return
-	end
-
-	local layers, values = {}, {}
-	if previous ~= nil then
-		for index = 1, math.max(previous.n, current.n) do
-			if previous[index] ~= current[index] or (index <= previous.n) ~= (index <= current.n) then
-				layers[#layers + 1] = string.format("%d:%s→%s", index - 1,
-					tostring(previous[index]), tostring(current[index]))
-			end
-		end
-	end
-	for index = 1, current.n do values[index] = tostring(current[index]) end
-	local time, length = frame_animation_layer(animation, avatar)
-	local clip = "?"
-	if type(time) == "number" and time >= 0 and time < math.huge
-		and type(length) == "number" and length > 0 and length < math.huge then
-		clip = string.format("%.3fs/t=%.2fs", length, time)
-	end
-	log("[physbone][动作状态] n=%d 变化层=%s L11片段=%s 全部=[%s]", current.n,
-		previous == nil and "初始" or table.concat(layers, ","), clip, table.concat(values, ","))
-	cache.lines = cache.lines + 1
-end
-
-local function apply_arm_pose_frame(runtime)
-	if type(Compat.apply_arm_pose) ~= "function" then return 0, 0 end
-	-- 本帧枚举（drive 已做则同帧复用）：本帧用到的句柄都来自这一次枚举。
-	if runtime.roster == nil or runtime.roster.frame ~= (runtime.frame or 0) then
-		local okRoster = pcall(Roster.update, runtime)
-		if okRoster and runtime.roster ~= nil and runtime.roster.identity then resolve_local_avatar_for_arm(runtime) end
-	end
-	local unit = runtime.avatar
-	if unit ~= nil and not Roster.isLive(runtime, unit) then
-		runtime.avatar, unit = nil, nil
-	end
-	if unit == nil then
-		unit = resolve_local_avatar_for_arm(runtime)
-	end
-	sample_action_state(runtime, unit)
-	local independent = runtime.options and runtime.options.independentBones
-	local hasIndependent = type(independent) == "table" and #independent > 0
-	if unit == nil and not hasIndependent then
-		runtime.armState = nil
-		IndependentLink.release_all(runtime)
-		runtime.armCalls = 0
-		-- 一次性：开着却一直找不到玩家角色（实机排查"到底跑没跑"用）。
-		runtime.armMissFrames = (runtime.armMissFrames or 0) + 1
-		if runtime.armMissFrames == 600 and not runtime.armMissLogged then
-			runtime.armMissLogged = true
-			runtime.logger("[physbone][警告] 姿态修正：开着但 600 帧内没找到玩家角色（avatar），一次都没写")
-		end
-		return 0, 0
-	end
-	-- E12f-C3：原来这里对本人 avatar 再调一次 `Compat.unit_alive`。IAS 没有：unit 只来自本帧枚举（R:894-896、R:1417-1422）。
-	-- 走到这里 `unit` 要么刚过 `Roster.isLive`（上面），要么来自 `Roster.localAvatar`（现在只认本帧枚举），所以必是本帧句柄。
-	local world = runtime.cache and runtime.cache.world or nil
-	if hasIndependent then
-		-- 2.1.66：IAS 对每个绑定的 avatar 每帧 retarget（R:6860-7010 bind_unit / push_avatar），不等身份；role 只喂物理类别（R:6975-6976）。
-		-- 所以：本人（role 1）走完整路径；其余每个在场 avatar（队友、或身份还没解出来时的所有人）走"只写旋转"路径。
-		-- 给了独立骨就只驱动独立骨：写 avatar 同名骨画面不认（实机证实），白花调用。
-		local written, calls = 0, 0
-		if unit ~= nil then
-			local state
-			written, calls, state = independent_frame(runtime, unit, world, independent, runtime.independent, false)
-			runtime.independent = state
-		elseif runtime.independent ~= nil then
-			independent_release(runtime, runtime.independent)
-			runtime.independent = nil
-			runtime.armState = nil
-		end
-		local remoteStates = runtime.independentRemotes or {}
-		runtime.independentRemotes = {}
-		local tune = tune_values(runtime)
-		local remoteEnabled = runtime.options.independentTeammates ~= false
-		if tune.text and tune.text.independentTeammates ~= nil then
-			remoteEnabled = tune.text.independentTeammates == "true" or tune.text.independentTeammates == "1"
-		end
-		local roster = runtime.roster
-		if remoteEnabled and roster ~= nil and roster.frame == (runtime.frame or 0) then
-			local metres = sched_settings(runtime).metres
-			local frame = runtime.frame or 0
-			local distances = {}
-			for _, owner in ipairs(runtime.avatars or {}) do distances[owner.unit] = owner.cameraDistance end
-			local index = 0
-			for avatarWorld, row in pairs(roster.byWorld) do
-				for _, owner in ipairs(row.avatars) do
-					if owner.unit ~= unit then
-						index = index + 1
-						local distance = distances[owner.unit] or math.huge
-						local stride = (runtime.options.profileHashes ~= nil or distance <= metres * metres) and 1 or 4
-						local remote = remoteStates[owner.unit]
-						remoteStates[owner.unit] = nil
-						if (frame + index) % stride == 0 then
-							local n, cost
-							n, cost, remote = independent_frame(runtime, owner.unit, avatarWorld, independent, remote, true)
-							written, calls = written + n, calls + cost
-						end
-						runtime.independentRemotes[owner.unit] = remote
-					end
-				end
-			end
-		end
-		for _, remote in pairs(remoteStates) do independent_release(runtime, remote) end
-		if not runtime.armFirstLogged and written > 0 then
-			runtime.armFirstLogged = true
-			runtime.logger("[physbone] 独立骨首次生效 unit=%s 写入=%d 调用=%d",
-				tostring(unit ~= nil and unit_tag(S, unit) or "队友/未解身份"), written, calls)
-		end
-		runtime.armCalls = calls
-		runtime.armCallsAccum = (runtime.armCallsAccum or 0) + calls
-		runtime.armFrames = (runtime.armFrames or 0) + 1
-		runtime.armAlpha = 0
-		return written, calls
-	end
-	local written, calls, alpha, _, resolved = Compat.apply_arm_pose(
-		S, world, unit, runtime.armState, runtime.dt, arm_pose_options(runtime))
-	runtime.armState = resolved
-	-- 一次性：第一次真正写进去 / 腿骨查不到。只记一行，用来在实机日志里确认"跑起来了没有"。
-	if not runtime.armFirstLogged and (written or 0) > 0 then
-		runtime.armFirstLogged = true
-		runtime.logger("[physbone] 姿态修正首次生效 unit=%s 写入=%d 调用=%d 腿=%s",
-			tostring(unit_tag(S, unit)), written or 0, calls or 0,
-			resolved ~= nil and (resolved.legNodes == false and "缺骨" or resolved.legNodes ~= nil and "已写" or "无目标") or "-")
-	end
-	if resolved ~= nil and resolved.legNodes == false and not runtime.legMissLogged then
-		runtime.legMissLogged = true
-		runtime.logger("[physbone][警告] 姿态修正：给了腿关节目标，但这个 unit 找不到腿骨，腿不修")
-	end
-	runtime.armCalls = calls or 0
-	runtime.armCallsAccum = (runtime.armCallsAccum or 0) + (calls or 0)
-	runtime.armFrames = (runtime.armFrames or 0) + 1
-	runtime.armAlpha = alpha or 0
-	return written or 0, calls or 0
-end
-
--- ---------------------------------------------------------------------------
--- E12f-C2：尸体副本（CorpseFreeze）。逐段复刻 IAS 1.6.4 的 `__hd2ir_corpse_freeze`（R:5432-6002）与
--- `__hd2ir_shared_body_lifecycle`（R:5190-5246）；代码自己写，行为与常数照 IAS，每段标注 IAS 行号（R:n）。
---
--- 和 IAS 唯一"不是逐字"的映射（用户允许的）：
---   · 原生 `freeze_corpse_physics(profile, instance, avatar)`（R:5923）没有可用实现。我们的物理求解器是 Lua，
---     所以它的等价物 = 停止模拟 / 停止写这具尸体的护甲件（被隐藏的原件）：丢掉原件的物理会话，并让 physics_sync 之后不再给它挂会话。
--- 没有 IAS 对应物、也没有在这里即兴补的东西，见 docs/agent 的交接文档（"未复刻"一节）。
---
--- 铰接下落由 CorpseMotion 段提供（IAS `__hd2ir_corpse_motion`，R:5248-5429）；这里只调用它导出的同名函数：
---   names / new(anchors, velocity) / advance(state, elapsed) / frames(state) / deform(frames, owner, pose) / owner(name)
---   以及状态里的 points.hips.p、steps（R:5748、R:5760）。
--- ---------------------------------------------------------------------------
-local CorpseFreeze = Roster.freeze
-CorpseFreeze.enabled, CorpseFreeze.active = false, false
-local cf = {
-	frozen = {}, clones = {}, liveCache = {}, livePending = {}, logged = {}, failed = {}, errors = {},
-	pending = {}, cores = {}, tornCache = {}, tornCore = {}, tornBudget = 0, jointCache = {}, offsetCache = {}, stopped = {},
-	tick = 0, now = 0, created = 0, runtime = nil,
-}
-CorpseFreeze.state = cf   -- 仅测试读取
-
-local unpack = unpack or table.unpack
-
--- 数学（IAS R:177-240；四元数 {x,y,z,w}，主动旋转、列向量约定）
-local CZ = {}
-function CZ.finite(n) return type(n) == "number" and n == n and math.abs(n) < math.huge end
-function CZ.qnormalize(q)
-	local n = math.sqrt(q[1] * q[1] + q[2] * q[2] + q[3] * q[3] + q[4] * q[4])
-	if not CZ.finite(n) or n < 1.0e-8 then return nil end
-	return { q[1] / n, q[2] / n, q[3] / n, q[4] / n }
-end
-function CZ.qconjugate(q) return { -q[1], -q[2], -q[3], q[4] } end
-function CZ.qmul(a, b)
-	local x = a[4] * b[1] + a[1] * b[4] + a[2] * b[3] - a[3] * b[2]
-	local y = a[4] * b[2] - a[1] * b[3] + a[2] * b[4] + a[3] * b[1]
-	local z = a[4] * b[3] + a[1] * b[2] - a[2] * b[1] + a[3] * b[4]
-	local w = a[4] * b[4] - a[1] * b[1] - a[2] * b[2] - a[3] * b[3]
-	local n = math.sqrt(x * x + y * y + z * z + w * w)
-	if not CZ.finite(n) or n < 1.0e-8 then return nil end
-	return { x / n, y / n, z / n, w / n }
-end
-function CZ.qrotate(q, p)
-	local x, y, z, w = q[1], q[2], q[3], q[4]
-	local tx = 2.0 * (y * p[3] - z * p[2])
-	local ty = 2.0 * (z * p[1] - x * p[3])
-	local tz = 2.0 * (x * p[2] - y * p[1])
-	return { p[1] + w * tx + (y * tz - z * ty), p[2] + w * ty + (z * tx - x * tz), p[3] + w * tz + (x * ty - y * tx) }
-end
-function CZ.qerror_degrees(a, b)
-	local ax, ay, az, aw = -a[1], -a[2], -a[3], a[4]
-	local x = aw * b[1] + ax * b[4] + ay * b[3] - az * b[2]
-	local y = aw * b[2] - ax * b[3] + ay * b[4] + az * b[1]
-	local z = aw * b[3] + ax * b[2] - ay * b[1] + az * b[4]
-	local w = aw * b[4] - ax * b[1] - ay * b[2] - az * b[3]
-	local n = math.sqrt(x * x + y * y + z * z + w * w)
-	if not CZ.finite(n) or n < 1.0e-8 then return math.huge end
-	w = math.abs(w / n)
-	if w > 1.0 then w = 1.0 end
-	return 2.0 * math.acos(w) * 180.0 / math.pi
-end
-function CZ.perror(a, b)
-	local x, y, z = a[1] - b[1], a[2] - b[2], a[3] - b[3]
-	return math.sqrt(x * x + y * y + z * z)
-end
-function CZ.compose_pose(aq, ap, bq, bp)
-	local q = CZ.qmul(aq, bq)
-	local rp = CZ.qrotate(aq, bp)
-	if q == nil or rp == nil then return nil, nil end
-	return q, { ap[1] + rp[1], ap[2] + rp[2], ap[3] + rp[3] }
-end
-function CZ.relative_pose(pq, pp, cq, cp)
-	local inverse = CZ.qconjugate(pq)
-	local q = CZ.qmul(inverse, cq)
-	local p = CZ.qrotate(inverse, { cp[1] - pp[1], cp[2] - pp[2], cp[3] - pp[3] })
-	return q, p
-end
-function CZ.close(aq, ap, bq, bp)   -- IAS R:5476-5478
-	return aq and ap and bq and bp and CZ.qerror_degrees(aq, bq) < .1 and CZ.perror(ap, bp) < .001
-end
-
--- 引擎读写（IAS world_pose / engine_vector / engine_quaternion，R:313-352、R:430）。
--- 世界姿态走仓库已有的 Unit.world_pose（1 次调用 + 1 次 to_elements）；写入走已有的 write_independent_*。
-local function cz_world_pose(unit, node)
-	local pose = Compat.independent_world_pose(S, unit, node)
-	if pose then return pose.q, pose.p end
-end
-local function cz_vector(p)
-	local ok, value = pcall(S.Vector3, p[1], p[2], p[3])
-	if ok then return value end
-end
-local function cz_quaternion(q)
-	local value = Compat.independent_rotation_object(S, q, true)
-	return value
-end
-local function cz_set(unit, node, pose)   -- IAS `set`（R:5658-5661）
-	assert(Compat.write_independent_rotation(S, unit, node, pose.q, true), 'rotation write failed')
-	assert(Compat.write_independent_position(S, unit, node, pose.p, 1), 'position write failed')
-end
-local function cz_slot(unit) return Roster.instanceSlot(unit, cf.tick) end   -- IAS R:5438
-local function cz_log(text)
-	local runtime = cf.runtime
-	if runtime and runtime.logger then runtime.logger('[physbone][尸体副本] %s', text) end
-end
-local function cz_note(key, message)   -- IAS R:5439-5441：同一个 key 只记一次
-	if not cf.logged[key] then cf.logged[key] = true; cz_log('corpse-copy-v4 ' .. message) end
-end
-function CorpseFreeze.report(kind, err)   -- IAS R:5442-5449：同类错误 5 s 记一次
-	local r = cf.errors[kind] or { next = 0, count = 0 }
-	cf.errors[kind] = r
-	r.count = r.count + 1
-	if cf.now >= r.next then
-		cz_log('corpse-copy-v4 ' .. kind .. ' rejected count=' .. r.count .. ' error=' .. tostring(err))
-		r.next = cf.now + 5
-	end
-end
-
---- IAS `eligible`（R:5451-5457）要求 profile 声明了性别 / authored / active / 非 observe_only。
---- 转换与部署已按原始 flags、节点 authored 位和启用的路由筛选。旧包没有声明。
-local function cz_eligible(b)
-	local profiles = cf.runtime and cf.runtime.options.corpseProfiles
-	return profiles and b and profiles[b.hash] == true and not b.pose_only
-end
-
-local function cz_available()   -- IAS R:5461-5470（去掉原生 ABI 一项）
-	for _, name in ipairs({ 'spawn_unit', 'destroy_unit', 'unlink_unit', 'update_unit' }) do
-		if type(S.World and S.World[name]) ~= 'function' then return false, 'World.' .. name end
-	end
-	for _, name in ipairs({ 'name_hash', 'set_unit_visibility', 'scene_graph_link', 'scene_graph_parent', 'has_node', 'node', 'alive' }) do
-		if type(S.Unit and S.Unit[name]) ~= 'function' then return false, 'Unit.' .. name end
-	end
-	return true
-end
-
---- IAS `core`（R:5471-5493）：死者的 hips 世界姿态 + 头相对 hips 的轴；每帧每个 avatar 只算一次。
-local function cz_core(avatar)
-	local U = S.Unit
-	local key = cz_slot(avatar.unit)
-	if cf.cores[key] then return cf.cores[key] end
-	if U.alive(avatar.unit) ~= true or U.has_node(avatar.unit, 'hips') ~= true then return nil end
-	local n = U.node(avatar.unit, 'hips')
-	local count = U.num_scene_graph_items(avatar.unit)
-	if type(n) ~= 'number' or n ~= math.floor(n) or n < 0 or n > count or count > 256 then return nil end
-	local q, p = cz_world_pose(avatar.unit, n)
-	if not q or not p then return nil end
-	local c = { node = n, q = q, p = p, owner = key }
-	if U.has_node(avatar.unit, 'head') == true then
-		local head = U.node(avatar.unit, 'head')
-		if type(head) == 'number' and head >= 0 and head <= count then
-			local _, hp = cz_world_pose(avatar.unit, head)
-			local d = hp and CZ.perror(hp, p)
-			if d and d > .1 and d < 2 then
-				c.up = CZ.qrotate(CZ.qconjugate(q), { (hp[1] - p[1]) / d, (hp[2] - p[2]) / d, (hp[3] - p[3]) / d })
-			end
-		end
-	end
-	cf.cores[key] = c
-	return c
-end
-
-local CZ_LIMB_EDGES = { { 'neck', 'head' }, { 'chest', 'neck' },
-	{ 'l_clavicle', 'l_shoulder' }, { 'l_shoulder', 'l_elbow' }, { 'l_elbow', 'l_hand' },
-	{ 'r_clavicle', 'r_shoulder' }, { 'r_shoulder', 'r_elbow' }, { 'r_elbow', 'r_hand' },
-	{ 'hips', 'l_thigh' }, { 'l_thigh', 'l_knee' }, { 'l_knee', 'l_foot' },
-	{ 'hips', 'r_thigh' }, { 'r_thigh', 'r_knee' }, { 'r_knee', 'r_foot' } }
-
---- IAS `detached`（R:5511-5527）：身体各段飞散（离 hips > 3.5 m，或肢段长度超过静止长度 + max(.12, 40%)）。
-local function cz_detached(native, c, cached)
-	for name, pose in pairs(native or {}) do
-		if type(pose) ~= 'table' or not pose.p then return true end
-		if name ~= 'boss' and name ~= 'root' and name ~= 'StingrayEntityRoot' and
-			name ~= 'FbxAxisSystem_ConvertNode' and CZ.perror(pose.p, c.p) > 3.5 then return true end
-	end
-	for _, edge in ipairs(CZ_LIMB_EDGES) do
-		local a, b = native and native[edge[1]], native and native[edge[2]]
-		local ca, cb = cached and cached[edge[1]], cached and cached[edge[2]]
-		if a and b and ca and cb then
-			local rest = CZ.perror(ca.p, cb.p)
-			if CZ.perror(a.p, b.p) > rest + math.max(.12, rest * .4) then return true end
-		end
-	end
-	return false
-end
-
---- IAS `capture`（R:5528-5544）：整件每个节点相对 hips 的姿态。
-local function cz_capture(unit, count, offset, c, explicit)
-	local rows, hits = {}, 0
-	for n = offset, count - 1 + offset do
-		local chosen = explicit and explicit[n + 1]
-		local q, p
-		if chosen then q, p, hits = chosen.q, chosen.p, hits + 1 else q, p = cz_world_pose(unit, n) end
-		if not q or not p then return nil end
-		q, p = CZ.relative_pose(c.q, c.p, q, p)
-		if not q or not p then return nil end
-		rows[n] = { q = { q[1], q[2], q[3], q[4] }, p = { p[1], p[2], p[3] } }
-	end
-	return rows, hits
-end
-
---- StingrayEntityRoot 节点号（IAS 的 node_offset，只可能是 0 或 1，R:5638-5639）。
---- 按实例槽缓存（同一个 unit 的节点表不会变）：IAS 的 offset 来自它每帧本来就要做的 authored_scene_node_offset（R:4053，
---- 属 retarget 的常规开销、不计入尸体项）；我们没有那一步，所以采样帧不能每次再付 2 次查询——否则尸体项会比 IAS 多。
---- 缓存条目 30 s 没被读到就丢（begin 里清）；真正复制前 cz_prepare 仍会逐项重新断言根节点号（R:5640-5641），缓存过期不会放过错误布局。
-local function cz_root_offset(unit)
-	local key = cz_slot(unit)
-	local cached = cf.offsetCache[key]
-	if cached then cached.time = cf.now; return cached.offset end
-	local U = S.Unit
-	if U.has_node(unit, 'StingrayEntityRoot') ~= true then return nil end
-	local n = U.node(unit, 'StingrayEntityRoot')
-	if n == 0 or n == 1 then cf.offsetCache[key] = { offset = n, time = cf.now }; return n end
-end
-
---- 关节映射：节点号 → 源骨名（IAS R:5617-5622：profile.target_flags 的 1024 位 + target_sources）。
---- 我们没有 target_flags；等价数据是转换器的 independentPieces（该件上的目标骨名）与 independentBones（目标骨 → 源骨名）。
---- 只有独立骨件有关节；纯物理件没有（⇒ 没有铰接下落，走 IAS 的"刚性倒下 / 活体定格"回退）。
---- 节点号按 (实例槽, hash) 缓存：同一个 unit 的节点表不会变，所以稳态零引擎调用。
-local function cz_unit_joints(b)
-	local runtime = cf.runtime
-	local options = runtime and runtime.options or {}
-	local key = cz_slot(b.unit)
-	local cached = cf.jointCache[key]
-	if cached and cached.hash == b.hash then return cached.map end
-	local map = {}
-	local names = options.independentPieces and options.independentPieces['#ID[' .. b.hash .. ']']
-	local source = {}
-	for _, bone in ipairs(options.independentBones or {}) do source[bone[1]] = bone[2] end
-	for _, name in ipairs(names or {}) do
-		local joint = source[name]
-		if joint then
-			local node = safe_node(S, b.unit, name)
-			if node then map[node] = joint end
-		end
-	end
-	cf.jointCache[key] = { hash = b.hash, map = map }
-	return map
-end
-
---- 关节的世界位置表（IAS 的 native：name -> {p}），由 capture 出来的 shape 算出（零引擎调用）。
-local function cz_native_from_shape(shape, joints, c)
-	local native = {}
-	for n, name in pairs(joints) do
-		local row = shape[n]
-		if row then
-			local r = CZ.qrotate(c.q, row.p)
-			native[name] = { p = { c.p[1] + r[1], c.p[2] + r[2], c.p[3] + r[3] } }
-		end
-	end
-	return native
-end
-
---- IAS `observe` 对死者的 torn（R:5604-5607）用的是原生每帧给的关节位置（`native`，R:2724-2735 `__hd2ir_sample_native_links`
---- 是 retarget 的常规开销），我们没有这份数据：改成每 0.25 s 一个桶读一次这件的关节节点（独立骨件才有）。
---- 这是相对 IAS 唯一多出来的引擎读取（IAS 的对应读取属常规 retarget、不算尸体项，但我们仍然限额）：
---- 为了让"已死未满 4 s"那几秒里尸体定格的每帧调用峰值不超过 IAS（IAS 此时每帧只付 core 的 10 次，R:5472-5493），
---- 把一个桶的读取摊到连续几帧：每帧最多 CZ_TORN_BUDGET 次调用（= 10）——先读一次 owner 的 core（≤10，同帧已缓存则免费），
---- 之后每帧最多 5 个关节（各 2 次）；全部读完才判 detached（用 core 那一帧的 hips 位置，几帧内位移远小于 3.5 m 的判据）。
-local CZ_TORN_BUDGET = 10
-
-local function cz_torn_estimate(b, key, bucket)
-	local e = cf.tornCache[key]
-	if e and e.bucket == bucket and e.done then return e.early end
-	if not e or e.bucket ~= bucket then
-		e = { bucket = bucket, early = e ~= nil and e.early or false, time = cf.now, idx = 1, native = {} }
-		cf.tornCache[key] = e
-	end
-	local joints = cz_unit_joints(b)
-	if next(joints) == nil then e.done, e.early = true, false; return false end
-	local owner = cz_slot(b.avatar.unit)
-	local scan = cf.tornCore[owner]
-	if not scan or scan.bucket ~= bucket then
-		local c = cf.cores[owner]
-		if not c then
-			if cf.tornBudget < CZ_TORN_BUDGET then return e.early end   -- core 最多 10 次调用：等一个预算整的帧
-			c = cz_core(b.avatar)
-			cf.tornBudget = 0
-		end
-		if not c then return e.early end
-		scan = { bucket = bucket, c = c, time = cf.now }
-		cf.tornCore[owner] = scan
-	end
-	if not e.order then
-		e.order = {}
-		for n in pairs(joints) do e.order[#e.order + 1] = n end
-		table.sort(e.order)
-	end
-	while e.idx <= #e.order and cf.tornBudget >= 2 do
-		local n = e.order[e.idx]
-		local _, p = cz_world_pose(b.unit, n)
-		cf.tornBudget = cf.tornBudget - 2
-		if p then e.native[joints[n]] = { p = p } end
-		e.idx = e.idx + 1
-	end
-	if e.idx > #e.order then
-		local last = cf.liveCache[key]
-		e.early = cz_detached(e.native, scan.c, last and last.native)
-		e.done = true
-	end
-	return e.early
-end
-
---- 开关：IAS 的原生 `corpse_freeze_enabled()`（R:5549）读 IAS 自己的设置。我们没有那个设置页；
---- 用调参文件 `corpseFreeze = 0/1` 与安装选项 `corpseFreeze`，调参文件优先；默认开，与 IAS 默认一致
---- （IAS native_bridge/preferences.py:20 `optimization.load(dict(freeze=True,...))`，1.6.4 面板里没有这个开关的按钮）。
-local function cz_enabled(runtime)
-	local ok, values = pcall(tune_values, runtime)
-	local value = ok and values and values.corpseFreeze
-	if value ~= nil then return value ~= 0 end
-	return not (runtime.options ~= nil and runtime.options.corpseFreeze == false)
-end
-
--- 共享身体的"化身号"簿记（IAS `__hd2ir_shared_body_lifecycle`，R:5190-5246）。
--- 原生那一侧（shared_next_incarnation / forget_shared_avatar / set_avatar_incarnation）我们没有；Lua 簿记照 IAS：
--- 每个实例槽一个化身号，epoch / world / network / kind 任何一项变了就忘掉旧的、之后给新的。
--- 在我们的运行时里这个号没有消费者（物理是 Lua 求解器，不需要原生去配对），所以它什么也不门控。
-local lifecycle = { live = {}, counter = 0, forgotten = 0 }
-CorpseFreeze.lifecycle = lifecycle
-local function lifecycle_valid(n) return type(n) == 'number' and n == math.floor(n) and n >= 0 and n <= 9007199254740991 end
-function lifecycle.observe(avatars, evidence)
-	local accepted = {}
-	local ok = pcall(function()
-		assert(type(avatars) == 'table' and #avatars <= 32)
-		local seen = {}
-		for _, item in ipairs(avatars) do
-			local id = item.instance_slot
-			assert(lifecycle_valid(id) and id > 0 and not seen[id]); seen[id] = true
-			local e = evidence(item)
-			if e ~= nil then
-				assert(lifecycle_valid(e.epoch) and lifecycle_valid(e.world) and lifecycle_valid(e.network))
-				accepted[id] = e
-			end
-		end
-	end)
-	if not ok then accepted = {} end   -- 证据不全 / 含糊就退役，不猜（R:5207）
-	for id, old in pairs(lifecycle.live) do
-		local e = accepted[id]
-		if not e or old.epoch ~= e.epoch or old.world ~= e.world or old.network ~= e.network or old.kind ~= e.kind then
-			lifecycle.forgotten = lifecycle.forgotten + 1
-			lifecycle.live[id] = nil
-		end
-	end
-	for id, e in pairs(accepted) do
-		if not lifecycle.live[id] then
-			lifecycle.counter = lifecycle.counter + 1
-			lifecycle.live[id] = { epoch = e.epoch, world = e.world, network = e.network, kind = e.kind, token = lifecycle.counter }
-		end
-	end
-end
-function lifecycle.token(id) local value = lifecycle.live[id]; return value and value.token end
-
---- IAS R:6917：每帧对在场 avatar 观察一次（evidence = shared_life）。只在尸体副本开启时才跑（共享身份证据每个存活角色每帧约 5 次引擎查询）。
-function CorpseFreeze.lifecycleObserve(runtime, avatars)
-	local frame = runtime.frame or 0
-	local rows = {}
-	for _, a in ipairs(avatars) do rows[#rows + 1] = { unit = a.unit, world = a.world, instance_slot = Roster.instanceSlot(a.unit, frame) } end
-	lifecycle.observe(rows, function(item) return Roster.sharedLife(item.unit, item.world, frame) end)
-end
-
-function CorpseFreeze.reset()
-	cf.frozen, cf.clones, cf.liveCache, cf.livePending, cf.logged, cf.failed, cf.errors = {}, {}, {}, {}, {}, {}, {}
-	cf.pending, cf.cores, cf.tornCache, cf.tornCore, cf.jointCache, cf.offsetCache, cf.stopped = {}, {}, {}, {}, {}, {}, {}
-	cf.created, cf.runtime = 0, nil
-	lifecycle.live, lifecycle.counter, lifecycle.forgotten = {}, 0, 0
-	for key in pairs(Roster.corpsePins) do Roster.corpsePins[key] = nil end
-	CorpseFreeze.enabled, CorpseFreeze.active = false, false
-end
-
---- IAS `begin`（R:5546-5553）。
-function CorpseFreeze.begin(runtime)
-	cf.runtime, cf.tick, cf.now = runtime, runtime.frame or 0, os.clock()
-	cf.pending, cf.cores, cf.livePending = {}, {}, {}
-	cf.tornBudget = CZ_TORN_BUDGET
-
-	local was = CorpseFreeze.enabled
-	CorpseFreeze.enabled = cz_enabled(runtime)
-	runtime.corpseExplicit = CorpseFreeze.enabled and runtime.options.corpseProfiles and {} or nil -- R:4707
-	if was ~= CorpseFreeze.enabled then
-		cz_log('corpse-copy-v4 enabled=' .. tostring(CorpseFreeze.enabled))
-		if not CorpseFreeze.enabled then lifecycle.observe({}, function() return nil end) end
-	end
-	CorpseFreeze.active = CorpseFreeze.enabled or next(cf.clones) ~= nil
-	for key, r in pairs(cf.liveCache) do if cf.now - r.time > 30 then cf.liveCache[key] = nil end end   -- R:5552
-	for key, r in pairs(cf.tornCache) do if cf.now - r.time > 30 then cf.tornCache[key] = nil end end
-	for key, r in pairs(cf.offsetCache) do if cf.now - r.time > 30 then cf.offsetCache[key] = nil end end
-	for key, r in pairs(cf.tornCore) do if cf.now - (r.time or cf.now) > 30 then cf.tornCore[key] = nil end end
-end
-
---- IAS `queue_input`（R:5590-5601）：死者 + 有 30 s 内的活体缓存 ⇒ 排一个"只用缓存"的待复制项。
---- IAS 在 retarget 读到原生快照之前调它（原生会拒绝撕裂的输入）；我们没有原生快照，early 恒为 false，
---- 紧接着同一帧的 observe 会覆盖它（R:4705 同样跟在后面），所以这里等价于只是排个占位。core 延到 flush 再取。
-function CorpseFreeze.queue_input(b, snapshot)
-	if not CorpseFreeze.enabled or not cz_eligible(b) or not b.instance_id or Roster.role(b.avatar.unit) ~= 3 then return end
-	local key = cz_slot(b.unit)
-	if (cf.frozen[key] and not cf.frozen[key].guard) or cf.clones[key] then return end
-	local cached = cf.liveCache[key]
-	if not cached or cached.world ~= cz_slot(b.world) or cached.owner ~= cz_slot(b.avatar.unit) or
-		cached.hash ~= b.hash or cached.count ~= b.node_count or cf.now - cached.time > 30 then return end
-	if snapshot then return end   -- 没有原生快照来源
-	cf.pending[key] = { world = b.world, binding = b, offset = cached.offset, cache_only = true, early = false }
-end
-
---- IAS `observe`（R:5602-5634）：活体每 0.25 s 一个样本（≤256 个，30 s 过期）；死者排一个待复制项。
-function CorpseFreeze.observe(b, explicit)
-	if not CorpseFreeze.enabled or not cz_eligible(b) then return end
-	local key = cz_slot(b.unit)
-	if (cf.frozen[key] and not cf.frozen[key].guard) or cf.clones[key] then return end
-	local role = Roster.role(b.avatar.unit)
-	if role ~= 1 and role ~= 2 and role ~= 3 then return end
-	local bucket = math.floor(cf.now * 4)
-	if role == 3 then
-		cf.pending[key] = { world = b.world, binding = b, explicit = explicit, early = cz_torn_estimate(b, key, bucket) }
-		return
-	end
-	-- 以下与 IAS 顺序不同处：先看桶 / 上限（零引擎调用），再读动画机与 core，调用数只会比 IAS 少。
-	local old = cf.liveCache[key]
-	if old and old.bucket == bucket then return end -- IAS R:5614–5616
-	local count = 0
-	for _ in pairs(cf.liveCache) do count = count + 1 end
-	if not old and count >= 256 then return end
-	if S.Unit.has_animation_state_machine(b.avatar.unit) ~= true then return end
-	local c = cz_core(b.avatar)
-	if not c then return end
-	local offset = cz_root_offset(b.unit)
-	if not offset then return end
-	local shape, explicitCount = cz_capture(b.unit, b.node_count, offset, c, explicit)
-	if not shape then return end
-	local joints = cz_unit_joints(b)
-	local native = cz_native_from_shape(shape, joints, c)
-	if cz_detached(native, c, old and old.native) then return end   -- 撕裂的样本不进缓存
-	local named = {}
-	for n, name in pairs(joints) do named[n] = name end
-	cf.livePending[key] = { shape = shape, explicitCount = explicitCount, bucket = bucket, time = cf.now, world = cz_slot(b.world), native = native, up = c.up,
-		owner = c.owner, hash = b.hash, count = b.node_count, offset = offset, joints = named,
-		core = { q = { unpack(c.q) }, p = { unpack(c.p) } } }
-end
-
---- IAS `prepare`（R:5635-5661）：复制前的布局核对。profile.nodes 的核对（R:5642-5644）无对应数据，略。
-local function cz_prepare(item, use_cache)
-	local U = S.Unit
-	local b = item.binding
-	local c = item.core or cz_core(b.avatar)
-	assert(c, 'core unavailable')
-	local unit, count = b.unit, b.node_count
-	local offset = item.offset or cz_root_offset(unit)
-	assert(cz_eligible(b) and (offset == 0 or offset == 1), 'undeclared gender or invalid offset')
-	assert(U.alive(unit) == true and U.num_scene_graph_items(unit) == count and count >= 2 and count <= 256 and
-		U.has_node(unit, 'StingrayEntityRoot') == true and U.node(unit, 'StingrayEntityRoot') == offset, 'unsupported Unit root/layout')
-	local resource = U.name_hash(unit)
-	assert(type(resource) == 'string' and #resource > 0, 'spawn resource unavailable')
-	local shape = not use_cache and cz_capture(unit, count, offset, c, item.explicit) or nil
-	assert(shape or use_cache, 'corrected shape capture failed')
-	local parents = {}
-	if use_cache then
-		for n = offset + 1, count - 1 + offset do parents[n] = U.scene_graph_parent(unit, n) end
-	end
-	return { unit = unit, world = item.world, shape = shape, count = count, offset = offset, core = c, resource = resource,
-		parents = parents, key = cz_slot(unit), hash = b.hash, world_slot = cz_slot(item.world), owner = c.owner,
-		avatar_unit = b.avatar.unit }
-end
-
---- IAS `apply`（R:5662-5686）。
-local function cz_apply(r)
-	local U, W = S.Unit, S.World
-	assert(cf.created < 256, 'copy lifetime limit')
-	cf.created = cf.created + 1   -- 失败的 spawn 也计数；一个会话内有上限（R:5663-5664）
-	local u = assert(W.spawn_unit(r.world, r.resource, assert(cz_vector(r.core.p)), assert(cz_quaternion(r.core.q))), 'spawn failed')
-	assert(u ~= r.unit, 'spawn returned original Unit')
-	r.clone = u
-	U.set_unit_visibility(u, false)
-	assert(U.alive(u) == true and U.name_hash(u) == r.resource and U.num_scene_graph_items(u) == r.count and
-		U.has_node(u, 'StingrayEntityRoot') == true and U.node(u, 'StingrayEntityRoot') == r.offset, 'copy identity/layout mismatch')
-	assert(U.has_animation_state_machine(u) ~= true, 'copy has active animation controller')
-	if type(U.num_actors) == 'function' then assert(U.num_actors(u) == 0, 'copy has native actors') end
-	W.unlink_unit(r.world, u)
-	U.scene_graph_link(u, r.offset, nil)
-	for n = r.offset + 1, r.count - 1 + r.offset do U.scene_graph_link(u, n, r.offset) end
-	cz_set(u, r.offset, r.core)
-	for n = r.offset + 1, r.count - 1 + r.offset do cz_set(u, n, r.shape[n]) end
-	W.update_unit(r.world, u)
-	for n = r.offset, r.count - 1 + r.offset do
-		local q, p = cz_world_pose(u, n)
-		local eq, ep = r.core.q, r.core.p
-		if n ~= r.offset then eq, ep = CZ.compose_pose(eq, ep, r.shape[n].q, r.shape[n].p) end
-		assert(CZ.close(q, p, eq, ep), 'copy world shape readback failed')
-		if n ~= r.offset then assert(U.scene_graph_parent(u, n) == r.offset, 'copy parent readback failed') end
-	end
-end
-
---- IAS `register_clone`（R:5687-5696）。副本 / 原件 / 世界 / 主人的槽位进 corpsePins（槽位表清理时不删）。
-local function cz_register_clone(r)
-	local key = cz_slot(r.clone)
-	local record = { world = r.world_slot, owner = r.owner, hash = r.hash, count = r.count, root = r.offset, original = r.key, clone = key,
-		guard = r.guard, shape = r.guard and r.shape or nil, motion_shape = r.motion_shape, motion_owners = r.motion_owners,
-		fixed_core = r.motion_shape and r.core or nil }
-	cf.clones[key] = record
-	local pins = Roster.corpsePins
-	pins[key], pins[r.key], pins[r.world_slot], pins[r.owner] = true, true, true, true
-	return record
-end
-
---- 替代原生 `freeze_corpse_physics`（R:5923）：停掉这件原件的 Lua 物理。
---- 之后 physics_sync 不再给它挂会话（CorpseFreeze.physicsStopped）；已有会话立刻丢掉（与"unit 不在枚举里"一样不碰句柄）。
-local function cz_freeze_physics(r)
-	cf.stopped[r.key] = true
-	local runtime = cf.runtime
-	if runtime and runtime.sessionByUnit then runtime.sessionByUnit[r.unit] = nil end
-	return true
-end
-function CorpseFreeze.physicsStopped(unit, frame)
-	if next(cf.stopped) == nil then return false end
-	return cf.stopped[Roster.instanceSlot(unit, frame or cf.tick)] == true
-end
-
---- IAS `fallen_rotation`（R:5697-5712）。
-local function cz_fallen_rotation(c, up)
-	assert(up, 'no intact body axis for fallen fallback')
-	local a = CZ.qrotate(c.q, up)
-	local d = math.sqrt(a[1] * a[1] + a[2] * a[2])
-	local b
-	if d > .01 then b = { a[1] / d, a[2] / d, 0 }
-	else
-		local side = CZ.qrotate(c.q, { 1, 0, 0 }); d = math.sqrt(side[1] * side[1] + side[2] * side[2])
-		b = d > .01 and { side[1] / d, side[2] / d, 0 } or { 1, 0, 0 }
-	end
-	local q = assert(CZ.qnormalize({ a[2] * b[3] - a[3] * b[2], a[3] * b[1] - a[1] * b[3],
-		a[1] * b[2] - a[2] * b[1], 1 + a[1] * b[1] + a[2] * b[2] + a[3] * b[3] }))
-	return CZ.qmul(CZ.qmul(CZ.qconjugate(c.q), q), c.q)
-end
-
---- IAS `rewrite_copy`（R:5713-5722）。
-local function cz_rewrite_copy(world, u, r, shape, c)
-	cz_set(u, r.root, c)
-	for n = r.root + 1, r.root + r.count - 1 do cz_set(u, n, shape[n]) end
-	S.World.update_unit(world, u)
-	for n = r.root + 1, r.root + r.count - 1 do
-		local q, p = cz_world_pose(u, n)
-		local eq, ep = CZ.compose_pose(c.q, c.p, shape[n].q, shape[n].p)
-		assert(CZ.close(q, p, eq, ep), 'guard final shape readback failed')
-	end
-end
-
---- IAS `start_motion`（R:5723-5774）。CorpseMotion 的导出名与 IAS 一致。
-local function cz_start_motion(prepared, g, age)
-	local m = CorpseMotion
-	assert(m and type(m.new) == 'function' and type(m.advance) == 'function' and type(m.frames) == 'function' and
-		type(m.deform) == 'function' and type(m.owner) == 'function' and type(m.names) == 'table', 'articulated module unavailable')
-	local ranked = {}
-	for _, r in ipairs(prepared) do ranked[#ranked + 1] = r end
-	local required = {}
-	for _, name in ipairs(m.names) do required[name] = true end
-	local function score(r)
-		local n = 0
-		for _, name in pairs(r.cached.joints or {}) do if required[name] then n = n + 1 end end
-		return n
-	end
-	table.sort(ranked, function(a, b) local x, y = score(a), score(b); if x ~= y then return x > y end; return a.hash < b.hash end)
-	local anchors = {}
-	local initial = assert(ranked[1].cached.core, 'missing complete living frame')
-	for _, r in ipairs(ranked) do
-		assert(cf.now - r.cached.time <= .8, 'living articulated sample too old')
-		for n, name in pairs(r.cached.joints or {}) do
-			if required[name] and not anchors[name] then
-				local q, p = CZ.compose_pose(initial.q, initial.p, r.shape[n].q, r.shape[n].p)
-				anchors[name] = { q = q, p = p }
-			end
-		end
-	end
-	local sampleAge = math.max(.016, cf.now - ranked[1].cached.time)
-	local current = prepared[1].core.p
-	local velocity = { (current[1] - initial.p[1]) / sampleAge, (current[2] - initial.p[2]) / sampleAge, (current[3] - initial.p[3]) / sampleAge }
-	local state = m.new(anchors, velocity)   -- 先完整校验，再改任何副本
-	local plans = {}
-	for _, r in ipairs(prepared) do
-		local owners, shape = {}, {}
-		for n, name in pairs(r.cached.joints or {}) do owners[n] = m.owner(name) end
-		for n = r.offset + 1, r.count - 1 + r.offset do
-			local q, p = CZ.compose_pose(initial.q, initial.p, r.shape[n].q, r.shape[n].p)
-			shape[n] = { q = q, p = p }
-			if not owners[n] then
-				local parent = r.parents[n]
-				local visited = {}
-				for _ = 1, r.count do
-					if type(parent) ~= 'number' or parent <= r.offset or parent >= r.offset + r.count or visited[parent] then break end
-					visited[parent] = true
-					if owners[parent] then owners[n] = owners[parent]; break end
-					parent = r.parents[parent]
-				end
-			end
-			if not owners[n] then
-				local best = math.huge
-				for _, name in ipairs(m.names) do
-					local d = CZ.perror(p, anchors[name].p)
-					if d < best then best = d; owners[n] = name end
-				end
-			end
-		end
-		plans[#plans + 1] = { r = r, shape = shape, owners = owners }
-	end
-	g.motion, g.motion_started = state, cf.now - math.min(age, 4)
-	for _, plan in ipairs(plans) do
-		plan.r.motion_shape, plan.r.motion_owners = plan.shape, plan.owners
-		plan.r.core = initial
-	end
-end
-
---- IAS `update_motion`（R:5775-5810）。
-local function cz_update_motion(world, g, rows)
-	local m = CorpseMotion
-	local complete, c
-	local ok, err = pcall(function()
-		complete = m.advance(g.motion, math.max(0, cf.now - g.motion_started))
-		local frames = m.frames(g.motion)
-		c = { q = { 0, 0, 0, 1 }, p = { unpack(g.motion.points.hips.p) } }
-		for _, row in ipairs(rows) do
-			local r = row.r
-			row.target = {}
-			for n, pose in pairs(r.motion_shape) do
-				local out = m.deform(frames, r.motion_owners[n], pose)
-				local q, p = CZ.relative_pose(c.q, c.p, out.q, out.p)
-				assert(q and p, 'invalid motion output')
-				row.target[n] = { q = q, p = p }
-			end
-		end
-		for _, row in ipairs(rows) do cz_rewrite_copy(world, row.u, row.r, row.target, c) end
-	end)
-	if ok then
-		for _, row in ipairs(rows) do
-			row.r.fixed_core, row.r.shape = c, row.target
-			if complete then
-				row.r.guard, row.r.shape, row.r.motion_shape, row.r.motion_owners = nil, nil, nil, nil
-				cf.liveCache[row.r.original] = nil
-			end
-		end
-		if complete then
-			cz_note('settled-' .. g.owner, 'frozen owner=' .. g.owner .. ' units=' .. #rows .. ' pose=articulated-fall fixed_world=true support=last-live-feet-approx steps=' ..
-				tostring(g.motion.steps) .. ' original_graph_untouched=true')
-		end
-	else
-		for _, row in ipairs(rows) do
-			local r = row.r
-			if not pcall(cz_rewrite_copy, world, row.u, r, r.shape, r.fixed_core) then r.quarantine = true end
-			r.guard, r.shape, r.motion_shape, r.motion_owners = nil, nil, nil, nil
-			cf.liveCache[r.original] = nil
-		end
-		CorpseFreeze.report('motion-write', err)
-	end
-end
-
---- IAS `finish_guard`（R:5811-5849）。
-local function cz_finish_guard(world, g, live, c)
-	local U = S.Unit
-	if not g.motion and cf.now < g.until_time then return end
-	local rows = {}
-	for _, key in ipairs(g.keys) do
-		local r = cf.frozen[key]
-		if not r or r.quarantine or not live[r.clone] or not live[key] then return end
-		local copy, original = live[r.clone], live[key]
-		if not cz_eligible(original) or original.hash ~= r.hash or copy.hash ~= r.hash or
-			U.alive(copy.unit) ~= true or U.alive(original.unit) ~= true or
-			U.num_scene_graph_items(copy.unit) ~= r.count or U.num_scene_graph_items(original.unit) ~= r.count then return end
-		rows[#rows + 1] = { r = r, u = copy.unit }
-	end
-	if g.motion then return cz_update_motion(world, g, rows) end
-	local ok, err = pcall(function()
-		local tilt = not g.settled and cz_fallen_rotation(c, g.up) or nil
-		for _, row in ipairs(rows) do
-			local r = row.r
-			if g.settled then row.target = g.settled[r.original]
-			else
-				row.target = {}
-				for n, p in pairs(r.shape) do row.target[n] = { q = CZ.qmul(tilt, p.q), p = CZ.qrotate(tilt, p.p) } end
-			end
-		end
-		for _, row in ipairs(rows) do cz_rewrite_copy(world, row.u, row.r, row.target, c) end
-	end)
-	if ok then
-		for _, row in ipairs(rows) do row.r.guard, row.r.shape = nil, nil; cf.liveCache[row.r.original] = nil end
-		cz_note('settled-' .. g.owner, 'frozen owner=' .. g.owner .. ' units=' .. #rows .. ' pose=' ..
-			(g.settled and 'intact-dead' or 'rigid-fallen-fallback') .. ' original_graph_untouched=true')
-	else
-		for _, row in ipairs(rows) do
-			if not pcall(cz_rewrite_copy, world, row.u, row.r, row.r.shape, c) then row.r.quarantine = true end
-			row.r.guard, row.r.shape = nil, nil
-			cf.liveCache[row.r.original] = nil
-		end
-		-- 最终写入失败：保留完整的显示，不每帧重试（R:5843-5847）
-		g.until_time = math.huge
-		CorpseFreeze.report('settle', err)
-	end
-end
-
---- IAS `flush`（R:5850-5950）：本帧结尾，对每个主人（一具尸体 = 一组件）决定是否复制。
-function CorpseFreeze.flush(bindings)
-	local U, W = S.Unit, S.World
-	local ready = cf.pending
-	cf.pending = {}
-	if not CorpseFreeze.enabled then return end
-	local ok, missing = cz_available()
-	if not ok then cz_note('api', 'unavailable=' .. missing .. '; original display retained'); return end
-	local groups = {}
-	for _, b in ipairs(bindings) do
-		local r = cf.frozen[cz_slot(b.unit)]
-		if cz_eligible(b) and b.instance_id and not cf.failed[cz_slot(b.avatar.unit)] and (not r or r.guard) and not cf.clones[cz_slot(b.unit)] then
-			local owner = cz_slot(b.avatar.unit)
-			local g = groups[owner] or {}
-			groups[owner] = g
-			g[#g + 1] = cz_slot(b.unit)
-		end
-	end
-	for owner, keys in pairs(groups) do
-		-- 活体缓存按"同一帧的一整组"发布（R:5862-5868）：缺一件 / 新旧桶混用都不覆盖上一份完整组。
-		local completeLive = true
-		for _, key in ipairs(keys) do if not cf.livePending[key] then completeLive = false; break end end
-		if completeLive then for _, key in ipairs(keys) do cf.liveCache[key] = cf.livePending[key] end end
-		local guard = cf.frozen[keys[1]] and cf.frozen[keys[1]].guard
-		if guard then
-			local shapes, c = {}, nil
-			local complete = #keys == #guard.keys
-			for _, key in ipairs(guard.keys) do
-				local item = ready[key]
-				if not item or item.early or item.cache_only then complete = false; break end
-				c = item.core or cz_core(item.binding.avatar)
-				local okShape, shape = pcall(function()
-					return cz_capture(item.binding.unit, item.binding.node_count, cz_root_offset(item.binding.unit), c, item.explicit)
-				end)
-				if not okShape or not shape then complete = false; break end
-				shapes[key] = shape
-			end
-			-- 优先用一具真正躺下的完整尸体，不要第一帧还站着瞄准的姿态；否则最终用刚性倒下回退（R:5880-5886）
-			if complete and c and c.up and cf.now < guard.until_time then
-				local axis = CZ.qrotate(c.q, c.up)
-				if math.abs(axis[3]) < .7 then guard.settled = shapes end
-			end
-		else
-			local prepared, reason, age = {}, nil, nil
-			local early, useCache = false, false
-			for _, key in ipairs(keys) do
-				local item = ready[key]
-				if not item then reason = 'incomplete corrected group'; break end
-				age = Roster.deadAge(item.binding.avatar.unit)
-				if not age then reason = 'no confirmed death clock'; break end
-				early = early or item.early
-				useCache = useCache or item.early or item.cache_only or false
-			end
-			if not reason and (age >= 4 or useCache) then
-				if cf.created + #keys > 256 then reason = 'copy lifetime limit' end
-				if not reason then
-					for _, key in ipairs(keys) do
-						local success, r = pcall(cz_prepare, ready[key], useCache)
-						if not success then reason = tostring(r); break end
-						prepared[#prepared + 1] = r
-					end
-				end
-				local bucket
-				if not reason and useCache then
-					for _, r in ipairs(prepared) do
-						local cached = cf.liveCache[r.key]
-						if not cached or cached.owner ~= owner or cached.world ~= r.world_slot or cached.hash ~= r.hash or
-							cached.count ~= r.count or cached.offset ~= r.offset or cf.now - cached.time > 30 or
-							(bucket and cached.bucket ~= bucket) then reason = 'no complete intact group cache'; break end
-						if not cached.up then reason = 'no intact body axis'; break end
-						bucket = cached.bucket
-						r.shape, r.up, r.cached = cached.shape, cached.up, cached
-					end
-				end
-				if not reason then
-					local protection = useCache and { until_time = cf.now + math.max(0, 4 - age), up = prepared[1].up, owner = owner, keys = keys } or nil
-					if protection then
-						local okMotion, err = pcall(cz_start_motion, prepared, protection, age)
-						if not okMotion then cz_note('motion-unavailable-' .. owner, 'articulated unavailable owner=' .. owner .. ' reason=' .. tostring(err)) end
-					end
-					for _, r in ipairs(prepared) do r.guard = protection end
-					-- 提交顺序（R:5919-5927）：apply → 停物理 → 显示副本 → 隐藏原件
-					local committed, err = pcall(function()
-						for _, r in ipairs(prepared) do cz_apply(r) end
-						for _, r in ipairs(prepared) do assert(cz_freeze_physics(r) == true, 'corpse physics retirement rejected') end
-						for _, r in ipairs(prepared) do U.set_unit_visibility(r.clone, true) end
-						for _, r in ipairs(prepared) do r.hidden = true; U.set_unit_visibility(r.unit, false) end
-					end)
-					if committed then
-						for _, r in ipairs(prepared) do
-							cf.frozen[r.key] = cz_register_clone(r)
-							if not protection then cf.liveCache[r.key] = nil end
-						end
-						cz_note('frozen-' .. owner, (protection and 'protected' or 'frozen') .. ' owner=' .. owner .. ' units=' .. #prepared ..
-							' delay=' .. string.format('%.3f', age) .. ' intact_cache=' .. tostring(useCache) .. ' original_graph_untouched=true')
-					else
-						cf.failed[owner] = true   -- 一具尸体只试一次 spawn 事务，不是每帧一次（R:5935）
-						local restored = true
-						for _, r in ipairs(prepared) do
-							if r.hidden and not pcall(U.set_unit_visibility, r.unit, true) then restored = false end
-							if r.clone then
-								pcall(U.set_unit_visibility, r.clone, false)
-								if not pcall(W.destroy_unit, r.world, r.clone) then
-									-- 只有我们新建的副本才能隔离 / 删除；清理失败也不让它回到普通发现里
-									local record = cz_register_clone(r)
-									record.quarantine = true
-								end
-							end
-						end
-						cz_note('failed-' .. owner, 'copy group failed owner=' .. owner .. ' display_restored=' .. tostring(restored) .. ' error=' .. tostring(err))
-					end
-				end
-			end
-			if reason and age and age >= 4 then cz_note('skip-' .. owner .. '-' .. reason, 'skipped owner=' .. owner .. ' reason=' .. reason) end
-		end
-	end
-end
-
---- IAS `F.filter`（R:5954-6000）：每个世界、每帧：副本不进名单；校验通过的原件也不进名单；
---- 副本跟随死者的核心并保持可见、原件保持隐藏；校验不过的恢复原件、藏起副本。
---- 绝不在这里销毁副本，也绝不清空 clones（IAS 同样；删除留作以后的实验）。
-function CorpseFreeze.filter(world, avatars, armour)
-	if next(cf.clones) == nil then return armour end
-	local U, W = S.Unit, S.World
-	local wid = cz_slot(world)
-	local owners, live, skip = {}, {}, {}
-	for _, a in ipairs(avatars) do owners[cz_slot(a.unit)] = a end
-	for _, item in ipairs(armour) do live[cz_slot(item.unit)] = item end
-	local finished = {}
-	for _, r in pairs(cf.clones) do
-		local g = r.guard
-		if r.world == wid and g and not finished[g] and owners[r.owner] then
-			finished[g] = true
-			local ok, err = pcall(function()
-				local c = cz_core(owners[r.owner])
-				if c then cz_finish_guard(world, g, live, c) end
-			end)
-			if not ok then CorpseFreeze.report('guard', err) end
-		end
-	end
-	for key, r in pairs(cf.clones) do
-		if r.world == wid then
-			local copyItem, original = live[key], live[r.original]
-			skip[key] = true
-			local valid = false
-			if not r.quarantine and copyItem and original and cz_eligible(original) and original.hash == r.hash and owners[r.owner] then
-				local ok, err = pcall(function()
-					local u = copyItem.unit
-					assert(U.alive(u) == true and U.num_scene_graph_items(u) == r.count, 'copy lifecycle changed')
-					local c = r.fixed_core or assert(cz_core(owners[r.owner]), 'core unavailable')
-					-- 每个显示 unit 两次写入；不再逐肢更新（R:5984-5986）
-					cz_set(u, r.root, c); W.update_unit(world, u)
-					local q, p = cz_world_pose(u, r.root)
-					assert(CZ.close(q, p, c.q, c.p), 'core following failed')
-					U.set_unit_visibility(u, true)
-					U.set_unit_visibility(original.unit, false)
-				end)
-				valid = ok
-				if not ok then cz_note('follow-' .. key, 'copy follow failed ' .. tostring(err)) end
-			end
-			if valid then skip[r.original] = not r.guard or r.guard.motion ~= nil
-			else
-				if copyItem then pcall(U.set_unit_visibility, copyItem.unit, false) end
-				if original then pcall(U.set_unit_visibility, original.unit, true) end
-			end
-		end
-	end
-	local result = {}
-	for _, item in ipairs(armour) do if not skip[cz_slot(item.unit)] then result[#result + 1] = item end end
-	return result
-end
-
---- 逐帧入口（drive 在写骨之后调用；IAS 对应 R:4046 / R:4705 的 queue_input / observe 与 R:7018 的 flush）。
---- bindings = 本帧过滤后的名单里有主人的件（IAS：armour_units 过滤之后建 binding）。
-function CorpseFreeze.frame(runtime)
-	if not CorpseFreeze.active then return end
-	local roster = runtime.roster
-	if roster == nil or roster.frame ~= cf.tick then return end
-	local bindings = {}
-	for world, row in pairs(roster.byWorld) do
-		local byUnit = {}
-		for _, a in ipairs(row.avatars) do byUnit[a.unit] = a end
-		for _, armour in ipairs(row.armour) do
-			local avatar = byUnit[row.owner[armour.unit]]
-			if avatar and type(armour.nodes) == 'number' and armour.nodes > 1 then
-				bindings[#bindings + 1] = { unit = armour.unit, world = world, avatar = avatar, node_count = armour.nodes,
-					hash = armour.hash, instance_id = cz_slot(armour.unit), profile = { hash = armour.hash } }
-			end
-		end
-	end
-
-	for _, b in ipairs(bindings) do
-		local ok, err = pcall(CorpseFreeze.queue_input, b, nil)
-		if not ok then CorpseFreeze.report('input', err) end
-		local explicit = runtime.corpseExplicit and runtime.corpseExplicit[b.unit]
-		if explicit ~= false then
-			ok, err = pcall(CorpseFreeze.observe, b, explicit and explicit.owner == b.avatar.unit and explicit.rows or nil)
-			if not ok then CorpseFreeze.report('capture', err) end
-		end
-	end
-	local ok, err = pcall(CorpseFreeze.flush, bindings)
-	if not ok then CorpseFreeze.report('flush', err) end
-end
-
-local function corpse_frame(runtime)
-	if CorpseFreeze.active then CorpseFreeze.frame(runtime) end
-	runtime.corpseExplicit = nil -- numeric results and Unit keys belong to this callback (IAS R:4044,4707).
-end
-
--- ---------------------------------------------------------------------------
--- E12e：物理会话生命周期（照 IAS：每帧按 Roster 结果以"实例槽位 + profile"绑定，不跨帧持有名单）。
--- IAS 对应：runtime.lua 6860 一带 `C.bind_unit(profile.id, instance_id, avatar.id, root)` 每帧一次；
--- 帧号/时间跳变、传送、布局变化由原生直接重置、不追赶。
--- 我们的 Lua 求解器必须自己持有链状态：状态按 unit 句柄（弱键）存，**只对本帧枚举里存在的 unit 有效**，
--- 本帧枚举里没有它 → 状态直接丢弃（不碰句柄）；没有 discover/打分额度/负缓存/退避/整组重挂。
--- ---------------------------------------------------------------------------
-local function physics_rig(runtime, hash, unit, carriers)
-	local rows = runtime.hashRig
-	if rows == nil then rows = {}; runtime.hashRig = rows end
-	local row = rows[hash]
-	if row ~= nil and row.rig ~= nil then return row end
-	local frame = runtime.frame or 0
-	if row ~= nil and frame < (row.retryAt or 0) then return nil end
-	-- profile 表：哈希 → 容器，每个哈希只匹配一次（IAS 的 profile 是启动时装载的静态数据）。
-	local best = Compat.select_rig(S, { unit }, carriers, runtime.isLiveFn)
-	local allowPartial = runtime.options.allowPartial == true
-	-- 与 2.1.60 一致：按件切骨的转换器产物只带容器的一部分骨，部分命中（score >= 1）是正常情形。
-	if best ~= nil and (best.full or allowPartial or (best.score or 0) >= 1) then
-		row = { rig = best.rig, path = best.path }
-		rows[hash] = row
-		return row
-	end
-	rows[hash] = { retryAt = frame + Roster.INTERVAL }   -- 取 IAS 的 DISCOVERY_INTERVAL 节奏
-	return nil
-end
-
-local function physics_sync(runtime)
-	local roster = runtime.roster
-	local frame = runtime.frame or 0
-	if roster == nil or roster.frame ~= frame then return end
-	if runtime.isLiveFn == nil then
-		runtime.isLiveFn = function(unit) return Roster.isLive(runtime, unit) end
-	end
-	local options = runtime.options
-	local carriers = runtime.carriers
-	if carriers == nil then
-		local raw = options.carriers
-		if raw == nil or #raw == 0 then raw = loadCarriers(S, runtime.cache, options, runtime.logger) end
-		local removed
-		carriers, removed = filterCarriers(raw, runtime.iasPhysicsGroups)
-		if #raw > 0 then runtime.carriers = carriers end
-		if removed > 0 and not runtime.iasFilterLogged then
-			runtime.logger("[physbone] IAS 可选组掩码=%d，排除 %d 条骨记录", runtime.iasPhysicsGroups, removed)
-			runtime.iasFilterLogged = true
-		end
-	end
-	if carriers == nil or #carriers == 0 then return end
-
-	-- 玩家名单：本帧枚举，按到相机的距离排序（第一位 = 离相机最近 = 自己的调度优先级）。
-	local list, ownerOf = {}, {}
-	local cameras = {}
-	for world, row in pairs(roster.byWorld) do
-		local cx, cy, cz = cameraPosition(S, world, runtime.cache)
-		cameras[world] = { cx, cy, cz }
-		for _, item in ipairs(row.avatars) do
-			local entry = { unit = item.unit, world = world, x = item.p[1], y = item.p[2], z = item.p[3], positionFrame = frame }
-			if cx ~= nil then
-				local dx, dy, dz = item.p[1] - cx, item.p[2] - cy, item.p[3] - cz
-				entry.cameraDistance = dx * dx + dy * dy + dz * dz
-			end
-			list[#list + 1] = entry
-		end
-	end
-	table.sort(list, function(a, b)
-		local da, db = a.cameraDistance, b.cameraDistance
-		if da ~= nil and db ~= nil then return da < db end
-		if da ~= nil then return true end
-		if db ~= nil then return false end
-		return tostring(a.unit) < tostring(b.unit)
-	end)
-	local previousTags = {}
-	for _, old in ipairs(runtime.avatars or {}) do previousTags[old.unit] = old.tag end
-	for index, entry in ipairs(list) do
-		entry.order = index
-		entry.tag = previousTags[entry.unit]
-		ownerOf[entry.unit] = entry
-	end
-	runtime.avatars = #list > 0 and list or nil
-	if #list > 0 then
-		runtime.world = list[1].world
-		-- 本帧已读过相机与各 avatar 根位置（IAS 同样每帧只读一次，R:1335 / R:6621-6626）：
-		-- refresh_avatar_distances 直接复用，不再重读。
-		local camera = cameras[list[1].world]
-		if camera ~= nil and camera[1] ~= nil then
-			runtime.poseCamera = { frame = frame, x = camera[1], y = camera[2], z = camera[3], world = list[1].world }
-			runtime.avatarsFreshFrame = frame
-		else
-			runtime.avatarsFreshFrame = nil
-		end
-		if not (roster.identity and arm_pose_enabled(runtime)) then runtime.avatar = list[1].unit end
-	end
-
-	local byUnit = runtime.sessionByUnit
-	if byUnit == nil then byUnit = setmetatable({}, { __mode = "k" }); runtime.sessionByUnit = byUnit end
-	local desired, wanted = {}, {}
-	for world, row in pairs(roster.byWorld) do
-		for _, armour in ipairs(row.armour) do
-			local ownerUnit = row.owner[armour.unit]
-			-- E12f-C2：已被尸体副本替换的原件不再绑定物理（替代 IAS 原生 freeze_corpse_physics，R:5923）。
-			if ownerUnit ~= nil and ownerOf[ownerUnit] ~= nil and not CorpseFreeze.physicsStopped(armour.unit, frame) then
-				desired[armour.unit] = { hash = armour.hash, owner = ownerOf[ownerUnit], world = world }
-				wanted[#wanted + 1] = armour.unit
-			end
-		end
-	end
-	-- 本帧枚举里没有（或不再归属任何 avatar）的 unit：丢掉状态，不碰句柄。
-	for unit in pairs(byUnit) do
-		if desired[unit] == nil then byUnit[unit] = nil end
-	end
-	table.sort(wanted, function(a, b)
-		local oa, ob = desired[a].owner.order, desired[b].owner.order
-		if oa ~= ob then return oa < ob end
-		return desired[a].hash < desired[b].hash
-	end)
-	local attachOptions = {
-		logger = runtime.logger, strictIdentity = options.strictIdentity == true,
-		fastWrite = options.fastWrite ~= false, solver = options.solver, bendBlend = options.bendBlend,
-		-- E12f-C3：会话 / attach 的判活都走本帧枚举查表（零引擎调用），不再逐会话 `Unit.alive`。
-		isLive = runtime.isLiveFn,
-	}
-	local attached = 0
-	for _, unit in ipairs(wanted) do
-		local want = desired[unit]
-		local session = byUnit[unit]
-		if session == nil then
-			local rig = physics_rig(runtime, want.hash, unit, carriers)
-			if rig ~= nil then
-				attachOptions.world = want.world
-				session = Compat.attach(S, unit, rig.rig, attachOptions)
-				session.rigSource, session.unitTag, session.attachFrame = rig.path, "#ID[" .. want.hash .. "]", frame
-				if #session.sessions > 0 then
-					byUnit[unit] = session
-					attached = attached + 1
-				else
-					runtime.emptyLogged = runtime.emptyLogged or setmetatable({}, { __mode = "k" })
-					if runtime.emptyLogged[unit] == nil then
-						runtime.emptyLogged[unit] = true
-						runtime.logger("[physbone][失败] unit=%s 挂载完成但产出 0 条链（容器 %s）", tostring(session.unitTag), tostring(rig.path))
-					end
-					session = nil
-				end
-			end
-		end
-		if session ~= nil then
-			session.iasPose = options.profileHashes ~= nil and (options.independentBones ~= nil or options.corpseProfiles ~= nil
-				or session.rig and session.rig.bones[1] and session.rig.bones[1].name:match('^ias_phys_') ~= nil)
-			session.corpseEligible = options.corpseProfiles and options.corpseProfiles[want.hash]
-			session.owner, session.ownerOrder, session.ownerTag = want.owner.unit, want.owner.order, want.owner.tag
-		end
-	end
-	local sessions = {}
-	for _, unit in ipairs(wanted) do
-		if byUnit[unit] ~= nil then sessions[#sessions + 1] = byUnit[unit] end
-	end
-	if attached > 0 then
-		local chains = 0
-		local counts = {}
-		for _, session in ipairs(sessions) do chains = chains + #session.sessions; counts[#counts + 1] = #session.sessions end
-		table.sort(counts, function(a, b) return a > b end)
-		-- 每件的链数（降序）：多于一件时才附带，用来确认"按件切骨"生效（各件不同、合计远小于全量）。
-		runtime.logger("[physbone] 已挂载 %d 个 unit / %d 条链（玩家 %d 个）；本帧新挂 %d%s", #sessions, chains, #list, attached,
-			#counts > 1 and ("；每件链数 " .. table.concat(counts, ",")) or "")
-		if runtime.attachedFrame == nil then
-			runtime.attachedFrame, runtime.driveFrames, runtime.callsAccum = frame, 0, 0
-			runtime.peakAngle, runtime.repeatCalls = 0, 0
-		end
-	end
-	runtime.sessions = #sessions > 0 and sessions or nil
-end
-
 local function drive(runtime)
 	local frame = runtime.frame
 	local options = runtime.options
@@ -6584,22 +3649,60 @@ local function drive(runtime)
 	end
 
 	Compat.begin_frame(frame)
-	-- E12d：IAS 式每帧枚举（avatar / 装甲件 / 本人身份）。本帧用到的独立骨句柄都来自这一次枚举。
-	local rosterOk = false
-	if arm_pose_enabled(runtime) or options.carriers == nil or #options.carriers > 0 then
-		local okRoster, rosterError = pcall(Roster.update, runtime)
-		rosterOk = okRoster and runtime.roster ~= nil
-		if not okRoster and not runtime.rosterErrorLogged then
-			runtime.rosterErrorLogged = true
-			logger("[physbone][错误] 每帧枚举失败：%s", tostring(rosterError))
-		end
-		if rosterOk and runtime.roster.identity and arm_pose_enabled(runtime) then resolve_local_avatar_for_arm(runtime) end
-	end
-	if runtime.independent and not arm_pose_enabled(runtime) then IndependentLink.release_all(runtime) end
 	local driveClock = os.clock()   -- 这一拍驱动块占用的 CPU 时间（心跳里报出来）
 
-	-- E12e：IAS 没有"先判死"这一步：本帧用到的句柄都来自本帧 Roster 的枚举（docs/agent/ias-runtime-lifecycle-map）。
-	-- 物理会话在下面的 physics_sync 里按"本帧枚举 + 实例槽位"建立/丢弃，不跨帧持有名单。
+	-- ---------- 生命周期：**先"不碰句柄"地判死** ----------
+	-- 必须在 `Compat.update` / `pruneSessions` / `refresh_avatar_distances` / 裙摆之前做：
+	-- 它们每一个都要 deref 手里的 unit 句柄。判据见 `refresh_live_units`（纯指针比较）。
+	--
+	-- 2026-11-12 抓到的真凶就在这里：`refresh_avatar_distances` 每帧对**每个 avatar 句柄**调
+	-- `Unit.world_position(avatar.unit, 1)`，而 `runtime.avatars` 是**上一帧**的名单 ——
+	-- 债券页快速切页时引擎会连续重建 avatar（展台上那个角色本身就是 avatar 资源），
+	-- 句柄一失效，这一行就是野读 → 原生 AV（0x3e564b / 参数 0x0 0x0），Lua 层完全看不出来。
+	-- 所以会话**和** avatar 两套句柄都要过同一道闸。
+	local haveSessions = runtime.sessions ~= nil and #runtime.sessions > 0
+	local haveAvatars = runtime.avatars ~= nil and #runtime.avatars > 0
+	if haveSessions or haveAvatars then
+		local live = refresh_live_units(runtime, S)
+		if live == "world-gone" then
+			-- 我们那个世界已经不在了：整组丢弃，一个句柄都不碰（下一帧重扫）。
+			logger("[physbone][LIFECYCLE] 世界已不在 ⇒ 整组丢弃 %d 个会话 / %d 个 avatar（不碰句柄）",
+				#(runtime.sessions or {}), #(runtime.avatars or {}))
+			runtime.sessions = nil
+			runtime.avatars = nil
+			runtime.avatar = nil
+			runtime.liveUnits = nil
+			runtime.reArm = 1
+			runtime.rearmAt = frame + 1
+		elseif live == "ok" and haveAvatars then
+			-- avatar 名单同样按指针过一遍：不在活体列表里的直接摘掉（不调任何 Unit API）。
+			local keptAvatars, droppedAvatars = {}, 0
+			for index = 1, #runtime.avatars do
+				local avatar = runtime.avatars[index]
+				if avatar.unit ~= nil and session_unit_live(runtime, avatar.unit) then
+					keptAvatars[#keptAvatars + 1] = avatar
+				else
+					droppedAvatars = droppedAvatars + 1
+				end
+			end
+			if droppedAvatars > 0 then
+				logger("[physbone][LIFECYCLE] %d 个 avatar 已不在活体列表里 ⇒ 从名单移除（指针判死，不碰句柄）%s",
+					droppedAvatars, #keptAvatars == 0 and "；名单空了" or "")
+				runtime.avatars = keptAvatars
+				if #keptAvatars == 0 then
+					runtime.avatar = nil
+					runtime.avatarTag = nil
+					-- 没有玩家了：会话也就没有主人，交给下面的"主人已不在"逻辑整体收掉。
+					runtime.reconcile = frame
+				else
+					-- `runtime.avatar` 是"排序第一的那个玩家"，它可能刚被摘掉；
+					-- 后面的 lift / 第一人称锁定都会拿它去发引擎调用，所以必须同步成还活着的那一个。
+					runtime.avatar = keptAvatars[1].unit
+					runtime.avatarTag = keptAvatars[1].tag
+				end
+			end
+		end
+	end
 
 	phase(runtime, "drive 开始")
 
@@ -6662,34 +3765,124 @@ local function drive(runtime)
 	end
 	if not advanced then return end
 
-	-- 帧间隔过大（加载/切场景）只让物理重置；IAS：帧号/时间跳变原生直接重置、不追赶（行 6455 一带 lua-recovery）。
+	-- ---------- 加载空档：不查存活，直接整组重挂 ----------
+	-- 加载界面期间 `render`/`update` 根本不跑（实测：静默 4~15 秒是常态），而这一整段时间里
+	-- 引擎正在销毁上一场景的 unit。等我们再被调到，`runtime.sessions` 里那些句柄很可能
+	-- 已经指向被释放的对象 —— 而**逐条查存活本身就是一个引擎调用**（`Compat.session_health`
+	-- → `Unit.alive`）。在"unit 已经被覆盖/释放"的窗口里发这个调用，就是原生崩溃
+	-- （2026-11-11 实机：崩在 0x3e564b 读空指针，且**只在物理 + 软映射同时开**时发生 ——
+	-- 因为只有那时该 unit 是覆盖出来的自定义件；单独开任意一个都不崩）。
+	-- 所以这里**不逐条判定**，整组丢掉、按"场景已变"重挂。宁可闪一下，也不去碰可能已死的句柄。
 	local gap = runtime.rawDelta
-	local resetPhysics = gap ~= nil and gap > 0.25
+	if gap ~= nil and gap > (options.loadGapSeconds or 0.5)
+		and runtime.sessions ~= nil and #runtime.sessions > 0 then
+		logger("[physbone][LIFECYCLE] 检测到加载空档 %.2f s ⇒ 不查存活，直接整组重挂（%d 个会话）",
+			gap, #runtime.sessions)
+		runtime.sessions = nil
+		runtime.reconcile = nil
+		runtime.reArm = 1
+		runtime.rearmAt = frame + (options.reArmFrames or 60)
+	end
 	runtime.rawDelta = nil
 
-	local function drive_arm_only_and_beat()
-		if not arm_pose_enabled(runtime) then return end
-		local armWritten, armCalls = apply_arm_pose_frame(runtime)
-		runtime.beatFrames = (runtime.beatFrames or 0) + 1
-		local tune = tune_values(runtime)
-		local heartbeat = math.floor(tune.heartbeatFrames or options.heartbeatFrames or 600)
-		if heartbeat < 1 then heartbeat = 0 end
-		if heartbeat > 0 and (runtime.beatFrames % heartbeat) == 0 then
-			local avgArm = (runtime.armFrames or 0) > 0 and ((runtime.armCallsAccum or 0) / runtime.armFrames) or 0
-			logger("[physbone] 手臂修正心跳 unit=%s 写入=%d 手臂调用=%d(%.0f/帧) alpha=%.2f",
-				tostring(runtime.avatarTag or "-"), armWritten, armCalls, avgArm, runtime.armAlpha or 0)
+	if runtime.sessions ~= nil and #runtime.sessions > 0 then
+		local dropped = pruneSessions(runtime)
+		-- **默认行为**：任何会话死亡 ⇒ 整组释放，一个句柄都不留。
+		--
+		-- 依据（2026-11-11 实机 + 用户对照实验 + 开关二分，已确认修复闪退）：
+		--   · `discoverOnly=1`（只扫描、**不持有句柄**）⇒ 不崩；
+		--   · `writeOff=1`（挂载但不写骨）⇒ 仍崩 ⇒ 与写骨无关；
+		--   · 两人**同时**切图才崩；多人局里自己一个人切图不崩；中途加入不崩。
+		-- 崩溃日志总是「掉了 N 个会话，**剩 M 个继续跑**」：那 M 个句柄被留着，
+		-- 紧接着是几十秒加载空档（render 不再回调、修剪跑不到），引擎在销毁它们
+		-- ⇒ 读空指针（转储 0x3e564b，异常参数 0x0 0x0）。
+		--
+		-- 代价：队友换甲/阵亡时全场会闪一下没物理（随后立刻重挂）。
+		-- 想退回旧行为（保留剩余会话）可在调参文件写 `dropAllOnDeath = 0`。
+		if dropped > 0 and (tune_values(runtime).dropAllOnDeath or 1) ~= 0 then
+			logger("[physbone][LIFECYCLE] dropAllOnDeath=1：掉了 %d 个会话 ⇒ 整组释放（不留任何句柄），随后重挂",
+				dropped)
+			runtime.sessions = nil
+			runtime.reconcile = nil
+			runtime.reArm = 1
+			runtime.rearmAt = frame + 1
+			-- 整组释放之后要**立刻**重扫：把重试门也清掉，否则上一次那批"0 命中"的
+			-- 结论会让新场景的头几拍空转（新的 unit 是不同实例，但门是按实例记的，
+			-- 不清也只是多等一轮；清掉是为了让补挂从第一拍就开始）。
+			runtime.scoreAttemptAt = nil
+			runtime.fillPending = nil
+			runtime.probeRejected = nil
+		elseif #runtime.sessions == 0 then
+			-- 全没了（换场景 / 全员阵亡）：退回等待，带退避（避免换甲期间每秒重挂一次）。
+			-- 存活时长决定退避：刚挂上就死 = 抖动（换甲中），要越等越久；
+			-- 稳定跑过 5 秒再死 = 正常换场景，下一次应当**立刻**重挂。
+			local survived = frame - (runtime.attachedFrame or frame)
+			runtime.sessions = nil
+			runtime.reconcile = nil
+			runtime.fillPending = nil
+			if survived >= (options.stableFrames or 600) then
+				runtime.reArm = 1
+			else
+				runtime.reArm = (runtime.reArm or 0) + 1
+			end
+			local delay = math.min(options.maxReArmFrames or 600, (options.reArmFrames or 60) * runtime.reArm)
+			runtime.rearmAt = frame + delay
+			logger("[physbone][LIFECYCLE] 场景已变（存活 %d 帧）⇒ 退避 %d 帧后重扫", survived, delay)
+		else
+			-- 只掉了一部分（某个队友换甲 / 退出 / 阵亡）：**留着活着的那些**，只补缺的。
+			-- 老版本在这一步是"丢掉全部会话再重扫"，多人局里那等于一个人换甲，全场人闪一下没物理。
+			if dropped > 0 then
+				logger("[physbone][LIFECYCLE] 掉了 %d 个会话，剩 %d 个继续跑，随后补挂缺的",
+					dropped, #runtime.sessions)
+				runtime.reconcile = frame
+			end
+			-- 会话全都还"健康"，但场上**玩家名单**可能变了（有人加入 / 有人退出 / 复活换了实体）。
+			-- 这里同样**不释放任何东西**：变的是名单，谁还在谁就继续跑。
+			local validateFrames = options.validateFrames == nil and 60 or options.validateFrames
+			if validateFrames > 0 and (frame % validateFrames) == 0 and avatarSetChanged(runtime) then
+				runtime.reconcile = frame
+			end
 		end
 	end
 
-	-- E12e：物理会话 = 本帧 Roster 枚举 ∩ 已有容器（IAS bind_unit：实例槽位 + profile，每帧）。
-	physics_sync(runtime)
-	runtime.iasCommits = runtime.options.profileHashes and {} or nil
-	if runtime.sessions == nil or #runtime.sessions == 0 then
-		runtime.sessions = nil
-		drive_arm_only_and_beat()
-		IndependentLink.flush(runtime)
-		corpse_frame(runtime) -- R:7017–7019: observe the same frame's retarget output before flush.
-		return
+	-- 名单变化后的补挂/收尾。走的是同一个 `tryAttach`（**增量**：只补没挂的、只收主人不在的），
+	-- 所以不需要先把自己人的会话丢掉 —— 那正是老版本多人局里"所有人闪一下没物理"的来源。
+	if runtime.reconcile ~= nil and runtime.sessions ~= nil and #runtime.sessions > 0 then
+		if frame >= runtime.reconcile then
+			local poll = options.reconcilePollFrames or (options.pollFrames or 20)
+			phase(runtime, "tryAttach 前")
+			if tryAttach(runtime) then
+				-- 装填还没完成（还有候选没轮到打分）时不能清掉 reconcile，否则"剩下的件"
+				-- 要等下一位玩家进场/有人阵亡才会被想起 —— 那正是老现象。
+				-- 另外：有"负结果待重试"时要把它排上，否则那批件永远没机会翻案。
+				runtime.reconcile = runtime.fillPending and (frame + poll) or runtime.negativeRetryAt
+				runtime.negativeRetryAt = nil
+			else
+				runtime.reconcile = frame + poll     -- 场景还没稳，下一拍再来
+			end
+		end
+	end
+
+	if runtime.sessions == nil then
+		if runtime.rearmAt ~= nil and frame < runtime.rearmAt then
+			note_wait(runtime, "退避等待重扫")
+			return
+		end
+		-- 等待中的轮询会跑一趟完整的 `discover`（扫所有 unit + 给每个候选打分，几千次引擎调用），
+		-- 所以**必须**随等待时长放慢：刚掉线那 2 秒要快（复活/换甲很快结束），
+		-- 之后就按 3 倍间隔扫一次 —— 否则"一直等不到"会变成持续的顿卡。
+		runtime.waitSince = runtime.waitSince or frame
+		local waited = frame - runtime.waitSince
+		local poll = options.pollFrames or 20
+		-- 装填中（还有候选没轮到处理）**不减速**：减速会把"补挂"拉成十几秒，
+		-- 观感就是"进图后十几秒完全没物理"。这期间每拍只多花预筛的钱（≈0.04 ms/件），
+		-- 真打分仍受 `scoreUnitsPerFrame` 限制，所以不会突破预算。
+		if waited > (options.waitSlowAfter or 200) and not runtime.fillPending then poll = poll * 3 end
+		if (frame % poll) ~= 0 then return end
+		if not tryAttach(runtime) then return end
+		runtime.waitSince = nil
+	else
+		runtime.waitSince = nil
 	end
 
 	-- ---------- 调度（谁拿最高物理权） ----------
@@ -6700,6 +3893,10 @@ local function drive(runtime)
 	phase(runtime, "refresh_avatar_distances 前")
 	refresh_avatar_distances(S, runtime)
 	phase(runtime, "refresh_avatar_distances 后")
+	-- 身份纠正（"玩家动它不动"的件放掉）：必须每帧入口都跑到，不能只在补挂时跑。
+	phase(runtime, "identity_watch 前")
+	pcall(identity_watch, S, runtime)
+	phase(runtime, "identity_watch 后")
 	fp_lock_watch(S, runtime)
 	phase(runtime, "scheduler_watch 前")
 	scheduler_watch(S, runtime, runtime.dt)
@@ -6730,6 +3927,7 @@ local function drive(runtime)
 	local nearMetres = sched_settings(runtime).metres
 	local nearLimit2 = nearMetres * nearMetres
 	local primaryChains, nearChains, farChains = 0, 0, 0
+	local staleOwners = 0
 	for index = 1, #runtime.sessions do
 		local session = runtime.sessions[index]
 		local chains = #(session.sessions or {})
@@ -6737,11 +3935,22 @@ local function drive(runtime)
 			primaryChains = primaryChains + chains
 		else
 			local ownerDistance = owner_distance_sq(runtime, session)
+			-- 主人不在当前玩家名单里（换场景/换船后 unit 重建）⇒ 距离恒为 math.huge，
+			-- 会把这件永久压进"最远档（每 16 帧）"，看起来就是没物理。
+			-- 正确的动作是**重新归属**，所以这里记一笔，下面触发一次重排/重挂。
+			if ownerDistance == math.huge then staleOwners = staleOwners + 1 end
 			if ownerDistance <= nearLimit2 then
 				nearChains = nearChains + chains
 			else
 				farChains = farChains + chains
 			end
+		end
+	end
+	if staleOwners > 0 and runtime.reconcile == nil then
+		runtime.reconcile = frame
+		if not runtime.staleOwnerLogged then
+			runtime.staleOwnerLogged = true
+			logger("[physbone][玩家] %d 个会话的主人已不在名单里 ⇒ 重新归属一次", staleOwners)
 		end
 	end
 	local nearStride, farStride = schedule_budget(primaryChains, nearChains, farChains, budget)
@@ -6770,16 +3979,8 @@ local function drive(runtime)
 	end
 
 	local written, skippedSame, engineCalls, staticChains = 0, 0, 0, 0
-	local armCalls
-	if arm_pose_enabled(runtime) and runtime.options.independentBones then
-		local _
-		_, armCalls = apply_arm_pose_frame(runtime)
-	end
 	local attempted = 0
 	local dt = runtime.dt or (1 / 60)
-	local ownerStates = {}
-	local ownerRoots = runtime.physicsOwnerRoots or {}
-	runtime.physicsOwnerRoots = {}
 	phase(runtime, "写骨 前（" .. tostring(#runtime.sessions) .. " 个会话）")
 	for index = 1, #runtime.sessions do
 		local session = runtime.sessions[index]
@@ -6790,47 +3991,16 @@ local function drive(runtime)
 		-- 丢了它，物理会比真实时间慢 —— 表现是"队友的头发像在水里"。
 		local pending = (session.pendingDt or 0) + dt
 		local order = session.ownerOrder or 99
-		session.skipOptionalIas = not session.iasPose and order > 1 and runtime.options.independentTranslations ~= nil
 		local due = true
-		local owner = session.owner
-		local poseState = runtime.independent and runtime.independent.avatar == owner and runtime.independent
-			or (runtime.independentRemotes or {})[owner]
-		local schedule = poseState and poseState.linkedUnits and poseState.linkedUnits[session.unit] and poseState.correction
-		if schedule and (schedule.paused or not schedule.due or poseState.frame ~= frame) then due = false end
-		if schedule and schedule.paused then
-			pending, session.resetPhysics, session.independentHistory = 0, true, nil
-		end
-		-- E12e-B4：原来这里按"avatar 有没有动画状态机 / 是否 Unit.alive"冻结物理（due=false、pending=0、重置），
-		-- 并且为此每个 avatar 每帧读一次 has_animation_state_machine。IAS 没有这道闸：没有状态机且未死亡的 avatar
-		-- 角色类是 0 但照常绑定（`bind_unit` R:7004，每帧对 bindings 里每一项；类只经 `set_avatar_physics_class`
-		-- R:6975-6976 推给原生）。原生只在帧号/时间跳变、传送、布局变化时重置（report-physics.md:20）。
-		-- 所以这里只保留"传送 ⇒ 重置"（IAS 原生同样会重置），其余不暂停、不重置。
-		-- 在不在本帧枚举里 = `Roster.isLive`（IAS 的判活口径，R:1417-1428）。
-		local ownerState = owner and ownerStates[owner]
-		if owner ~= nil and ownerState == nil and Roster.isLive(runtime, owner) then
-			ownerState = {}
-			ownerStates[owner] = ownerState
-			-- Roster 本帧已读过 avatar 根位置（physics_sync 写进 runtime.avatars）：直接取，不再读引擎。
-			local x, y, z
-			for _, entry in ipairs(runtime.avatars or {}) do
-				if entry.unit == owner and entry.positionFrame == frame then x, y, z = entry.x, entry.y, entry.z break end
-			end
-			if x == nil then x, y, z = readVector(S, try(S.Unit.world_position, owner, 1)) end
-			if x ~= nil then
-				local previous = ownerRoots[owner]
-				ownerState.teleport = previous ~= nil and vec_dist(x, y, z, previous[1], previous[2], previous[3]) > 2
-				runtime.physicsOwnerRoots[owner] = { x, y, z }
-			end
-		end
-		if resetPhysics or (ownerState and ownerState.teleport) then session.resetPhysics = true end
-		if order > 1 and not session.iasPose then
+		if order > 1 then
 			local stride = owner_distance_sq(runtime, session) <= nearLimit2 and nearStride or farStride
 			-- 用**会话下标**错峰，而不是玩家序号：同一个玩家的若干护甲件如果同帧，
 			-- 每 stride 帧就会出现一次成本尖峰（帧时间抖动比平均成本更影响手感）。
 			if stride > 1 and ((frame + index) % stride) ~= 0 then due = false end
 		end
-		-- E12e：原来这里有"会话死亡后停写 N 帧"的拆解窗口（driveHoldUntil）。IAS 没有：它不跨帧持有句柄，
-		-- 不在本帧枚举里的 unit 本帧压根碰不到，其余的照常处理（R:1417-1428、R:6862-6867、R:7004）。窗口已删除。
+		-- 拆解窗口：任何会话死亡后的一小段里不写骨（理由见 pruneSessions 里那段注释）。
+		-- 仍然走"没轮到"的同一条路，所以 pendingDt 照常累积、物理速度不变。
+		if due and runtime.driveHoldUntil ~= nil and frame < runtime.driveHoldUntil then due = false end
 		-- 诊断开关（调参文件 `writeOff = 1`）：发现 / 挂载 / 调度 / 判活全都照旧，**只是不写骨**。
 		-- 用途（2026-11-11）：物理 + 软映射同时开、多人局换场景必崩，而崩溃时我们的 Lua 根本没在跑
 		-- （加载期间不回调，回来之前就崩了）。于是只剩两种可能，这个开关能把它们分开：
@@ -6843,28 +4013,19 @@ local function drive(runtime)
 			end
 			due = false
 		end
-		-- E12e-B5：原来这里写骨前再调一次 `Unit.alive`。IAS 没有：unit 句柄只来自本回调的枚举、不跨帧（R:894-896、R:1417-1422）。
-		-- 会话 unit 本来就是本帧 physics_sync 从本帧 Roster 里建出来的；唯一可能跨帧的是本帧枚举失败/没跑
-		-- （physics_sync 提前返回、runtime.sessions 还是上一帧的）——这时 `Roster.isLive` 为假，本帧不碰这些句柄。零引擎调用。
-		if due and not Roster.isLive(runtime, session.unit) then due = false end
-		if due or session.independentPresentation and Roster.isLive(runtime, session.unit)
-			and (tune_values(runtime).writeOff or 0) == 0 then
-			local operation = due and (session.resetPhysics and Compat.reset_physics or Compat.update) or nil
-			if session.iasPose and runtime.iasCommits then
-				local group = runtime.iasCommits[session.unit] or { world = session.world, rows = {}, before = {} }
-				runtime.iasCommits[session.unit], session.iasCommit = group, group
-				if session.corpseEligible and runtime.corpseExplicit and runtime.corpseExplicit[session.unit] ~= false then
-					runtime.corpseExplicit[session.unit] = { owner = session.owner, rows = group.rows }
-				end
-			end
-			local ok, out, solved = pcall(IndependentLink.physics, runtime, session, schedule, operation, pending)
-			if not ok and session.iasCommit then session.iasCommit.failed = true end
-			session.iasCommit = nil
-			if solved or due and not ok then
-				pending = 0
-				attempted = attempted + 1
-				session.resetPhysics = nil
-			end
+		-- 写骨前再复查一次存活：pruneSessions 只在**帧首**判过，
+		-- 而场景拆解会在本帧中途继续释放 unit —— 那一小段窗口正是"写进野对象"的来源。
+		-- unit_alive 是便宜的引擎调用，比赌一次野指针便宜得多。
+		if due and session.unit ~= nil and type(Compat.unit_alive) == "function" then
+			local okAlive, alive = pcall(Compat.unit_alive, S, session.unit)
+			if okAlive and alive == false then due = false end
+		end
+		if not due then
+			session.pendingDt = pending
+		else
+			session.pendingDt = 0
+			attempted = attempted + 1
+			local ok, out = pcall(Compat.update, session, pending)
 			if ok then
 				if type(out) == "number" then written = written + out end
 			elseif not session.updateErrorLogged then
@@ -6875,13 +4036,11 @@ local function drive(runtime)
 			skippedSame = skippedSame + (session.skippedSame or 0)
 			engineCalls = engineCalls + (session.engineCalls or 0)
 		end
-		session.pendingDt = pending
 
 		for _, item in ipairs(session.sessions) do
 			if (item.staticFrames or 0) > 0 then staticChains = staticChains + 1 end
 		end
 	end
-	IndependentLink.flush(runtime)
 	runtime.driveFrames = (runtime.driveFrames or 0) + 1
 	-- 心跳专用计数：`driveFrames` 每次 tryAttach 成功都会归零（补挂在挂满后仍每 1~2 秒成功一次），
 	-- 拿它取模，心跳就永远打不出来。这个只在安装时归零。
@@ -6891,20 +4050,13 @@ local function drive(runtime)
 	-- 放在物理写入之后：这一帧渲染用的就是"抬过"的 avatar 根。
 	apply_lift(runtime)
 
-	local armSuffix = ""
-	if arm_pose_enabled(runtime) then
-		if armCalls == nil then
-			local _
-			_, armCalls = apply_arm_pose_frame(runtime)
-		end
-		local avgArm = (runtime.armFrames or 0) > 0 and ((runtime.armCallsAccum or 0) / runtime.armFrames) or 0
-		armSuffix = string.format(" 手臂调用=%d(%.0f/帧) alpha=%.2f", armCalls, avgArm, runtime.armAlpha or 0)
-	end
-
 	runtime.callsAccum = (runtime.callsAccum or 0) + engineCalls
 	runtime.staticChains = staticChains
 	runtime.lastChainTotal = primaryChains + nearChains + farChains
 	runtime.lastAttempted = attempted
+	-- 这一帧一条都没驱动（stride 分帧的正常现象）时不能让"零帧看门狗"累加，
+	-- 否则分帧本身会被误判成"驱动失效"→ 重挂 → 分帧 → 再判失效，无限循环。
+	local attemptedAny = attempted > 0
 
 	-- 峰值：**偏离绑定方向**的最大角，也就是"离模型原本的形状有多远"。
 	--
@@ -6919,14 +4071,13 @@ local function drive(runtime)
 		for _, item in ipairs(session.sessions) do
 			local rotations = item.lastRotations
 			if rotations ~= nil then
-				local simBones = item.tip and item.tip.bones or item.bones
 				for index = 1, #rotations do
 					local angle = rotations[index][4]
 					if angle > framePeak then
 						framePeak = angle
 						local chainBone = item.chain and item.chain[index]
 						worstName = chainBone and chainBone.name or nil
-						local simBone = simBones and simBones[index]
+						local simBone = item.bones and item.bones[index]
 						local gains = simBone and simBone.gains
 						worstLimit = (gains and gains.limit or 0) * 180 / math.pi
 					end
@@ -6952,14 +4103,14 @@ local function drive(runtime)
 	if heartbeat > 0 and (runtime.beatFrames % heartbeat) == 0 then
 		local chains = 0
 		for _, session in ipairs(runtime.sessions) do chains = chains + #session.sessions end
-		logger("[physbone] 驱动心跳 unit=%d 链=%d 玩家=%d 分帧=%d/%d 本帧驱动=%d 驱动=%.2f ms dt=%.4f 本帧 写入=%d 跳过=%d 引擎调用=%d 累计/帧=%.0f 静止链=%d 偏离绑定峰值=%.1f°(史上%.1f°) 最离谱=%s(限%.0f°) 同拍重复=%d%s",
+		logger("[physbone] 驱动心跳 unit=%d 链=%d 玩家=%d 分帧=%d/%d 本帧驱动=%d 驱动=%.2f ms dt=%.4f 本帧 写入=%d 跳过=%d 引擎调用=%d 累计/帧=%.0f 静止链=%d 偏离绑定峰值=%.1f°(史上%.1f°) 最离谱=%s(限%.0f°) 同拍重复=%d",
 			#runtime.sessions, chains, #(runtime.avatars or {}), runtime.nearStride or 1, runtime.farStride or 1, attempted,
 			(os.clock() - driveClock) * 1000,
 			runtime.dt or 0, written, skippedSame, engineCalls,
 			runtime.callsAccum / runtime.driveFrames, staticChains, framePeakDeg,
 			runtime.peakAngle or 0,
 			worstName ~= nil and tostring(worstName) or "-", worstLimit,
-			runtime.repeatCalls or 0, armSuffix)
+			runtime.repeatCalls or 0)
 	end
 
 	-- 逐链明细（默认关）：区分"求解器在动"和"参数算出来就是 0"——后者在画面上就是钢板。
@@ -7006,15 +4157,36 @@ local function drive(runtime)
 		logger("[physbone][debug] 逐件峰值（全体 %.1f°）%s", peak, table.concat(pieces, " "))
 	end
 
-	-- E12e-B4：这里原来有"驱动失效"看门狗（连续 N 帧一条骨都没处理 / 任一链 disabled ⇒ 丢掉全部会话等重挂）。
-	-- IAS 没有按帧计数的看门狗：它只有已锁存的试验开关（R:3914、R:3967、R:4007），那些开关
-	-- 只停自己的那个试验，从不丢会话。`item.disabled` 在整个运行时里没有任何地方会被置位，也一并删除。
-	-- `zeroFrames` / `zeroLimit` 选项 / "[驱动失效]" 日志随之删除。
+	-- ⚠️ 判"驱动失效"不能用"这一帧写了几个骨"：加了"姿态没变就跳过"之后，
+	-- 站着不动时 written 天然就是 0，用它判失效会让静止的角色每 45 帧重挂一次（踩过）。
+	-- 真正的判据是"求解器有没有在处理链"：写了 + 因没变而跳过 = 处理过的骨数。
+	--
+	-- 多人分帧之后还要再排除一种假信号：**这一帧按 stride 谁都不该被驱动**。
+	-- 那种帧一条骨都不会被处理，但这不是故障——它是节流本身。判据要挂"有没有尝试过"。
 	phase(runtime, "写骨 后")
-
-	-- E12f-C2：尸体副本的逐帧采样 / 复制（IAS：写骨之后的 observe R:4705，帧尾的 flush R:7018）。
-	-- 内部自带 pcall；未开启且没有副本时是一次布尔判断。
-	corpse_frame(runtime)
+	local handled = written + skippedSame
+	if not attemptedAny then
+		-- 分帧跳过的帧：不算数，也不清零（清零会让"卡住"永远攒不到上限）
+	elseif handled == 0 then
+		runtime.zeroFrames = (runtime.zeroFrames or 0) + 1
+	else
+		runtime.zeroFrames = 0
+	end
+	local tripped = false
+	for _, session in ipairs(runtime.sessions) do
+		for _, item in ipairs(session.sessions) do
+			if item.disabled == true then tripped = true end
+		end
+	end
+	if runtime.zeroFrames >= (options.zeroLimit or 45) or tripped then
+		logger("[physbone][驱动失效] 连续 %d 帧一条骨都没处理（护栏=%s）⇒ 退回等待重挂",
+			runtime.zeroFrames, tostring(tripped))
+		runtime.sessions = nil
+		runtime.zeroFrames = 0
+		runtime.reArm = (runtime.reArm or 0) + 1
+		local delay = math.min(options.maxReArmFrames or 600, (options.reArmFrames or 60) * runtime.reArm)
+		runtime.rearmAt = frame + delay
+	end
 
 	-- 姿态快照：外部按下热键 ⇒ 写请求文件 ⇒ 这里把骨架采下来。
 	-- 放在**物理写完、渲染之前**：采到的就是这一帧画到屏幕上的姿态。
@@ -7031,39 +4203,6 @@ end
 ---@param stingray table 引擎命名空间
 ---@param options table { compat, logPath, debug, archiveId, ... }
 ---@return table runtime
--- 分项计数的包装（见 Perf）。所有被包装的都是上面已经定义好的局部函数 / 表字段；
--- 局部函数是按上值被别的函数引用的，所以在这里重新赋值，之前定义的调用方也会走包装。
-local perfWrapped = false
-local function perf_wrap_all()
-	if perfWrapped then return end
-	perfWrapped = true
-	refresh_avatar_distances = Perf.wrap("F8", refresh_avatar_distances)
-	fp_lock_watch = Perf.wrap("F8", fp_lock_watch)
-	scheduler_watch = Perf.wrap("F8", scheduler_watch)
-	drive = Perf.wrap("F9", drive)   -- drive 本体剩余部分（时钟、生命周期、门控）：未归入子项的调用都记在这里
-	sched_poll = Perf.wrap("F9", sched_poll)
-	-- 2.1.66：F9 拆项（2026-11-23 实机 F9 从 ~500 跳到 ~2880 次/帧，当时只有总数、看不出是谁）。
-	-- 子项排他记账：F9d 装甲件发现 / F9i 身份轮询 / F9c 尸体定格 / F9s 物理同步；F9 本身是剩下的（时钟、门控、调度）。
-	roster_discover = Perf.wrap("F9d", roster_discover)
-	roster_identity = Perf.wrap("F9i", roster_identity)
-	physics_sync = Perf.wrap("F9s", physics_sync)
-	for _, name in ipairs({ "begin", "filter", "frame", "lifecycleObserve" }) do
-		CorpseFreeze[name] = Perf.wrap("F9c", CorpseFreeze[name])
-	end
-	independent_frame = Perf.wrap("F4", independent_frame)
-	apply_arm_pose_frame = Perf.wrap("F4", apply_arm_pose_frame)
-	sample_action_state = Perf.wrap("F5", sample_action_state)
-	frame_animation_machine = Perf.wrap("F5", frame_animation_machine)
-	independent_scan = Perf.wrap("P3", independent_scan)
-	IndependentLink.find_weapon = Perf.wrap("F3", IndependentLink.find_weapon)
-	IndependentLink.physics = Perf.wrap("F6", IndependentLink.physics)
-	IndependentLink.present = Perf.wrap("F4p", IndependentLink.present)
-	IndependentLink.attach = Perf.wrap("F4a", IndependentLink.attach)
-	IndependentLink.held_weapon = Perf.wrap("F3", IndependentLink.held_weapon)
-	IndependentLink.action = Perf.wrap("F5", IndependentLink.action)
-	M.independent_physics_ = IndependentLink.physics
-end
-
 function M.install(stingray, options)
 	local existing = rawget(_G, INSTALL_KEY)
 	if existing ~= nil then return existing end
@@ -7079,38 +4218,8 @@ function M.install(stingray, options)
 	Compat = compat
 
 	local logger, logContext = makeLogger(options)
-	-- 分项计数：默认开（用户下次实机要一次拿全分项）；`perfCounters = false` 关。
-	Roster.reset()
-	Roster.negativeSeconds = tonumber(options.rosterNegativeSeconds) or 0.25   -- IAS 行 1553；仅测试用选项可调
-	Roster.pollInterval = tonumber(options.identityPollSeconds) or 0.25   -- IAS：4 Hz（行 4747）；仅测试用选项可调
-	Perf.reset()
-	Perf.on = options.perfCounters ~= false
-	if Perf.on then
-		Perf.window = math.floor(tonumber(options.perfWindow) or 600)
-		Perf.instrument(S)
-		for _, name in ipairs({ "update", "attach", "session_health", "unit_alive" }) do
-			if type(Compat[name]) == "function" and not rawget(Compat, "__perf_" .. name) then
-				local bucket = (name == "update" and "F6") or (name == "attach" and "P7") or "F7"
-				Compat[name] = Perf.wrap(bucket, Compat[name])
-				rawset(Compat, "__perf_" .. name, true)
-			end
-		end
-		perf_wrap_all()
-		local rawLogger = logger
-		logger = function(format, ...)
-			if type(format) == "string" then
-				if format:find("有新玩家", 1, true) then Perf.event("P4") end
-				if format:find("跳过 %d 个离它所属玩家", 1, true) or format:find("跳过 %d", 1, true) and format:find("尸体", 1, true) then Perf.event("P5") end
-				if format:find("玩家动它不动", 1, true) or format:find("没有跟着动", 1, true) then Perf.event("P6") end
-				if format:find("[独立骨] 清单", 1, true) then Perf.event("P3log") end
-			end
-			return rawLogger(format, ...)
-		end
-	end
-
 	state = {
 		options = options,
-		iasPhysicsGroups = math.floor(tonumber(options.iasPhysicsGroups) or 0) % 16,
 		logger = logger,
 		logContext = logContext,
 		cache = {},
@@ -7119,13 +4228,17 @@ function M.install(stingray, options)
 		-- 场上的玩家 avatar 名单（每个玩家一项）。会话按 `session.owner` 归属到其中一项上，
 		-- 名单变化只影响"补挂/收尾"，不会推翻别人的会话。
 		avatars = nil,
+		reconcile = nil,     -- 名单变化后待执行的补挂帧号；nil = 没有待办
 		nearStride = 1,      -- 6 m 内队友的分帧步长（1 = 每帧）
 		farStride = 1,       -- 6 m 外队友的分帧步长
 		frame = 0,
 		dt = options.dt or (1 / 60),
+		reArm = 0,
+		rearmAt = nil,
 		driveFrames = 0,
 		beatFrames = 0,
 		callsAccum = 0,
+		zeroFrames = 0,
 		waitReason = nil,
 		waitRepeat = 0,
 		installed = true,
@@ -7138,30 +4251,10 @@ function M.install(stingray, options)
 		-- 先让原来的 render 跑完（别的 mod 可能也在包装），再写我们的姿态：
 		-- 这样引擎已经算完动画、还没画，我们写进去的 local pose 会直接用于本帧蒙皮。
 		local result
-		if driver.weaponShift then Perf.active = Perf.on; IndependentLink.restore_weapon(driver); Perf.active = false end
 		if originalRender ~= nil then result = originalRender(...) end
 		if driver.installed then
 			driver.frame = driver.frame + 1
-			local calls0 = Perf.totalCalls
-			Perf.cur = nil
-			Perf.active = Perf.on
 			local ok, err = pcall(drive, driver)
-			Perf.active = false
-			if Perf.on then
-				Perf.cur = nil
-				Perf.frames = Perf.frames + 1
-				local spent = Perf.totalCalls - calls0
-				if spent > (Perf.events.maxFrameCalls or 0) then Perf.events.maxFrameCalls = spent end
-				if Compat.perf_resync then Perf.events.P1 = Compat.perf_resync end
-				if Perf.frames >= Perf.window then
-					pcall(Perf.summary, driver)
-					local keepResync = Perf.events.P1
-					Perf.reset()
-					Perf.events.P1 = keepResync
-				end
-			end
-			driver.frameAnimation = nil
-			if not ok and driver.weaponShift then IndependentLink.restore_weapon(driver) end
 			if not ok and not driver.driveErrorLogged then
 				driver.driveErrorLogged = true
 				driver.logger("[physbone][错误] 驱动失败：%s", tostring(err))
@@ -7174,16 +4267,6 @@ function M.install(stingray, options)
 		M.VERSION,
 		options.mode == "boot" and "独占 boot" or "外置模块",
 		os.date("%Y-%m-%d %H:%M:%S"))
-	if options.iasPhysicsGroups ~= nil then
-		logger("[physbone] IAS 可选组掩码=%d（刘海/呆毛=1 挂件=2 胸部=4 臀部=8）", state.iasPhysicsGroups)
-	end
-	if options.armPose == true then
-		local legs = Compat.leg_joint_targets ~= nil and Compat.leg_joint_targets(options.legJointTarget) or nil
-		logger("[physbone] 姿态修正已开：肩目标=%s 腿目标=%s 独立骨=%s",
-			Compat.arm_shoulder_targets(options.armShoulderTarget) ~= nil and "有" or (options.armShoulderTarget ~= nil and "无效" or "无"),
-			legs ~= nil and (#legs .. " 根") or (options.legJointTarget ~= nil and "无效" or "无"),
-			type(options.independentBones) == "table" and (#options.independentBones .. " 根") or "无")
-	end
 	return state
 end
 
@@ -7191,17 +4274,12 @@ end
 function M.uninstall()
 	local runtime = state
 	if runtime == nil then return false end
-	if not IndependentLink.restore_weapon(runtime) then return false end
 	runtime.installed = false
-	IndependentLink.release_all(runtime)
 	for _, session in ipairs(runtime.sessions or {}) do
 		pcall(Compat.release, session)
 	end
 	runtime.sessions = nil
 	rawset(_G, "render", originalRender)
-	if runtime.weaponUpdate and rawget(_G, "update") == runtime.weaponUpdate then
-		rawset(_G, "update", runtime.originalWeaponUpdate)
-	end
 	rawset(_G, INSTALL_KEY, nil)
 	state = nil
 	return true
@@ -7215,15 +4293,6 @@ function M.setOptions(patch)
 end
 
 M.install_ = M.install
-M.perf_ = Perf
-M.roster_ = Roster
-M.corpseMotion_ = CorpseMotion
-M.corpse_ = Roster.freeze
--- 仅测试：把假 CorpseMotion 的函数拷进 CorpseMotion 表（C1 合入后它是那张局部表；单独在本分支上它是全局表）。
-M.set_corpse_motion_ = function(stub)
-	for key, value in pairs(stub) do CorpseMotion[key] = value end
-end
-M.set_engine_ = function(engine) S = engine end   -- 仅测试：不经 install 直接给 Roster 一个引擎
 
 -- 测试钩子：抬升探针的两块纯逻辑（读调参文件 / 给一个 unit 加偏移）。
 -- 单独暴露出来，是因为"不累加、引擎重设后能重写、关掉时能还原"这三条
@@ -7244,10 +4313,6 @@ M.make_logger_ = makeLogger
 M.snapshot_parse_ = parse_snapshot_request
 M.snapshot_ids_ = snapshot_ids
 M.snapshot_json_ = snapshot_json
-M.arm_pose_enabled_ = arm_pose_enabled
-M.apply_arm_pose_frame_ = apply_arm_pose_frame
-M.independent_physics_ = IndependentLink.physics
-M.independent_contact_ = IndependentLink
 M.snapshot_poll_ = snapshot_poll
 M.snapshot_dir_ = snapshot_dir
 

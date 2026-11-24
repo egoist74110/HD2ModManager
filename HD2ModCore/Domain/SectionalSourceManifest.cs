@@ -148,6 +148,10 @@ public sealed record SectionalSourceDocument(
 	IReadOnlyList<SectionalSourceEntry> Sources,
 	SectionalSourceAssetKeys AssetKeys)
 {
+	/// <summary>IAS 普通 Mod 的来源约定版本，用于重建时沿用 IAS 专属的拆件选项。</summary>
+	[System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingDefault)]
+	public int IasSourceVersion { get; init; }
+
 	/// <summary>护甲与头盔至少选了一个才有"来源"可转。</summary>
 	public bool HasSelection => Armor?.HasValue == true || Helmet?.HasValue == true;
 }

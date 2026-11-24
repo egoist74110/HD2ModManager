@@ -2,6 +2,7 @@
 
   <PropertyGroup>
     <TargetFramework>net8.0</TargetFramework>
+    <TargetFramework Condition="'$(OS)' == 'Windows_NT'">net10.0-windows</TargetFramework>
     <IsPackable>false</IsPackable>
   </PropertyGroup>
 
@@ -14,16 +15,26 @@
   <ItemGroup>
     <ProjectReference Include="..\HD2ModCore\HD2ModCore.csproj" />
     <ProjectReference Include="..\HD2ModAdaptation\HD2ModAdaptation.csproj" />
+    <Compile Include="..\HD2IasWorker\PreparedIasDeployment.cs" Link="Ias\PreparedIasDeployment.cs" />
   </ItemGroup>
 
   <ItemGroup>
     <Content Include="..\HD2ModManager\ThirdParty\7zip\**\*" Link="third_party\7zip\%(RecursiveDir)%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 
-  <ItemGroup>
+  <ItemGroup Condition="'$(TargetFramework)' == 'net10.0-windows'">
+    <ProjectReference Include="..\HD2ModManager\HD2ModManager.csproj" />
+    <Compile Include="..\HD2SourceModel.Tests\SourceFormatFixtures.cs" Link="Ias\SourceFormatFixtures.cs" />
+  </ItemGroup>
+
+  <ItemGroup Condition="'$(TargetFramework)' == 'net8.0'">
     <Compile Include="..\HD2ModManager\ViewModels\BottomBarLayout.cs" Link="BottomBarLayout.cs" />
     <!-- 树的多选集合运算：纯逻辑、不碰 WPF，所以按文件链进来测。 -->
     <Compile Include="..\HD2ModManager\Controls\Trees\TreeSelectionMath.cs" Link="TreeSelectionMath.cs" />
+    <Compile Remove="IasPageViewModelTests.cs" />
+    <Compile Remove="IasVpkDropTests.cs" />
+    <Compile Remove="IasLibraryPickerTests.cs" />
+    <Compile Remove="IasLibraryPickerRenderTests.cs" />
   </ItemGroup>
 
 </Project>

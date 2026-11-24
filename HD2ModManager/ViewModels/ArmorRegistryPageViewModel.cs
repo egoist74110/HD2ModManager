@@ -932,6 +932,12 @@ public sealed class ArmorRegistryPageViewModel : FullWorkspacePageViewModel
 		// 覆盖也可能算在**马上就要被启动部署改掉**的那份部署上。
 		// 列表本身不等闸门（见 RefreshAsync 的第一段）。
 		if (displayFactsReady is not null) await displayFactsReady.ConfigureAwait(false);
+		return await ReadArmorDisplayFactsAsync(library, catalog).ConfigureAwait(false);
+	}
+
+	internal static async Task<IReadOnlyDictionary<string, ArmorDisplayFacts>> ReadArmorDisplayFactsAsync(
+		ModLibraryService library, IReadOnlyList<RuntimeArmorCatalogEntry> catalog, CancellationToken ct = default)
+	{
 		var result = new Dictionary<string, ArmorDisplayFacts>(StringComparer.OrdinalIgnoreCase);
 		var gameData = SettingsService.GetGameDataFolder();
 		if (string.IsNullOrWhiteSpace(gameData) || !Directory.Exists(gameData))
@@ -953,7 +959,7 @@ public sealed class ArmorRegistryPageViewModel : FullWorkspacePageViewModel
 			var coverage = await library.InformationCenter.RequestArmorCoverageAsync(
 				gameData,
 				archiveIds,
-				new ModInformationRequest(ModInformationKind.ArmorCoverage, "ArmorRegistryPage")).ConfigureAwait(false);
+				new ModInformationRequest(ModInformationKind.ArmorCoverage, "ArmorRegistryPage"), ct).ConfigureAwait(false);
 			if (coverage.Data is null)
 			{
 				// 索引未建或生产失败都表现为 Data 为空。前者是正常状态，后者需要留下线索。
@@ -1003,7 +1009,7 @@ public sealed class ArmorRegistryPageViewModel : FullWorkspacePageViewModel
 				//      ——后者会把只改了材质的 Mod 也算进来，显示出一个没换模型的图标；
 				//   3) 那个 Mod 自己没有图标时，沿父链向上找（FindModIconInParentChain）。
 				var imagePath = entry.HasEffectiveUnitOverride && entry.UnitWinnerNodeId is { } winner && nodesById.ContainsKey(winner)
-					? FindModIconInParentChain(winner.Value, parents)
+					? FindModIconInParentChain(library, winner.Value, parents)
 					: null;
 				result[item.ArchiveId] = new ArmorDisplayFacts(imagePath, entry.HasEffectiveUnitOverride);
 			}
@@ -1019,7 +1025,7 @@ public sealed class ArmorRegistryPageViewModel : FullWorkspacePageViewModel
 		return result;
 	}
 
-	private string? FindModIconInParentChain(Guid nodeId, IReadOnlyDictionary<Guid, IReadOnlyList<Guid>> parents)
+	private static string? FindModIconInParentChain(ModLibraryService library, Guid nodeId, IReadOnlyDictionary<Guid, IReadOnlyList<Guid>> parents)
 	{
 		var visited = new HashSet<Guid>();
 		var queue = new Queue<Guid>();
@@ -1969,7 +1975,7 @@ public sealed class ArmorRegistryPageViewModel : FullWorkspacePageViewModel
 			|| choice.MemberItemIds.Any(id => id.ToString(CultureInfo.InvariantCulture).Contains(term, StringComparison.OrdinalIgnoreCase));
 	}
 
-	private sealed record ArmorDisplayFacts(string? ImagePath, bool HasEffectiveUnitOverride);
+	internal sealed record ArmorDisplayFacts(string? ImagePath, bool HasEffectiveUnitOverride);
 
 	private HashSet<(uint Target, uint Source)> GetMappingKeys()
 		=> Mappings.Select(mapping => (mapping.Target.ItemId, mapping.Source.ItemId)).ToHashSet();
@@ -2177,7 +2183,7 @@ public sealed class ArmorRegistryPageViewModel : FullWorkspacePageViewModel
 	/// 低污染映射前的素体准备（规划 §12.1）：只看这次映射用到的素体，逐个判断是不是当前设置下的最新产物，
 	/// 只对需要的重编（走详情页「切换」那条 <see cref="ModCompileService.CompileAsync"/>，目标是自己的素体）。
 	/// 返回本次要跳过的素体 key（重编失败 / 不能自动重编 / 游戏在运行）；<c>null</c> = 用户取消，整次应用中止。
-	/// 没有任何素体需要重编时什么都不做，与以前的「应用」完全一样。
+	/// 没有任何素体需要重编时只记录命中数量。
 	/// </summary>
 	private async Task<IReadOnlySet<string>?> PrepareSourceModelsAsync(IReadOnlyList<RuntimeArmorRegistryMapping> desired)
 	{
@@ -2186,6 +2192,7 @@ public sealed class ArmorRegistryPageViewModel : FullWorkspacePageViewModel
 		var sourceKeys = LowPollutionFreshness.SourceModelKeys(Enabled, desired);
 		var paths = SettingsService.CreateStoragePaths();
 		var lowPollution = SettingsService.GetEffectiveLowPollutionMode();
+		var cacheContext = SettingsService.CreateVpkHostContext() with { LowPollutionMode = lowPollution };
 		// 飞船 NPC（女舰长、维修技术员）的专用 unit 只为「映射了 NPC 的素体」生成：按素体归拢这次映射里的 NPC。
 		var npcByModel = LowPollutionFreshness.NpcItemIdsByModel(Enabled && lowPollution ? desired : []);
 		var seafSources = npcByModel.Where(pair => pair.Value.Contains(KitNpcRecords.SeafSoldierItemId)).Select(pair => pair.Key).ToArray();
@@ -2201,22 +2208,28 @@ public sealed class ArmorRegistryPageViewModel : FullWorkspacePageViewModel
 			Path.GetFullPath(modDirectory).TrimEnd('\\', '/'),
 			StringComparison.OrdinalIgnoreCase));
 		// 提示里要写用户认得的 Mod 名：文件夹名常常只是一串创意工坊编号（2026-11-14 用户看不出是谁出错）。
-		var items = (await LowPollutionFreshness.PlanAsync(paths.ModsDirectory, keys, lowPollution, npcByModel: npcByModel).ConfigureAwait(true))
+		var items = (await Task.Run(() => LowPollutionFreshness.PlanAsync(paths.ModsDirectory, keys, lowPollution,
+				npcByModel: npcByModel, cacheContext: cacheContext)).ConfigureAwait(true))
 			.Select(item => NodeOf(item.ModDirectory)?.Metadata.Name is { Length: > 0 } displayName ? item with { Name = displayName } : item)
 			.ToList();
 		var need = items.Where(item => item.Status == LowPollutionPrepStatus.NeedsRecompile).ToArray();
 		var blocked = items.Where(item => item.Status == LowPollutionPrepStatus.Blocked).ToArray();
 		if (blocked.FirstOrDefault(item => staleSeafKeys.Contains(item.ModelKey)) is { } oldSeaf)
 			throw new InvalidOperationException($"无法清理 {oldSeaf.Name} 中上一次的 SEAF 补丁。{oldSeaf.Reason}");
-		if (need.Length == 0 && blocked.Length == 0) return empty;
-
 		var skipped = new HashSet<string>(blocked.Select(item => item.ModelKey), StringComparer.OrdinalIgnoreCase);
 		foreach (var item in blocked)
 		{
 			LogService.Info($"低污染模式：跳过素体 {item.Name} 的映射：{item.Reason}");
 			notifications.Show($"{item.Name}：{item.Reason}。这次不应用它的映射。", NotificationLevel.Warning, TimeSpan.FromSeconds(14), "护甲注册");
 		}
-		if (need.Length == 0) return skipped;
+		foreach (var item in items.Where(item => item.Status == LowPollutionPrepStatus.UpToDate))
+			LogService.Info($"低污染模式：素体 {item.Name}（{item.ModelKey}）已是最新：{item.Reason}");
+		if (need.Length == 0)
+		{
+			var upToDate = items.Count - blocked.Length;
+			LogService.Info($"低污染模式：缓存换入 0 个，重编 0 个，已是最新 {upToDate} 个，跳过 {blocked.Length} 个。");
+			return skipped;
+		}
 
 		if (IsGameRunning())
 		{
@@ -2228,55 +2241,69 @@ public sealed class ArmorRegistryPageViewModel : FullWorkspacePageViewModel
 			return skipped;
 		}
 
-		var title = lowPollution ? "低污染：重编映射用到的素体" : "关闭低污染：恢复素体普通产物";
+		var title = lowPollution ? "低污染：准备映射用到的素体" : "关闭低污染：恢复素体普通产物";
 		var task = backgroundTasks?.Enqueue(
 			BackgroundTaskKind.RebuildVpk,
 			title,
 			$"{need.Length} 个素体（已是最新的 {items.Count - need.Length - blocked.Length} 个跳过）",
 			origin: "护甲映射",
-			userVisibleReason: "低污染模式改变了素体产物的形态，映射前只重编这次用到、且还不是最新的素体。",
+			userVisibleReason: "护甲映射会换入仍有效的素体缓存，缺少有效缓存时重新编译。",
 			suggestedAction: "完成后会自动部署并应用映射。",
 			presentation: BackgroundTaskPresentation.Foreground);
 		task?.MarkRunning("准备中");
 		var cancellation = task?.CancellationToken ?? CancellationToken.None;
-		StatusTitle = "正在重编素体";
+		StatusTitle = "正在准备素体";
 
 		var changedNodes = new List<ModNodeId>();
 		var pendingSeafCleanup = need.Where(item => staleSeafKeys.Contains(item.ModelKey))
 			.Select(item => item.ModelKey).ToHashSet(StringComparer.OrdinalIgnoreCase);
+		VpkHostContext ContextOf(LowPollutionPrepItem item) => cacheContext with
+		{
+			ModDisplayName = item.Name,
+			NpcItemIds = npcByModel.TryGetValue(item.ModelKey, out var npcs) ? [.. npcs.Order()] : [],
+		};
+		void RecordChange(LowPollutionPrepItem item)
+		{
+			pendingSeafCleanup.Remove(item.ModelKey);
+			if (NodeOf(item.ModDirectory) is { } node) changedNodes.Add(node.Id);
+		}
+
 		var result = await LowPollutionRecompiler.RunAsync(
 			items,
 			async (item, token) =>
 			{
-				if (pendingSeafCleanup.Count != 0 && seafSources.Contains(item.ModelKey, StringComparer.OrdinalIgnoreCase))
-					return (false, "上一份 SEAF 补丁还在，先清理旧补丁才能切换素体。");
 				var node = NodeOf(item.ModDirectory);
+				var context = ContextOf(item);
+				LogService.Info($"低污染模式：重编素体 {item.Name}（{item.ModelKey}，低污染模式：{(lowPollution ? "开" : "关")}）：{item.Reason}，目标形态无有效缓存。");
 				var outcome = await ModCompileService.CompileAsync(
 					node is null ? Path.GetFileName(item.ModDirectory.TrimEnd('\\', '/')) : node.Id.Value.ToString("N"),
 					item.ModDirectory,
-					// 只给映射到这个素体的 NPC 生成专用 unit；没映射（或取消了）就是空，编译产物里不留 NPC 资源。
-					SettingsService.CreateVpkHostContext(item.Name) with
-					{
-						NpcItemIds = npcByModel.TryGetValue(item.ModelKey, out var mappedNpcs) ? [.. mappedNpcs.Order()] : [],
-					},
+					context,
 					[RuntimeArmorRegistryService.CustomModelArchiveId(item.ModelKey)],
 					null,
 					stage => task?.UpdateStage($"{item.Name}：{stage}"),
 					token).ConfigureAwait(true);
-				if (outcome.Ok)
-				{
-					pendingSeafCleanup.Remove(item.ModelKey);
-					if (node is not null) changedNodes.Add(node.Id);
-				}
+				if (outcome.Ok) RecordChange(item);
 				return (outcome.Ok, outcome.Error ?? "编译失败。");
 			},
 			(index, total, item) =>
 			{
-				StatusDetail = $"重编素体 {index}/{total}：{item.Name}（{item.Reason}）";
+				StatusDetail = $"准备素体 {index}/{total}：{item.Name}（{item.Reason}）";
 				task?.UpdateStage(StatusDetail);
 				task?.UpdateProgress((double)(index - 1) / total);
 			},
-			cancellation).ConfigureAwait(true);
+			cancellation,
+			tryRestore: async (item, token) =>
+			{
+				if (pendingSeafCleanup.Count != 0 && seafSources.Contains(item.ModelKey, StringComparer.OrdinalIgnoreCase))
+					throw new InvalidOperationException("上一份 SEAF 补丁还在，先清理旧补丁才能切换素体。");
+				if (!await Task.Run(async () => await LowPollutionFreshness.TryActivateCachedAsync(item, ContextOf(item), token)
+					.ConfigureAwait(false), token).ConfigureAwait(true))
+					return false;
+				RecordChange(item);
+				LogService.Info($"低污染模式：缓存换入素体 {item.Name}（{item.ModelKey}，{(lowPollution ? "压缩" : "普通")}）。");
+				return true;
+			}).ConfigureAwait(true);
 
 		if (changedNodes.Count > 0)
 		{
@@ -2289,20 +2316,20 @@ public sealed class ArmorRegistryPageViewModel : FullWorkspacePageViewModel
 		foreach (var (item, error) in result.Failed)
 		{
 			skipped.Add(item.ModelKey);
-			LogService.Info($"低污染模式：素体 {item.Name} 重编失败，跳过它的映射：{error}");
+			LogService.Info($"低污染模式：素体 {item.Name} 准备失败，跳过它的映射：{error}");
 		}
 		if (result.Canceled)
 		{
 			task?.MarkCanceled();
 			notifications.Show(
-				$"已取消：{result.Recompiled.Count} 个素体已重编，其余没动。这次没有写映射；再点「应用」会接着做（已是最新的会跳过）。",
+				$"已取消：缓存换入 {result.Restored.Count} 个，重编成功 {result.Recompiled.Count} 个。这次没有写映射。",
 				NotificationLevel.Warning, TimeSpan.FromSeconds(14), "护甲注册");
 			return null;
 		}
 
-		var summary = $"重编素体：{result.Recompiled.Count} 个完成"
+		var summary = $"缓存换入 {result.Restored.Count} 个，重编成功 {result.Recompiled.Count} 个（尝试 {result.RecompileCount} 个）"
 			+ (result.Failed.Count > 0 ? $"，{result.Failed.Count} 个失败（{result.Failed[0].Item.Name}：{result.Failed[0].Error}），它们的映射本次跳过" : string.Empty)
-			+ $"，{result.UpToDate.Count} 个已是最新、跳过。";
+			+ $"，已是最新 {result.UpToDate.Count} 个，跳过 {blocked.Length} 个。";
 		LogService.Info("低污染模式：" + summary);
 		if (result.Failed.Count > 0) task?.MarkFailed(summary); else task?.MarkCompleted();
 		notifications.Show(summary, result.Failed.Count == 0 ? NotificationLevel.Info : NotificationLevel.Warning, TimeSpan.FromSeconds(16), "护甲注册");

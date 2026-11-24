@@ -680,6 +680,7 @@ public sealed class SourceMaterialConverter
 	public const byte DefaultMetallic = 6;
 
 	private readonly SourceMaterialSource source;
+	internal SourceMaterialSource Source => source;
 	private readonly Bc7Encoder encoder;
 	private readonly Hd2MaterialTemplateLibrary templates;
 
@@ -758,7 +759,7 @@ public sealed class SourceMaterialConverter
 	/// </para>
 	/// </summary>
 	private readonly System.Collections.Concurrent.ConcurrentDictionary<
-		(ulong Hash, int Length, bool Srgb), byte[]> bc7ByContent = new();
+		(ulong Hash, int Width, int Height, bool Srgb), Lazy<byte[]>> bc7ByContent = new();
 
 	/// <summary>按内容去重的 BC7 编码，返回完整 DDS（148 字节头 + 像素）。</summary>
 	/// <summary>
@@ -912,15 +913,16 @@ public sealed class SourceMaterialConverter
 
 	private byte[] EncodeBc7Deduplicated(byte[] rgba, int width, int height, bool srgb)
 	{
-		var key = (HashRgba(rgba), rgba.Length, srgb);
+		var key = (HashRgba(rgba), width, height, srgb);
 		return bc7ByContent.GetOrAdd(
 			key,
-			_ => encoder.EncodeToBc7(Hd2TextureAsset.BuildDds(width, height, Rgba8Unorm, [rgba]), srgb));
+			_ => new Lazy<byte[]>(() => encoder.EncodeToBc7(
+				Hd2TextureAsset.BuildDds(width, height, Rgba8Unorm, [rgba]), srgb))).Value;
 	}
 
 	/// <summary>与内容绑定的解码缓存：同一张 VTF 只解一次（texconv 解 2048² 约 0.1 s）。</summary>
 	private readonly System.Collections.Concurrent.ConcurrentDictionary<
-		(string Name, int Length, ulong Hash), byte[]> decodedTextures = new();
+		(string Name, int Length, ulong Hash), Lazy<byte[]>> decodedTextures = new();
 
 	/// <summary>
 	/// 「这张贴图读不出来」这一类的异常：格式不支持、文件坏了、算术溢出（头部字段是垃圾时）。
@@ -957,12 +959,9 @@ public sealed class SourceMaterialConverter
 	private byte[] DecodeTextureCached(string textureName, byte[] vtfBytes, VtfFile vtf)
 	{
 		var key = (textureName, vtfBytes.Length, HashRgba(vtfBytes));
-		if (decodedTextures.TryGetValue(key, out var cached))
-			return (byte[])cached.Clone();
-
-		var rgba = encoder.DecodeToRgba(BuildSourceDds(vtf));
-		decodedTextures.TryAdd(key, (byte[])rgba.Clone());
-		return rgba;
+		var decoded = decodedTextures.GetOrAdd(key,
+			_ => new Lazy<byte[]>(() => encoder.DecodeToRgba(BuildSourceDds(vtf)))).Value;
+		return (byte[])decoded.Clone();
 	}
 
 	/// <summary>

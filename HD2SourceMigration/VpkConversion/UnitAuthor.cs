@@ -55,7 +55,8 @@ public sealed class UnitAuthor
 
 	public UnitAuthorResult Author(UnitAuthorRequest request) => Author(request, null);
 
-	internal UnitAuthorResult Author(UnitAuthorRequest request, IReadOnlyDictionary<int, RetargetedMesh>? nativeLods)
+	internal UnitAuthorResult Author(UnitAuthorRequest request, IReadOnlyDictionary<int, RetargetedMesh>? nativeLods,
+		bool preserveAbsentCustomization = false)
 	{
 		ArgumentNullException.ThrowIfNull(request);
 		var diagnostics = new List<string>();
@@ -226,6 +227,10 @@ public sealed class UnitAuthor
 			diagnostics.AddRange(rebuilt.Diagnostics.Select(diagnostic => $"[{diagnostic.Code}] {diagnostic.Message}"));
 			return new(null, null, null, diagnostics);
 		}
+
+		// IAS 按原版装备件表替换同键 Unit。原件没有槽位记录时，保留这个布局。
+		if (preserveAbsentCustomization && rebuilt.Model.CustomizationInfoOffset == 0)
+			return new(rebuilt.Output.TocData, rebuilt.Output.GpuData, rebuilt.Model, []);
 
 		// 槽位是变长记录，只能拼字节；见 UnitCustomizationRewriter 的说明。
 		var (tocData, model) = UnitCustomizationRewriter.Rewrite(

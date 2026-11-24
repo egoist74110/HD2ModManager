@@ -1,3 +1,6 @@
+using System.Buffers.Binary;
+using System.Text;
+using HD2ModAdaptation.PatchReconstruction;
 using HD2SourceMigration.IasConversion;
 using HD2SourceModel;
 
@@ -40,29 +43,53 @@ public sealed class IasPhysicsTests
 		Assert.Throws<InvalidDataException>(() => IasPhysicsReader.Read(bytes));
 	}
 
-	[Theory]
-	[InlineData("Back_L.016", 0)]
-	[InlineData("JacketStrap_01", 0)]
-	[InlineData("Bang_R", 1)]
-	[InlineData("Ahoge.001", 1)]
-	[InlineData("ACC2", 2)]
-	[InlineData("Breast.L", 3)]
-	[InlineData("Butt.R", 4)]
-	public void ClassifiesChain(string chain, int group) =>
-		Assert.Equal(group, IasPhysicsMigration.Group(chain));
-
 	[Fact]
-	public void ConvertsToSpringRigUnitsAndPreservesConeAndGroup()
+	public void ConvertsToMasterSpringRigUnitsAndFlags()
 	{
 		var joint = new IasPhysicsJoint("Bang_R", 11, .025f, IasLimit.Cone, .5f, 0, 2, 1);
 		var chain = new IasPhysicsChain("Bang_R", 6, .5f, new(0, 0, -4), [joint]);
-		var spring = IasPhysicsMigration.ConvertParameters(chain, joint, 1f / 120, .2f, first: true);
+		var spring = IasPhysicsMigration.ConvertParameters(chain, joint, 1f / 120, .2f);
 		Assert.Equal(12, spring.YawStiffness);
 		Assert.Equal(.2, spring.Length * .01905, 6);
 		Assert.Equal(4, spring.TipMass * .01905, 5);
 		Assert.Equal(.5, spring.AngleLimit);
-		Assert.Equal(1, spring.Flags >> IasPhysicsMigration.GroupShift & 15);
-		Assert.NotEqual(0, spring.Flags & IasPhysicsMigration.ChainStart);
+		Assert.Equal(SourceJiggleBone.Flexible | SourceJiggleBone.LengthConstrained | SourceJiggleBone.AngleConstrained,
+			spring.Flags);
+	}
+
+	internal static async Task<HashSet<uint>> ReadSpringHashesAsync(string patch)
+	{
+		var container = await PhysBoneCarrier.TryReadContainerFromFileAsync(patch + ".gpu_resources");
+		if (container is null)
+			return [];
+		const int record = 48;
+		var nameLength = BinaryPrimitives.ReadUInt16LittleEndian(container.AsSpan(record));
+		Assert.Equal(PhysBoneCarrier.RigRecordName, Encoding.UTF8.GetString(container, record + 56, nameLength));
+		var offset = checked((int)BinaryPrimitives.ReadUInt64LittleEndian(container.AsSpan(record + 4)));
+		var length = checked((int)BinaryPrimitives.ReadUInt64LittleEndian(container.AsSpan(record + 12)));
+		return ReadSpringHashes(container.AsSpan(offset, length));
+	}
+
+	private static HashSet<uint> ReadSpringHashes(ReadOnlySpan<byte> rig)
+	{
+		Assert.True(rig.StartsWith(PhysBoneSpringRig.Magic));
+		Assert.Equal(PhysBoneSpringRig.Version, BinaryPrimitives.ReadUInt32LittleEndian(rig[8..]));
+		var count = BinaryPrimitives.ReadInt32LittleEndian(rig[12..]);
+		var nameTable = BinaryPrimitives.ReadInt32LittleEndian(rig[16..]);
+		var size = BinaryPrimitives.ReadInt32LittleEndian(rig[24..]);
+		var hashes = new HashSet<uint>();
+		for (var i = 0; i < count; i++)
+		{
+			var record = rig[(32 + i * size)..];
+			var name = rig[(nameTable + BinaryPrimitives.ReadInt32LittleEndian(record[8..]))..];
+			var bone = Encoding.UTF8.GetString(name[..name.IndexOf((byte)0)]);
+			Assert.StartsWith("jiggle_", bone, StringComparison.Ordinal);
+			Assert.True(hashes.Add(Hd2NameHash.Of(bone)));
+			Assert.InRange(BinaryPrimitives.ReadInt32LittleEndian(record[4..]), -1, i - 1);
+			Assert.InRange(BinaryPrimitives.ReadUInt32LittleEndian(record[16..]), 0u, 127u);
+		}
+		Assert.NotEmpty(hashes);
+		return hashes;
 	}
 
 	private static byte[] Fixture()

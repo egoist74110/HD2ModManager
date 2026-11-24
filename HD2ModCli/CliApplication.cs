@@ -76,10 +76,19 @@ public static class CliApplication
 	private static async Task<int> DispatchAsync(CliInvocation invocation)
 	{
 		var command = invocation.Command.Select(value => value.Trim().ToLowerInvariant()).ToArray();
+		if (command.Length >= 2 && command[0] == "ias" && command[1] is "install" or "uninstall" or "enable" or "disable" or "role" or "reshade" or "dlss" or "add" or "remove" or "list" or "to-standard" or "recover")
+		{
+			using var timing = HD2ModCore.Ias.IasTiming.Begin("命令行 ias " + string.Join(' ', command.Skip(1)));
+			return await CliIasModuleCommands.RunAsync(command[1], invocation).ConfigureAwait(false);
+		}
+		if (command.Length == 2 && command[0] == "ias" && command[1] is "feed" or "download" or "status")
+			return await CliIasFeedCommands.RunAsync(command[1], invocation.Options.IasGameRoot is { } iasGame
+				? invocation.Options with { GameData = Path.Combine(Path.GetFullPath(iasGame), "data") } : invocation.Options).ConfigureAwait(false);
+		if (command.Length >= 2 && command[0] == "ias" && command[1] == "pack")
+			return await CliIasPackaging.RunAsync(command, invocation).ConfigureAwait(false);
 		if (command.Length == 3 && command[0] == "ias" && command[1] == "convert")
-			return await CliIasConversion.ConvertAsync(invocation.Command[2], invocation.Options.GameData, invocation.Options.Output).ConfigureAwait(false);
-		if (command.Length == 3 && command[0] == "ias" && command[1] == "preview")
-			return await CliIasConversion.PreviewAsync(invocation.Command[2], invocation.Options.GameData, invocation.Options.Output).ConfigureAwait(false);
+			return await CliIasConversion.ConvertAsync(invocation.Command[2], invocation.Options.GameData, invocation.Options.Output,
+				invocation.Options.IasTargetArmor, invocation.Options.IasTargetHelmet, invocation.Options.ManagerRoot, invocation.Options.IasMergeHelmet).ConfigureAwait(false);
 		var addToProfileSupported = (command.Length == 3 && command[0] == "import" && command[1] == "plan")
 			|| (command.Length >= 4 && command[0] == "import" && command[1] == "batch" && command[2] == "plan");
 		if (!string.IsNullOrWhiteSpace(invocation.Options.AddToProfile) && !addToProfileSupported)
@@ -8893,6 +8902,16 @@ HD2 Mod Manager 命令行
 	  hd2mod doctor --manager-root <管理器目录> --library <Mod库目录> --json
 	  hd2mod status --manager-root <管理器目录> --json
 	  hd2mod game locate [--manager-root <管理器目录>] --json
+	  hd2mod ias pack hd2|l4d2 <patch目录或VPK> --game-data <目录> --output <新目录> --ias <Generator目录> --aqsdk <目录> [--material-vpk <文件>（l4d2，可重复）]
+	  hd2mod ias install|uninstall|add <路径...>|remove <id>|list --manager-root <目录> --game-root <目录>
+	  hd2mod ias to-standard <id> --manager-root <目录> --game-root <目录> [--target-armor <archive|itemId>] [--target-helmet <archive|itemId>] [--merge-helmet]
+	  hd2mod ias convert <源目录> --game-data <目录> --output <目录> [--manager-root <已安装 IAS 的管理器目录>] [--target-armor <archive|itemId>] [--target-helmet <archive|itemId>] [--merge-helmet]
+	  hd2mod ias enable|disable --manager-root <目录> --game-root <目录> [--json]
+	  hd2mod ias role enable|disable <id> --manager-root <目录> --game-root <目录> [--json]
+	  hd2mod ias reshade on|off --manager-root <目录> --game-root <目录> [--json]
+	  hd2mod ias dlss off|fg|nr --manager-root <目录> --game-root <目录> [--json]
+	  hd2mod ias recover --manager-root <目录> --game-root <目录> [--json]
+	    [--texconv <exe>] [--name <名称>] [--rig-gender female|male] [--id <UUID>] [--no-ias-phys] [--json]
 	  hd2mod custom-model inspect <Mod GUID> --manager-root <管理器目录> --library <Mod库目录> --game-data <游戏data目录> --json
 	  hd2mod custom-model convert <Mod GUID> <来源Archive[,头盔Archive]> <素体名称> --manager-root <管理器目录> --library <Mod库目录> --game-data <游戏data目录> --output <输出根目录> --confirm --json
 	  hd2mod armor-registry status [--registry-root <协议目录>] --json

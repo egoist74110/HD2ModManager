@@ -307,12 +307,12 @@ public static class CoreServices
 	public static IGameDataDeploymentLeaseProvider CreateGameDataDeploymentLeaseProvider()
 		=> new GameDataDeploymentLeaseProvider();
 	public static DeploymentCapabilityService CreateDeploymentCapabilityService() => new();
-	public static IProfileApplyService CreateProfileApplyService(StoragePaths paths, IModInformationCenter informationCenter, OptionActivationStore? optionActivations = null)
-		=> new ProfileApplyService(informationCenter, CreateApplyPlanner(), CreateApplyExecutor(), CreateDeploymentCapabilityService(), paths, optionActivations, CreateLuaDeploymentService(paths), CreateRuntimeArmorRegistryService(paths));
-	public static IProfileDeploymentCoordinator CreateProfileDeploymentCoordinator(StoragePaths paths, Func<string?> gameDataDirectoryProvider, IModInformationCenter informationCenter, IDeploymentDelay? delay = null, TimeSpan? bufferDuration = null, OptionActivationStore? optionActivations = null)
+	public static IProfileApplyService CreateProfileApplyService(StoragePaths paths, IModInformationCenter informationCenter, OptionActivationStore? optionActivations = null, Func<bool>? effectiveLowPollutionMode = null)
+		=> new ProfileApplyService(informationCenter, CreateApplyPlanner(), CreateApplyExecutor(), CreateDeploymentCapabilityService(), paths, optionActivations, CreateLuaDeploymentService(paths), CreateRuntimeArmorRegistryService(paths), effectiveLowPollutionMode);
+	public static IProfileDeploymentCoordinator CreateProfileDeploymentCoordinator(StoragePaths paths, Func<string?> gameDataDirectoryProvider, IModInformationCenter informationCenter, IDeploymentDelay? delay = null, TimeSpan? bufferDuration = null, OptionActivationStore? optionActivations = null, Func<bool>? effectiveLowPollutionMode = null)
 		=> new ProfileDeploymentCoordinator(
 			CreateModLibraryManager(paths),
-			CreateProfileApplyService(paths, informationCenter, optionActivations),
+			CreateProfileApplyService(paths, informationCenter, optionActivations, effectiveLowPollutionMode),
 			CreateApplyExecutor(),
 			paths,
 			gameDataDirectoryProvider,

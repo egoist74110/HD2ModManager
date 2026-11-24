@@ -44,6 +44,7 @@ public partial class ShellViewModel
         _trailingNavItems =
         [
             new NavItemDescriptor("nav.armor", "护甲映射", NavIconKey.ArmorRegistry, ShowArmorRegistryCommand),
+            new NavItemDescriptor("nav.ias", "IAS", NavIconKey.Ias, ShowIasCommand) { ToolTipText = "HD2 综合护甲系统" },
             new NavItemDescriptor("nav.settings", "设置", NavIconKey.Settings, ShowSettingsCommand)
         ];
 
@@ -55,6 +56,7 @@ public partial class ShellViewModel
     {
         if (e.PropertyName is nameof(IsHomeActive)
             or nameof(IsArmorRegistryActive)
+            or nameof(IsIasActive)
             or nameof(IsSettingsActive))
         {
             SyncNav();
@@ -67,6 +69,7 @@ public partial class ShellViewModel
 
         _leadingNavItems[0].IsActive = IsHomeActive;
         _trailingNavItems[0].IsActive = IsArmorRegistryActive;
-        _trailingNavItems[1].IsActive = IsSettingsActive;
+        _trailingNavItems[1].IsActive = IsIasActive;
+        _trailingNavItems[2].IsActive = IsSettingsActive;
     }
 }

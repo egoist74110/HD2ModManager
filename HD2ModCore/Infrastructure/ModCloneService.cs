@@ -179,7 +179,7 @@ public static class ModCloneService
 		foreach (var directory in Directory.EnumerateDirectories(source, "*", SearchOption.TopDirectoryOnly))
 		{
 			var name = Path.GetFileName(directory);
-			if (ExcludedDirectories.Contains(name)) continue;
+			if (ExcludedDirectories.Contains(name) || ModNodePayloadLayout.IsInactiveOverwriteDirectoryName(name)) continue;
 			// 备份目录是派生的中间产物，不该被复制成"新的一代"。
 			if (name.Contains(".bak-", StringComparison.OrdinalIgnoreCase)
 				|| name.Contains(".backup-", StringComparison.OrdinalIgnoreCase)) continue;

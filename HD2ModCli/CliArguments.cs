@@ -168,7 +168,14 @@ public sealed record CliGlobalOptions(
 	bool? LegRefit = null,
 	bool? ShoulderTwist = null,
 	bool? KneeBlend = null,
-	bool? ShoulderFix = null);
+	bool? ShoulderFix = null,
+	IasPackArguments? IasPack = null,
+	string? IasGameRoot = null,
+	string? IasOfflinePackage = null,
+	bool IasRemoveCharacters = false,
+	string? IasTargetArmor = null,
+	string? IasTargetHelmet = null,
+	bool IasMergeHelmet = false);
 
 public sealed record CliInvocation(IReadOnlyList<string> Command, CliGlobalOptions Options);
 
@@ -244,6 +251,13 @@ public static class CliArgumentParser
 		var json = false;
 		var dryRun = false;
 		var command = new List<string>();
+		IasPackArguments? iasPack = null;
+		string? iasGameRoot = null;
+		string? iasOfflinePackage = null;
+		var iasRemoveCharacters = false;
+		string? iasTargetArmor = null;
+		string? iasTargetHelmet = null;
+		var iasMergeHelmet = false;
 
 		for (var index = 0; index < args.Length; index++)
 		{
@@ -258,6 +272,24 @@ public static class CliArgumentParser
 					break;
 				case "--game-data":
 					gameData = ReadValue(args, ref index, argument);
+					break;
+				case "--merge-helmet":
+					iasMergeHelmet = true;
+					break;
+				case "--target-armor":
+					iasTargetArmor = ReadValue(args, ref index, argument);
+					break;
+				case "--target-helmet":
+					iasTargetHelmet = ReadValue(args, ref index, argument);
+					break;
+				case "--game-root":
+					iasGameRoot = ReadValue(args, ref index, argument);
+					break;
+				case "--offline-package":
+					iasOfflinePackage = ReadValue(args, ref index, argument);
+					break;
+				case "--remove-characters":
+					iasRemoveCharacters = true;
 					break;
 				case "--registry-root":
 					registryRoot = ReadValue(args, ref index, argument);
@@ -306,6 +338,21 @@ public static class CliArgumentParser
 					break;
 				case "--material-source":
 					materialSource = ReadValue(args, ref index, argument);
+					break;
+				case "--ias":
+				case "--aqsdk":
+				case "--texconv":
+				case "--rig-gender":
+				case "--id":
+				case "--l4d2-root":
+				case "--material-vpk":
+				case "--model-stem":
+				case "--body-archive":
+				case "--helmet-archive":
+					iasPack = (iasPack ?? new()).WithValue(argument, ReadValue(args, ref index, argument));
+					break;
+				case "--no-ias-phys":
+					iasPack = (iasPack ?? new()) with { WithPhysics = false };
 					break;
 				case "--albedo-factor":
 					var rawAlbedoFactor = ReadValue(args, ref index, argument);
@@ -669,7 +716,19 @@ public static class CliArgumentParser
 		}
 
 		if (command.Count == 0) command.Add("help");
-		return new CliInvocation(command, new CliGlobalOptions(managerRoot, library, gameData, registryRoot, output, plan, host, addToProfile, keys, addKeys, removeKeys, archiveId, kind, header, picks, position, limit, cursor, setActive, withUnsharedOptions, withEffective, onlyCompetition, overwrite, confirm, json, avatarToc, boneHash, components, name, materialSource, albedoFactor, matcap, donor, file, sections, dryRun, idNamespace, disabled, cutout, idNamespaceToken, matcapGain, metalRoughness, metalCutout, cutoutTemplate, unitIds, reuseModel, headMerge, headMergeConsent, vpkList, materialSourceList, componentSourceList, treatAs, treatAsList, alphaExperiment, ditherScale, ditherDensity, ditherPattern, normalFlipY, noDraw, cutoutGeometry, headScale, legRefit, shoulderTwist, kneeBlend, shoulderFix));
+		var iasVerb = command.Count >= 2 && command[0].Equals("ias", StringComparison.OrdinalIgnoreCase)
+			? command[1].ToLowerInvariant() : null;
+		if ((iasTargetArmor is not null || iasTargetHelmet is not null || iasMergeHelmet) && iasVerb is not ("convert" or "to-standard"))
+			throw new CliUserException("IasArguments", "--target-armor、--target-helmet 和 --merge-helmet 只用于 IAS 转换。");
+		if (iasGameRoot is not null && (gameData is not null || iasVerb is not ("install" or "uninstall" or "enable" or "disable" or "role" or "reshade" or "dlss" or "add" or "remove" or "list" or "to-standard" or "status" or "recover")))
+			throw new CliUserException("CommandOptionNotSupported", "--game-root 仅可用于 IAS 部署命令，且不能与 --game-data 同用。");
+		if (iasOfflinePackage is not null && iasVerb != "install" || iasRemoveCharacters && iasVerb != "uninstall")
+			throw new CliUserException("CommandOptionNotSupported", "--offline-package 仅可用于 ias install，--remove-characters 仅可用于 ias uninstall。");
+		if (iasPack is not null && !(command.Count >= 2
+			&& command[0].Equals("ias", StringComparison.OrdinalIgnoreCase)
+			&& command[1].Equals("pack", StringComparison.OrdinalIgnoreCase)))
+			throw new CliUserException("CommandOptionNotSupported", "IAS 打包选项仅可用于 ias pack。");
+		return new CliInvocation(command, new CliGlobalOptions(managerRoot, library, gameData, registryRoot, output, plan, host, addToProfile, keys, addKeys, removeKeys, archiveId, kind, header, picks, position, limit, cursor, setActive, withUnsharedOptions, withEffective, onlyCompetition, overwrite, confirm, json, avatarToc, boneHash, components, name, materialSource, albedoFactor, matcap, donor, file, sections, dryRun, idNamespace, disabled, cutout, idNamespaceToken, matcapGain, metalRoughness, metalCutout, cutoutTemplate, unitIds, reuseModel, headMerge, headMergeConsent, vpkList, materialSourceList, componentSourceList, treatAs, treatAsList, alphaExperiment, ditherScale, ditherDensity, ditherPattern, normalFlipY, noDraw, cutoutGeometry, headScale, legRefit, shoulderTwist, kneeBlend, shoulderFix, iasPack, iasGameRoot, iasOfflinePackage, iasRemoveCharacters, iasTargetArmor, iasTargetHelmet, iasMergeHelmet));
 	}
 
 	private static string ReadValue(string[] args, ref int index, string option)

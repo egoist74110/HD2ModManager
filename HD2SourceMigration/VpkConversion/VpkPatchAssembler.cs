@@ -448,7 +448,8 @@ public sealed class VpkPatchAssembler
 		// 头身合并：把头的注册件从「头盔槽 / 层 0」挪到胸部的第一个空层（见 MergeHeadIntoTorso）。
 		// **不改 patch 字节**，只改注册表条目，于是头盔 item 没有模型、头跟着护甲走。
 		bool mergeHeadIntoTorso = false,
-		Action<string, int, int>? onProgress = null)
+		Action<string, int, int>? onProgress = null,
+		IReadOnlyList<int>? materialSourceIndices = null)
 	{
 		ArgumentNullException.ThrowIfNull(plans);
 		ArgumentException.ThrowIfNullOrWhiteSpace(outputDirectory);
@@ -520,7 +521,6 @@ public sealed class VpkPatchAssembler
 
 		// 源材质下标 → 材质 id。Unit 的作者要靠它把每一段指向正确的材质。
 		var materialIdsBySourceMaterial = new Dictionary<int, ulong>();
-
 		if (materialConverter is not null && (materialScope is not null || sourceMaterialNames is not null))
 			ResolveAndEmitMaterials();
 
@@ -529,7 +529,8 @@ public sealed class VpkPatchAssembler
 		// 必须在写几何之前、且在材质解析之后：判据是"这个材质的颜色来自 `$iris`"，
 		// 那要求读 VMT 并量出贴图里画着眼睛的那块矩形——也就是 ResolveAndEmitMaterials
 		// 手上那批 VMT。漏掉这一步的表现是"眼球不是没有材质，而是整颗只剩一个像素的颜色"。
-		if (materialConverter is not null && geometry is not null && sourceMaterialNames is not null)
+		if ((materialSourceIndices is null || plans.Count != 0) &&
+			materialConverter is not null && geometry is not null && sourceMaterialNames is not null)
 		{
 			var (reprojected, eyeNotes) = EyeUv.Reproject(
 				geometry, sourceMaterialNames, materialConverter.ResolveEyeColorSource, eyeFrame);
@@ -845,6 +846,8 @@ public sealed class VpkPatchAssembler
 		{
 			var converter = materialConverter!;
 			var scope = materialScope;
+			// 材质独立打包时，实际消费这些索引的 Unit 由调用方另行编写。
+			var usedMaterialIndices = materialSourceIndices ?? (geometry is null ? [] : UsedMaterialIndices(plans, geometry).ToArray());
 
 			// ① 要解析的材质名。**去重**：`MaterialPaths` 里同名材质会出现多次。
 			var stems = new List<string>();
@@ -853,7 +856,7 @@ public sealed class VpkPatchAssembler
 			var requiredStems = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 			if (sourceMaterialNames is not null)
 			{
-				foreach (var materialIndex in UsedMaterialIndices(plans, geometry!))
+				foreach (var materialIndex in usedMaterialIndices)
 				{
 					if (materialIndex < 0 || materialIndex >= sourceMaterialNames.Count)
 						continue;
@@ -1085,7 +1088,7 @@ public sealed class VpkPatchAssembler
 			// 把 id 分派回源材质下标（Unit 作者按下标取）。
 			if (sourceMaterialNames is not null)
 			{
-				foreach (var materialIndex in UsedMaterialIndices(plans, geometry!))
+				foreach (var materialIndex in usedMaterialIndices)
 				{
 					if (materialIndex < 0 || materialIndex >= sourceMaterialNames.Count)
 						continue;
@@ -1203,7 +1206,8 @@ public sealed class VpkPatchAssembler
 			{
 				try
 				{
-					if (scope is null || !scope.TryReadVmt(stem, out var bytes) || bytes.Length == 0) return false;
+					var source = scope ?? (materialSourceIndices is null ? null : converter.Source);
+					if (source is null || !source.TryReadVmt(stem, out var bytes) || bytes.Length == 0) return false;
 					// ⚠️ **按 VMT 语法判，不能对原始文本 `Contains("$no_draw")`。**
 					// 后者会把注释（`// $no_draw`）、以及 `$no_draw "0"`（= 关）也算成"不要画"，
 					// 于是本该显示的部件被剔掉几何。`IsEnabled` 已经处理了"0/false/空值算关"。
@@ -1375,7 +1379,7 @@ public sealed class VpkPatchAssembler
 			if (sourceMaterialNames is not null)
 			{
 				var firstSourceIndexByMaterialId = new Dictionary<ulong, int>();
-				foreach (var materialIndex in UsedMaterialIndices(plans, geometry!))
+				foreach (var materialIndex in usedMaterialIndices)
 				{
 					if (materialIndex < 0 || materialIndex >= sourceMaterialNames.Count)
 						continue;

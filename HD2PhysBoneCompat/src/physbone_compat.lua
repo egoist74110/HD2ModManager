@@ -441,11 +441,6 @@ end
 --- </para>
 ---@return table chains 每条路径是一个骨记录数组；首节的 `isBranch` 为 true 表示它有 jiggle 父骨
 ---@return table byIndex 源骨下标 → 骨记录
-local function ias_chain_start(bone)
-	return type(bone.name) == "string" and bone.name:match("^ias_phys_")
-		and math.floor((bone.flags or 0) / 4096) % 2 == 1
-end
-
 function M.build_chains(bones)
 	local byIndex = {}
 	for _, bone in ipairs(bones) do byIndex[bone.index] = bone end
@@ -453,10 +448,8 @@ function M.build_chains(bones)
 	local children = {}
 	for _, bone in ipairs(bones) do
 		local key = bone.parent
-		if not ias_chain_start(bone) then
-			children[key] = children[key] or {}
-			children[key][#children[key] + 1] = bone
-		end
+		children[key] = children[key] or {}
+		children[key][#children[key] + 1] = bone
 	end
 
 	M.apply_world_segments(bones)
@@ -493,7 +486,7 @@ function M.build_chains(bones)
 	local starts = {}
 	for _, bone in ipairs(bones) do
 		local parent = byIndex[bone.parent]
-		if parent == nil or isForkParent(parent) or ias_chain_start(bone) then
+		if parent == nil or isForkParent(parent) then
 			starts[#starts + 1] = bone
 		end
 	end
@@ -517,29 +510,6 @@ function M.build_chains(bones)
 		end
 	end
 	return chains, byIndex
-end
-
-local function ias_group(bone)
-	return bone.name:match("^ias_phys_") and math.floor((bone.flags or 0) / 256) % 16 or 0
-end
-
--- The group occupies bits 8–11 only on IAS records. Filter before any engine node lookup.
-function M.filter_ias_groups(rig, mask)
-	local bones = {}
-	local removed = 0
-	for _, bone in ipairs(rig.bones) do
-		local group = ias_group(bone)
-		if group == 0 or math.floor((mask or 0) / 2 ^ (group - 1)) % 2 == 1 then
-			bones[#bones + 1] = bone
-		else
-			removed = removed + 1
-		end
-	end
-	if removed == 0 then return rig, 0 end
-	local filtered = {}
-	for key, value in pairs(rig) do filtered[key] = value end
-	filtered.bones = bones
-	return filtered, removed
 end
 
 -- ---------------------------------------------------------------------------
@@ -1092,7 +1062,7 @@ function M.step_tip(item, dt, apx, apy, apz, qx, qy, qz, qw)
 		--      各节转角 7.66° / 0.00° / 0.00°）。
 		--   ② k==1 ⇒ 真的没有父节。
 		local rest, rel = restDirs[k], relDevs[k]
-		if k == 1 or gains.ias then
+		if k == 1 then
 			prevX, prevY, prevZ = rest[1], rest[2], rest[3]
 		elseif rel == nil then
 			local d = item.dirs[k - 1]
@@ -1120,18 +1090,10 @@ function M.step_tip(item, dt, apx, apy, apz, qx, qy, qz, qw)
 		local velPitch = ux * tip.vx + uy * tip.vy + uz * tip.vz
 		local accYaw = gains.kYaw * errYaw - gains.cYaw * velYaw
 		local accPitch = gains.kPitch * errPitch - gains.cPitch * velPitch
-		local gravity = gains.g
-		if gains.ias then
-			-- Solve the full transverse force implicitly. Applying damping to the spring
-			-- alone raises the gravity equilibrium by a factor of (1 + dt * c).
-			accYaw = (accYaw - gravity * lz) / (1 + dt * gains.cYaw + dt * dt * gains.kYaw)
-			accPitch = (accPitch - gravity * uz) / (1 + dt * gains.cPitch + dt * dt * gains.kPitch)
-			gravity = 0
-		end
 		-- 重力：上的反面（一致性电池 E1 实测世界 +Z 朝上）
 		local ax = accYaw * lx + accPitch * ux
 		local ay = accYaw * ly + accPitch * uy
-		local az = accYaw * lz + accPitch * uz - gravity
+		local az = accYaw * lz + accPitch * uz - gains.g
 		tip.vx, tip.vy, tip.vz = tip.vx + ax * dt, tip.vy + ay * dt, tip.vz + az * dt
 		tip.px, tip.py, tip.pz = tip.px + tip.vx * dt, tip.py + tip.vy * dt, tip.pz + tip.vz * dt
 		-- 定长约束（样本 flags=0x31 含 lenC ⇒ 尖端钉在半径 L 的球面上，且没有 along 弹簧）
@@ -1234,11 +1196,10 @@ function M.step_tip(item, dt, apx, apy, apz, qx, qy, qz, qw)
 		-- 分轴约束的骨**不走这条**（见上面 axisLimits 的说明；单轴受限时另一轴不夹分量、
 		-- 锥也不生效，理由与投影顺序的顾虑见 `gains_of` 里单轴受限那段）。
 		local dot = nx * prevX + ny * prevY + nz * prevZ
-		local cone, cosCone = gains.limit, gains.cosLimit
-		if not gains.axisLimits and cone > 0 and dot < cosCone then
+		if not gains.axisLimits and gains.limit > 0 and dot < gains.cosLimit then
 			local sx, sy, sz, _ = swing_axis(prevX, prevY, prevZ, nx, ny, nz)
 			if sx ~= nil then
-				local rqx, rqy, rqz, rqw = q_axis_angle(sx, sy, sz, cone)
+				local rqx, rqy, rqz, rqw = q_axis_angle(sx, sy, sz, gains.limit)
 				local obx, oby, obz = nx, ny, nz
 				nx, ny, nz = qrot(rqx, rqy, rqz, rqw, prevX, prevY, prevZ)
 				-- 同上：把**朝墙外**的那份速度去掉。否则它会一直堆在墙外，
@@ -1433,21 +1394,18 @@ function M.step_spring(spring, dt, accelX, accelY, accelZ)
 	-- 最后一道闸：任何非有限值都复位。
 	-- 宁可这一帧"回到原位"，也不能让 NaN 写进节点矩阵——那会让网格消失且不可恢复。
 	local function sane(value)
-		return type(value) == "number" and math.abs(value) < math.huge
+		if type(value) ~= "number" then return 0 end
+		if value ~= value or value == math.huge or value == -math.huge then return 0 end
+		return value
 	end
-	if not (sane(state[1]) and sane(state[2]) and sane(velocity[1]) and sane(velocity[2])) then
-		spring.yaw, spring.pitch, spring.yawVelocity, spring.pitchVelocity = 0, 0, 0, 0
-		return false
-	end
-	spring.yaw, spring.pitch = state[1], state[2]
-	spring.yawVelocity, spring.pitchVelocity = velocity[1], velocity[2]
+	spring.yaw, spring.pitch = sane(state[1]), sane(state[2])
+	spring.yawVelocity, spring.pitchVelocity = sane(velocity[1]), sane(velocity[2])
 	if spring.limit > 0 then
 		if spring.yaw > spring.limit then spring.yaw = spring.limit end
 		if spring.yaw < -spring.limit then spring.yaw = -spring.limit end
 		if spring.pitch > spring.limit then spring.pitch = spring.limit end
 		if spring.pitch < -spring.limit then spring.pitch = -spring.limit end
 	end
-	return true
 end
 M.MASS_BASE = MASS_BASE
 
@@ -1640,8 +1598,7 @@ end
 local function read_vec3(S, vector)
 	if vector == nil then return nil end
 	local ok, x, y, z = pcall(function() return S.Vector3.to_elements(vector) end)
-	if ok and type(x) == "number" and type(y) == "number" and type(z) == "number"
-		and math.abs(x) < math.huge and math.abs(y) < math.huge and math.abs(z) < math.huge then return x, y, z end
+	if ok and type(x) == "number" and x == x then return x, y, z end
 	return nil
 end
 
@@ -1656,9 +1613,9 @@ local function read_quat4(S, unit, node)
 		if q == nil then return nil end
 		return S.Quaternion.to_elements(q)   -- 必须与上一步同一次调用内完成
 	end)
-	if not ok or type(x) ~= "number" or type(y) ~= "number" or type(z) ~= "number" or type(w) ~= "number" then return nil end
+	if not ok or type(x) ~= "number" or type(w) ~= "number" then return nil end
 	local length = math.sqrt(x * x + y * y + z * z + w * w)
-	if not (length >= 1e-9 and length < math.huge) then return nil end
+	if length < 1e-9 then return nil end
 	return x / length, y / length, z / length, w / length
 end
 
@@ -1728,14 +1685,6 @@ function M.unit_alive(S, unit)
 	return true
 end
 
---- 判活的统一入口。调用方（运行时）给了 `isLive`（本帧枚举的纯表查询，零引擎调用）就只查表：
---- 句柄只来自本帧枚举、不跨帧，IAS 不对这类句柄再调 `Unit.alive`（R:894-896、R:1417-1422）。
---- 没给（单测 / 外部直接用本库）才退回 `Unit.alive`。
-local function unit_live(S, unit, isLive)
-	if type(isLive) == "function" then return isLive(unit) == true end
-	return M.unit_alive(S, unit) == true
-end
-
 --- 会话身份诊断：**只观察，不据此停驱动**。
 --- 返回 { nodes = 当前场景图节点数, has = 抽样骨名是否还能解析 }。
 --- <para>
@@ -1777,21 +1726,13 @@ function M.session_health(session, stamp)
 	if session.dead ~= nil then return session.dead end
 	-- 同一帧只判一次：探针的 prune_sessions 和 update_tip 都会问，不去重就是每帧 2 次引擎调用/会话。
 	if stamp ~= nil and session.healthStamp == stamp then return "ok" end
+	if stamp ~= nil then session.healthStamp = stamp end
 	local S = session.S
-	if type(session.isLive) == "function" then
-		-- E12f-C3：运行时托管的会话——判活只查本帧枚举（零引擎调用，IAS 无逐会话 Unit.alive，R:894-896、R:1417-1422）。
-		-- 本帧不在枚举里 ⇒ 本帧不碰它，但**不**永久判死：枚举失败 / 单帧缺席时下一帧还能恢复；
-		-- 会话的去留由运行时按本帧枚举决定。也不记 healthStamp，同一帧再问仍然如实回答。
-		if not session.isLive(session.unit) then return "dead" end
-		if stamp ~= nil then session.healthStamp = stamp end
-	else
-		if stamp ~= nil then session.healthStamp = stamp end
-		local aliveNow, aliveError = M.unit_alive(S, session.unit)
-		if not aliveNow then
-			session.dead = "dead"
-			session.deadReason = aliveError
-			return "dead"
-		end
+	local aliveNow, aliveError = M.unit_alive(S, session.unit)
+	if not aliveNow then
+		session.dead = "dead"
+		session.deadReason = aliveError
+		return "dead"
 	end
 	session.healthFrames = (session.healthFrames or 0) + 1
 	local every = session.identityEvery or 30
@@ -1858,7 +1799,7 @@ local function rig_root_positions(rig)
 	for position = 1, #rig.bones do
 		local bone = rig.bones[position]
 		-- 父骨不在本 rig 里 ⇒ 这是链根（父是 HD2 原生骨，运行时按 `parentName` 找锚点）。
-		if bone.parent == nil or byIndex[bone.parent] == nil or ias_chain_start(bone) then
+		if bone.parent == nil or byIndex[bone.parent] == nil then
 			positions[#positions + 1] = position
 		end
 	end
@@ -1948,10 +1889,9 @@ end
 ---@param S table stingray 命名空间
 ---@param units table 候选 unit 数组（会对每个 unit 取最大命中数）
 ---@param candidates table { { rig = <parse_rig 结果>, path = <string> }, ... }
----@param isLive function|nil 本帧枚举判活（运行时传入；缺省退回 Unit.alive）
 ---@return table|nil best { rig, path, score, total, full }
 ---@return table scored 排序后的完整打分表
-function M.select_rig(S, units, candidates, isLive)
+function M.select_rig(S, units, candidates)
 	if type(candidates) ~= "table" or #candidates == 0 then return nil, {} end
 	units = units or {}
 
@@ -1963,7 +1903,7 @@ function M.select_rig(S, units, candidates, isLive)
 			local total = #rig.bones
 			local score = 0
 			for _, unit in ipairs(units) do
-				if unit_live(S, unit, isLive) then
+				if M.unit_alive(S, unit) then
 					local hits = 0
 					for bone = 1, total do
 						local aliases = aliasesByBone[bone]
@@ -2001,20 +1941,17 @@ end
 --- 有了这个键，第 2 个玩家起直接复用下标表，attach 成本从 N× 降到 1× + (N-1)×(读姿态)。
 --- </para>
 --- 拿不到资源哈希时返回 nil（退回不缓存，行为与优化前一致）。
-function M.attach_cache_key(S, unit, nodeCount, rig)
+function M.attach_cache_key(S, unit, nodeCount)
 	local ok, value = pcall(function() return S.Unit.name_hash(unit) end)
 	if not ok or type(value) ~= "string" or #value < 8 then return nil, nil end
 	local cache = M._attachCache
-	if cache == nil then cache = setmetatable({}, { __mode = "k" }); M._attachCache = cache end
-	-- Chain ordinals only identify nodes within this particular (possibly filtered) rig.
-	local scope = rig or M
-	if cache[scope] == nil then cache[scope] = {} end
-	return value .. "|" .. tostring(nodeCount), cache[scope]
+	if cache == nil then cache = {}; M._attachCache = cache end
+	return value .. "|" .. tostring(nodeCount), cache
 end
 
 --- 清空 attach 缓存。换关卡 / 换模型后可以调一次（不清也不会错，只是多占一点内存）。
 function M.clear_attach_cache()
-	M._attachCache = nil
+	M._attachCache = {}
 end
 
 --- 把 rig 挂到一个 Unit 上。
@@ -2031,7 +1968,7 @@ function M.attach(S, unit, rig, options)
 	logger("[physbone] attach 进入：rig %d 根骨", #rig.bones)
 	-- 生命周期闸：attach 本身要发上百次引擎调用（每根骨 has_node / node / local_pose /
 	-- world_position）。Unit 在 attach 途中被销毁同样是 AV，所以进门先验一次。
-	if not unit_live(S, unit, options.isLive) then
+	if not M.unit_alive(S, unit) then
 		logger("[physbone] attach 放弃：目标 Unit 已销毁（alive=false）")
 		return { S = S, world = options.world, unit = unit, rig = rig, sessions = {}, dead = "dead" }
 	end
@@ -2096,7 +2033,7 @@ function M.attach(S, unit, rig, options)
 
 	-- 多玩家穿同一套护甲时，节点下标完全一样（同一个资源的不同实例）。
 	-- 缓存"链 → 节点下标"，第 2 个玩家起就不用再跑几百次 has_node/node。
-	local cacheKey, attachCache = M.attach_cache_key(S, unit, nodeCount, rig)
+	local cacheKey, attachCache = M.attach_cache_key(S, unit, nodeCount)
 	local cachedChains = cacheKey and attachCache[cacheKey]
 	if cachedChains ~= nil then
 		logger("[physbone] 复用同款护甲的节点解析缓存（%d 条链，省掉约 %d 次引擎调用）",
@@ -2111,7 +2048,7 @@ function M.attach(S, unit, rig, options)
 		-- attach 整段跑在同一帧里，正常情况引擎不可能中途销毁 Unit（单线程）。
 		-- 这条是保险：万一某个引擎调用内部把它弄失效了（懒加载失败、资源回收），
 		-- 我们宁愿少挂几条链，也不要在失效 Unit 上继续读 local_pose / world_position。
-		if not unit_live(S, unit, options.isLive) then
+		if not M.unit_alive(S, unit) then
 			logger("[physbone] attach 中断：第 %d/%d 条链时目标 Unit 已销毁", chainIndex, #chains)
 			return { S = S, world = options.world, unit = unit, rig = rig,
 				sessions = {}, dead = "dead", partialSessions = sessions }
@@ -2125,7 +2062,6 @@ function M.attach(S, unit, rig, options)
 			break
 		else
 
-		local isIas = chain[1].name:match("^ias_phys_") ~= nil
 		-- 1) 链上每一节都必须是真实存在的节点
 		--    同款护甲复用缓存时，抽第一根骨做一次 has_node 抽查：万一实例的节点布局不同
 		--    （理论上不会），抽查失败就退回逐根解析。
@@ -2153,9 +2089,9 @@ function M.attach(S, unit, rig, options)
 			-- 2) 锚点：链根挂在哪根 HD2 骨上（用它的世界位置算加速度）
 			-- 锚点**名字**要在锚点解析之前就算好：世界朝向锚定的判据要用它判断
 			-- "这条链挂在手臂上还是躯干上"（见 M.world_anchor_of）。
-			local anchorName = chain[1].parentName
-			if not isIas then anchorName = M.anchor_name(anchorName, options.anchorMap) or anchorName end
-			local anchorNode = cached and nodes == cached.nodes and cached.anchorNode or nil
+			local anchorName = M.anchor_name(chain[1].parentName, options.anchorMap)
+				or chain[1].parentName
+			local anchorNode = cached and cached.anchorNode or nil
 			if anchorNode == nil then
 				-- rig v2 直接带父骨名字，所以这里能跨到 HD2 的骨名表上。
 				-- 映射表没命中时**把名字本身当成 HD2 骨名**再试一次：链是我们自己插进 Unit 的，
@@ -2202,28 +2138,15 @@ function M.attach(S, unit, rig, options)
 				local tipData = nil
 				if not snapshotFailed then
 					local bindWorld, okWorld = {}, true
-					local qbx, qby, qbz, qbw, awx, awy, awz
-					if isIas then
-						-- IAS appends joints with identity local bind rotations. Accumulating
-						-- their local translations gives the bind shape in the actual parent
-						-- frame, including on reattach after another chain has moved that parent.
-						local x, y, z = 0, 0, 0
-						for index, base in ipairs(basePoses) do
-							x, y, z = x + base.px, y + base.py, z + base.pz
-							bindWorld[index] = { x, y, z }
-						end
-						qbx, qby, qbz, qbw, awx, awy, awz = 0, 0, 0, 1, 0, 0, 0
-					else
-						for index = 1, #nodes do
-							local wx, wy, wz = read_vec3(S, S.Unit.world_position(unit, nodes[index]))
-							if wx == nil then okWorld = false break end
-							bindWorld[index] = { wx, wy, wz }
-						end
-						qbx, qby, qbz, qbw = read_quat4(S, unit, anchorNode)
-						awx, awy, awz = read_vec3(S, S.Unit.world_position(unit, anchorNode))
+					for index = 1, #nodes do
+						local wx, wy, wz = read_vec3(S, S.Unit.world_position(unit, nodes[index]))
+						if wx == nil then okWorld = false break end
+						bindWorld[index] = { wx, wy, wz }
 					end
-					if okWorld and qbx ~= nil and awx ~= nil then
+					local qbx, qby, qbz, qbw = read_quat4(S, unit, anchorNode)
+					if okWorld and qbx ~= nil then
 						-- 锚点 bind 世界位置（用它把每节的 bind 位置换成锚点局部系）
+						local awx, awy, awz = read_vec3(S, S.Unit.world_position(unit, anchorNode))
 						local cqx, cqy, cqz, cqw = qconj(qbx, qby, qbz, qbw)
 						local bonesNew, tipsNew, segDirLocal = {}, {}, {}
 						for index = 1, #chain do
@@ -2232,26 +2155,6 @@ function M.attach(S, unit, rig, options)
 							local lx, ly, lz = qrot(cqx, cqy, cqz, cqw, ox, oy, oz)
 							local gains = M.gains_of(chain[index].params, lengthScale, gravityScale,
 								{ flags = chain[index].flags, limitRelax = options.limitRelax })
-							if isIas then
-								gains.ias = true
-								-- IAS stiffness is an authored response rate. Preserve that
-								-- time scale in the overdamped target spring (response ≈ k/c).
-								gains.kYaw = gains.kYaw * math.max(gains.cYaw, gains.kYaw, 1)
-								gains.kPitch = gains.kPitch * math.max(gains.cPitch, gains.kPitch, 1)
-								-- Preserve the sign and relative effect of gravity up to
-								-- 7° of static bending per segment. Adjacent segment
-								-- corrections can oppose each other at a skin joint.
-								gains.g = math.min(gains.g, math.sin(math.rad(7)) * gains.L
-									* math.min(gains.kYaw, gains.kPitch))
-								-- The transverse spring has no restoring force at 180°.
-								-- Keep unconstrained tissue within a small elastic arc to
-								-- avoid folding the chest/hips during anchor translation.
-								local group = ias_group(chain[index])
-								local ceiling = (group == 3 or group == 4) and math.rad(7) or (math.pi / 2 - 0.01)
-								if gains.limit == 0 or gains.limit > ceiling then
-									gains.limit, gains.cosLimit = ceiling, math.cos(ceiling)
-								end
-							end
 							bonesNew[index] = {
 								gains = gains,
 								offLocal = { lx, ly, lz },
@@ -2346,7 +2249,6 @@ function M.attach(S, unit, rig, options)
 						-- 实机是"胸口反重力立起来/往上飘"。判据交给 M.world_anchor_of：
 						-- flags 齐全 **且** 锚点不是躯干/头/胯。
 						local worldAnchored, anchorReason = M.world_anchor_of(chain[1].flags or 0, anchorName)
-						if isIas then worldAnchored = false end
 						if worldAnchored then
 							logger("[physbone] 链 %s：flags=0x%02x，锚点 %s ⇒ 世界朝向锚定（父级只带动平移）",
 								tostring(chain[1] and chain[1].name), chain[1].flags or 0,
@@ -2361,7 +2263,7 @@ function M.attach(S, unit, rig, options)
 							dirs = {}, anchorBindQ = { qbx, qby, qbz, qbw },
 							goalQ = worldAnchored and { qbx, qby, qbz, qbw } or nil,
 						}
-						tipData.bendBlend = not isIas and (options.bendBlend == nil and 1.0 or options.bendBlend) or nil
+						tipData.bendBlend = options.bendBlend == nil and 1.0 or options.bendBlend
 						-- 分轴限位的**静止参考系**：右/上/前三个轴一次性在 goalQ 里算好。
 						--
 						-- ⚠️ 必须和"绑定方向"用同一个参考系。曾经混用过（方向用 goalQ、轴用当前 q），
@@ -2406,7 +2308,6 @@ function M.attach(S, unit, rig, options)
 					end
 					sessions[#sessions + 1] = {
 						chain = chain,
-						optionalIas = ias_group(chain[1]) ~= 0,
 						nodes = nodes,
 						springs = springs,
 						basePoses = basePoses,
@@ -2494,8 +2395,6 @@ function M.attach(S, unit, rig, options)
 		nodeCount = nodeCount,          -- 生命周期闸：场景图节点数（仅用于漂移观测）
 		identityNode = identityNode,    -- 生命周期闸：抽样骨名 id（仅用于漂移观测）
 		identityEvery = options.identityEvery or 30,
-		-- E12f-C3：运行时给的本帧枚举判活（零引擎调用）；session_health 用它代替逐会话 Unit.alive。
-		isLive = options.isLive,
 		-- 身份漂移是否参与"停驱动"判定。默认 **false**：只有实机确认了正确判据才打开。
 		-- 2026-11-01：开着它导致每秒一次 attach/丢弃循环（头发冻结并来回切）。
 		strictIdentity = options.strictIdentity == true,
@@ -2503,7 +2402,6 @@ function M.attach(S, unit, rig, options)
 		-- 上限 20 留了余量，但远小于位置跳变能产生的量级。
 		maxAccel = options.maxAccel or 10,   -- 走路 3~8 m/s²；留一点余量
 		positionSmoothing = options.positionSmoothing or 0.2,
-		teleportThreshold = options.teleportThreshold or 2.0,
 		jumpThreshold = options.jumpThreshold or 0.25,   -- 米；一帧移动 25cm 只可能是跳变
 		jumpCooldown = options.jumpCooldown or 30,        -- 跳变后静默帧数
 		chainBudget = options.chainBudget or 0.55,        -- 整条链的累计偏角上限（rad，约 31°）
@@ -2515,52 +2413,8 @@ function M.attach(S, unit, rig, options)
 end   -- M.attach 的收尾（缺它会连 M.update 一起吞掉，§24 踩过）
 
 --- 每帧调用。dt 用引擎时间；返回本次实际写入的骨数（便于测成本）。
-local function restore_chain(session, item)
-	local S = session.S
-	local restored = 0
-	for index, base in ipairs(item.basePoses) do
-		local ok, written = pcall(function()
-			local pose = rebuild_pose(S, base)
-			if pose ~= nil and pose_sane(S, pose) then
-				return S.Unit.set_local_pose(session.unit, item.nodes[index], pose) ~= false
-			end
-			return false
-		end)
-		if ok and written then restored = restored + 1 end
-	end
-	for _, spring in ipairs(item.springs or {}) do
-		spring.yaw, spring.pitch, spring.yawVelocity, spring.pitchVelocity = 0, 0, 0, 0
-	end
-	if item.tip then
-		for _, tip in ipairs(item.tip.tips) do tip.ready = false end
-		item.tip.dirs, item.tip.maxSpeed2 = {}, 0
-	end
-	item.lastWritten, item.lastRotations, item.lastAnchor, item.lastAnchorQ = nil, nil, nil, nil
-	item.previousPosition, item.previousVelocity, item.staticFrames = nil, nil, 0
-	return restored
-end
-
--- IAS R:4566 updates once after all changed nodes on this Unit were written.
-local function refresh_physics(session)
-	if session.iasCommit then session.iasCommit.dirty = true; return true, true end
-	return pcall(session.S.World.update_unit, session.world, session.unit)
-end
-
-function M.reset_physics(session)
-	if session == nil or M.session_health(session, M.frame) ~= "ok" then return 0 end
-	local restored = 0
-	for _, item in ipairs(session.sessions) do
-		if not (session.skipOptionalIas and item.optionalIas) then
-			restored = restored + restore_chain(session, item)
-		end
-	end
-	if restored > 0 and session.world ~= nil then refresh_physics(session) end
-	return restored
-end
-
 function M.update(session, dt, maxWrite)
 	if session == nil or #session.sessions == 0 then return 0 end
-	if dt and dt > 0.25 then return M.reset_physics(session) end
 	-- P2：默认走尖端点簧核。`options.solver = "angle"` 可切回旧核，仅用于游戏内 A/B 对照。
 	if session.solver ~= "angle" then return M.update_tip(session, dt, maxWrite) end
 	-- 生命周期闸（同 update_tip）：旧核也在碰 Unit，一样必须先验活。
@@ -2590,7 +2444,6 @@ function M.update(session, dt, maxWrite)
 
 	local written = 0
 	for _, item in ipairs(session.sessions) do
-		local writtenBefore, reset = written, false
 		-- 1) 锚点的世界位置 → 二阶差分得到加速度（这是"引擎侧做不到、必须我们算"的那一步）
 		local okPos, worldPosition = pcall(function() return S.Unit.world_position(session.unit, item.anchorNode) end)
 		local px, py, pz = nil, nil, nil
@@ -2680,12 +2533,7 @@ function M.update(session, dt, maxWrite)
 		for index = 1, #item.chain do
 			if maxWrite and written >= maxWrite then break end
 			local spring = item.springs[index]
-			if not M.step_spring(spring, dt, accel[1], accel[2], accel[3]) then
-				written = written + restore_chain(session, item)
-				logger("[physbone][护栏] 角度链数值异常，已恢复基准姿态")
-				reset = true
-				break
-			end
+			M.step_spring(spring, dt, accel[1], accel[2], accel[3])
 
 			-- 二次保险：把整条链的累计偏角封在 session.chainBudget 内。
 			-- 单节限位已经按节数摊开，这里再兜一次，防止参数/节数变化时又叠成反重力。
@@ -2705,7 +2553,7 @@ function M.update(session, dt, maxWrite)
 			-- 不再逐级衰减：源模型每节的参数完全相同，累加弯曲来自层级，而不是靠衰减。
 
 			local base = item.basePoses[index]
-			if base ~= nil then
+			if base ~= nil and not item.disabled then
 				-- 每一步失败都带一句原因返回。为什么：整条链有 6 个引擎调用，
 				-- 任何一环坏掉都只表现为"什么都没写"，光看结果永远分不清是
 				-- API 失效、姿态非法、还是句柄过期（2026-10-31 实测：写了 8 秒后突然开始 0 写入）。
@@ -2754,18 +2602,18 @@ function M.update(session, dt, maxWrite)
 				end
 			else
 				session.skippedWrites = (session.skippedWrites or 0) + 1
-				if session.firstFailReason == nil then
+				if item.disabled ~= true and session.firstFailReason == nil then
 					session.firstFailReason = string.format("node#%d base=nil", index)
 					logger("[physbone][失败] basePose 为空：%s", session.firstFailReason)
 				end
 			end
 		end
 
-		-- 3) 护栏：末节世界坐标越过链长上限时，只把该链写回基准。
+		-- 3) 护栏：末节世界坐标飞出去就说明姿态已经坏到不可逆 —— 立刻把这条链清零并停掉。
 		-- 为什么必须有这一层：`is_valid` 与行列式检查都在"写出之前"，一旦哪一帧漏过去，
 		-- 网格会被拉成一根针，而且**肉眼看见时已经发生**（2026-10-31 用户实拍）。
 		-- 这里用"末节离 bind 位置多远"当最终判据，代价是每链每帧一次 world_position。
-		if item.bindTip ~= nil and item.bindAnchor ~= nil and not reset and written > writtenBefore then
+		if item.bindTip ~= nil and item.bindAnchor ~= nil and not item.disabled and written > 0 then
 			local okTip, tipPos = pcall(function() return S.Unit.world_position(unit, item.nodes[#item.nodes]) end)
 			local okDep, depPos = pcall(function() return S.Unit.world_position(unit, item.anchorNode) end)
 			if okTip and tipPos ~= nil and okDep and depPos ~= nil then
@@ -2777,20 +2625,18 @@ function M.update(session, dt, maxWrite)
 				if okTip2 and okDep2 and type(tx) == "number" and type(ax) == "number" then
 					-- 相对锚点的偏移，角色整体移动被抵消
 					local nx, ny, nz = tx - ax, ty - ay, tz - az
-					local reach = item.restReach
-					if reach == nil then
-						local bind, anchor = item.bindTip, item.bindAnchor
-						reach = 0
-						for _, base in ipairs(item.basePoses) do
-							reach = reach + math.sqrt(base.px^2 + base.py^2 + base.pz^2)
+					local bx = item.bindTip[1] - item.bindAnchor[1]
+					local by = item.bindTip[2] - item.bindAnchor[2]
+					local bz = item.bindTip[3] - item.bindAnchor[3]
+					local dx, dy, dz = nx - bx, ny - by, nz - bz
+					local drift = math.sqrt(dx * dx + dy * dy + dz * dz)
+					if drift ~= drift or drift > 1.5 then
+						for index = 1, #item.springs do
+							item.springs[index].yaw, item.springs[index].pitch = 0, 0
+							item.springs[index].yawVelocity, item.springs[index].pitchVelocity = 0, 0
 						end
-						reach = math.max(reach, math.sqrt((bind[1]-anchor[1])^2 + (bind[2]-anchor[2])^2 + (bind[3]-anchor[3])^2))
-						item.restReach = reach
-					end
-					local distance = math.sqrt(nx*nx + ny*ny + nz*nz)
-					if not (distance <= reach * 1.5 + 1e-5) then
-						written = written + restore_chain(session, item)
-						logger("[physbone][护栏] 角度链超出静止长度，已恢复基准姿态")
+						item.disabled = true
+						logger("[physbone][护栏] 相对锚点偏离 %.2f m，这条链已被停用（姿态不可信）", drift)
 					end
 				end
 			end
@@ -2801,7 +2647,7 @@ function M.update(session, dt, maxWrite)
 	-- 代价说明：world 为 nil 时**必须不调**——update_unit(nil, unit) 是一次 AV 崩溃，
 	-- 而不是能靠 pcall 拦住的 Lua 错误（2026-10-31 实测踩过）。
 	if written > 0 and session.world ~= nil then
-		refresh_physics(session)
+		pcall(function() S.World.update_unit(session.world, unit) end)
 	end
 	return written
 end
@@ -2854,7 +2700,7 @@ function M.release(session)
 		end
 	end
 	if restored > 0 and session.world ~= nil then
-		refresh_physics(session)
+		pcall(function() S.World.update_unit(session.world, unit) end)
 	end
 	return restored
 end
@@ -2912,76 +2758,15 @@ local function write_pose(S, unit, node, rotation, base)
 		local qx, qy, qz, qw = q_axis_angle(rotation[1], rotation[2], rotation[3], rotation[4])
 		local q = S.Quaternion.from_elements(qx, qy, qz, qw)
 		if q == nil then return false end
-		return S.Unit.set_local_rotation(unit, node, q) ~= false
+		S.Unit.set_local_rotation(unit, node, q)
+		return true
 	end
 	local q = S.Quaternion.axis_angle(S.Vector3(rotation[1], rotation[2], rotation[3]), rotation[4])
 	if q == nil then return false end
 	local pose = S.Matrix4x4.from_quaternion_position(q, S.Vector3(base.px, base.py, base.pz))
 	if pose == nil then return false end
-	return S.Unit.set_local_pose(unit, node, pose) ~= false
-end
-
--- IAS R:2360–2387, 2640–2661. Use the pose the renderer will receive,
--- including presentation interpolation. A reset by animation must be repaired.
-local function physics_write(session, node, rotation, base, writer, parent)
-	local cost = M._fastWrite and 2 or 5
-	local world
-	if session.iasPose then
-		local before, reads = M.contact_math.local_pose(session.S, session.unit, node)
-		if not before then return false, false, reads end
-		local q = { q_axis_angle(rotation[1], rotation[2], rotation[3], rotation[4]) }
-		local position = not M._fastWrite and { base.px,base.py,base.pz } or nil
-		if parent and before then world = M.independent_fk(parent, q, position or before.p) end
-		if before and M.contact_math.unchanged(before, q, position) then
-			if session.iasCommit then session.iasCommit.rows[node+1] = world end
-			return true, false, reads, world
-		end
-		if session.iasCommit then session.iasCommit.before[node] = session.iasCommit.before[node] or before end
-		cost = cost + reads
-	end
-	local ok = writer(session.S, session.unit, node, rotation, base)
-	if session.iasCommit then
-		if ok then session.iasCommit.rows[node+1] = world else session.iasCommit.failed = true end
-	end
-	return ok, ok, cost, world
-end
-
-local function physics_between(from, to, fraction)
-	local ax, ay, az, aw = q_axis_angle(from[1], from[2], from[3], from[4])
-	local bx, by, bz, bw = q_axis_angle(to[1], to[2], to[3], to[4])
-	if ax*bx + ay*by + az*bz + aw*bw < 0 then ax, ay, az, aw = -ax, -ay, -az, -aw end
-	local old = 1 - fraction
-	return { q_to_axis_angle(ax*old + bx*fraction, ay*old + by*fraction,
-		az*old + bz*fraction, aw*old + bw*fraction) }
-end
-
-function M.present_independent_physics(session, fraction)
-	local presentation = session.independentPresentation
-	if not presentation then return 0 end
-	if M.session_health(session, M.frame) ~= "ok" then
-		session.independentPresentation = nil
-		return 0
-	end
-	local written, calls = 0, 0
-	local complete = true
-	for node, row in pairs(presentation.rows) do
-		local rotation = fraction == 1 and row.to or physics_between(row.from, row.to, fraction)
-		local ok, result, changed, cost = pcall(physics_write, session, node, rotation, row.base, write_pose)
-		calls = calls + (cost or 0)
-		if ok and result then
-			if changed then written = written + 1 end
-		else
-			complete = false
-		end
-	end
-	if written > 0 then
-		local ok, result = refresh_physics(session)
-		complete = complete and ok and result ~= false
-		calls = calls + 1
-	end
-	session.engineCalls = (session.engineCalls or 0) + calls
-	if fraction == 1 and complete then session.independentPresentation = nil end
-	return written
+	S.Unit.set_local_pose(unit, node, pose)
+	return true
 end
 
 --- 快路径的**写入语义**校验（只在拿到真实节点后做一次，非破坏性）。
@@ -3110,26 +2895,8 @@ local function rotation_sane(rotation, base)
 	return true
 end
 
---- 尖端链健康检查：每节尖端到它的动画基座（锚点 + 旋转后的 offLocal，与 step_tip 一致）不超过 1.5 倍段长，且数值有限。
---- 2026-11-23 实机：首版调用处把四元数传成了 lastQ[1..4]（位置 + qx），基座全错，
---- 每帧每链都被判异常、重置并写一行日志（18 分钟 237 万行），物理失效且主线程被日志拖到 50 fps。
-local function tip_chain_valid(chain, px, py, pz, qx, qy, qz, qw)
-	for index, tip in ipairs(chain.tips) do
-		if tip.ready then
-			local bone = chain.bones[index]
-			local offset = bone.offLocal
-			local x, y, z = qrot(qx, qy, qz, qw, offset[1], offset[2], offset[3])
-			x, y, z = tip.px-px-x, tip.py-py-y, tip.pz-pz-z
-			local velocity = tip.vx^2 + tip.vy^2 + tip.vz^2
-			if not (x*x + y*y + z*z <= (1.5*bone.gains.L)^2 + 1e-10 and velocity < math.huge) then return false end
-		end
-	end
-	return true
-end
-
 function M.update_tip(session, dt, maxWrite)
 	if session == nil or #session.sessions == 0 then return 0 end
-	if dt and dt > 0.25 then return M.reset_physics(session) end
 	-- ⚠️ 生命周期闸必须在**任何**引擎调用之前（K1/K2）。这条一旦跳过，
 	-- 军械库/空投仓换甲时就是对已销毁 Unit 调 world_position/set_local_pose ⇒ 原生 AV。
 	local health = M.session_health(session, M.frame)
@@ -3154,7 +2921,6 @@ function M.update_tip(session, dt, maxWrite)
 	local h = dt / steps
 
 	local writePose = session.debugPoseCheck and write_pose_checked or write_pose
-	local presentation = session.independentSample
 	-- "姿态没变就别写"的阈值（弧度）。**这是性能上最划算的一个旋钮**：
 	-- 每次写入要 2 次引擎调用（`Quaternion.from_elements` + `set_local_rotation`），
 	-- 而实机实测 ~1000 次引擎调用 ≈ 2.8 ms（341~418 条链）。把几乎没变的姿态跳过，
@@ -3220,8 +2986,6 @@ function M.update_tip(session, dt, maxWrite)
 	local staticLimit = session.staticSkipLimit or 120
 	local jumpThreshold = session.jumpThreshold or 0.25
 	local jumpEps2 = jumpThreshold * jumpThreshold
-	local teleportThreshold = session.teleportThreshold or 2.0   -- 米；超过它才当真正的传送去重置
-	local sqrt = math.sqrt
 	local writeEpsilonNeg = -epsilon
 	-- 局部化热点引用：PUC Lua 5.1 不会自动消掉重复的 table 链式查找。
 	local stepTip, localRotations = M.step_tip, M.local_rotations
@@ -3235,12 +2999,12 @@ function M.update_tip(session, dt, maxWrite)
 	-- `os.clock()` 又会把引擎其它线程的占用算进来（实测同工作量 1.58 ms vs 5.21 ms）。
 	-- 调用次数是唯一不会被环境噪声污染的口径。
 	local calls = 1
-
+	local perWrite = (M._fastWrite == true) and 2 or 5
 
 	for si = 1, itemCount do
 		local item = items[si]
 		local tip = item.tip
-		if tip ~= nil and not (session.skipOptionalIas and item.optionalIas) then
+		if not item.disabled and tip ~= nil then
 			local anchorNode = item.anchorNode
 			local cached = anchors[anchorNode]
 			if cached == nil then
@@ -3248,18 +3012,8 @@ function M.update_tip(session, dt, maxWrite)
 				anchors[anchorNode] = cached
 			end
 			if cached[8] ~= epoch then
-				local apx, apy, apz, qx, qy, qz, qw
-				local group = session.iasCommit
-				if group and next(group.rows) then
-					local anchor = M.contact_math.projected(S, unit, anchorNode, group.rows, session.nodeCount)
-					if anchor then
-						apx, apy, apz = anchor.p[1], anchor.p[2], anchor.p[3]
-						qx, qy, qz, qw = anchor.q[1], anchor.q[2], anchor.q[3], anchor.q[4]
-					end
-				else
-					apx, apy, apz = read_vec3(S, S.Unit.world_position(unit, anchorNode))
-					qx, qy, qz, qw = read_quat4(S, unit, anchorNode)
-				end
+				local apx, apy, apz = read_vec3(S, S.Unit.world_position(unit, anchorNode))
+				local qx, qy, qz, qw = read_quat4(S, unit, anchorNode)
 				if apx ~= nil and qx ~= nil then
 					cached[1], cached[2], cached[3] = apx, apy, apz
 					cached[4], cached[5], cached[6], cached[7] = qx, qy, qz, qw
@@ -3275,9 +3029,6 @@ function M.update_tip(session, dt, maxWrite)
 				local qx, qy, qz, qw = cached[4], cached[5], cached[6], cached[7]
 				-- 与**上次真正求解时**的锚点比：位移平方 + 四元数点积（|dot| 接近 1 = 转得很少）
 				local lastQ = item.lastAnchorQ
-				local history = item.lastAnchor
-				local valid = not history or not lastQ or tip_chain_valid(tip, history[1], history[2], history[3],
-					lastQ[4], lastQ[5], lastQ[6], lastQ[7])
 				local static = false
 				if lastQ ~= nil and (tip.maxSpeed2 or 0) < 1e-8
 					and (item.staticFrames or 0) < staticLimit then
@@ -3288,15 +3039,7 @@ function M.update_tip(session, dt, maxWrite)
 						if d > motionDot then static = true end
 					end
 				end
-				if not valid then
-					written = written + restore_chain(session, item)
-					-- 限流：同一条链 10 秒内只记一次（日志每行都是主线程文件写入）。
-					local now = M.frame or 0
-					if item.guardLoggedAt == nil or now - item.guardLoggedAt >= 600 then
-						item.guardLoggedAt = now
-						logger("[physbone][护栏] 尖端链数值异常或超出静止长度，已恢复基准姿态（链 %s）", tostring(item.name or si))
-					end
-				elseif static and not session.iasPose then
+				if static then
 					item.staticFrames = (item.staticFrames or 0) + 1
 					-- 这些骨这帧"处理过但没写"，计入 handled，否则上层会误判成"驱动失效"。
 					skippedSame = skippedSame + #tip.bones
@@ -3308,40 +3051,17 @@ function M.update_tip(session, dt, maxWrite)
 				lastQ[4], lastQ[5], lastQ[6], lastQ[7] = qx, qy, qz, qw
 				-- 位置跳变（换装 / 切 LOD / 瞬移）：让尖端直接对齐目标，比"静默 N 帧"恢复得快
 				local jumped = false
-				local carried = false
 				if item.lastAnchor ~= nil then
 					local dx = apx - item.lastAnchor[1]
 					local dy = apy - item.lastAnchor[2]
 					local dz = apz - item.lastAnchor[3]
-					local d2 = dx * dx + dy * dy + dz * dz
-					jumped = d2 > jumpEps2
-					if jumped then
-						local distance = sqrt(d2)
-						if distance > (M.perf_jump_max or 0) then M.perf_jump_max = distance end
-						-- E12c：锚点位移在 [jumpThreshold, teleportThreshold) 之间时**不重置**，
-						-- 把整条链的尖端状态随锚点一起平移（位置、上一帧位置都搬，速度不变）。
-						-- IAS 的状态存在驱动骨本地系里，锚点平移根本不会触发重置；只有帧/时间/传送间隙才重置。
-						-- 实机 2.1.58：4 人局里队友链每帧都因"远程玩家按网络 tick 阶跃"被判跳变（累计 13.8 万次），
-						-- 每次都把尖端对齐回目标 ⇒ 物理等于每帧被清零。
-						if distance < teleportThreshold and item.lastWritten ~= nil then
-							local itips = tip.tips
-							for index = 1, #itips do
-								local t = itips[index]
-								if t.ready then
-									t.px, t.py, t.pz = t.px + dx, t.py + dy, t.pz + dz
-								end
-							end
-							carried, jumped = true, false
-							M.perf_carry = (M.perf_carry or 0) + 1
-						end
-					end
+					jumped = (dx * dx + dy * dy + dz * dz) > jumpEps2
 				end
 				local tips = tip.tips
 				if jumped then
 					for index = 1, #tips do tips[index].ready = false end
 					item.lastWritten = nil   -- 跳变后必须整条重写（否则脏标记会让我们以为"没变"）
 					item.jumps = (item.jumps or 0) + 1
-					M.perf_resync = (M.perf_resync or 0) + 1
 					if item.jumps <= 3 then
 						logger("[physbone][RESYNC] 锚点跳变，%d 个尖端已对齐目标（第 %d 次）",
 							#tips, item.jumps)
@@ -3352,14 +3072,6 @@ function M.update_tip(session, dt, maxWrite)
 				lastAnchor[1], lastAnchor[2], lastAnchor[3] = apx, apy, apz
 
 				for _ = 1, steps do stepTip(tip, h, apx, apy, apz, qx, qy, qz, qw) end
-				if not tip_chain_valid(tip, apx, apy, apz, qx, qy, qz, qw) then
-					written = written + restore_chain(session, item)
-					local now = M.frame or 0
-					if item.guardLoggedAt == nil or now - item.guardLoggedAt >= 600 then
-						item.guardLoggedAt = now
-						logger("[physbone][护栏] 尖端求解结果异常，已恢复基准姿态（链 %s）", tostring(item.name or si))
-					end
-				else
 				local rotations = localRotations(tip, qx, qy, qz, qw)
 				item.lastRotations = rotations   -- 给观测层读（探针按它打"各节转角"）
 
@@ -3368,15 +3080,7 @@ function M.update_tip(session, dt, maxWrite)
 				if lastWritten == nil then lastWritten = {}; item.lastWritten = lastWritten end
 				local basePoses, nodeIds = item.basePoses, item.nodes
 				local boneCount = #tip.bones
-				local parentPose = session.iasCommit and { p = { apx,apy,apz }, q = { qx,qy,qz,qw } }
 				for index = 1, boneCount do
-					local parent = parentPose
-					parentPose = nil -- a missing or rejected node breaks the solved chain
-					if parent then
-						local expected = index == 1 and anchorNode or nodeIds[index-1]
-						if S.Unit.scene_graph_parent(unit, nodeIds[index]) ~= expected then parent = nil end
-						calls = calls + 1
-					end
 					if maxWrite and written >= maxWrite then break end
 					local base = basePoses[index]
 					local rotation = rotations[index]
@@ -3408,7 +3112,7 @@ function M.update_tip(session, dt, maxWrite)
 							-- 用两次比较代替 math.abs（省一次标准库 C 调用）。
 							local prev = lastWritten[index]
 							local same = false
-							if prev ~= nil and not session.iasPose then
+							if prev ~= nil then
 								local d = prev[4] - rotation[4]
 								if d >= writeEpsilonNeg and d <= epsilon then
 									same = (prev[1] * rotation[1] + prev[2] * rotation[2]
@@ -3418,24 +3122,14 @@ function M.update_tip(session, dt, maxWrite)
 							if same then
 								skippedSame = skippedSame + 1
 							else
-								local displayed = rotation
-								local node = nodeIds[index]
-								local row
-								if presentation and presentation.history and prev then
-									row = { from = { prev[1], prev[2], prev[3], prev[4] }, to = rotation, base = base }
-									displayed = physics_between(row.from, rotation, presentation.lead)
-								end
-								local okWrite, didWrite, changed, cost, world = pcall(physics_write, session, node, displayed, base, writePose, parent)
-								if okWrite and didWrite then parentPose = world end
-								calls = calls + (cost or 0)
+								local okWrite, didWrite = pcall(writePose, S, unit, nodeIds[index], rotation, base)
 								if okWrite and didWrite == true then
-									if row then presentation.rows[node] = row end
-									if changed then written = written + 1 else skippedSame = skippedSame + 1 end
+									written = written + 1
+									calls = calls + perWrite
 									if prev == nil then prev = {}; lastWritten[index] = prev end
 									prev[1], prev[2], prev[3], prev[4] =
 										rotation[1], rotation[2], rotation[3], rotation[4]
 								else
-									if session.iasCommit then session.iasCommit.failed = true end
 									session.skippedWrites = (session.skippedWrites or 0) + 1
 									if session.firstFailReason == nil then
 										session.firstFailReason = string.format("tip node#%d %s", index, tostring(didWrite))
@@ -3466,1109 +3160,19 @@ function M.update_tip(session, dt, maxWrite)
 					logger("[physbone][G4] 连续 600 帧最大偏角只有 %.2f° ⇒ 求解器活着但冻结（查输入为 0 / 增益映射）",
 						angleDeg)
 				end
-				end   -- 求解结果有效
-				end   -- 静态链跳过分支
+				end   -- 收尾：静态链跳过分支的 else
 			end
 		end
 	end
 
 	if written > 0 and session.world ~= nil then
-		refresh_physics(session)
+		pcall(function() S.World.update_unit(session.world, unit) end)
 		calls = calls + 1
 	end
 	session.engineCalls = calls
 	session.skippedSame = skippedSame
 	session.tipApplied = (session.tipApplied or 0) + 1
 	return written
-end
-
--- ---------------------------------------------------------------------------
--- P3：手臂姿态运行时修正（无武器内收 + 持枪 2-bone IK + 平滑过渡）
--- ---------------------------------------------------------------------------
-
-local ARM_BONE_NAMES = {
-	"chest",
-	"l_clavicle", "l_shoulder", "l_elbow", "l_hand",
-	"r_clavicle", "r_shoulder", "r_elbow", "r_hand",
-}
-M.ARM_BONE_NAMES = ARM_BONE_NAMES
-
-local ARM_ANIM_VAR_CANDIDATES = {
-	"aim_weight", "aim", "is_aiming", "weapon_equipped", "stance",
-}
-
-local function mat3_to_quat(m11, m12, m13, m21, m22, m23, m31, m32, m33)
-	local trace = m11 + m22 + m33
-	local qx, qy, qz, qw
-	if trace > 0 then
-		local s = math.sqrt(trace + 1.0) * 2.0
-		qw = 0.25 * s
-		qx = (m32 - m23) / s
-		qy = (m13 - m31) / s
-		qz = (m21 - m12) / s
-	elseif m11 > m22 and m11 > m33 then
-		local s = math.sqrt(1.0 + m11 - m22 - m33) * 2.0
-		qw = (m32 - m23) / s
-		qx = 0.25 * s
-		qy = (m12 + m21) / s
-		qz = (m13 + m31) / s
-	elseif m22 > m33 then
-		local s = math.sqrt(1.0 + m22 - m11 - m33) * 2.0
-		qw = (m13 - m31) / s
-		qx = (m12 + m21) / s
-		qy = 0.25 * s
-		qz = (m23 + m32) / s
-	else
-		local s = math.sqrt(1.0 + m33 - m11 - m22) * 2.0
-		qw = (m21 - m12) / s
-		qx = (m13 + m31) / s
-		qy = (m23 + m32) / s
-		qz = 0.25 * s
-	end
-	local len = math.sqrt(qx * qx + qy * qy + qz * qz + qw * qw)
-	if len < 1e-9 then return 0, 0, 0, 1 end
-	return qx / len, qy / len, qz / len, qw / len
-end
-
-local function qslerp(ax, ay, az, aw, bx, by, bz, bw, t)
-	if t <= 0 then return ax, ay, az, aw end
-	if t >= 1 then return bx, by, bz, bw end
-	local dot = ax * bx + ay * by + az * bz + aw * bw
-	if dot < 0 then
-		bx, by, bz, bw, dot = -bx, -by, -bz, -bw, -dot
-	end
-	if dot > 0.9995 then
-		local x = ax + (bx - ax) * t
-		local y = ay + (by - ay) * t
-		local z = az + (bz - az) * t
-		local w = aw + (bw - aw) * t
-		local len = math.sqrt(x * x + y * y + z * z + w * w)
-		if len < 1e-9 then return 0, 0, 0, 1 end
-		return x / len, y / len, z / len, w / len
-	end
-	local theta0 = math.acos(math.max(-1, math.min(1, dot)))
-	local theta = theta0 * t
-	local sinT0 = math.sin(theta0)
-	local s1 = math.sin(theta) / sinT0
-	local s0 = math.cos(theta) - dot * s1
-	return s0 * ax + s1 * bx, s0 * ay + s1 * by, s0 * az + s1 * bz, s0 * aw + s1 * bw
-end
-
-local function min_arc_quat(fx, fy, fz, tx, ty, tz)
-	local fl = math.sqrt(fx * fx + fy * fy + fz * fz)
-	local tl = math.sqrt(tx * tx + ty * ty + tz * tz)
-	if fl < 1e-9 or tl < 1e-9 then return 0, 0, 0, 1 end
-	local ax, ay, az, angle = swing_axis(fx / fl, fy / fl, fz / fl, tx / tl, ty / tl, tz / tl)
-	if ax == nil then return 0, 0, 0, 1 end
-	return q_axis_angle(ax, ay, az, angle)
-end
-
-local function read_world_pose_lua(S, unit, node)
-	local okPose, pose = pcall(S.Unit.world_pose, unit, node)
-	if not okPose or pose == nil then return nil, 1 end
-	local ok, e1, e2, e3, e4, e5, e6, e7, e8, e9, e10, e11, e12 = pcall(S.Matrix4x4.to_elements, pose)
-	if not ok or type(e12) ~= "number" or e12 ~= e12 then return nil, 2 end
-	local qx, qy, qz, qw = mat3_to_quat(e1, e4, e7, e2, e5, e8, e3, e6, e9)
-	return {
-		px = e10, py = e11, pz = e12,
-		qx = qx, qy = qy, qz = qz, qw = qw,
-		fwdx = e7, fwdy = e8, fwdz = e9,
-	}, 2
-end
-
-local function write_arm_local(S, unit, node, qx, qy, qz, qw, px, py, pz, fallbackPos)
-	local calls = 0
-	if type(qx) ~= "number" or type(qy) ~= "number" or type(qz) ~= "number" or type(qw) ~= "number" then
-		return false, calls
-	end
-	if qx ~= qx or qy ~= qy or qz ~= qz or qw ~= qw then return false, calls end
-	local qLen2 = qx * qx + qy * qy + qz * qz + qw * qw
-	if qLen2 < 1e-12 or qLen2 > 1e12 then return false, calls end
-
-	local fastVerified = M._fastWrite == true and M._fastWriteVerified == true
-	if px == nil and fastVerified and type(S.Quaternion.from_elements) == "function" then
-		local q = S.Quaternion.from_elements(qx, qy, qz, qw)
-		calls = calls + 1
-		if q == nil then return false, calls end
-		S.Unit.set_local_rotation(unit, node, q)
-		calls = calls + 1
-		return true, calls
-	end
-
-	local posX, posY, posZ = px, py, pz
-	if posX == nil then
-		if fallbackPos == nil then return false, calls end
-		posX, posY, posZ = fallbackPos[1], fallbackPos[2], fallbackPos[3]
-	end
-	if type(posX) ~= "number" or posX ~= posX or type(posY) ~= "number" or posY ~= posY or type(posZ) ~= "number" or posZ ~= posZ then
-		return false, calls
-	end
-
-	local q
-	if M._fastWrite == true and type(S.Quaternion.from_elements) == "function" then
-		q = S.Quaternion.from_elements(qx, qy, qz, qw)
-		calls = calls + 1
-	else
-		local ax, ay, az, angle = q_to_axis_angle(qx, qy, qz, qw)
-		if ax == nil then
-			q = S.Quaternion.axis_angle(S.Vector3(0, 0, 1), 0)
-		else
-			q = S.Quaternion.axis_angle(S.Vector3(ax, ay, az), angle)
-		end
-		calls = calls + 2
-	end
-	if q == nil then return false, calls end
-	local pose = S.Matrix4x4.from_quaternion_position(q, S.Vector3(posX, posY, posZ))
-	calls = calls + 2
-	if pose == nil then return false, calls end
-	S.Unit.set_local_pose(unit, node, pose)
-	calls = calls + 1
-	return true, calls
-end
-
---- 解析并缓存 avatar 的手臂骨骼节点索引；同时探测一次动画变量（如有）。
-function M.resolve_arm_bones(S, unit, state)
-	if unit == nil or type(S.Unit) ~= "table" or type(S.Unit.node) ~= "function" then return nil end
-	local nodeCount = nil
-	if type(S.Unit.num_scene_graph_items) == "function" then
-		local okN, n = pcall(S.Unit.num_scene_graph_items, unit)
-		if okN and type(n) == "number" then nodeCount = n end
-	end
-	if state ~= nil and state.unit == unit and state.nodes ~= nil
-		and (nodeCount == nil or state.nodeCount == nodeCount) then
-		return state
-	end
-	local hasNodeFn = type(S.Unit.has_node) == "function"
-	local nodes = {}
-	for index = 1, #ARM_BONE_NAMES do
-		local name = ARM_BONE_NAMES[index]
-		if hasNodeFn then
-			local okH, has = pcall(S.Unit.has_node, unit, name)
-			if not okH or has ~= true then return nil end
-		end
-		local ok, id = pcall(S.Unit.node, unit, name)
-		if not ok or type(id) ~= "number" or id < 1 or (nodeCount ~= nil and id > nodeCount) then
-			return nil
-		end
-		nodes[name] = id
-	end
-	local animVarId = nil
-	if type(S.Unit.animation_find_variable) == "function"
-		and type(S.Unit.animation_get_variable) == "function" then
-		local hasAnimVarFn = type(S.Unit.animation_has_variable) == "function"
-		for index = 1, #ARM_ANIM_VAR_CANDIDATES do
-			local varName = ARM_ANIM_VAR_CANDIDATES[index]
-			local allowed = true
-			if hasAnimVarFn then
-				local okA, hasA = pcall(S.Unit.animation_has_variable, unit, varName)
-				allowed = okA and hasA == true
-			end
-			if allowed then
-				local okV, vid = pcall(S.Unit.animation_find_variable, unit, varName)
-				if okV and type(vid) == "number" and vid >= 0 then
-					animVarId = vid
-					break
-				end
-			end
-		end
-	end
-	return {
-		unit = unit,
-		nodeCount = nodeCount,
-		nodes = nodes,
-		animVarId = animVarId,
-		alpha = (state and state.alpha) or 0,
-	}
-end
-
---- 单侧无武器内收求解（1:1 移植 P2 solve_unarmed_side）。
---- `shoulderTarget`（可选，锁骨局部坐标 {x,y,z}）：把肩关节直接放回模型自己的肩关节位置。
---- 转换时手臂网格被整体平移到了潜兵的宽肩关节上；把关节挪回去，网格随之复原，
---- 手臂就绕模型原来的转轴转动。给了它就不再做 `shoulderNarrowM` 收肩。
-function M.solve_unarmed_side(chest, clav, sh, el, side, adductionDeg, forearmCompDeg, shoulderNarrowM, shoulderTarget)
-	local sign = side == "l" and -1.0 or 1.0
-	local fwdLen = math.sqrt(chest.fwdx * chest.fwdx + chest.fwdy * chest.fwdy + chest.fwdz * chest.fwdz)
-	if fwdLen < 1e-9 then return nil end
-	local fx, fy, fz = chest.fwdx / fwdLen, chest.fwdy / fwdLen, chest.fwdz / fwdLen
-
-	local dqx, dqy, dqz, dqw = q_axis_angle(fx, fy, fz, sign * adductionDeg * math.pi / 180.0)
-	local shWx, shWy, shWz, shWw = qmul(dqx, dqy, dqz, dqw, sh.qx, sh.qy, sh.qz, sh.qw)
-	local cInvx, cInvy, cInvz, cInvw = qconj(clav.qx, clav.qy, clav.qz, clav.qw)
-	local shLx, shLy, shLz, shLw = qmul(cInvx, cInvy, cInvz, cInvw, shWx, shWy, shWz, shWw)
-
-	local dqElx, dqEly, dqElz, dqElw = q_axis_angle(fx, fy, fz, -sign * forearmCompDeg * math.pi / 180.0)
-	local elMidX, elMidY, elMidZ, elMidW = qmul(dqx, dqy, dqz, dqw, el.qx, el.qy, el.qz, el.qw)
-	local elWx, elWy, elWz, elWw = qmul(dqElx, dqEly, dqElz, dqElw, elMidX, elMidY, elMidZ, elMidW)
-	local shInvx, shInvy, shInvz, shInvw = qconj(shWx, shWy, shWz, shWw)
-	local elLx, elLy, elLz, elLw = qmul(shInvx, shInvy, shInvz, shInvw, elWx, elWy, elWz, elWw)
-
-	local px, py, pz = nil, nil, nil
-	if shoulderTarget ~= nil then
-		px, py, pz = shoulderTarget[1], shoulderTarget[2], shoulderTarget[3]
-	elseif shoulderNarrowM ~= nil and shoulderNarrowM ~= 0 then
-		local lx, ly, lz = qrot(cInvx, cInvy, cInvz, cInvw, sh.px - clav.px, sh.py - clav.py, sh.pz - clav.pz)
-		local len = math.sqrt(lx * lx + ly * ly + lz * lz)
-		if len > 1e-6 then
-			local s = math.max(0.05, (len - shoulderNarrowM) / len)
-			px, py, pz = lx * s, ly * s, lz * s
-		end
-	end
-
-	return {
-		shQ = { shLx, shLy, shLz, shLw },
-		shP = px ~= nil and { px, py, pz } or nil,
-		elQ = { elLx, elLy, elLz, elLw },
-	}
-end
-
--- 最短弧先转上臂，再在旋转后的肩下转前臂，最后锁定手腕世界旋转。
-local function aim_arm(clav, sh, el, ha, dx1, dy1, dz1, dx2, dy2, dz2, ax, ay, az, bx, by, bz)
-	local dqShX, dqShY, dqShZ, dqShW = min_arc_quat(dx1, dy1, dz1, ax, ay, az)
-	local shWx, shWy, shWz, shWw = qmul(dqShX, dqShY, dqShZ, dqShW, sh.qx, sh.qy, sh.qz, sh.qw)
-	local elMidX, elMidY, elMidZ, elMidW = qmul(dqShX, dqShY, dqShZ, dqShW, el.qx, el.qy, el.qz, el.qw)
-	local fxMid, fyMid, fzMid = qrot(dqShX, dqShY, dqShZ, dqShW, dx2, dy2, dz2)
-	local dqElX, dqElY, dqElZ, dqElW = min_arc_quat(fxMid, fyMid, fzMid, bx, by, bz)
-	local elWx, elWy, elWz, elWw = qmul(dqElX, dqElY, dqElZ, dqElW, elMidX, elMidY, elMidZ, elMidW)
-
-	local cInvx, cInvy, cInvz, cInvw = qconj(clav.qx, clav.qy, clav.qz, clav.qw)
-	local shInvx, shInvy, shInvz, shInvw = qconj(shWx, shWy, shWz, shWw)
-	local elInvx, elInvy, elInvz, elInvw = qconj(elWx, elWy, elWz, elWw)
-	return {
-		shQ = { qmul(cInvx, cInvy, cInvz, cInvw, shWx, shWy, shWz, shWw) },
-		elQ = { qmul(shInvx, shInvy, shInvz, shInvw, elWx, elWy, elWz, elWw) },
-		haQ = { qmul(elInvx, elInvy, elInvz, elInvw, ha.qx, ha.qy, ha.qz, ha.qw) },
-	}
-end
-
---- 单侧持枪 2-bone 解析 IK（1:1 移植 P2 solve_ik_side，锁定手腕世界位姿）。
---- `shoulderTarget`（可选，锁骨局部坐标）：肩关节挪到这里之后再解 IK，手腕仍锁在原位（枪不动）。
-function M.solve_ik_side(chest, clav, sh, el, ha, inwardPullM, shoulderTarget)
-	local dx1, dy1, dz1 = el.px - sh.px, el.py - sh.py, el.pz - sh.pz
-	local dx2, dy2, dz2 = ha.px - el.px, ha.py - el.py, ha.pz - el.pz
-	local l1 = math.sqrt(dx1 * dx1 + dy1 * dy1 + dz1 * dz1)
-	local l2 = math.sqrt(dx2 * dx2 + dy2 * dy2 + dz2 * dz2)
-	local sx, sy, sz = sh.px, sh.py, sh.pz
-	if shoulderTarget ~= nil then
-		local ox, oy, oz = qrot(clav.qx, clav.qy, clav.qz, clav.qw, shoulderTarget[1], shoulderTarget[2], shoulderTarget[3])
-		sx, sy, sz = clav.px + ox, clav.py + oy, clav.pz + oz
-	end
-	local vx, vy, vz = ha.px - sx, ha.py - sy, ha.pz - sz
-	local dRaw = math.sqrt(vx * vx + vy * vy + vz * vz)
-	if l1 < 1e-6 or l2 < 1e-6 or dRaw < 1e-6 then return nil end
-
-	local minD = math.abs(l1 - l2) + 1e-4
-	local maxD = l1 + l2 - 1e-4
-	local d = math.max(minD, math.min(maxD, dRaw))
-	local ux, uy, uz = vx / dRaw, vy / dRaw, vz / dRaw
-
-	local cosA = math.max(-1.0, math.min(1.0, (l1 * l1 + d * d - l2 * l2) / (2.0 * l1 * d)))
-	local sinA = math.sqrt(math.max(0.0, 1.0 - cosA * cosA))
-
-	local dotOrig = dx1 * ux + dy1 * uy + dz1 * uz
-	local ox, oy, oz = dx1 - ux * dotOrig, dy1 - uy * dotOrig, dz1 - uz * dotOrig
-
-	local ix, iy, iz = chest.px - sx, chest.py - sy, chest.pz - sz
-	local iLen = math.sqrt(ix * ix + iy * iy + iz * iz)
-	iz = -0.35 * iLen
-	local iNorm = math.sqrt(ix * ix + iy * iy + iz * iz)
-	if iNorm > 1e-9 then ix, iy, iz = ix / iNorm, iy / iNorm, iz / iNorm else ix, iy, iz = 0, 0, -1 end
-
-	local tx, ty, tz = ox + ix * inwardPullM, oy + iy * inwardPullM, oz + iz * inwardPullM
-	local dotT = tx * ux + ty * uy + tz * uz
-	local px, py, pz = tx - ux * dotT, ty - uy * dotT, tz - uz * dotT
-	local pLen = math.sqrt(px * px + py * py + pz * pz)
-	if pLen < 1e-6 then
-		px, py, pz = ox, oy, oz
-		pLen = math.sqrt(px * px + py * py + pz * pz)
-		if pLen < 1e-6 then return nil end
-	end
-	local nx, ny, nz = px / pLen, py / pLen, pz / pLen
-
-	local elNewX = sx + ux * (l1 * cosA) + nx * (l1 * sinA)
-	local elNewY = sy + uy * (l1 * cosA) + ny * (l1 * sinA)
-	local elNewZ = sz + uz * (l1 * cosA) + nz * (l1 * sinA)
-
-	local result = aim_arm(clav, sh, el, ha, dx1, dy1, dz1, dx2, dy2, dz2,
-		elNewX - sx, elNewY - sy, elNewZ - sz, ha.px - elNewX, ha.py - elNewY, ha.pz - elNewZ)
-	result.shP = shoulderTarget
-	return result
-end
-
-local function finite_arm_number(n)
-	return type(n) == "number" and n > -math.huge and n < math.huge
-end
-
-local function arm_cross(ax, ay, az, bx, by, bz)
-	return ay*bz - az*by, az*bx - ax*bz, ax*by - ay*bx
-end
-
-function M.independent_quaternion(x, y, z, w)
-	if not (finite_arm_number(x) and finite_arm_number(y) and finite_arm_number(z) and finite_arm_number(w)) then return nil end
-	local norm = x*x + y*y + z*z + w*w
-	if norm > 1e-12 and norm < 1e12 then
-		local d = math.sqrt(norm)
-		return { x/d, y/d, z/d, w/d }
-	end
-end
-
-function M.independent_hemisphere(q, previous)
-	if previous and q[1]*previous[1] + q[2]*previous[2] + q[3]*previous[3] + q[4]*previous[4] < 0 then
-		return { -q[1], -q[2], -q[3], -q[4] }
-	end
-	return q
-end
-
-function M.independent_rest_offset(avatarRest, modelRest)
-	local x, y, z, w = qmul(-avatarRest[1], -avatarRest[2], -avatarRest[3], avatarRest[4],
-		modelRest[1], modelRest[2], modelRest[3], modelRest[4])
-	if math.abs(x) < 1e-8 and math.abs(y) < 1e-8 and math.abs(z) < 1e-8 then return { 0, 0, 0, 1 }, true end
-	return M.independent_quaternion(x, y, z, w), false
-end
-
-function M.independent_world_delta(current, offset, parent)
-	local x, y, z, w = qmul(current[1], current[2], current[3], current[4], offset[1], offset[2], offset[3], offset[4])
-	return { qmul(-parent[1], -parent[2], -parent[3], parent[4], x, y, z, w) }
-end
-
-function M.independent_fk(parent, rotation, position)
-	local x, y, z = qrot(parent.q[1], parent.q[2], parent.q[3], parent.q[4], position[1], position[2], position[3])
-	return { p = { parent.p[1] + x, parent.p[2] + y, parent.p[3] + z },
-		q = { qmul(parent.q[1], parent.q[2], parent.q[3], parent.q[4], rotation[1], rotation[2], rotation[3], rotation[4]) } }
-end
-
-function M.independent_relative(parent, world)
-	local q, p = parent.q, world.p
-	local x, y, z = qrot(-q[1], -q[2], -q[3], q[4],
-		p[1] - parent.p[1], p[2] - parent.p[2], p[3] - parent.p[3])
-	local rotation = M.independent_world_delta(world.q, { 0, 0, 0, 1 }, q)
-	return { x, y, z }, M.independent_hemisphere(rotation, { 0, 0, 0, 1 })
-end
-
--- Numeric rigid poses are shared by the contact solver and the attachment writer.
-M.contact_math = {}
-do
-	local V = M.contact_math
-	function V.add(a, b) return { a[1]+b[1], a[2]+b[2], a[3]+b[3] } end
-	function V.sub(a, b) return { a[1]-b[1], a[2]-b[2], a[3]-b[3] } end
-	function V.scale(v, s) return { v[1]*s, v[2]*s, v[3]*s } end
-	function V.dot(a, b) return a[1]*b[1]+a[2]*b[2]+a[3]*b[3] end
-	function V.cross(a, b)
-		return { arm_cross(a[1], a[2], a[3], b[1], b[2], b[3]) }
-	end
-	function V.length(v) return math.sqrt(V.dot(v, v)) end
-	function V.normal(v)
-		local n = V.length(v)
-		if n > 1e-6 and n < math.huge then return V.scale(v, 1/n) end
-	end
-	function V.project(v, axis) return V.sub(v, V.scale(axis, V.dot(v, axis))) end
-	function V.rotate(q, v)
-		return { qrot(q[1], q[2], q[3], q[4], v[1], v[2], v[3]) }
-	end
-	function V.arc(a, b, pole)
-		local x, y = V.normal(a), V.normal(b)
-		if not x or not y then return { 0, 0, 0, 1 } end
-		if pole and V.dot(x, y) < -1+1e-6 then
-			local axis = V.normal(V.project(pole, x))
-			if axis then return { axis[1], axis[2], axis[3], 0 } end
-		end
-		return { min_arc_quat(a[1], a[2], a[3], b[1], b[2], b[3]) }
-	end
-	function V.matrix_pose(m)
-		for i = 1, 12 do if not finite_arm_number(m[i]) then return end end
-		local x, y, z = { m[1], m[5], m[9] }, { m[2], m[6], m[10] }, { m[3], m[7], m[11] }
-		if V.length(V.sub(V.cross(x, y), z)) > 0.002 or math.abs(V.dot(x, x)-1) > 0.002
-			or math.abs(V.dot(y, y)-1) > 0.002 or math.abs(V.dot(x, y)) > 0.002 then return end
-		local q = M.independent_quaternion(mat3_to_quat(m[1], m[2], m[3], m[5], m[6], m[7], m[9], m[10], m[11]))
-		if q then return { p = { m[4], m[8], m[12] }, q = q } end
-	end
-	function V.world_pose(S, unit, node)
-		local ok, value = pcall(S.Unit.world_pose, unit, node)
-		if not ok or value == nil then return nil, 1 end
-		local valid, xx, yx, zx, xy, yy, zy, xz, yz, zz, x, y, z = pcall(S.Matrix4x4.to_elements, value)
-		if valid then return V.matrix_pose({ xx, xy, xz, x, yx, yy, yz, y, zx, zy, zz, z }), 2 end
-		return nil, 2
-	end
-	-- IAS R:376–415, 2360–2387: compare in the current local frame, including
-	-- animation or another writer moving the node since the previous callback.
-	function V.local_pose(S, unit, node)
-		local reads = 0
-		if S.Unit.local_pose and S.Matrix4x4.to_elements then
-			reads = 1
-			local ok, matrix = pcall(S.Unit.local_pose, unit, node)
-			if ok and matrix then
-				reads = 2
-				local valid,a,d,g,b,e,h,c,f,i,x,y,z = pcall(S.Matrix4x4.to_elements,matrix)
-				local pose = valid and V.matrix_pose({ a,b,c,x,d,e,f,y,g,h,i,z })
-				if pose then return pose, reads end
-			end
-		end
-		local q = M.independent_quaternion(S.Quaternion.to_elements(S.Unit.local_rotation(unit, node)))
-		local px,py,pz = S.Vector3.to_elements(S.Unit.local_position(unit, node))
-		if q and finite_arm_number(px) and finite_arm_number(py) and finite_arm_number(pz) then
-			return { q = q, p = { px,py,pz } }, reads+4
-		end
-		return nil, reads+4
-	end
-	function V.unchanged(before, q, p)
-		local a = before.q
-		local dot = a[1]*q[1]+a[2]*q[2]+a[3]*q[3]+a[4]*q[4]
-		local norm = q[1]*q[1]+q[2]*q[2]+q[3]*q[3]+q[4]*q[4]
-		if norm < 1e-16 or not (dot*dot >= norm * math.cos(math.rad(0.0001)*0.5)^2) then return false end
-		if not p then return true end
-		local dx,dy,dz = before.p[1]-p[1], before.p[2]-p[2], before.p[3]-p[3]
-		return dx*dx+dy*dy+dz*dz <= 1e-14
-	end
-	-- R:2191–2214: follow the actual parent chain to a solved world row.
-	-- An unrelated branch keeps its engine world transform (including the Unit root).
-	function V.projected(S, unit, node, explicit, count)
-		local trail, seen, current = {}, {}, node
-		local parentPose
-		while type(current) == "number" and current >= 1 and current <= count and current == math.floor(current) do
-			if seen[current] then return nil end
-			parentPose = explicit[current + 1]
-			if parentPose then break end
-			seen[current] = true
-			trail[#trail + 1] = current
-			current = S.Unit.scene_graph_parent(unit, current)
-		end
-		if not parentPose then return V.world_pose(S, unit, node) end
-		for index = #trail,1,-1 do
-			local pose = V.local_pose(S, unit, trail[index])
-			if not pose then return nil end
-			parentPose = M.independent_fk(parentPose, pose.q, pose.p)
-		end
-		return parentPose
-	end
-	function V.inverse(pose)
-		local p, q = M.independent_relative(pose, { p = { 0, 0, 0 }, q = { 0, 0, 0, 1 } })
-		return { p = p, q = q }
-	end
-	function V.smooth(value)
-		local t = math.max(0, math.min(1, value))
-		return t*t*(3-2*t)
-	end
-	function V.blend(a, b, t)
-		local q, r = a.q, M.independent_hemisphere(b.q, a.q)
-		return { p = V.add(a.p, V.scale(V.sub(b.p, a.p), t)),
-			q = M.independent_quaternion(q[1]+(r[1]-q[1])*t, q[2]+(r[2]-q[2])*t,
-				q[3]+(r[3]-q[3])*t, q[4]+(r[4]-q[4])*t) }
-	end
-end
-
-function M.contact_girdle(chest, shoulder, wrist, lengths, source, singleHand)
-	local V = M.contact_math
-	local a, b = lengths[1], lengths[2]
-	if math.min(a, b) < 1e-6 then return nil, 1 end
-	local shoulderRay, wristRay = V.sub(shoulder.p, chest.p), V.sub(wrist.p, chest.p)
-	local reach = (a+b)*0.99999
-	local factor = 1
-	if singleHand then
-		local upper = V.normal(V.sub(source[2].p, source[1].p))
-		local lower = V.normal(V.sub(source[3].p, source[2].p))
-		if not upper or not lower then return nil, factor end
-		local cosine = math.max(math.cos(math.rad(25)), V.dot(upper, lower))
-		reach = math.sqrt(a*a+b*b+2*a*b*cosine)
-		factor = math.max(1, math.min(1.05, V.length(V.sub(wristRay, shoulderRay))/reach))
-		reach = reach*factor
-	end
-	local product = V.length(shoulderRay) * V.length(wristRay)
-	local axis = V.normal(V.cross(shoulderRay, wristRay))
-	if not axis or product <= 1e-12 or V.length(V.sub(wristRay, shoulderRay)) <= reach then return nil, factor end
-	local function acos(clamped) return math.acos(math.max(-1, math.min(1, clamped))) end
-	local current = acos(V.dot(shoulderRay, wristRay)/product)
-	local limit = acos((V.dot(shoulderRay, shoulderRay)+V.dot(wristRay, wristRay)-reach*reach)/(2*product))
-	local angle = math.min(math.rad(singleHand and 15 or 25), math.max(0, current-limit))
-	if angle > 1e-6 then return { q_axis_angle(axis[1], axis[2], axis[3], angle) }, factor end
-	return nil, factor
-end
-
-function M.contact_arm(model, source, wrist, lengths, factor, freeHand)
-	local V = M.contact_math
-	local sh, el, hand = model[1], model[2], model[3]
-	local nativeUpper = V.sub(source[2].p, source[1].p)
-	local nativeLower = V.sub(source[3].p, source[2].p)
-	local target = V.sub(wrist.p, sh.p)
-	local current = V.sub(hand.p, sh.p)
-	local axis = V.normal(target) or V.normal(current)
-	local span = lengths[1] + lengths[2]
-	if not axis or math.min(lengths[1], lengths[2]) < 1e-6 then return end
-	local distance = V.length(target)
-	local a, b = lengths[1]*factor, lengths[2]*factor
-	if freeHand then
-		local upper, lower = V.normal(nativeUpper), V.normal(nativeLower)
-		if upper and lower then
-			distance = math.min(distance, math.sqrt(math.max(0, a*a+b*b+2*a*b*V.dot(upper, lower))))
-		end
-	end
-	local reach = math.max(math.abs(a-b)+span*1e-5, math.min((a+b)*0.99999, distance))
-	local nativeAxis = V.normal(V.add(nativeUpper, nativeLower))
-	local pole
-	if nativeAxis then
-		local nativePole = V.project(nativeUpper, nativeAxis)
-		if V.length(nativePole) > (V.length(nativeUpper)+V.length(nativeLower))*0.0001 then
-			pole = V.normal(V.rotate(V.arc(nativeAxis, axis, nativePole), nativePole))
-		end
-	end
-	pole = pole or V.normal(V.project(V.sub(el.p, sh.p), axis)) or V.normal(V.project(nativeUpper, axis))
-	if not pole then
-		local fallback = math.abs(axis[1]) < 0.9 and { 1, 0, 0 } or { 0, 1, 0 }
-		pole = V.normal(V.project(fallback, axis))
-	end
-	local along = (a*a-b*b+reach*reach)/(2*reach)
-	local upper = V.add(V.scale(axis, along), V.scale(pole, math.sqrt(math.max(0, a*a-along*along))))
-	local endOffset = V.scale(axis, reach)
-	local shoulderDelta = V.arc(V.sub(el.p, sh.p), upper, pole)
-	local movedElbow = M.independent_fk({ p = sh.p, q = shoulderDelta }, el.q, { 0, 0, 0 })
-	local lowerDelta = V.arc(V.rotate(shoulderDelta, V.sub(hand.p, el.p)), V.sub(endOffset, upper), pole)
-	local elbow = M.independent_fk({ p = V.add(sh.p, upper), q = lowerDelta }, movedElbow.q, { 0, 0, 0 })
-	local shoulder = M.independent_fk({ p = sh.p, q = shoulderDelta }, sh.q, { 0, 0, 0 })
-	return shoulder, elbow, { p = V.add(sh.p, endOffset), q = wrist.q }
-end
-
-function M.contact_palm(wrist, index, pinky)
-	local V = M.contact_math
-	local across = V.sub(index.p, pinky.p)
-	local x = V.normal(V.sub(V.scale(V.add(index.p, pinky.p), 0.5), wrist.p))
-	local y = x and V.normal(V.project(across, x))
-	if not y then return end
-	local z = V.cross(x, y)
-	return M.independent_quaternion(mat3_to_quat(x[1], y[1], z[1], x[2], y[2], z[2], x[3], y[3], z[3]))
-end
-
-function M.calibrate_leg(modelHips, thigh, knee, foot, sourceHips, sourceThigh, sourceFoot, scale, normal)
-	local h, s, f = sourceHips.q, sourceHips.p, sourceFoot.p
-	local ax, ay, az = qrot(h[1], h[2], h[3], h[4], 0, 0, 1)
-	local a, b, c, pivot = thigh.p, knee.p, foot.p, modelHips.p
-	local sourceLateral = (f[1]-s[1])*ax + (f[2]-s[2])*ay + (f[3]-s[3])*az
-	local modelLateral = (c[1]-pivot[1])*ax + (c[2]-pivot[2])*ay + (c[3]-pivot[3])*az
-	local correction = sourceLateral*scale-modelLateral
-	local tx, ty, tz = c[1]+ax*correction-a[1], c[2]+ay*correction-a[2], c[3]+az*correction-a[3]
-	local reach = math.sqrt(tx*tx+ty*ty+tz*tz)
-	if reach < 1e-6 then return end
-	local dx, dy, dz = tx/reach, ty/reach, tz/reach
-	local ux, uy, uz = b[1]-a[1], b[2]-a[2], b[3]-a[3]
-	local lx, ly, lz = c[1]-b[1], c[2]-b[2], c[3]-b[3]
-	local upper2, lower2 = ux*ux+uy*uy+uz*uz, lx*lx+ly*ly+lz*lz
-	local upper, lower = math.sqrt(upper2), math.sqrt(lower2)
-	if math.min(upper, lower) < 1e-6 then return end
-	local margin = (upper+lower)*1e-6
-	reach = math.max(math.abs(upper-lower)+margin, math.min(upper+lower-margin, reach))
-	local along = (upper2-lower2+reach*reach)/(2*reach)
-	local height = math.sqrt(math.max(0, upper2-along*along))
-	local q = sourceThigh.q
-	local nx, ny, nz = qrot(q[1], q[2], q[3], q[4], normal[1], normal[2], normal[3])
-	local px, py, pz = arm_cross(nx, ny, nz, dx, dy, dz)
-	local plen = math.sqrt(px*px+py*py+pz*pz)
-	if plen < 1e-6 then return end
-	local bx, by, bz = dx*along+px*height/plen, dy*along+py*height/plen, dz*along+pz*height/plen
-	local sx, sy, sz, sw = min_arc_quat(ux, uy, uz, bx, by, bz)
-	local aq, bq = thigh.q, knee.q
-	local upperQ = { qmul(sx, sy, sz, sw, aq[1], aq[2], aq[3], aq[4]) }
-	local movedQ = { qmul(sx, sy, sz, sw, bq[1], bq[2], bq[3], bq[4]) }
-	lx, ly, lz = qrot(sx, sy, sz, sw, lx, ly, lz)
-	tx, ty, tz = dx*reach, dy*reach, dz*reach
-	sx, sy, sz, sw = min_arc_quat(lx, ly, lz, tx-bx, ty-by, tz-bz)
-	return { p = a, q = upperQ },
-		{ p = { a[1]+bx, a[2]+by, a[3]+bz }, q = { qmul(sx, sy, sz, sw, movedQ[1], movedQ[2], movedQ[3], movedQ[4]) } },
-		{ p = { a[1]+tx, a[2]+ty, a[3]+tz }, q = foot.q }
-end
-
-function M.clothing_driver_angles(source, reference, neutral)
-	local relative = M.independent_world_delta(source, { 0, 0, 0, 1 }, reference)
-	local x, y, z, w = qmul(-neutral[1], -neutral[2], -neutral[3], neutral[4],
-		relative[1], relative[2], relative[3], relative[4])
-	local xx, yy, zz = x*x, y*y, z*z
-	local r11, r21 = 1-2*(yy+zz), 2*(x*y+w*z)
-	local planar = math.sqrt(r11*r11+r21*r21)
-	local a, b, c = 0, math.atan2(2*(w*y-x*z), planar), 0
-	if planar < 1e-6 then
-		a = math.atan2(2*(w*x-y*z), 1-2*(xx+zz))
-	else
-		local r32, r33 = 2*(y*z+w*x), 1-2*(xx+yy)
-		a, c = math.atan2(r32, r33), math.atan2(r21, r11)
-		local altA, altB, altC = math.atan2(-r32, -r33), math.atan2(2*(w*y-x*z), -planar), math.atan2(-r21, -r11)
-		if math.abs(altA)+math.abs(altB)+math.abs(altC) < math.abs(a)+math.abs(b)+math.abs(c) then
-			a, b, c = altA, altB, altC
-		end
-	end
-	local degrees = 180/math.pi
-	return { a*degrees, b*degrees, c*degrees }
-end
-
-local function clothing_curve(points, at)
-	local first, last = points[1], points[#points]
-	if at <= first[1] then return { first[2], first[3], first[4] } end
-	if at >= last[1] then return { last[2], last[3], last[4] } end
-	for i = 2, #points do
-		local right = points[i]
-		if at <= right[1] then
-			local left = points[i-1]
-			local t = (at-left[1])/(right[1]-left[1])
-			return { left[2]+t*(right[2]-left[2]), left[3]+t*(right[3]-left[3]), left[4]+t*(right[4]-left[4]) }
-		end
-	end
-end
-
-function M.clothing_rotation(rule, primary, secondary, rest)
-	local angles = { 0, 0, 0 }
-	for index, axis in ipairs(rule.axes) do
-		local value = clothing_curve(axis.points, primary[index] * (axis.flags % 2 == 1 and -1 or 1))
-		if rule.mode ~= 0 then
-			local other = clothing_curve(axis.points, secondary[axis.secondaryAxis+1] * (axis.flags >= 2 and -1 or 1))
-			for j = 1, 3 do
-				if rule.mode == 1 then value[j] = math.max(value[j], other[j])
-				elseif rule.mode == 2 then value[j] = math.min(value[j], other[j])
-				else value[j] = math.max(-180, math.min(180, value[j]+other[j])) end
-			end
-		end
-		for j = 1, 3 do angles[j] = angles[j]+value[j] end
-	end
-	local half = math.pi/360
-	local a, b, c = angles[1]*half, angles[2]*half, angles[3]*half
-	local x, y, z, w = qmul(0, 0, math.sin(c), math.cos(c), 0, math.sin(b), 0, math.cos(b))
-	x, y, z, w = qmul(x, y, z, w, math.sin(a), 0, 0, math.cos(a))
-	local basis = rule.basis
-	x, y, z, w = qmul(basis[1], basis[2], basis[3], basis[4], x, y, z, w)
-	x, y, z, w = qmul(x, y, z, w, -basis[1], -basis[2], -basis[3], basis[4])
-	x, y, z, w = qmul(rest[1], rest[2], rest[3], rest[4], x, y, z, w)
-	return { qslerp(rest[1], rest[2], rest[3], rest[4], x, y, z, w, rule.influence) }
-end
-
-local function read_arm_position(S, unit, node)
-	local ok, p = pcall(S.Unit.world_position, unit, node)
-	if not ok or p == nil then return nil, 1 end
-	local okV, x, y, z = pcall(S.Vector3.to_elements, p)
-	if not okV or not (finite_arm_number(x) and finite_arm_number(y) and finite_arm_number(z)) then return nil, 2 end
-	return { px = x, py = y, pz = z }, 2
-end
-
---- 每侧的 avatar 目标在同一帧供所有护甲件复用。
-function M.independent_ik_target(S, avatar, shoulder, elbow, hand, previous)
-	local ha, handCalls = read_world_pose_lua(S, avatar, hand)
-	local el, elbowCalls = read_arm_position(S, avatar, elbow)
-	local sh, shoulderCalls = read_arm_position(S, avatar, shoulder)
-	local calls = handCalls + elbowCalls + shoulderCalls
-	if ha == nil or el == nil or sh == nil or not M.independent_quaternion(ha.qx, ha.qy, ha.qz, ha.qw)
-		or not (finite_arm_number(ha.px) and finite_arm_number(ha.py) and finite_arm_number(ha.pz)) then return nil, calls end
-	local nx, ny, nz = arm_cross(el.px-sh.px, el.py-sh.py, el.pz-sh.pz, ha.px-el.px, ha.py-el.py, ha.pz-el.pz)
-	local length = math.sqrt(nx*nx + ny*ny + nz*nz)
-	local normal = length > 1e-6 and { nx/length, ny/length, nz/length } or previous
-	return { hand = ha, normal = normal }, calls
-end
-
-local function project_arm_pole(x, y, z, ux, uy, uz)
-	local dot = x * ux + y * uy + z * uz
-	x, y, z = x - dot * ux, y - dot * uy, z - dot * uz
-	local len = math.sqrt(x * x + y * y + z * z)
-	if len < 1e-6 then return nil end
-	return x / len, y / len, z / len
-end
-
-local function solve_independent_arm(sh, el, wrist, target, shoulderLocal, stretch)
-	local ha = target.hand
-	local dx1, dy1, dz1 = el.px - sh.px, el.py - sh.py, el.pz - sh.pz
-	local dx2, dy2, dz2 = wrist.px - el.px, wrist.py - el.py, wrist.pz - el.pz
-	local l1 = math.sqrt(dx1 * dx1 + dy1 * dy1 + dz1 * dz1)
-	local l2 = math.sqrt(dx2 * dx2 + dy2 * dy2 + dz2 * dz2)
-	if not (l1 >= 1e-6 and l1 < math.huge and l2 >= 1e-6 and l2 < math.huge) then return nil end
-	local vx, vy, vz = ha.px - sh.px, ha.py - sh.py, ha.pz - sh.pz
-	local raw = math.sqrt(vx * vx + vy * vy + vz * vz)
-	if not finite_arm_number(raw) then return nil end
-	local ux, uy, uz = dx1 / l1, dy1 / l1, dz1 / l1
-	if raw >= 1e-6 then ux, uy, uz = vx / raw, vy / raw, vz / raw end
-	local factor = stretch and math.max(1, math.min(1.05, raw / (0.99999 * (l1 + l2)))) or 1
-	l1, l2 = l1 * factor, l2 * factor
-	local d = math.max(math.abs(l1 - l2), 1e-6, math.min(0.99999 * (l1 + l2), raw))
-	local cosine = math.max(-1, math.min(1, (l1*l1 + d*d - l2*l2) / (2*l1*d)))
-	local along = l1 * cosine
-	local height = math.sqrt(math.max(0, l1 * l1 - along * along))
-	local nx, ny, nz
-	if target.normal then
-		local n = target.normal
-		local x, y, z = arm_cross(ux, uy, uz, n[1], n[2], n[3])
-		nx, ny, nz = project_arm_pole(x, y, z, ux, uy, uz)
-	end
-	if nx == nil then nx, ny, nz = project_arm_pole(dx1, dy1, dz1, ux, uy, uz) end
-	if nx == nil then
-		-- 共线且需要弯肘：取稳定的垂直方向。
-		if math.abs(uz) < 0.9 then
-			nx, ny, nz = project_arm_pole(0, 0, -1, ux, uy, uz)
-		else
-			nx, ny, nz = project_arm_pole(0, 1, 0, ux, uy, uz)
-		end
-	end
-	local ax, ay, az = along * ux + height * nx, along * uy + height * ny, along * uz + height * nz
-	-- 由拷贝后的肩世界旋转和已知 local 旋转反推父骨，无需再读父骨世界矩阵。
-	local q = shoulderLocal
-	local ix, iy, iz, iw = qconj(q[1], q[2], q[3], q[4])
-	local px, py, pz, pw = qmul(sh.qx, sh.qy, sh.qz, sh.qw, ix, iy, iz, iw)
-	return aim_arm({ qx = px, qy = py, qz = pz, qw = pw }, sh, el, ha, dx1, dy1, dz1, dx2, dy2, dz2,
-		ax, ay, az, d * ux - ax, d * uy - ay, d * uz - az), factor
-end
-
-function M.independent_rotation_object(S, rotation, fastWrite)
-	local x, y, z, w = rotation[1], rotation[2], rotation[3], rotation[4]
-	local len2 = x * x + y * y + z * z + w * w
-	if not (len2 > 1e-12 and len2 < 1e12) then return nil, 0 end
-	local calls = 0
-	if fastWrite then
-		local scale = 1 / math.sqrt(len2)
-		local ok, q = pcall(S.Quaternion.from_elements, x * scale, y * scale, z * scale, w * scale)
-		if ok and q ~= nil then return q, 1 end
-		calls = 1
-	end
-	local length = math.sqrt(x*x + y*y + z*z)
-	local ax, ay, az, angle = 0, 0, 1, w < 0 and 2*math.pi or 0
-	if length > 1e-9 then ax, ay, az, angle = x/length, y/length, z/length, 2*math.atan2(length, w) end
-	local okAxis, axis = pcall(S.Vector3, ax, ay, az)
-	if not okAxis or axis == nil then return nil, calls + 1 end
-	local okQ, q = pcall(S.Quaternion.axis_angle, axis, angle)
-	return okQ and q or nil, calls + 2
-end
-
-function M.write_independent_rotation(S, unit, node, rotation, fastWrite)
-	local q, calls = M.independent_rotation_object(S, rotation, fastWrite)
-	if q == nil then return false, calls end
-	local written, result = pcall(S.Unit.set_local_rotation, unit, node, q)
-	return written and result ~= false, calls + 1
-end
-
-function M.write_independent_position(S, unit, node, position, factor)
-	local ok, vector = pcall(S.Vector3, position[1]*factor, position[2]*factor, position[3]*factor)
-	if not ok or vector == nil then return false, 1 end
-	local written, result = pcall(S.Unit.set_local_position, unit, node, vector)
-	return written and result ~= false, 2
-end
-
-local function independent_ik_rotations(sh, el, wrist, target, alpha, base, previous, stretch)
-	local solved, factor = solve_independent_arm(sh, el, wrist, target, base[1], stretch)
-	if solved == nil then return nil end
-	local rotations = { solved.shQ, solved.elQ, solved.haQ }
-	for i, q in ipairs(rotations) do
-		q = M.independent_quaternion(q[1], q[2], q[3], q[4])
-		if not q then return nil end
-		if alpha < 1 then
-			local a = base[i]
-			q = { qslerp(a[1], a[2], a[3], a[4], q[1], q[2], q[3], q[4], alpha) }
-		end
-		rotations[i] = M.independent_hemisphere(q, previous[i])
-	end
-	return rotations, 1 + (factor - 1) * alpha
-end
-
-function M.independent_world_pose(S, unit, node)
-	local pose, calls = read_world_pose_lua(S, unit, node)
-	if not pose or not (finite_arm_number(pose.px) and finite_arm_number(pose.py) and finite_arm_number(pose.pz)) then
-		return nil, calls
-	end
-	local q = M.independent_quaternion(pose.qx, pose.qy, pose.qz, pose.qw)
-	if q then return { p = { pose.px, pose.py, pose.pz }, q = q }, calls end
-	return nil, calls
-end
-
-function M.solve_independent_fk_ik(sh, el, wrist, target, alpha, base, previous)
-	local function components(pose)
-		local p, q = pose.p, pose.q
-		return { px = p[1], py = p[2], pz = p[3], qx = q[1], qy = q[2], qz = q[3], qw = q[4] }
-	end
-	return independent_ik_rotations(components(sh), components(el), components(wrist), target, alpha, base, previous, true)
-end
-
---- 兼容没有模型绑定位置的旧数据。
-function M.apply_independent_ik(S, unit, nodes, target, fastWrite, alpha, base, previous, positions, sample)
-	local shoulder, elbow, hand = nodes[1], nodes[2], nodes[3]
-	local sh, shCalls = read_world_pose_lua(S, unit, shoulder)
-	local el, elCalls = read_world_pose_lua(S, unit, elbow)
-	local wrist, handCalls = read_arm_position(S, unit, hand)
-	local calls = shCalls + elCalls + handCalls
-	if sh == nil or el == nil or wrist == nil then return 0, calls end
-	local rotations, factor = independent_ik_rotations(sh, el, wrist, target, alpha, base, previous, positions ~= nil)
-	if not rotations then return 0, calls end
-	local written, stretched = 0, false
-	for i, node in ipairs(nodes) do
-		local ok, cost = M.write_independent_rotation(S, unit, node, rotations[i], fastWrite)
-		calls = calls + cost
-		if not ok then break end
-		written = written + 1
-	end
-	if written == 3 and factor > 1 then
-		stretched = true -- 即使只写成功一段，也要恢复两段。
-		for i = 2, 3 do
-			local ok, cost = M.write_independent_position(S, unit, nodes[i], positions[i], factor)
-			calls = calls + cost
-			if not ok then written = -1 break end
-		end
-	end
-	if written ~= 3 then return -1, calls, nil, stretched end
-	local expected
-	if sample then
-		local function offset(from, to, bind)
-			if bind then return { bind[1]*factor, bind[2]*factor, bind[3]*factor } end
-			return { qrot(-from.qx, -from.qy, -from.qz, from.qw,
-				(to.px-from.px)*factor, (to.py-from.py)*factor, (to.pz-from.pz)*factor) }
-		end
-		local b = base[1]
-		local parent = { qmul(sh.qx, sh.qy, sh.qz, sh.qw, -b[1], -b[2], -b[3], b[4]) }
-		local q = rotations[1]
-		local start = { p = { sh.px, sh.py, sh.pz },
-			q = { qmul(parent[1], parent[2], parent[3], parent[4], q[1], q[2], q[3], q[4]) } }
-		local mid = M.independent_fk(start, rotations[2], offset(sh, el, positions and positions[2]))
-		expected = M.independent_fk(mid, rotations[3], offset(el, wrist, positions and positions[3])).p
-	end
-	return written, calls, rotations, stretched, expected
-end
-
---- 状态判定：优先探测动画变量，否则退回角色局部几何判据。返回目标 alpha ∈ [0, 1]。
-function M.detect_arm_target_alpha(S, unit, armState, poses, mode)
-	if mode == "unarmed" then return 0.0, 0 end
-	if mode == "ik" or mode == "rifle" then return 1.0, 0 end
-	local calls = 0
-	if armState ~= nil and armState.animVarId ~= nil and type(S.Unit.animation_get_variable) == "function" then
-		local ok, val = pcall(S.Unit.animation_get_variable, unit, armState.animVarId)
-		calls = calls + 1
-		if ok and type(val) == "number" then
-			return (val > 0.5 and 1.0 or 0.0), calls
-		end
-	end
-	local chest = poses.chest
-	local lSh, rSh = poses.l_shoulder, poses.r_shoulder
-	local lHa, rHa = poses.l_hand, poses.r_hand
-	local raised = (lHa.pz - lSh.pz > -0.18) or (rHa.pz - rSh.pz > -0.18)
-	local hdx, hdy, hdz = rHa.px - lHa.px, rHa.py - lHa.py, rHa.pz - lHa.pz
-	local handDist = math.sqrt(hdx * hdx + hdy * hdy + hdz * hdz)
-	local mx = 0.5 * (lHa.px + rHa.px) - chest.px
-	local my = 0.5 * (lHa.py + rHa.py) - chest.py
-	local mz = 0.5 * (lHa.pz + rHa.pz) - chest.pz
-	local fwdLen = math.sqrt(chest.fwdx * chest.fwdx + chest.fwdy * chest.fwdy + chest.fwdz * chest.fwdz)
-	local inFront = false
-	if fwdLen > 1e-9 then
-		local dotFwd = (mx * chest.fwdx + my * chest.fwdy + mz * chest.fwdz) / fwdLen
-		inFront = dotFwd > 0.15
-	end
-	if (raised and inFront) or (handDist < 0.38 and inFront) then
-		return 1.0, calls
-	end
-	return 0.0, calls
-end
-
---- 校验 `armShoulderTarget = { l = {x,y,z}, r = {x,y,z} }`（锁骨局部坐标，米）。
---- 两侧都是 3 个有限数才算有效；否则返回 nil，整套回到旧的「内收 + 收肩」行为。
-function M.arm_shoulder_targets(value)
-	if type(value) ~= "table" then return nil end
-	local out = {}
-	for _, side in ipairs({ "l", "r" }) do
-		local v = value[side]
-		if type(v) ~= "table" then return nil end
-		for i = 1, 3 do
-			local c = v[i]
-			if type(c) ~= "number" or c ~= c or c == math.huge or c == -math.huge or math.abs(c) > 1.0 then return nil end
-		end
-		out[side] = { v[1], v[2], v[3] }
-	end
-	return out
-end
-
---- 腿关节归位目标（转换时写的 `legJointTarget`：骨名 → 父骨局部位置 {x,y,z}，米）。
---- 返回按写入顺序排好的列表 { {name, x, y, z}, ... }：每侧 thigh → knee → foot → ball，
---- 父骨先于子骨——子骨的目标是相对"父骨归位后"算的。缺骨、非数、越界（|c| > 1）一律整体无效。
-local LEG_TARGET_BONES = { "thigh", "knee", "foot", "ball" }
-local legTargetCache = setmetatable({}, { __mode = "k" })
-function M.leg_joint_targets(value)
-	if type(value) ~= "table" then return nil end
-	local cached = legTargetCache[value]
-	if cached ~= nil then return cached or nil end
-	local out = {}
-	for _, side in ipairs({ "l", "r" }) do
-		for _, bone in ipairs(LEG_TARGET_BONES) do
-			local name = side .. "_" .. bone
-			local v = value[name]
-			if type(v) ~= "table" then legTargetCache[value] = false; return nil end
-			for i = 1, 3 do
-				local c = v[i]
-				if type(c) ~= "number" or c ~= c or math.abs(c) > 1.0 then
-					legTargetCache[value] = false
-					return nil
-				end
-			end
-			out[#out + 1] = { name, v[1], v[2], v[3] }
-		end
-	end
-	legTargetCache[value] = out
-	return out
-end
-
---- 把腿关节的局部位置写成目标值，旋转不动（动画每帧会把位置改回潜兵的，所以每帧都要写）。
---- 节点下标缓存在 `state.legNodes`，unit 或场景图节点数变了才重查。
---- 返回 written, calls。任何一根骨查不到就整条腿都不写——只挪一半比不挪更难看。
-function M.apply_leg_pose(S, unit, state, targets)
-	if targets == nil or state == nil or type(S.Unit.set_local_position) ~= "function" then return 0, 0 end
-	local calls = 0
-	if state.legNodes == nil or state.legNodesFor ~= targets then
-		local nodes = {}
-		local hasNodeFn = type(S.Unit.has_node) == "function"
-		for index = 1, #targets do
-			local name = targets[index][1]
-			if hasNodeFn then
-				local okH, has = pcall(S.Unit.has_node, unit, name)
-				calls = calls + 1
-				if not okH or has ~= true then state.legNodes = false; state.legNodesFor = targets; return 0, calls end
-			end
-			local ok, id = pcall(S.Unit.node, unit, name)
-			calls = calls + 1
-			if not ok or type(id) ~= "number" or id < 1 or (state.nodeCount ~= nil and id > state.nodeCount) then
-				state.legNodes = false
-				state.legNodesFor = targets
-				return 0, calls
-			end
-			nodes[index] = id
-		end
-		state.legNodes = nodes
-		state.legNodesFor = targets
-	end
-	if state.legNodes == false then return 0, calls end
-	local written = 0
-	for index = 1, #targets do
-		local t = targets[index]
-		local okV, v = pcall(S.Vector3, t[2], t[3], t[4])
-		calls = calls + 1
-		if okV and v ~= nil then
-			local okW = pcall(S.Unit.set_local_position, unit, state.legNodes[index], v)
-			calls = calls + 1
-			if okW then written = written + 1 end
-		end
-	end
-	return written, calls
-end
-
---- 对单个 avatar unit 执行一帧手臂姿态修正。返回 written, calls, alpha, targetAlpha。
-function M.apply_arm_pose(S, world, unit, armState, dt, opts)
-	opts = opts or {}
-	local mode = opts.armMode or "auto"
-	if mode == "off" or mode == "vanilla" then
-		return 0, 0, armState and armState.alpha or 0, 0
-	end
-	local resolved = M.resolve_arm_bones(S, unit, armState)
-	if resolved == nil then return 0, 0, 0, 0 end
-
-	if M._fastWrite == nil then
-		M.probe_fast_write(S, opts.logger)
-	end
-	if M._fastWrite == true and not M._fastWriteVerified then
-		M.verify_fast_write(S, unit, resolved.nodes.l_elbow, opts.logger)
-	end
-
-	local poses = {}
-	local calls = 0
-	for index = 1, #ARM_BONE_NAMES do
-		local name = ARM_BONE_NAMES[index]
-		local p = read_world_pose_lua(S, unit, resolved.nodes[name])
-		calls = calls + 2
-		if p == nil then return 0, calls, resolved.alpha or 0, 0 end
-		poses[name] = p
-	end
-
-	local targetAlpha, varCalls = M.detect_arm_target_alpha(S, unit, resolved, poses, mode)
-	calls = calls + varCalls
-	local blendTime = opts.armBlendTime or 0.12
-	local alpha = resolved.alpha or 0
-	if dt ~= nil and dt > 0 and blendTime > 0 then
-		local step = math.min(1.0, dt / blendTime)
-		if alpha < targetAlpha then
-			alpha = math.min(targetAlpha, alpha + step)
-		elseif alpha > targetAlpha then
-			alpha = math.max(targetAlpha, alpha - step)
-		end
-	else
-		alpha = targetAlpha
-	end
-	resolved.alpha = alpha
-
-	-- 给了肩关节目标位置（转换时从模型自己的骨架算出来）就只挪关节、不再额外转角：
-	-- 内收 16° 原本是在错误的转轴上凑形状，挪回原位后它会把手臂拉成竖直的「钢管」。
-	local targets = M.arm_shoulder_targets(opts.armShoulderTarget)
-	local adductionDeg = opts.armAdductionDeg or (targets ~= nil and 0.0 or 16.0)
-	local forearmCompDeg = opts.armForearmCompDeg or (targets ~= nil and 0.0 or 5.0)
-	local shoulderNarrowM = opts.armShoulderNarrow or 0.025
-	local inwardPullM = opts.armIkPull or 0.09
-
-	local written = 0
-	local sides = { "l", "r" }
-	for sIdx = 1, 2 do
-		local side = sides[sIdx]
-		local clav = poses[side .. "_clavicle"]
-		local sh = poses[side .. "_shoulder"]
-		local el = poses[side .. "_elbow"]
-		local ha = poses[side .. "_hand"]
-
-		local target = targets ~= nil and targets[side] or nil
-		local un = alpha < 1.0 and M.solve_unarmed_side(poses.chest, clav, sh, el, side, adductionDeg, forearmCompDeg, shoulderNarrowM, target) or nil
-		local ik = alpha > 0.0 and M.solve_ik_side(poses.chest, clav, sh, el, ha, inwardPullM, target) or nil
-
-		local shQ, shP, elQ, haQ
-		if alpha <= 0.0 and un ~= nil then
-			shQ, shP, elQ = un.shQ, un.shP, un.elQ
-		elseif alpha >= 1.0 and ik ~= nil then
-			shQ, shP, elQ, haQ = ik.shQ, ik.shP, ik.elQ, ik.haQ
-		elseif un ~= nil and ik ~= nil then
-			shQ = { qslerp(un.shQ[1], un.shQ[2], un.shQ[3], un.shQ[4], ik.shQ[1], ik.shQ[2], ik.shQ[3], ik.shQ[4], alpha) }
-			elQ = { qslerp(un.elQ[1], un.elQ[2], un.elQ[3], un.elQ[4], ik.elQ[1], ik.elQ[2], ik.elQ[3], ik.elQ[4], alpha) }
-			local elInvx, elInvy, elInvz, elInvw = qconj(el.qx, el.qy, el.qz, el.qw)
-			local haOrigX, haOrigY, haOrigZ, haOrigW = qmul(elInvx, elInvy, elInvz, elInvw, ha.qx, ha.qy, ha.qz, ha.qw)
-			haQ = { qslerp(haOrigX, haOrigY, haOrigZ, haOrigW, ik.haQ[1], ik.haQ[2], ik.haQ[3], ik.haQ[4], alpha) }
-			if ik.shP ~= nil then
-				shP = ik.shP
-			elseif un.shP ~= nil then
-				local cInvx, cInvy, cInvz, cInvw = qconj(clav.qx, clav.qy, clav.qz, clav.qw)
-				local ox, oy, oz = qrot(cInvx, cInvy, cInvz, cInvw, sh.px - clav.px, sh.py - clav.py, sh.pz - clav.pz)
-				shP = {
-					un.shP[1] + (ox - un.shP[1]) * alpha,
-					un.shP[2] + (oy - un.shP[2]) * alpha,
-					un.shP[3] + (oz - un.shP[3]) * alpha,
-				}
-			end
-		end
-
-		local shFallback, elFallback, haFallback
-		if not (M._fastWrite == true and M._fastWriteVerified == true) then
-			local cInvx, cInvy, cInvz, cInvw = qconj(clav.qx, clav.qy, clav.qz, clav.qw)
-			shFallback = { qrot(cInvx, cInvy, cInvz, cInvw, sh.px - clav.px, sh.py - clav.py, sh.pz - clav.pz) }
-			local sInvx, sInvy, sInvz, sInvw = qconj(sh.qx, sh.qy, sh.qz, sh.qw)
-			elFallback = { qrot(sInvx, sInvy, sInvz, sInvw, el.px - sh.px, el.py - sh.py, el.pz - sh.pz) }
-			local eInvx, eInvy, eInvz, eInvw = qconj(el.qx, el.qy, el.qz, el.qw)
-			haFallback = { qrot(eInvx, eInvy, eInvz, eInvw, ha.px - el.px, ha.py - el.py, ha.pz - el.pz) }
-		end
-
-		if shQ ~= nil then
-			local okW, cW = write_arm_local(S, unit, resolved.nodes[side .. "_shoulder"], shQ[1], shQ[2], shQ[3], shQ[4], shP and shP[1] or nil, shP and shP[2] or nil, shP and shP[3] or nil, shFallback)
-			calls = calls + cW
-			if okW then written = written + 1 end
-		end
-		if elQ ~= nil then
-			local okW, cW = write_arm_local(S, unit, resolved.nodes[side .. "_elbow"], elQ[1], elQ[2], elQ[3], elQ[4], nil, nil, nil, elFallback)
-			calls = calls + cW
-			if okW then written = written + 1 end
-		end
-		if haQ ~= nil then
-			local okW, cW = write_arm_local(S, unit, resolved.nodes[side .. "_hand"], haQ[1], haQ[2], haQ[3], haQ[4], nil, nil, nil, haFallback)
-			calls = calls + cW
-			if okW then written = written + 1 end
-		end
-	end
-
-	-- 腿关节归位放在最后：手臂求解读的是写入前的姿态，腿和手臂两条链互不影响；
-	-- 写完一起做一次 update_unit。
-	local legTargets = M.leg_joint_targets(opts.legJointTarget)
-	if legTargets ~= nil then
-		local legWritten, legCalls = M.apply_leg_pose(S, unit, resolved, legTargets)
-		written = written + legWritten
-		calls = calls + legCalls
-	end
-
-	if written > 0 and world ~= nil then
-		pcall(S.World.update_unit, world, unit)
-		calls = calls + 1
-	end
-	return written, calls, alpha, targetAlpha, resolved
 end
 
 return M

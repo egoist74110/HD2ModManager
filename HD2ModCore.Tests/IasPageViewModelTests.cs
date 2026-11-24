@@ -1,0 +1,1238 @@
+using System.IO;
+using System.IO.Compression;
+using HD2ModCore.Ias;
+using HD2ModCore.Domain;
+using HD2ModManager.Enums;
+using HD2ModManager.Services;
+using HD2ModManager.Services.Ias;
+using HD2ModManager.ViewModels;
+
+namespace HD2ModCore.Tests;
+
+[Collection("WpfApplication")]
+public sealed class IasPageViewModelTests
+{
+    [Fact]
+    public async Task RunningGameDisablesWritesAndRecoveryRunsOnReentryAfterExit()
+    {
+        var service = new ServiceStub(IasStatusKind.UpdateAvailable, "1.6.4")
+        {
+            GameRunning = true,
+            Graphics = new(true, IasDlssMode.Off),
+            PhysicsOn = true,
+            BuiltInLuaOn = true
+        };
+        using var page = CreatePage(service);
+        await page.EnterAsync();
+
+        Assert.True(page.GameRunning);
+        Assert.Equal(IasGameRunningException.Notice, page.GameRunningNotice);
+        Assert.False(page.PrimaryCommand.CanExecute(null));
+        Assert.False(page.UninstallCommand.CanExecute(null));
+        Assert.False(page.TurnOffPhysicsCommand.CanExecute(null));
+        Assert.False(page.TurnOffLuaCommand.CanExecute(null));
+        Assert.False(page.CanToggleIas);
+        Assert.False(page.CanToggleCharacter);
+        Assert.False(page.CanToggleReShade);
+        Assert.False(page.CanToggleDlss);
+        Assert.False(page.CanAcceptDrop);
+        var role = Assert.Single(page.Characters);
+        Assert.False(page.RemoveCharacterCommand.CanExecute(role));
+        Assert.False(page.ConvertCharacterCommand.CanExecute(role));
+        Assert.Equal(0, service.RecoveryCalls);
+
+        page.Leave();
+        service.GameRunning = false;
+        await page.EnterAsync();
+
+        Assert.False(page.GameRunning);
+        Assert.Equal(1, service.RecoveryCalls);
+        Assert.True(page.PrimaryCommand.CanExecute(null));
+        Assert.True(page.CanToggleIas);
+    }
+
+    [Theory]
+    [InlineData(IasStatusKind.Checking, null, "Gray", "正在检查…", null, null, false)]
+    [InlineData(IasStatusKind.NotInstalled, null, "Gray", "IAS 未安装", "将从 IAS 官方 GitHub 下载约 249 MB，默认仅启用护甲部件。", "安装 IAS", false)]
+    [InlineData(IasStatusKind.Installed, "1.6.4", "Green", "已安装 1.6.4", "已是最新版本。", null, true)]
+    [InlineData(IasStatusKind.UpdateAvailable, "1.6.4", "Blue", "有新版本 1.6.5", "当前 1.6.4。", "更新", true)]
+    [InlineData(IasStatusKind.GameMismatch, "1.6.4", "Yellow", "游戏已更新，IAS 尚未适配", "等 IAS 作者发布新版本后再更新。游戏版本信息。", null, false)]
+    [InlineData(IasStatusKind.MissingMdl3, "1.6.4", "Yellow", "缺少前置 MDL3", "先在首页把 MDL3 加进当前配置。", null, false)]
+    [InlineData(IasStatusKind.NotInProfile, "1.6.4", "Gray", "IAS 已停用（当前配置）", "IAS 和角色都已从当前配置撤下，部件和角色都还在，打开开关即可恢复。", null, false)]
+    [InlineData(IasStatusKind.FeedUnavailable, "1.6.4", "Gray", "已安装 1.6.4", "暂时连不上 IAS 官方源：连接超时。", "重试", true)]
+    [InlineData(IasStatusKind.FeedUnavailable, null, "Gray", "IAS 未安装", "暂时连不上 IAS 官方源：连接超时。", "重试", false)]
+    [InlineData(IasStatusKind.Error, null, "Red", "出错了", "连接超时。", "重试", false)]
+    public async Task StatusTable(IasStatusKind kind, string? version, string color, string title, string? detail, string? action, bool ready)
+    {
+        using var page = CreatePage(new ServiceStub(kind, version) { EnabledInActiveProfile = ready });
+
+        await page.EnterAsync();
+
+        Assert.Equal(color, page.StatusColor);
+        Assert.Equal(title, page.StatusText);
+        Assert.Equal(detail, page.StatusDetail);
+        Assert.Equal(action, page.PrimaryActionText);
+        Assert.Equal(action is not null, page.PrimaryCommand.CanExecute(null));
+        Assert.Equal(ready, page.CanAcceptDrop);
+        Assert.Equal(ready || kind == IasStatusKind.NotInProfile, page.ShowIasToggle);
+        Assert.Equal(page.ShowIasToggle, page.CanToggleIas);
+        Assert.Equal(ready, page.CanToggleCharacter);
+        Assert.Equal(kind is IasStatusKind.NotInstalled or IasStatusKind.UpdateAvailable, page.ShowDownloadSource);
+        Assert.Equal(ready ? "把 IAS Mod、普通护甲 Mod 或求生 VPK 拖到窗口任意位置" : kind switch
+        {
+            IasStatusKind.Checking => "正在检查 IAS 状态…",
+            IasStatusKind.GameMismatch => "游戏更新后 IAS 暂不可用，等 IAS 更新后再添加角色",
+            IasStatusKind.MissingMdl3 => "先把 MDL3 加进当前配置",
+            IasStatusKind.NotInProfile => "先打开 IAS",
+            _ => "先安装 IAS 才能添加角色"
+        }, page.DropText);
+    }
+
+    [Theory]
+    [InlineData(null, false, false, IasStatusKind.FeedUnavailable)]
+    [InlineData("1.6.4", false, true, IasStatusKind.MissingMdl3)]
+    [InlineData("1.6.4", true, false, IasStatusKind.FeedUnavailable)]
+    [InlineData("1.6.4", true, true, IasStatusKind.FeedUnavailable)]
+    public void BackendCombinesGatesAndFeedState(string? version, bool mdl3, bool inProfile, IasStatusKind expected)
+    {
+        HD2ModCore.Ias.IasModuleState state = version is null
+            ? new HD2ModCore.Ias.IasModuleState.NotInstalled() : new HD2ModCore.Ias.IasModuleState.Installed(version);
+        var status = IasModuleService.ProjectStatus(state, new(null, HD2ModCore.Ias.IasFeedFailure.Network, "离线"), version, mdl3, inProfile);
+        Assert.Equal(expected, status.Kind);
+        Assert.Equal(version, status.InstalledVersion);
+        Assert.Equal(inProfile, status.EnabledInActiveProfile);
+    }
+
+    [Theory]
+    [InlineData(IasStatusKind.Installed, "1.6.4", true, false, false, true)]
+    [InlineData(IasStatusKind.Installed, "1.6.4", true, true, false, true)]
+    [InlineData(IasStatusKind.Installed, "1.6.4", true, false, true, true)]
+    [InlineData(IasStatusKind.GameMismatch, "1.6.4", true, true, true, true)]
+    [InlineData(IasStatusKind.NotInProfile, "1.6.4", false, true, true, false)]
+    [InlineData(IasStatusKind.NotInstalled, null, false, true, true, false)]
+    public async Task ConflictWarningReflectsActiveProfile(IasStatusKind kind, string? version, bool inProfile,
+        bool physicsOn, bool mappingInUse, bool showWarning)
+    {
+        var service = new ServiceStub(kind, version)
+        {
+            EnabledInActiveProfile = inProfile,
+            PhysicsOn = physicsOn,
+            MappingInUse = mappingInUse,
+        };
+        var dialogs = new DialogStub(null);
+        using var page = CreatePage(service, dialogs);
+
+        await page.EnterAsync();
+
+        Assert.Equal(showWarning, page.ShowConflictWarning);
+        Assert.Equal(showWarning && physicsOn, page.ShowTurnOffPhysics);
+        Assert.Equal(showWarning && physicsOn, page.TurnOffPhysicsCommand.CanExecute(null));
+        Assert.Equal(showWarning && mappingInUse, page.ShowMappingWarning);
+        Assert.Null(dialogs.LastConfirmation);
+    }
+
+    [Theory]
+    [InlineData(IasStatusKind.NotInstalled, true, true, true)]
+    [InlineData(IasStatusKind.UpdateAvailable, true, true, true)]
+    [InlineData(IasStatusKind.NotInProfile, true, true, true)]
+    [InlineData(IasStatusKind.NotInstalled, true, false, false)]
+    [InlineData(IasStatusKind.UpdateAvailable, false, true, false)]
+    [InlineData(IasStatusKind.NotInProfile, false, true, false)]
+    public async Task PrimaryActionOffersToTurnOffPhysicsAfterSuccessfulDeployment(IasStatusKind kind, bool success,
+        bool physicsOn, bool shouldConfirm)
+    {
+        var service = new ServiceStub(kind, kind == IasStatusKind.NotInstalled ? null : "1.6.4")
+        {
+            PhysicsOn = physicsOn,
+            FinishPrimaryAction = success,
+        };
+        var dialogs = new DialogStub(null);
+        using var page = CreatePage(service, dialogs);
+        await page.EnterAsync();
+
+        if (kind == IasStatusKind.NotInProfile) await page.SetIasEnabledAsync(true);
+        else await page.ExecutePrimaryAsync();
+
+        Assert.Equal(shouldConfirm, dialogs.LastConfirmation is not null);
+        Assert.Equal(0, service.TurnOffCalls);
+        Assert.Equal(success || kind == IasStatusKind.UpdateAvailable, page.ShowConflictWarning);
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task FailedToggleKeepsRequestedPositionWhileBusyAndRestoresAfterFailure(bool total)
+    {
+        var pending = new TaskCompletionSource<IasOperationResult>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var service = new ServiceStub(IasStatusKind.Installed, "1.6.4")
+        {
+            Toggle = pending.Task
+        };
+        using var page = CreatePage(service);
+        await page.EnterAsync();
+        var row = Assert.Single(page.Characters);
+
+        var operation = total ? page.SetIasEnabledAsync(false) : page.SetCharacterEnabledAsync(row, false);
+
+        Assert.True(page.IsBusy);
+        Assert.True(page.ShowIasToggle);
+        Assert.False(page.CanToggleIas);
+        Assert.False(page.CanToggleCharacter);
+        Assert.False(total ? page.IasEnabled : row.IsChecked);
+        pending.SetResult(new(false, "模拟部署失败", []));
+        await operation;
+
+        Assert.True(page.IasEnabled);
+        Assert.True(row.IsChecked);
+        Assert.True(page.CanToggleCharacter);
+        Assert.Equal("模拟部署失败", page.ResultText);
+    }
+
+    [Fact]
+    public async Task DisablingIasHidesWarningAndLocksRoleToggleButKeepsRoleActions()
+    {
+        var service = new ServiceStub(IasStatusKind.UpdateAvailable, "1.6.4")
+        {
+            FinishPrimaryAction = true, PhysicsOn = true, BuiltInLuaOn = true, CharacterEnabled = false
+        };
+        var dialogs = new DialogStub(null);
+        using var page = CreatePage(service, dialogs);
+        await page.EnterAsync();
+        await page.SetIasEnabledAsync(false);
+
+        var row = Assert.Single(page.Characters);
+        Assert.True(row.IsDisabled);
+        Assert.False(page.ShowConflictWarning);
+        Assert.False(page.CanToggleCharacter);
+        Assert.True(page.ConvertCharacterCommand.CanExecute(row));
+        Assert.True(page.RemoveCharacterCommand.CanExecute(row));
+        Assert.True(page.CanToggleIas);
+        Assert.Equal("更新", page.PrimaryActionText);
+        Assert.Null(dialogs.LastConfirmation);
+    }
+
+    [Theory]
+    [InlineData(true, false, "关掉管理器物理？", "关掉物理", true)]
+    [InlineData(false, true, "关掉管理器内置 Lua？", "关掉内置 Lua", true)]
+    [InlineData(true, true, "关掉管理器的物理和内置 Lua？", "全部关掉", true)]
+    [InlineData(true, false, "关掉管理器物理？", "关掉物理", false)]
+    [InlineData(false, true, "关掉管理器内置 Lua？", "关掉内置 Lua", false)]
+    [InlineData(true, true, "关掉管理器的物理和内置 Lua？", "全部关掉", false)]
+    public async Task EnablingOffersExactlyTheManagerFeaturesThatAreOn(bool physics, bool lua, string title, string button, bool confirm)
+    {
+        var service = new ServiceStub(IasStatusKind.Installed, "1.6.4")
+        {
+            EnabledInActiveProfile = false, PhysicsOn = physics, BuiltInLuaOn = lua, FinishPrimaryAction = true
+        };
+        var dialogs = new DialogStub(confirm ? false : null);
+        using var page = CreatePage(service, dialogs);
+        await page.EnterAsync();
+        await page.SetIasEnabledAsync(true);
+
+        var confirmation = Assert.IsType<IasConfirmation>(dialogs.LastConfirmation);
+        Assert.Equal(title, confirmation.Title);
+        Assert.Equal(button, confirmation.ConfirmLabel);
+        Assert.Equal("先不关", confirmation.CancelLabel);
+        if (physics)
+        {
+            Assert.Contains("潜兵身上的护甲", confirmation.Message);
+            Assert.Contains("NPC 不受影响。", confirmation.Message);
+            Assert.Contains("物理 Mod 不再生效", confirmation.Message);
+        }
+        if (lua) Assert.Contains("也建议关掉管理器的内置 Lua。", confirmation.Message);
+        Assert.Equal((confirm && physics, confirm && lua), service.LastTurnOff);
+        Assert.Equal(physics && !confirm, page.ShowTurnOffPhysics);
+        Assert.Equal(lua && !confirm, page.ShowTurnOffLua);
+        Assert.Equal(page.ShowTurnOffPhysics, page.TurnOffPhysicsCommand.CanExecute(null));
+        Assert.Equal(page.ShowTurnOffLua, page.TurnOffLuaCommand.CanExecute(null));
+    }
+
+    [Fact]
+    public async Task WarningLuaButtonOnlyTurnsOffLuaWhenBothAreOn()
+    {
+        var service = new ServiceStub(IasStatusKind.Installed, "1.6.4") { PhysicsOn = true, BuiltInLuaOn = true };
+        var dialogs = new DialogStub(false);
+        using var page = CreatePage(service, dialogs);
+        await page.EnterAsync();
+        await page.ConfirmTurnOffLuaAsync();
+
+        Assert.Equal("关掉管理器内置 Lua？", dialogs.LastConfirmation?.Title);
+        Assert.Equal((false, true), service.LastTurnOff);
+        Assert.True(page.ShowTurnOffPhysics);
+        Assert.False(page.ShowTurnOffLua);
+    }
+
+    [Theory]
+    [InlineData(true, false)]
+    [InlineData(false, false)]
+    [InlineData(true, true)]
+    [InlineData(false, true)]
+    public async Task PhysicsChangesOnlyAfterConfirmation(bool confirm, bool afterInstall)
+    {
+        var service = afterInstall
+            ? new ServiceStub(IasStatusKind.NotInstalled) { PhysicsOn = true, FinishPrimaryAction = true, MappingInUse = true }
+            : new ServiceStub(IasStatusKind.Installed, "1.6.4") { EnabledInActiveProfile = true, PhysicsOn = true, MappingInUse = true };
+        // 对话框的 false 表示按了主按钮且没有勾选框，null 才是取消。
+        var dialogs = new DialogStub(confirm ? false : null);
+        using var page = CreatePage(service, dialogs);
+        await page.EnterAsync();
+
+        if (afterInstall) await page.ExecutePrimaryAsync();
+        else await page.ConfirmTurnOffPhysicsAsync();
+
+        Assert.Equal(new IasConfirmation("关掉管理器物理？",
+            "IAS 接管潜兵身上的护甲，和带物理的普通 Mod 会冲突。NPC 不受影响。关闭管理器物理后，管理器物理 Mod 不再生效。以后可以在设置里重新打开。",
+            "关掉物理", CancelLabel: "先不关"), dialogs.LastConfirmation);
+        Assert.Equal(confirm ? 1 : 0, service.TurnOffCalls);
+        Assert.Equal(!confirm, page.ShowTurnOffPhysics);
+        Assert.True(page.ShowConflictWarning);
+        Assert.True(page.ShowMappingWarning);
+    }
+
+    [Fact]
+    public async Task InstallationFinishingOffPageOffersConfirmationOnReturn()
+    {
+        var pending = new TaskCompletionSource<IasOperationResult>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var service = new ServiceStub(IasStatusKind.NotInstalled)
+        {
+            PhysicsOn = true,
+            Install = (_, _) => pending.Task,
+            ReadStatus = (read, _) => Task.FromResult(read == 1 ? Status(IasStatusKind.NotInstalled, null)
+                : Status(IasStatusKind.Installed, "1.6.4") with { EnabledInActiveProfile = true, PhysicsOn = true }),
+        };
+        var dialogs = new DialogStub(null);
+        using var page = CreatePage(service, dialogs);
+        await page.EnterAsync();
+        var operation = page.ExecutePrimaryAsync();
+
+        page.Leave();
+        pending.SetResult(new(true, "已安装 IAS。", []));
+        await operation;
+
+        Assert.Null(dialogs.LastConfirmation);
+        await page.EnterAsync();
+        Assert.NotNull(dialogs.LastConfirmation);
+        Assert.Equal(0, service.TurnOffCalls);
+    }
+
+    [Fact]
+    public async Task OperationDisablesAllOtherCommandsAndCannotOverlap()
+    {
+        var pending = new TaskCompletionSource<IasOperationResult>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var reported = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var service = new ServiceStub(IasStatusKind.UpdateAvailable, "1.6.4")
+        {
+            Install = (progress, _) =>
+            {
+                progress.Report(new("正在下载…", 62, "正在下载 154 / 249 MB", true));
+                return pending.Task;
+            },
+        };
+        using var page = CreatePage(service);
+        await page.EnterAsync();
+        page.PropertyChanged += (_, _) =>
+        {
+            if (page.CanCancel) reported.TrySetResult();
+        };
+        var row = Assert.Single(page.Characters);
+        var operation = page.ExecutePrimaryAsync();
+        await reported.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        try
+        {
+            Assert.True(page.ShowProgress);
+            Assert.True(page.IsBusy);
+            Assert.Equal("Blue", page.StatusColor);
+            Assert.Equal("正在下载…", page.StatusText);
+            Assert.Equal("62%", page.ProgressText);
+            Assert.Null(page.StatusDetail);
+            Assert.Null(page.PrimaryActionText);
+            Assert.False(page.PrimaryCommand.CanExecute(null));
+            Assert.False(page.UninstallCommand.CanExecute(null));
+            Assert.True(page.ChooseLibraryModCommand.CanExecute(null));
+            Assert.True(page.ConvertCharacterCommand.CanExecute(row));
+            Assert.False(page.RemoveCharacterCommand.CanExecute(row));
+            Assert.False(page.OpenOfficialPageCommand.CanExecute(null));
+            Assert.False(page.OpenCreatedModCommand.CanExecute(null));
+            Assert.True(page.CancelCommand.CanExecute(null));
+            Assert.True(page.CanAcceptDrop);
+            Assert.True(page.UpdateWindowDrop([AppContext.BaseDirectory]));
+            Assert.Contains("排队", page.DropText);
+            Assert.Equal(0, service.AddCalls);
+            await page.ExecutePrimaryAsync();
+            Assert.Equal(1, service.InstallCalls);
+        }
+        finally
+        {
+            pending.SetResult(new(true, "已安装 IAS 1.6.5。", []));
+            await operation;
+        }
+        Assert.Equal(2, service.StatusReads);
+    }
+
+    [Theory]
+    [InlineData(WorkspaceMode.Ias, true)]
+    [InlineData(WorkspaceMode.Home, false)]
+    [InlineData(WorkspaceMode.ProfileOnly, false)]
+    [InlineData(WorkspaceMode.LibraryOnly, false)]
+    [InlineData(WorkspaceMode.ProfileLibrarySplit, false)]
+    [InlineData(WorkspaceMode.Settings, false)]
+    [InlineData(WorkspaceMode.ArmorRegistry, false)]
+    public void OnlyIasOwnsWindowDrop(WorkspaceMode mode, bool ownsDrop)
+    {
+        using var page = CreatePage(new ServiceStub(IasStatusKind.NotInstalled));
+        Assert.Same(ownsDrop ? page : null, ShellViewModel.ResolveIasWindowDropPage(mode, page));
+    }
+
+    [Theory]
+    [InlineData(IasStatusKind.NotInstalled, "先安装 IAS 才能添加角色")]
+    [InlineData(IasStatusKind.GameMismatch, "游戏更新后 IAS 暂不可用，等 IAS 更新后再添加角色")]
+    public async Task UnavailablePageHighlightsStatusWithoutImporting(IasStatusKind kind, string message)
+    {
+        var service = new ServiceStub(kind);
+        using var page = CreatePage(service);
+        await page.EnterAsync();
+
+        Assert.False(page.UpdateWindowDrop([AppContext.BaseDirectory]));
+        Assert.True(page.IsWindowDropHighlighted);
+        Assert.Equal(message, page.DropText);
+        await page.HandleWindowDropAsync([AppContext.BaseDirectory]);
+        Assert.False(page.IsWindowDropHighlighted);
+        Assert.Equal(0, service.AddCalls);
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(null)]
+    public async Task WindowDropConfirmsBeforeCallingService(bool? answer)
+    {
+        var service = new ServiceStub(IasStatusKind.Installed, "1.6.4");
+        var dialogs = new DialogStub(answer);
+        using var page = CreatePage(service, dialogs);
+        await page.EnterAsync();
+        Assert.True(page.UpdateWindowDrop([AppContext.BaseDirectory]));
+        Assert.True(page.IsWindowDropHighlighted);
+        Assert.Equal(0, service.AddCalls);
+        Assert.Null(dialogs.LastConfirmation);
+
+        await page.HandleWindowDropAsync([AppContext.BaseDirectory]);
+
+        Assert.Equal(answer.HasValue ? 1 : 0, service.AddCalls);
+        Assert.Equal("添加 IAS 角色", dialogs.LastConfirmation?.Title);
+        Assert.Equal(answer.HasValue, page.ResultSuccess);
+        Assert.False(page.IsWindowDropHighlighted);
+    }
+
+    [Fact]
+    public async Task BusyPageRunsConfirmedItemsInOrderAfterFailureAndSkipsCancelledAndDuplicateItems()
+    {
+        using var drops = new DropFiles();
+        var first = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var queueIdle = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var calls = new List<string>();
+        var service = new ServiceStub(IasStatusKind.Installed, "1.6.4")
+        {
+            Add = async (paths, _, _) =>
+            {
+                var name = Path.GetFileName(Assert.Single(paths));
+                calls.Add(name);
+                if (name == "First.zip")
+                {
+                    await first.Task;
+                    throw new InvalidOperationException("模拟失败");
+                }
+                return new(true, "已添加", []);
+            },
+            Convert = (armor, helmet, merge) =>
+            {
+                Assert.Equal("0x00000009", armor);
+                Assert.Equal("0x00000002", helmet);
+                Assert.True(merge);
+                calls.Add("转换");
+                return new(true, "已转换", []);
+            },
+            AddFromLibrary = id =>
+            {
+                calls.Add(id);
+                return new(true, "已从库添加", []);
+            },
+        };
+        var dialogs = new DialogStub(true) { Selected = [new("library-id", "库中护甲", null, "护甲")] };
+        var notifications = new NotificationService();
+        var tasks = new BackgroundTaskService();
+        var messages = new MessageCenterService(notifications, tasks);
+        var queue = new IasOperationQueue(tasks, service);
+        using var page = CreatePage(service, dialogs, notifications, queue);
+        await page.EnterAsync();
+
+        var active = page.HandleWindowDropAsync([drops.First]);
+        Assert.Equal("First.zip", page.CurrentQueueItem?.Name);
+        Assert.True(page.UpdateWindowDrop([drops.Second]));
+        var second = page.HandleWindowDropAsync([drops.Second]);
+        var secondMessage = Assert.Single(messages.ActiveTasks, item => item.Title == "添加 IAS 角色：Second.zip");
+        Assert.Equal(BackgroundTaskStatus.Queued, secondMessage.Task!.Status);
+        var secondStatuses = new List<BackgroundTaskStatus>();
+        secondMessage.Task.PropertyChanged += (_, e) =>
+        {
+            if (e.PropertyName == nameof(BackgroundTaskItem.Status)) secondStatuses.Add(secondMessage.Task.Status);
+        };
+        await page.HandleWindowDropAsync([Path.Combine(Path.GetDirectoryName(drops.First)!, ".", "FIRST.zip")]);
+        var cancelled = page.HandleWindowDropAsync([drops.Cancelled]);
+        var row = Assert.Single(page.Characters);
+        page.ConvertCharacterCommand.Execute(row);
+        var panel = Assert.IsType<IasConversionPanelViewModel>(row.Conversion);
+        Assert.Equal("原来那套：原护甲", panel.Armor.SelectionText);
+        Assert.Equal("原来那套：原护甲", panel.Armor.Choices.Cast<IasTargetChoice>().First().Name);
+        Assert.Null(panel.Armor.SelectionIconPath);
+        panel.Armor.SelectCommand.Execute(ArmorChoice);
+        panel.MergeHelmet = true;
+        page.StartConversionCommand.Execute(row);
+        panel.MergeHelmet = false;
+        Assert.Null(row.Conversion);
+        page.ChooseLibraryModCommand.Execute(null);
+        Assert.Equal(4, dialogs.Confirmations);
+        Assert.Equal(["Second.zip", "Cancelled.zip", row.Name, "库中护甲"], page.WaitingQueue.Select(item => item.Name));
+        Assert.False(page.UninstallCommand.CanExecute(null));
+        Assert.False(page.CanToggleIas);
+        var waitingMessage = Assert.Single(messages.ActiveTasks, item => item.Title == "添加 IAS 角色：Cancelled.zip");
+        Assert.True(waitingMessage.CanCancel);
+        waitingMessage.Task!.Cancel();
+        await cancelled;
+        Assert.Equal(BackgroundTaskStatus.Canceled, waitingMessage.Task.Status);
+        Assert.DoesNotContain(waitingMessage, messages.ActiveTasks);
+        Assert.Equal(["First.zip"], calls);
+
+        queue.Changed += (_, _) => { if (!queue.HasWork) queueIdle.TrySetResult(); };
+        first.SetResult();
+        await Task.WhenAll(active, second, queueIdle.Task).WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal(["First.zip", "Second.zip", "转换", "library-id"], calls);
+        var failed = Assert.Single(messages.AttentionItems, item => item.Title == "添加 IAS 角色：First.zip");
+        Assert.Equal(BackgroundTaskStatus.Failed, failed.Task!.Status);
+        Assert.Contains("模拟失败", failed.CopyText);
+        Assert.Equal([BackgroundTaskStatus.Running, BackgroundTaskStatus.Completed], secondStatuses);
+        Assert.Contains(secondMessage, messages.RecentNotifications);
+        Assert.DoesNotContain(notifications.History, item => item.Level == NotificationLevel.Error);
+    }
+
+    [Fact]
+    public async Task MultiSelectedLibraryModsQueueOneItemEachAfterOneConfirmation()
+    {
+        var calls = new List<string>();
+        var first = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        IasVpkTargets? seenTargets = null;
+        var service = new ServiceStub(IasStatusKind.Installed, "1.6.4")
+        {
+            EnabledInActiveProfile = true,
+            AddFromLibraryAsync2 = async (id, targets) =>
+            {
+                calls.Add(id);
+                seenTargets = targets;
+                if (id == "a") await first.Task;
+                return new(true, "已从库添加", []);
+            },
+        };
+        var unavailable = new IasLibraryCandidate("role", "已是角色", null, "普通 Mod") { UnavailableReason = "已经是 IAS 角色" };
+        var dialogs = new DialogStub(true)
+        {
+            Selected = [new("a", "甲", null, "普通 Mod"), new("b", "乙", null, "求生 VPK") { Source = IasLibrarySource.L4d2Vpk },
+                unavailable, new("a", "甲（重复）", null, "普通 Mod")]
+        };
+        var notifications = new NotificationService();
+        var tasks = new BackgroundTaskService();
+        var messages = new MessageCenterService(notifications, tasks);
+        var queue = new IasOperationQueue(tasks, service);
+        using var page = CreatePage(service, dialogs, notifications, queue);
+        await page.EnterAsync();
+
+        page.ChooseLibraryModCommand.Execute(null);
+
+        Assert.Equal(1, dialogs.LibraryDialogs);
+        Assert.Equal(1, dialogs.Confirmations);
+        Assert.Equal("把 2 个 Mod 加入队列，转换为 IAS 角色并安装？", dialogs.LastConfirmation!.Message);
+        Assert.Equal("甲", page.CurrentQueueItem?.Name);
+        Assert.Equal(["乙"], page.WaitingQueue.Select(item => item.Name));
+        Assert.Equal(2, messages.ActiveTasks.Count(item => item.Title.StartsWith("从 Mod 库添加 IAS 角色：")));
+        Assert.NotNull(seenTargets);
+
+        var idle = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        queue.Changed += (_, _) => { if (!queue.HasWork) idle.TrySetResult(); };
+        first.SetResult();
+        await idle.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal(["a", "b"], calls);
+    }
+
+    [Fact]
+    public async Task SingleSelectedLibraryModConfirmationNamesTheMod()
+    {
+        var service = new ServiceStub(IasStatusKind.Installed, "1.6.4")
+        {
+            EnabledInActiveProfile = true,
+            AddFromLibrary = _ => new(true, "已从库添加", []),
+        };
+        var dialogs = new DialogStub(true) { Selected = [new("a", "甲", null, "普通 Mod")] };
+        using var page = CreatePage(service, dialogs);
+        await page.EnterAsync();
+
+        page.ChooseLibraryModCommand.Execute(null);
+
+        Assert.Equal("把「甲」加入队列，转换为 IAS 角色并安装？", dialogs.LastConfirmation!.Message);
+    }
+
+    [Fact]
+    public async Task CancellingLibraryDialogQueuesNothing()
+    {
+        var service = new ServiceStub(IasStatusKind.Installed, "1.6.4") { EnabledInActiveProfile = true };
+        var dialogs = new DialogStub(true) { Selected = null };
+        using var page = CreatePage(service, dialogs);
+        await page.EnterAsync();
+
+        page.ChooseLibraryModCommand.Execute(null);
+
+        Assert.Equal(1, dialogs.LibraryDialogs);
+        Assert.Equal(0, dialogs.Confirmations);
+        Assert.Empty(page.WaitingQueue);
+        Assert.Null(page.CurrentQueueItem);
+    }
+
+    [Fact]
+    public async Task QueueSurvivesPageDisposalAndRebuiltPageShowsSameTasks()
+    {
+        using var drops = new DropFiles();
+        var first = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var secondStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var second = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var service = new ServiceStub(IasStatusKind.Installed, "1.6.4")
+        {
+            Add = async (paths, _, token) =>
+            {
+                if (Assert.Single(paths) == drops.First) await first.Task;
+                else
+                {
+                    secondStarted.TrySetResult();
+                    await second.Task;
+                }
+                token.ThrowIfCancellationRequested();
+                return new(true, "已添加", []);
+            },
+        };
+        var tasks = new BackgroundTaskService();
+        var queue = new IasOperationQueue(tasks, service);
+        using var page = CreatePage(service, new DialogStub(true), queue: queue);
+        await page.EnterAsync();
+        var current = page.HandleWindowDropAsync([drops.First]);
+        var waiting = page.HandleWindowDropAsync([drops.Second]);
+        page.Leave();
+        page.Dispose();
+
+        using var rebuilt = CreatePage(service, queue: queue);
+        await rebuilt.EnterAsync();
+        Assert.Same(tasks.Tasks[0], rebuilt.CurrentQueueItem?.Task);
+        Assert.Same(tasks.Tasks[1], Assert.Single(rebuilt.WaitingQueue).Task);
+        Assert.False(rebuilt.CanToggleIas);
+        rebuilt.Leave();
+
+        first.SetResult();
+        await secondStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal(BackgroundTaskStatus.Completed, tasks.Tasks[0].Status);
+        Assert.Equal(BackgroundTaskStatus.Running, tasks.Tasks[1].Status);
+        second.SetResult();
+        await Task.WhenAll(current, waiting).WaitAsync(TimeSpan.FromSeconds(5));
+        await rebuilt.EnterAsync();
+        Assert.Empty(rebuilt.WaitingQueue);
+        Assert.Null(rebuilt.CurrentQueueItem);
+        Assert.True(rebuilt.CanToggleIas);
+        Assert.All(tasks.Tasks, task => Assert.Equal(BackgroundTaskStatus.Completed, task.Status));
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task CancellationUsesTheTaskTokenAndCloseWaitsForRollback(bool closingManager)
+    {
+        using var drops = new DropFiles();
+        var cancelled = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        CancellationToken executionToken = default;
+        var service = new ServiceStub(IasStatusKind.Installed, "1.6.4")
+        {
+            Add = async (paths, _, token) =>
+            {
+                if (Assert.Single(paths) != drops.First) return new(true, "已添加", []);
+                executionToken = token;
+                using var registration = token.Register(() => cancelled.TrySetResult());
+                await release.Task;
+                token.ThrowIfCancellationRequested();
+                return new(true, "已添加", []);
+            },
+        };
+        var tasks = new BackgroundTaskService();
+        var notifications = new NotificationService();
+        var messages = new MessageCenterService(notifications, tasks);
+        var queue = new IasOperationQueue(tasks, service);
+        using var page = CreatePage(service, new DialogStub(true), notifications, queue);
+        await page.EnterAsync();
+        var current = page.HandleWindowDropAsync([drops.First]);
+        var waiting = page.HandleWindowDropAsync([drops.Second]);
+        page.Leave();
+        var running = Assert.Single(messages.ActiveTasks, item => item.Task?.Status == BackgroundTaskStatus.Running);
+        Assert.Equal(executionToken, running.Task!.CancellationToken);
+        Assert.True(running.CanCancel);
+        Task drain;
+        if (closingManager) drain = queue.StopAsync();
+        else
+        {
+            running.Task.Cancel();
+            drain = current;
+        }
+        await cancelled.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.False(drain.IsCompleted);
+        Assert.False(running.CanCancel);
+        release.SetResult();
+        await Task.WhenAll(current, waiting, drain).WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal(BackgroundTaskStatus.Canceled, running.Task.Status);
+        Assert.Equal(closingManager ? 1 : 2, service.AddCalls);
+        if (closingManager)
+        {
+            Assert.All(messages.Messages, item => Assert.Contains("因关闭管理器取消", item.CopyText));
+            Assert.All(tasks.Tasks, task => Assert.Equal(BackgroundTaskStatus.Canceled, task.Status));
+        }
+        else Assert.Equal(BackgroundTaskStatus.Completed, tasks.Tasks[1].Status);
+    }
+
+    [Fact]
+    public async Task RunningQueueShowsTheSameProgressInThePageAndMessageCenter()
+    {
+        using var drops = new DropFiles();
+        var reports = new TaskCompletionSource<IProgress<IasPageProgress>>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource<IasOperationResult>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var service = new ServiceStub(IasStatusKind.Installed, "1.6.4")
+        {
+            Add = (_, progress, _) =>
+            {
+                reports.TrySetResult(progress);
+                return release.Task;
+            },
+        };
+        var tasks = new BackgroundTaskService();
+        var notifications = new NotificationService();
+        var messages = new MessageCenterService(notifications, tasks);
+        var queue = new IasOperationQueue(tasks, service);
+        using var page = CreatePage(service, new DialogStub(true), notifications, queue);
+        await page.EnterAsync();
+        var work = page.HandleWindowDropAsync([drops.First]);
+        var message = Assert.Single(messages.ActiveTasks);
+        var published = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        message.Task!.PropertyChanged += (_, e) =>
+        {
+            if (e.PropertyName == nameof(BackgroundTaskItem.Progress)) published.TrySetResult();
+        };
+        var progress = await reports.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        progress.Report(new("正在转换", 42, "准备护甲", true));
+        await published.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        Assert.Same(page.CurrentQueueItem?.Task, message.Task);
+        Assert.Contains("正在转换 · 准备护甲", message.Detail);
+        Assert.Equal(message.Task.Stage, page.ProgressDetail);
+        Assert.Equal(.42, message.Progress);
+        Assert.Equal(42, page.ProgressValue);
+        release.SetResult(new(true, "已添加", []));
+        await work.WaitAsync(TimeSpan.FromSeconds(5));
+    }
+
+    private static readonly IasTargetChoice ArmorChoice = new("DP-9 测试护甲", "中甲", [new(9, "0000000000000009", "测试护甲")]);
+    private static readonly IasTargetChoice HelmetChoice = new("DP-9 测试头盔", "中甲",
+        [new(10, "000000000000000a", "测试头盔", GameDataEquipmentKitKind.Helmet)]);
+
+    [Fact]
+    public async Task MissingOriginalBlocksQueueUntilAChoiceIsMade()
+    {
+        var service = new ServiceStub(IasStatusKind.Installed, "1.6.4")
+        {
+            StandardTargets = new(new("原护甲", 1, [ArmorChoice]), new(null, null, [HelmetChoice])),
+            Convert = (armor, helmet, merge) =>
+            {
+                Assert.Equal("0x00000001", armor);
+                Assert.Equal("0x0000000a", helmet);
+                Assert.False(merge);
+                return new(true, "已转换", []);
+            },
+        };
+        var tasks = new BackgroundTaskService();
+        var dialogs = new DialogStub(null);
+        using var page = CreatePage(service, dialogs, queue: new(tasks, service));
+        await page.EnterAsync();
+        var row = Assert.Single(page.Characters);
+        page.ConvertCharacterCommand.Execute(row);
+        var panel = Assert.IsType<IasConversionPanelViewModel>(row.Conversion);
+        Assert.True(panel.Helmet.NeedsSelection);
+        page.StartConversionCommand.Execute(row);
+        Assert.Empty(tasks.Tasks);
+        Assert.Contains("头盔", panel.Message);
+        panel.Helmet.SelectCommand.Execute(HelmetChoice);
+        page.StartConversionCommand.Execute(row);
+        Assert.Equal(BackgroundTaskStatus.Completed, Assert.Single(tasks.Tasks).Status);
+        Assert.Equal(0, dialogs.Confirmations);
+    }
+
+    [Fact]
+    public async Task VpkSettingsRestoreAndInvalidSelectionFailsInTheQueue()
+    {
+        using var drops = new DropFiles();
+        var service = new ServiceStub(IasStatusKind.Installed, "1.6.4");
+        var tasks = new BackgroundTaskService();
+        var queue = new IasOperationQueue(tasks, service);
+        IasVpkTargets? saved = new("removed", HelmetChoice.Primary!.ArchiveId);
+        service.AddWithTargets = targets => targets?.Error is { } error ? new(false, error, []) : new(true, "已添加", []);
+        var dialogs = new DialogStub(null);
+        using (var page = new IasPageViewModel(service, dialogs, new(), _ => null, _ => { }, queue, saved, value => saved = value))
+        {
+            await page.EnterAsync();
+            Assert.True(page.VpkArmor.NeedsSelection);
+            Assert.Contains("已失效", page.VpkTargetWarning);
+            await page.HandleWindowDropAsync([drops.Vpk]);
+            Assert.Equal(BackgroundTaskStatus.Failed, Assert.Single(tasks.Tasks).Status);
+            page.VpkArmor.SelectCommand.Execute(ArmorChoice);
+            Assert.Null(page.VpkTargetWarning);
+            Assert.Equal(ArmorChoice.Primary!.ArchiveId, saved!.Body);
+        }
+        Assert.Equal(0, dialogs.Confirmations);
+        using var rebuilt = new IasPageViewModel(service, new DialogStub(true), new(), _ => null, _ => { }, queue, saved);
+        await rebuilt.EnterAsync();
+        Assert.Equal(ArmorChoice.Name, rebuilt.VpkArmor.SelectionText);
+        Assert.Equal(HelmetChoice.Name, rebuilt.VpkHelmet.SelectionText);
+        await rebuilt.HandleWindowDropAsync([drops.Second]);
+        Assert.Equal(BackgroundTaskStatus.Completed, tasks.Tasks.Last().Status);
+    }
+
+    [Fact]
+    public async Task LoadingTheVpkCatalogLeavesDropAvailableAndCloseWaitsForCleanup()
+    {
+        var cancellation = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var service = new ServiceStub(IasStatusKind.Installed, "1.6.4")
+        {
+            LoadVpkTargets = async token =>
+            {
+                using var registration = token.Register(() => cancellation.TrySetResult());
+                await release.Task;
+                token.ThrowIfCancellationRequested();
+                return new([ArmorChoice], [HelmetChoice]);
+            },
+        };
+        using var page = CreatePage(service);
+        await page.EnterAsync();
+        Assert.True(page.CanAcceptDrop);
+        Assert.Contains("正在读取", page.VpkTargetWarning);
+        var closing = page.StopPageOperationForCloseAsync();
+        await cancellation.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.False(closing.IsCompleted);
+        release.SetResult();
+        await closing.WaitAsync(TimeSpan.FromSeconds(5));
+    }
+
+    [Fact]
+    public async Task ProgressNotificationsOnlyRefreshProgressBindings()
+    {
+        var pending = new TaskCompletionSource<IasOperationResult>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var applied = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var changes = new System.Collections.Concurrent.ConcurrentQueue<string?>();
+        var primaryChanges = 0;
+        var service = new ServiceStub(IasStatusKind.UpdateAvailable, "1.6.4")
+        {
+            Install = (progress, _) =>
+            {
+                changes.Clear();
+                primaryChanges = 0;
+                progress.Report(new("正在下载…", 62, "测试", true));
+                return pending.Task;
+            },
+        };
+        using var page = CreatePage(service);
+        await page.EnterAsync();
+        page.PrimaryCommand.CanExecuteChanged += (_, _) => Interlocked.Increment(ref primaryChanges);
+        page.PropertyChanged += (_, args) =>
+        {
+            changes.Enqueue(args.PropertyName);
+            if (args.PropertyName == nameof(page.CanCancel)) applied.TrySetResult();
+        };
+        var operation = page.ExecutePrimaryAsync();
+        try
+        {
+            await applied.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            Assert.DoesNotContain(string.Empty, changes);
+            Assert.Contains(nameof(page.ProgressDetail), changes);
+            Assert.Equal(0, primaryChanges);
+        }
+        finally
+        {
+            pending.SetResult(new(true, "完成", []));
+            await operation;
+        }
+    }
+
+    [Fact]
+    public async Task OperationFailureShowsBackendMessageAndWarningsAfterRefresh()
+    {
+        var notifications = new NotificationService();
+        var service = new ServiceStub(IasStatusKind.NotInstalled)
+        {
+            Install = (_, _) => Task.FromResult(new IasOperationResult(false, "部署失败。", ["文件被占用。"])),
+        };
+        using var page = CreatePage(service, notifications: notifications);
+        await page.EnterAsync();
+
+        await page.ExecutePrimaryAsync();
+
+        Assert.True(page.HasResult);
+        Assert.False(page.ResultSuccess);
+        Assert.Equal("部署失败。（1 条提示）", page.ResultText);
+        Assert.Equal("文件被占用。", Assert.Single(page.ResultWarnings));
+        var notice = Assert.Single(notifications.History);
+        Assert.Equal("部署失败。", notice.Message);
+        Assert.Equal(NotificationLevel.Error, notice.Level);
+        Assert.Equal(2, service.StatusReads);
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    [InlineData(null)]
+    public async Task UninstallPassesConfirmationCheckboxOrSkipsOnCancel(bool? checkedValue)
+    {
+        var service = new ServiceStub(IasStatusKind.Installed, "1.6.4");
+        var dialogs = new DialogStub(checkedValue);
+        using var page = CreatePage(service, dialogs);
+        await page.EnterAsync();
+
+        await page.UninstallAsync();
+
+        Assert.Equal("同时删除已导入的 1 个角色", dialogs.LastConfirmation?.CheckBoxLabel);
+        Assert.Equal(checkedValue, service.RemoveCharacters);
+        Assert.Equal(checkedValue.HasValue ? 1 : 0, service.UninstallCalls);
+    }
+
+    [Fact]
+    public async Task LeavingCancelsRefreshAndReentryStartsAnother()
+    {
+        var blocked = new TaskCompletionSource<IasPageStatus>(TaskCreationOptions.RunContinuationsAsynchronously);
+        CancellationToken refreshToken = default;
+        var service = new ServiceStub(IasStatusKind.Installed, "1.6.4")
+        {
+            ReadStatus = (read, ct) =>
+            {
+                if (read != 1) return Task.FromResult(Status(IasStatusKind.Installed, "1.6.4") with { EnabledInActiveProfile = true });
+                refreshToken = ct;
+                return blocked.Task;
+            },
+        };
+        using var page = CreatePage(service);
+        var firstEntry = page.EnterAsync();
+
+        page.Leave();
+        await page.EnterAsync();
+        Assert.True(refreshToken.IsCancellationRequested);
+        Assert.Equal(1, service.StatusReads);
+
+        blocked.SetResult(Status(IasStatusKind.Error, null));
+        await firstEntry;
+        Assert.Equal("已安装 1.6.4", page.StatusText);
+        Assert.Equal(2, service.StatusReads);
+        Assert.Equal(1, service.CharacterReads);
+    }
+
+    [Fact]
+    public async Task LeavingDoesNotCancelInstallation()
+    {
+        var pending = new TaskCompletionSource<IasOperationResult>(TaskCreationOptions.RunContinuationsAsynchronously);
+        CancellationToken operationToken = default;
+        var service = new ServiceStub(IasStatusKind.NotInstalled)
+        {
+            Install = (_, ct) =>
+            {
+                operationToken = ct;
+                return pending.Task;
+            },
+        };
+        using var page = CreatePage(service);
+        await page.EnterAsync();
+        var operation = page.ExecutePrimaryAsync();
+
+        page.Leave();
+        Assert.False(operationToken.IsCancellationRequested);
+        await page.EnterAsync();
+        Assert.Equal(1, service.StatusReads);
+
+        pending.SetResult(new(true, "已安装 IAS 1.6.4。", []));
+        await operation;
+        Assert.Equal(2, service.StatusReads);
+    }
+
+    [Theory]
+    [InlineData(IasStatusKind.NotInstalled, null, false, false)]
+    [InlineData(IasStatusKind.Installed, "1.6.4", false, false)]
+    [InlineData(IasStatusKind.GameMismatch, "1.6.4", true, false)]
+    [InlineData(IasStatusKind.Installed, "1.6.4", true, true)]
+    public async Task GraphicsControlsRequireInstalledAndEnabledIas(IasStatusKind kind, string? version, bool enabled, bool canUse)
+    {
+        var service = new ServiceStub(kind, version) { EnabledInActiveProfile = enabled };
+        using var page = CreatePage(service);
+        await page.EnterAsync();
+        Assert.Equal(canUse, page.CanToggleReShade);
+        Assert.False(page.CanToggleDlss);
+        await page.SetDlssAsync(IasDlssMode.FrameGeneration);
+        Assert.Equal(0, service.DlssCalls);
+    }
+
+    [Fact]
+    public async Task FirstReShadeConfirmationCanBeCancelledAndIsRememberedAfterAcceptance()
+    {
+        var service = new ServiceStub(IasStatusKind.Installed, "1.6.4");
+        var dialogs = new DialogStub(null);
+        using var page = CreatePage(service, dialogs);
+        await page.EnterAsync();
+
+        await page.SetReShadeAsync(true);
+        Assert.Equal(1, dialogs.Confirmations);
+        Assert.Equal("我知道了，打开", dialogs.LastConfirmation?.ConfirmLabel);
+        Assert.Equal("取消", dialogs.LastConfirmation?.CancelLabel);
+        Assert.Contains("反作弊误判", dialogs.LastConfirmation!.Message);
+        Assert.False(page.ReShadeEnabled);
+        Assert.Empty(service.ReShadeCalls);
+        Assert.False(service.GraphicsRiskAcknowledged);
+
+        dialogs.Answer = false;
+        await page.SetReShadeAsync(true);
+        Assert.True(page.ReShadeEnabled);
+        Assert.True(page.CanToggleDlss);
+        await page.SetDlssAsync(IasDlssMode.NeuralRendering);
+        Assert.True(page.DlssNeuralRendering);
+        await page.SetReShadeAsync(false);
+        Assert.False(page.CanToggleDlss);
+        Assert.True(page.DlssOff);
+        Assert.Contains("同时关闭 DLSS", page.ResultText);
+
+        using var reopened = CreatePage(service, dialogs);
+        await reopened.EnterAsync();
+        await reopened.SetReShadeAsync(true);
+        Assert.True(reopened.ReShadeEnabled);
+        Assert.Equal(2, dialogs.Confirmations);
+        Assert.Equal(new[] { (true, true), (false, false), (true, false) }, service.ReShadeCalls);
+    }
+
+    [Fact]
+    public async Task GraphicsControlsAreDisabledDuringAnotherOperation()
+    {
+        var pending = new TaskCompletionSource<IasOperationResult>();
+        var service = new ServiceStub(IasStatusKind.UpdateAvailable, "1.6.4")
+        {
+            Install = (_, _) => pending.Task,
+            Graphics = new(true, IasDlssMode.FrameGeneration)
+        };
+        using var page = CreatePage(service);
+        await page.EnterAsync();
+        Assert.True(page.CanToggleDlss);
+        var update = page.ExecutePrimaryAsync();
+        Assert.False(page.CanToggleReShade);
+        Assert.False(page.CanToggleDlss);
+        await page.SetReShadeAsync(false);
+        Assert.Empty(service.ReShadeCalls);
+        pending.SetResult(new(false, "更新失败。", []));
+        await update;
+        Assert.True(page.CanToggleReShade);
+        Assert.True(page.DlssFrameGeneration);
+    }
+
+    private static IasPageViewModel CreatePage(ServiceStub service, DialogStub? dialogs = null,
+        NotificationService? notifications = null, IasOperationQueue? queue = null)
+        => new(service, dialogs ?? new DialogStub(null), notifications ?? new NotificationService(), _ => null, _ => { },
+            queue ?? new IasOperationQueue(new BackgroundTaskService(), service));
+
+    private static IasPageStatus Status(IasStatusKind kind, string? version)
+        => new(kind, version, "1.6.5", 249 * 1024 * 1024, null, "https://example.com/releases", "连接超时。", "游戏版本信息。");
+
+    private sealed class DropFiles : IDisposable
+    {
+        private readonly string _root = Directory.CreateTempSubdirectory("ias-queue-test-").FullName;
+        public string First => Path.Combine(_root, "First.zip");
+        public string Second => Path.Combine(_root, "Second.zip");
+        public string Cancelled => Path.Combine(_root, "Cancelled.zip");
+        public string Vpk => Path.Combine(_root, "Source.vpk");
+
+        public DropFiles()
+        {
+            foreach (var path in new[] { First, Second, Cancelled })
+            {
+                using var zip = ZipFile.Open(path, ZipArchiveMode.Create);
+            }
+            File.WriteAllBytes(Vpk, []);
+        }
+
+        public void Dispose() => IasFileTree.Delete(_root);
+    }
+
+    private sealed class DialogStub(bool? answer) : IIasPageDialogs
+    {
+        public IReadOnlyList<IasLibraryCandidate>? Selected { get; init; }
+        public int LibraryDialogs { get; private set; }
+        public bool? Answer { get; set; } = answer;
+        public int Confirmations { get; private set; }
+        public IasConfirmation? LastConfirmation { get; private set; }
+        public bool? Confirm(IasConfirmation confirmation)
+        {
+            LastConfirmation = confirmation;
+            Confirmations++;
+            return Answer;
+        }
+        public IReadOnlyList<IasLibraryCandidate>? ChooseLibraryMods(
+            Func<CancellationToken, Task<IReadOnlyList<IasLibraryCandidate>>> loadCandidates, CancellationToken ct)
+        {
+            LibraryDialogs++;
+            return Selected;
+        }
+    }
+
+    private sealed class ServiceStub(IasStatusKind kind, string? version = null) : IIasModuleService
+    {
+        public bool GameRunning { get; set; }
+        public int RecoveryCalls { get; private set; }
+        public bool IsGameRunning() => GameRunning;
+        public Task<bool> RecoverPendingAsync(CancellationToken ct)
+        {
+            RecoveryCalls++;
+            return Task.FromResult(false);
+        }
+
+        public Func<IProgress<IasPageProgress>, CancellationToken, Task<IasOperationResult>>? Install { get; init; }
+        public Task<IasOperationResult>? Toggle { get; init; }
+        public Func<int, CancellationToken, Task<IasPageStatus>>? ReadStatus { get; init; }
+        public bool EnabledInActiveProfile { get; set; } = kind is IasStatusKind.Installed or IasStatusKind.UpdateAvailable ||
+            kind == IasStatusKind.FeedUnavailable && version is not null;
+        public bool PhysicsOn { get; set; }
+        public bool BuiltInLuaOn { get; set; }
+        public bool CharacterEnabled { get; set; } = true;
+        public IasGraphicsState Graphics { get; set; } = new(false, IasDlssMode.Off);
+        public bool GraphicsRiskAcknowledged { get; private set; }
+        public List<(bool Enabled, bool Acknowledge)> ReShadeCalls { get; } = [];
+        public int DlssCalls { get; private set; }
+        public (bool Physics, bool Lua) LastTurnOff { get; private set; }
+        public bool MappingInUse { get; init; }
+        public bool FinishPrimaryAction { get; init; }
+        public int AddCalls { get; private set; }
+        public Func<IReadOnlyList<string>, IProgress<IasPageProgress>, CancellationToken, Task<IasOperationResult>>? Add { get; init; }
+        public Func<string?, string?, bool, IasOperationResult>? Convert { get; init; }
+        public Func<IasVpkTargets?, IasOperationResult>? AddWithTargets { get; set; }
+        public Func<CancellationToken, Task<IasVpkTargetCatalog>>? LoadVpkTargets { get; init; }
+        public IasStandardTargetCatalog StandardTargets { get; init; } =
+            new(new("原护甲", 1, [ArmorChoice]), new("原头盔", 2, [HelmetChoice]));
+        public Func<string, IasOperationResult>? AddFromLibrary { get; init; }
+        public Func<string, IasVpkTargets?, Task<IasOperationResult>>? AddFromLibraryAsync2 { get; init; }
+        public int StatusReads { get; private set; }
+        public int CharacterReads { get; private set; }
+        public int InstallCalls { get; private set; }
+        public int TurnOffCalls { get; private set; }
+        public int UninstallCalls { get; private set; }
+        public bool? RemoveCharacters { get; private set; }
+
+        public Task<IasPageStatus> GetStatusAsync(CancellationToken ct)
+        {
+            StatusReads++;
+            return ReadStatus?.Invoke(StatusReads, ct) ?? Task.FromResult(Status(kind, version) with
+            {
+                EnabledInActiveProfile = EnabledInActiveProfile,
+                PhysicsOn = PhysicsOn,
+                BuiltInLuaOn = BuiltInLuaOn,
+                MappingInUse = MappingInUse,
+                Graphics = version is null ? null : Graphics,
+                HasGraphicsPackages = version is not null,
+                GraphicsRiskAcknowledged = GraphicsRiskAcknowledged,
+            });
+        }
+
+        public Task<IReadOnlyList<IasCharacterInfo>> GetCharactersAsync(CancellationToken ct)
+        {
+            CharacterReads++;
+            return Task.FromResult<IReadOnlyList<IasCharacterInfo>>([new("character", "Milfy SR-64", null, IasCharacterSource.IasPackage, DateTimeOffset.UnixEpoch, CharacterEnabled)]);
+        }
+
+        public Task<IReadOnlyList<IasLibraryCandidate>> GetConvertibleLibraryModsAsync(CancellationToken ct) =>
+            Task.FromResult<IReadOnlyList<IasLibraryCandidate>>([]);
+        public Task<IasVpkTargetCatalog> GetVpkTargetCatalogAsync(CancellationToken ct) =>
+            LoadVpkTargets?.Invoke(ct) ?? Task.FromResult(new IasVpkTargetCatalog([ArmorChoice], [HelmetChoice]));
+        public Task<IasStandardTargetCatalog> GetStandardTargetCatalogAsync(string characterId, CancellationToken ct) =>
+            Task.FromResult(StandardTargets);
+        public IasDropClassification Classify(IReadOnlyList<string> paths) => throw new NotSupportedException();
+        public Task<IasOperationResult> InstallOrUpdateAsync(IProgress<IasPageProgress> progress, CancellationToken ct)
+        {
+            InstallCalls++;
+            return Install?.Invoke(progress, ct) ?? CompletePrimaryAction();
+        }
+
+        public Task<IasOperationResult> UninstallAsync(bool removeCharacters, IProgress<IasPageProgress> progress, CancellationToken ct)
+        {
+            UninstallCalls++;
+            RemoveCharacters = removeCharacters;
+            return Task.FromResult(new IasOperationResult(true, "已卸载 IAS。", []));
+        }
+
+        public async Task<IasOperationResult> SetEnabledInActiveProfileAsync(bool enabled, IProgress<IasPageProgress> progress, CancellationToken ct)
+        {
+            var result = Toggle is not null ? await Toggle : new(FinishPrimaryAction, "已处理 IAS 开关。", []);
+            if (result.Success) EnabledInActiveProfile = enabled;
+            return result;
+        }
+
+        public async Task<IasOperationResult> SetCharacterEnabledAsync(string characterId, bool enabled, IProgress<IasPageProgress> progress, CancellationToken ct)
+        {
+            var result = Toggle is not null ? await Toggle : new(FinishPrimaryAction, "已处理角色开关。", []);
+            if (result.Success) CharacterEnabled = enabled;
+            return result;
+        }
+
+        public Task<IasOperationResult> SetReShadeAsync(bool enabled, bool acknowledgeRisk, IProgress<IasPageProgress> progress, CancellationToken ct)
+        {
+            ReShadeCalls.Add((enabled, acknowledgeRisk));
+            GraphicsRiskAcknowledged |= acknowledgeRisk;
+            var removedDlss = !enabled && Graphics.Dlss != IasDlssMode.Off;
+            Graphics = new(enabled, enabled ? Graphics.Dlss : IasDlssMode.Off);
+            return Task.FromResult(new IasOperationResult(true, removedDlss ? "已同时关闭 DLSS。" : "ReShade 已更新。", []));
+        }
+
+        public Task<IasOperationResult> SetDlssAsync(IasDlssMode mode, IProgress<IasPageProgress> progress, CancellationToken ct)
+        {
+            DlssCalls++;
+            Graphics = Graphics with { Dlss = mode };
+            return Task.FromResult(new IasOperationResult(true, "DLSS 已更新。", []));
+        }
+
+        private Task<IasOperationResult> CompletePrimaryAction()
+        {
+            if (!FinishPrimaryAction) return Task.FromResult(new IasOperationResult(false, "部署失败。", []));
+            kind = IasStatusKind.Installed;
+            version = "1.6.5";
+            EnabledInActiveProfile = true;
+            return Task.FromResult(new IasOperationResult(true, "已部署 IAS。", []));
+        }
+
+        public Task<IasOperationResult> TurnOffManagerFeaturesAsync(bool physics, bool builtInLua, CancellationToken ct)
+        {
+            TurnOffCalls++;
+            LastTurnOff = (physics, builtInLua);
+            if (physics) PhysicsOn = false;
+            if (builtInLua) BuiltInLuaOn = false;
+            return Task.FromResult(new IasOperationResult(true, "已关掉管理器物理。", []));
+        }
+        public Task<IasOperationResult> AddAsync(IReadOnlyList<string> paths, IProgress<IasPageProgress> progress, CancellationToken ct,
+            IasVpkTargets? vpkTargets = null)
+        {
+            AddCalls++;
+            return Add?.Invoke(paths, progress, ct) ?? Task.FromResult(AddWithTargets?.Invoke(vpkTargets) ?? new IasOperationResult(true, "已添加", []));
+        }
+        public Task<IasOperationResult> AddFromLibraryAsync(string modId, IProgress<IasPageProgress> progress, CancellationToken ct,
+            IasVpkTargets? vpkTargets = null) =>
+            AddFromLibraryAsync2 is { } gated ? gated(modId, vpkTargets)
+                : Task.FromResult((AddFromLibrary ?? throw new NotSupportedException())(modId));
+        public Task<IasOperationResult> RemoveCharacterAsync(string characterId, IProgress<IasPageProgress> progress, CancellationToken ct) => throw new NotSupportedException();
+        public Task<IasOperationResult> ConvertToStandardModAsync(string characterId, IProgress<IasPageProgress> progress, CancellationToken ct,
+            string? targetArmor = null, string? targetHelmet = null, bool mergeHelmet = false) =>
+            Task.FromResult((Convert ?? throw new NotSupportedException())(targetArmor, targetHelmet, mergeHelmet));
+    }
+}

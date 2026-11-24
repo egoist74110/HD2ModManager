@@ -11,17 +11,18 @@ public sealed record LowPollutionRecompileResult(
 	IReadOnlyList<LowPollutionPrepItem> UpToDate,
 	bool Canceled)
 {
+	public IReadOnlyList<LowPollutionPrepItem> Restored { get; init; } = [];
+
 	/// <summary>本次映射要跳过的素体 key（失败 + 不能自动做）。</summary>
 	public IReadOnlySet<string> SkippedModelKeys => Failed.Select(f => f.Item.ModelKey)
 		.Concat(Blocked.Select(item => item.ModelKey))
 		.ToHashSet(StringComparer.OrdinalIgnoreCase);
 
-	public int RecompileCount => Recompiled.Count + Failed.Count;
+	public int RecompileCount { get; init; }
 }
 
 /// <summary>
-/// 「应用」映射前的素体重编编排（规划 §12.1）：只对 <see cref="LowPollutionPrepStatus.NeedsRecompile"/> 的素体逐个编译，
-/// 一个失败不影响下一个；取消就停。编译本身由调用方注入（走详情页「切换」那条 <c>ModCompileService.CompileAsync</c>）。
+/// 「应用」映射前逐个准备待处理素体：先尝试换入缓存，再按需编译；一个失败不影响下一个，取消就停。
 /// </summary>
 public static class LowPollutionRecompiler
 {
@@ -29,10 +30,13 @@ public static class LowPollutionRecompiler
 		IReadOnlyList<LowPollutionPrepItem> items,
 		Func<LowPollutionPrepItem, CancellationToken, Task<(bool Ok, string Message)>> compile,
 		Action<int, int, LowPollutionPrepItem>? progress,
-		CancellationToken cancellationToken = default)
+		CancellationToken cancellationToken = default,
+		Func<LowPollutionPrepItem, CancellationToken, ValueTask<bool>>? tryRestore = null)
 	{
 		var recompiled = new List<LowPollutionPrepItem>();
+		var restored = new List<LowPollutionPrepItem>();
 		var failed = new List<(LowPollutionPrepItem, string)>();
+		var recompileCount = 0;
 		var need = items.Where(item => item.Status == LowPollutionPrepStatus.NeedsRecompile).ToArray();
 		var canceled = false;
 		for (var index = 0; index < need.Length; index++)
@@ -41,6 +45,12 @@ public static class LowPollutionRecompiler
 			progress?.Invoke(index + 1, need.Length, need[index]);
 			try
 			{
+				if (tryRestore is not null && await tryRestore(need[index], cancellationToken).ConfigureAwait(false))
+				{
+					restored.Add(need[index]);
+					continue;
+				}
+				recompileCount++;
 				var (ok, message) = await compile(need[index], cancellationToken).ConfigureAwait(false);
 				if (ok) recompiled.Add(need[index]);
 				else failed.Add((need[index], message));
@@ -62,6 +72,10 @@ public static class LowPollutionRecompiler
 			failed,
 			[.. items.Where(item => item.Status == LowPollutionPrepStatus.Blocked)],
 			[.. items.Where(item => item.Status == LowPollutionPrepStatus.UpToDate)],
-			canceled);
+			canceled)
+		{
+			Restored = restored,
+			RecompileCount = recompileCount,
+		};
 	}
 }

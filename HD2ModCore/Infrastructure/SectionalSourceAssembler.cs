@@ -1,4 +1,5 @@
 using HD2ModCore.Domain;
+using HD2ModCore.Ias;
 
 namespace HD2ModCore.Infrastructure;
 
@@ -91,6 +92,11 @@ public static class SectionalSourceAssembler
 
 		// 跨来源连续累加：序号即叠加顺序，后来源的数字更大、在转换器里覆盖前来源的同 key unit。
 		var nextIndex = 0;
+		// IAS 本体跨护甲、头盔与公共材质归档。按归档预先编号，入库时就不会改写依据里的文件名。
+		var archiveIndexes = IasSectionalSource.IsMarkedPackage(sources[0].Directory)
+			? new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase)
+			: null;
+		var iasMaterials = archiveIndexes is not null ? new List<HD2ModAdaptation.PatchReconstruction.PatchTocEntry>() : null;
 
 		for (var order = 0; order < sources.Count; order++)
 		{
@@ -111,7 +117,13 @@ public static class SectionalSourceAssembler
 				}
 
 				// 只改序号，hex 原样保留 —— 见类型注释里"文件名必须保持 hex16.patch_N"。
-				var name = $"{info.ArchiveHex16}.patch_{nextIndex++}";
+				var index = nextIndex++;
+				if (archiveIndexes is not null)
+				{
+					index = archiveIndexes.GetValueOrDefault(info.ArchiveHex16);
+					archiveIndexes[info.ArchiveHex16] = index + 1;
+				}
+				var name = $"{info.ArchiveHex16}.patch_{index}";
 				CopyInto(patch, Path.Combine(modDirectory, name));
 				foreach (var suffix in SidecarSuffixes)
 				{
@@ -128,6 +140,8 @@ public static class SectionalSourceAssembler
 					var scanned = await scanner.ScanEntriesAsync(patch, cancellationToken).ConfigureAwait(false);
 					foreach (var entry in scanned)
 					{
+						if (entry.AssetKey.TypeId == HD2ModAdaptation.PatchReconstruction.MaterialDependencyResolver.MaterialTypeId)
+							iasMaterials?.Add(entry);
 						if (entry.AssetKey.TypeId != HD2ModAdaptation.PatchReconstruction.UnitMesh.PatchUnitMeshReader.UnitTypeId) continue;
 						var id = entry.AssetKey.FileId.ToString("x16", System.Globalization.CultureInfo.InvariantCulture);
 						if (!ids.Contains(id, StringComparer.OrdinalIgnoreCase)) ids.Add(id);
@@ -181,10 +195,16 @@ public static class SectionalSourceAssembler
 				notes.Add($"来源「{entry.Name}」有 {unknown} 个 unit 在游戏件表里查不到坐标（索引未建或不是原版护甲件）。");
 		}
 
+		if (iasMaterials is not null)
+			assetKeys = await IasSectionalSource.ExtendMaterialClosureAsync(assetKeys, iasMaterials, cancellationToken).ConfigureAwait(false);
+
 		var document = new SectionalSourceDocument(
 			SectionalSourceManifest.CurrentSchema,
 			DateTimeOffset.UtcNow,
-			armor, helmet, withCells, assetKeys);
+			armor, helmet, withCells, assetKeys)
+		{
+			IasSourceVersion = archiveIndexes is not null ? 1 : 0,
+		};
 
 		var error = SectionalSourceFile.TryWrite(modDirectory, document);
 		return error is null

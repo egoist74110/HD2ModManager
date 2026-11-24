@@ -4,12 +4,14 @@
     <OutputType>WinExe</OutputType>
     <TargetFramework>net10.0-windows</TargetFramework>
     <UseWPF>true</UseWPF>
+    <IasWorkerPublishPrefix>bin\</IasWorkerPublishPrefix>
     <!-- 程序版本号（SemVer）。应用内更新用它判断有没有新版本；发布脚本据此给压缩包命名，所以发版只改这一处。 -->
     <Version>1.5.21</Version>
     <ApplicationIcon>Resources\helldivers2.ico</ApplicationIcon>
   </PropertyGroup>
   <ItemGroup>
     <ProjectReference Include="..\HD2ModCore\HD2ModCore.csproj" />
+    <ProjectReference Include="..\HD2SourceMigration\HD2SourceMigration.csproj" />
     <!-- Build the headless companion with the desktop application, without
          making the WPF application depend on the CLI assembly at runtime. -->
     <ProjectReference Include="..\HD2ModCli\HD2ModCli.csproj" ReferenceOutputAssembly="false" />
@@ -28,8 +30,14 @@
            physical file beside the published application. -->
       <ExcludeFromSingleFile>true</ExcludeFromSingleFile>
     </Content>
+    <Content Include="..\HD2SourceMigration\IasPackaging\Scripts\**\*" Link="data\resources\ias\%(RecursiveDir)%(Filename)%(Extension)"
+             CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" ExcludeFromSingleFile="true" />
   </ItemGroup>
   
+  <ItemGroup>
+    <InternalsVisibleTo Include="HD2ModCore.Tests" />
+  </ItemGroup>
+
   <!-- Rely on implicit ApplicationDefinition for App.xaml -->
 
   <!-- Rely on implicit WPF XAML items; do not explicitly include Page/ApplicationDefinition to avoid duplicates -->
@@ -53,4 +61,5 @@
 	<Copy SourceFiles="@(Hd2ModCliSkillDocumentation)" DestinationFiles="@(Hd2ModCliSkillDocumentation->'$(TargetDir)hd2mod-docs\skills\%(RecursiveDir)%(Filename)%(Extension)')" SkipUnchangedFiles="true" />
   </Target>
 
+  <Import Project="..\HD2IasWorker\IasWorkerArtifacts.targets" />
 </Project>

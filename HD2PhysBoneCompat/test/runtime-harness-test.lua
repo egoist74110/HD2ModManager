@@ -28,18 +28,7 @@ local FILLER = 2400
 local engine = { alive = {}, nodes = {}, anim = {}, pos = {}, time = 10.0, writes = 0 }
 local world = { name = "w" }
 
--- IAS 的 profile 表只认 16 位十六进制资源 id：装甲件的 id 一律是 16 位 hex，名单是装载时就定死的静态池。
--- （旧写法 "#ID[t6a1]" 这类名字不是资源 id，每帧枚举按 hash 找就永远找不到它们。）
-local HEX_ID = "^#ID%[%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%]$"
-local PROFILE_POOL, nextProfile = {}, 0
-for index = 1, 160 do PROFILE_POOL[index] = string.format("%016x", 0xd0000000 + index) end
-
 local function newUnit(tag, nodeCount, animated, resource)
-	if not animated and resource ~= nil and not resource:match(HEX_ID) then
-		nextProfile = nextProfile + 1
-		assert(nextProfile <= #PROFILE_POOL, "profile 池不够用")
-		resource = "#ID[" .. PROFILE_POOL[nextProfile] .. "]"
-	end
 	local unit = { tag = tag, resource = resource or ("#ID[" .. tag .. "]"), ids = {}, nodeOf = {} }
 	engine.alive[unit] = true
 	engine.nodes[unit] = nodeCount
@@ -146,7 +135,7 @@ do
 end
 local armors = {}
 for index, count in ipairs(ARMOR_NODES) do
-	armors[index] = newUnit("armor" .. index, count, false, string.format("#ID[c%015x]", index))
+	armors[index] = newUnit("armor" .. index, count, false, "#ID[armor" .. index .. "]")
 	dress(armors[index])
 end
 local fillers = {}
@@ -158,13 +147,8 @@ engine.hidden = {}
 function engine.unitsArray()
 	local list = {}
 	if avatar ~= nil and engine.hidden[avatar] ~= true then list[#list + 1] = avatar end
-	-- 多 avatar 场景（T7：尸体 + 新玩家）：额外的 avatar 一并列出。
-	for _, extra in ipairs(engine.extraAvatars or {}) do
-		if engine.hidden[extra] ~= true then list[#list + 1] = extra end
-	end
-	-- 被销毁的 unit（alive=false）不会再出现在真引擎的枚举里；IAS 的每帧枚举也没有"先判活"这一步。
 	for _, unit in ipairs(armors) do
-		if engine.hidden[unit] ~= true and engine.alive[unit] ~= false then list[#list + 1] = unit end
+		if engine.hidden[unit] ~= true then list[#list + 1] = unit end
 	end
 	for _, unit in ipairs(fillers) do
 		if engine.hidden[unit] ~= true then list[#list + 1] = unit end
@@ -176,42 +160,6 @@ rawset(_G, "stingray", S)
 
 -- ---------------------------------------------------------------------------
 local Runtime = assert(assert(loadfile(runtimePath))())
--- E12d/e：照 IAS，avatar 与装甲件都是每帧从引擎枚举出来的：
---   avatar = World.units_by_resource(world, 资源路径)；装甲件 = units_by_resource(world, IdString64.from_hex(哈希))。
-S.IdString64 = { from_hex = function(hash) return { hex = hash } end }
-S.World.num_units = function() return #engine.unitsArray() end
-S.World.units_by_resource = function(_, key)
-	local out = {}
-	if type(key) == "table" then
-		-- 资源索引：只列还活着、引擎还认的 unit（被销毁的不会再出现，和真引擎一样）。
-		for _, unit in ipairs(armors) do
-			if engine.alive[unit] == true and engine.hidden[unit] ~= true and unit.resource:find(key.hex, 1, true) then
-				out[#out + 1] = unit
-			end
-		end
-		return out
-	end
-	-- avatar 资源枚举：只看资源（带 support_mg 挂点的就是 avatar 资源的 unit），不看动画状态机——
-	-- 真引擎里阵亡后的尸体仍是这个资源的 unit，仍会被列出（IAS R:1365）。
-	for _, unit in ipairs(engine.unitsArray()) do
-		if unit.ids[SUPPORT_MG] then out[#out + 1] = unit end
-	end
-	return out
-end
-do
-	local rawInstall = Runtime.install
-	Runtime.install = function(stingray, options)
-		options = options or {}
-		if options.independentPieces == nil then
-			options.independentPieces = {}
-			for index = 1, #ARMOR_NODES do options.independentPieces[string.format("#ID[c%015x]", index)] = { "x" } end
-		end
-		if options.profileHashes == nil then options.profileHashes = PROFILE_POOL end
-		if options.identityPollSeconds == nil then options.identityPollSeconds = 0 end
-		if options.rosterNegativeSeconds == nil then options.rosterNegativeSeconds = 0 end
-		return rawInstall(stingray, options)
-	end
-end
 local logPath = (os.getenv("LOCALAPPDATA") or ".") .. "\\hd2pbx_runtime.txt"
 
 print("T1 install 后能自己发现并挂上")
@@ -221,6 +169,7 @@ do
 
 	local runtime = Runtime.install(S, {
 		compat = Compat,
+		maxMatchedPerOwner = 0,   -- 这些用例验的是匹配/公平性，不是"每玩家最多几件"的上限
 		carriers = { { rig = RIG, path = "fake.patch_1.gpu_resources" } },
 		logPath = logPath,
 		settleFrames = 2, snapshot = false, tunePath = "nonexistent-hd2pbx-tune.txt",
@@ -254,7 +203,7 @@ do
 
 	local armors2 = {}
 	for index, count in ipairs(ARMOR_NODES) do
-		armors2[index] = newUnit("b" .. index, count, false, string.format("#ID[c%015x]", index))
+		armors2[index] = newUnit("b" .. index, count, false, "#ID[b" .. index .. "]")
 		dress(armors2[index])
 	end
 	armors = armors2
@@ -277,6 +226,176 @@ do
 		tostring(err))
 end
 
+-- ---------------------------------------------------------------------------
+-- T5：观测。这一组全是"2026-11-01 排查两轮都拿不到事实"的直接产物。
+-- 每一条都对应一个曾经的盲区：没进驱动块 / 进了没写 / 写了没生效 / 根本没挂上。
+print("T5 观测：日志可读、失败有原因、静止不误判")
+
+local function countOf(text, needle)
+	local count, pos = 0, 1
+	while true do
+		local found = string.find(text, needle, pos, true)
+		if found == nil then break end
+		count = count + 1
+		pos = found + #needle
+	end
+	return count
+end
+
+do
+	local logPath2 = (os.getenv("LOCALAPPDATA") or ".") .. "\\hd2pbx_runtime_t5.txt"
+	os.remove(logPath2)
+	local function readLog()
+		local handle = io.open(logPath2, "r")
+		if handle == nil then return "" end
+		local text = handle:read("*a")
+		handle:close()
+		return text or ""
+	end
+
+	-- 一份"骨名完全对不上"的容器：用来逼出 `#plan == 0` 那条以前完全静默的路径。
+	local wrongRig = { bones = { {
+		index = 1, name = "nope_1", parent = 0, parentName = "head",
+		pos = { 0, 0, 0 }, params = RIG.bones[1].params, flags = 0x31,
+	} } }
+
+	local armorsA = {}
+	for index, count in ipairs(ARMOR_NODES) do
+		armorsA[index] = newUnit("t5a" .. index, count, false, "#ID[t5a" .. index .. "]")
+		dress(armorsA[index])
+	end
+	armors = armorsA
+
+	local runtime = Runtime.install(S, {
+		compat = Compat,
+		maxMatchedPerOwner = 0,   -- 这些用例验的是匹配/公平性，不是"每玩家最多几件"的上限
+		carriers = { { rig = wrongRig, path = "wrong.patch_1.gpu_resources" } },
+		logPath = logPath2,
+		settleFrames = 2, snapshot = false, tunePath = "nonexistent-hd2pbx-tune.txt",
+		pollFrames = 1,
+		heartbeatFrames = 10,
+	})
+	local probeRender = rawget(_G, "render")
+
+	for _ = 1, 40 do engine.time = engine.time + 1 / 72; probeRender() end
+	local text = readLog()
+	check("挂不上时给出原因", text:find("没有 unit 命中任何物理容器", 1, true) ~= nil)
+	check("原因里给出量化线索（最高命中 x/y）", text:find("最高命中 0/1", 1, true) ~= nil)
+	check("同一原因只落一次（不刷屏）",
+		countOf(text, "没有 unit 命中任何物理容器") == 1,
+		string.format("出现 %d 次", countOf(text, "没有 unit 命中任何物理容器")))
+
+	-- 换成正确容器：下一拍应该挂上，并把实例名记进日志。
+	runtime.carriers = { { rig = RIG, path = "fake.patch_1.gpu_resources" } }
+	for _ = 1, 40 do engine.time = engine.time + 1 / 72; probeRender() end
+	text = readLog()
+	check("挂上后会话数正确", runtime.sessions ~= nil and #runtime.sessions == #ARMOR_NODES,
+		string.format("会话=%s", tostring(runtime.sessions and #runtime.sessions)))
+	check("挂载日志带实例名", text:find("#ID[t5a1]", 1, true) ~= nil)
+	check("会话记住了 unitTag", runtime.sessions[1].unitTag:find("^#ID%[t5a%d+%]$") ~= nil,
+		tostring(runtime.sessions[1].unitTag))
+
+	-- 心跳：证明驱动块被进入过，并给出当帧四个事实。
+	check("有心跳行", text:find("驱动心跳", 1, true) ~= nil)
+	check("心跳带写入/跳过/引擎调用",
+		text:find("写入=", 1, true) ~= nil and text:find("跳过=", 1, true) ~= nil
+			and text:find("引擎调用=", 1, true) ~= nil)
+
+	-- 每行前缀必须是"时间戳 + 帧号"：没有帧号就看不出"30 帧后全灭"这类时序规律。
+	local firstLine = text:match("([^\n]*)") or ""
+	check("日志行带时间戳与帧号", firstLine:match("^%d%d:%d%d:%d%d f%d+") ~= nil, firstLine)
+
+	-- 静止 200 帧：written 会掉到 0，但 handled（写入+跳过）不为 0 ⇒ 绝不能判"驱动失效"。
+	-- 这条是整个看门狗的存在理由：2026-11-01 用 `written == 0` 判失效，结果静止的角色
+	-- 每 45 帧被重挂一次，画面是"头发在垂直和原样之间来回切"。
+	local reArmBefore = runtime.reArm
+	for _ = 1, 200 do engine.time = engine.time + 1 / 72; probeRender() end
+	check("静止时不误判驱动失效", runtime.reArm == reArmBefore,
+		string.format("reArm %d → %d", reArmBefore, runtime.reArm))
+	text = readLog()
+	check("静止时没报驱动失效", text:find("驱动失效", 1, true) == nil)
+	-- 抓一帧"写入=0 但跳过>0"作为实证：这正是 written 单独看会误判、handled 不会的那种帧。
+	check("出现过 写入=0 但 跳过>0 的帧", text:find("写入=0 跳过=[1-9]", 1) ~= nil)
+
+	-- 全部销毁：prune 必须把 dead / rebuilt 分开报，并带存活帧数（P0.5 的判据）。
+	for _, unit in ipairs(armorsA) do engine.alive[unit] = false end
+	for _ = 1, 30 do engine.time = engine.time + 1 / 72; probeRender() end
+	text = readLog()
+	check("prune 分开报已销毁/已重建",
+		text:find("丢弃 6 个已销毁 / 0 个已重建", 1, true) ~= nil)
+	check("失效会话带存活帧数与实例名",
+		text:find("会话失效（dead）：unit=#ID%[t5a%d+%] 存活 %d+ 帧", 1) ~= nil)
+
+	check("uninstall 成功", Runtime.uninstall() == true)
+	-- 再装一次：日志必须是**追加**的，否则上一次启动的证据会被抹掉。
+	Runtime.install(S, { compat = Compat, logPath = logPath2 })
+	Runtime.uninstall()
+	text = readLog()
+	check("日志是追加而非覆盖", countOf(text, "已安装") == 2,
+		string.format("已安装 出现 %d 次", countOf(text, "已安装")))
+end
+
+
+-- ---------------------------------------------------------------------------
+print("T5b 预筛不掩盖诊断：部分命中仍要报出「最高命中 x/y」")
+--
+-- 加预筛（每份容器只问第 1 根骨）之后，必须守住的性质：它只挡"连第 1 根骨都没有"
+-- 的件。**部分命中**的件必须照样真打分、照样把 `最高命中 1/2` 写进日志 ——
+-- 否则下次再出现"护甲挂不上"，我们连"差几根骨"都看不到（2026-11-12 已经为此
+-- 瞎猜了一整轮）。
+do
+	local logPath5b = (os.getenv("LOCALAPPDATA") or ".") .. "\\hd2pbx_runtime_t5b.txt"
+	os.remove(logPath5b)
+	local function readLog5b()
+		local handle = io.open(logPath5b, "r")
+		if handle == nil then return "" end
+		local text = handle:read("*a")
+		handle:close()
+		return text or ""
+	end
+
+	-- 2 根骨的容器：第 1 根和护甲件对得上，第 2 根对不上 ⇒ 1/2。
+	local partialRig = { bones = {
+		{ index = 1, name = BONE_NAMES[1], parent = 0, parentName = "head",
+			pos = { 0, 0, 0 }, params = RIG.bones[1].params, flags = 0x31 },
+		{ index = 2, name = "nope_2", parent = 1, parentName = BONE_NAMES[1],
+			pos = { 0, -0.1, 0 }, params = RIG.bones[1].params, flags = 0x31 },
+	} }
+
+	local armorsB = {}
+	for index, count in ipairs(ARMOR_NODES) do
+		armorsB[index] = newUnit("t5b" .. index, count, false, "#ID[t5b" .. index .. "]")
+		dress(armorsB[index])
+	end
+	armors = armorsB
+
+	local runtime = Runtime.install(S, {
+		compat = Compat,
+		maxMatchedPerOwner = 0,   -- 这些用例验的是匹配/公平性，不是"每玩家最多几件"的上限
+		carriers = { { rig = partialRig, path = "partial.patch_1.gpu_resources" } },
+		logPath = logPath5b,
+		settleFrames = 2, snapshot = false, tunePath = "nonexistent-hd2pbx-tune.txt",
+		pollFrames = 1,
+		heartbeatFrames = 10,
+	})
+	local probeRender = rawget(_G, "render")
+	for _ = 1, 40 do engine.time = engine.time + 1 / 72; probeRender() end
+	local text = readLog5b()
+	-- 改法演进（2026-11-12）：现在**不再要求全命中**，部分命中也会走到 attach
+	-- （配合转换器侧"每个 unit 只带自己用得上的骨"）。所以这条用例改为验证：
+	-- 1/2 命中的件必须真的被送去挂载，而不是被判"不可用"直接丢掉。
+	check("部分命中的件没有被预筛挡掉", text:find("预筛全挂", 1, true) == nil)
+	local triedAttach = text:find("attach 进入", 1, true) ~= nil
+		or text:find("挂载完成但产出 0 条链", 1, true) ~= nil
+	check("部分命中会真的送去挂载（不再要求全命中）", triedAttach,
+		text:match("没有 unit 命中[^\n]*") or "（既没 attach 也没失败行）")
+	Runtime.uninstall()
+end
+
+
+-- ---------------------------------------------------------------------------
+-- T6：同一时间步内被调用多次，绝不能重复积分。
+--
 -- `Application.time_since_launch` **每帧只更新一次**，而 render 钩子实测每帧被调用多次。
 -- 如果后面那几次沿用上一次的 dt 再积一遍，一帧就积了 N 倍的时间：物理快 N 倍、
 -- 永远停不下来。实机表现就是"头发飘逸过头"——所以这条必须钉死。
@@ -292,6 +411,7 @@ do
 	armors = armorsB
 	local runtime = Runtime.install(S, {
 		compat = Compat,
+		maxMatchedPerOwner = 0,   -- 这些用例验的是匹配/公平性，不是"每玩家最多几件"的上限
 		carriers = { { rig = RIG, path = "fake.patch_1.gpu_resources" } },
 		logPath = logPath3,
 		settleFrames = 2, snapshot = false, tunePath = "nonexistent-hd2pbx-tune.txt",
@@ -331,29 +451,24 @@ end
 
 
 -- ---------------------------------------------------------------------------
--- 尚未实现的 IAS 行为：用例先写成"待办"，明确打印原因，不静默删除。
--- 跑套件时这些行以 SKIP 开头，不计入 PASS/FAIL，但会出现在输出里。
-local pendingCount = 0
-local function pending(name, reason)
-	pendingCount = pendingCount + 1
-	print(string.format("  SKIP %-52s %s", name, reason))
-end
-
--- ---------------------------------------------------------------------------
--- T7：阵亡 → 尸体留在原地 → 新玩家实体出现。（E12e：按 IAS 1.6.4 的行为重写断言）
+-- T7：阵亡 → 尸体留在原地 → 新玩家实体出现。
 --
--- 旧版（2.0.x–2.1.5x）假设"尸体不再算玩家 ⇒ 整组释放、交还基准姿态、重挂新玩家"。那是我们自己的
--- discover / release 机制，IAS 里没有。IAS 在这个场景里的行为（R = ias-1.6.4 runtime.lua 行号）：
---   · 尸体仍是 avatar 资源的 unit，`World.units_by_resource(world, AVATAR_RESOURCE)` 还会列出它（R:1365），
---     所以它仍是一个 avatar；它那套件的根探针离它 0 m、离新玩家 50 m，按"最近 avatar + d2 < 9.0（R:6794）
---     + 次近余量 0.20（R:1815）"归属尸体，照常进 bindings、每帧 bind_unit（R:6862-6867、R:7004）。
---     没有"主人不再算玩家就整组释放"这一步。
---   · 新玩家那套同理归属新玩家；两套互不抢（另一个 avatar 在 50 m 外，远超 0.20 余量）。
---   · 尸体从枚举里消失（被销毁）之后，这套件 3 m 内没有 avatar，d2 < 9.0 不成立（R:6794）⇒ 不再绑定，
---     状态丢弃；没有"交还基准姿态"这一步（IAS 的原生状态挂在实例槽位上，槽位不再被喂就结束）。
---   · 死后 4 s 的"尸体副本定格"（R:5190-6002：生成副本、隐藏原件、原件移出名单、freeze_corpse_physics）
---     依赖原生 freeze_corpse_physics，本批没有实现 ⇒ 在下面单独列为 pending。
-print("T7 阵亡→复活：尸体仍是 avatar、两套各归各的（IAS 行为）")
+-- 这是实机反馈的原始问题：玩家阵亡后尸体**不会被销毁**，`pruneSessions` 只看
+-- `Unit.alive` / 节点数，判不出"人已经换了"，于是我们一直驱动着尸体，
+-- 而新玩家的护甲 unit 从来没被挂过 —— 表现就是"复活之后没有物理"。
+--
+-- ⚠️ **2.0.0 之后这个场景的模型变了，断言也跟着变。**
+-- 1.9.x 只有一个"玩家"概念，靠"出现新的 avatar 候选"判换人；多人局里那条判据是**错的**
+-- （队友一进房间就把我的会话全丢、重挂到队友身上）。2.0.0 改成：
+--   每套护甲归属**离它最近的那个玩家**，会话记住主人；主人不在才释放。
+-- 所以"换人"不再是一个判定事件，而是两件独立的事：
+--   ① 尸体不再算玩家（HD2 里尸体是 ragdoll，没有动画状态机）⇒ 它那套护甲**失去主人**；
+--   ② 失去主人的护甲离"最近的玩家"很远 ⇒ 被 `maxArmorDistance` 过滤掉，不会被挂回去。
+-- 这里验的仍然是最初那三件事，只是换成新模型的等价形式：
+--   ① 尸体那套护甲失去主人并被释放（而不是"检测到换人"）；
+--   ② 尸体被**交还基准姿态**（不留在最后写入的姿势，像被冻住）；
+--   ③ 新玩家的护甲被挂上，而尸体那套（离新玩家 50 m）不再被驱动。
+print("T7 阵亡→复活：释放尸体、重挂新玩家")
 do
 	local logPath7 = (os.getenv("LOCALAPPDATA") or ".") .. "\\hd2pbx_runtime_t7.txt"
 	os.remove(logPath7)
@@ -363,16 +478,6 @@ do
 		local text = handle:read("*a")
 		handle:close()
 		return text or ""
-	end
-	local function countOf(text, needle)
-		local count, pos = 0, 1
-		while true do
-			local found = string.find(text, needle, pos, true)
-			if not found then break end
-			count = count + 1
-			pos = found + #needle
-		end
-		return count
 	end
 
 	-- 玩家 A 在原点，带 6 件护甲（都贴着玩家）
@@ -393,20 +498,27 @@ do
 
 	local runtime = Runtime.install(S, {
 		compat = Compat,
+		maxMatchedPerOwner = 0,   -- 这些用例验的是匹配/公平性，不是"每玩家最多几件"的上限
 		carriers = { { rig = RIG, path = "fake.patch_1.gpu_resources" } },
 		logPath = logPath7,
 		settleFrames = 2, snapshot = false, tunePath = "nonexistent-hd2pbx-tune.txt",
 		pollFrames = 1,
+		validateFrames = 1,      -- 每帧都校验，测试才跑得快
+		maxArmorDistance = 3.0,
 	})
 	local probeRender = rawget(_G, "render")
 	for _ = 1, 60 do engine.time = engine.time + 1 / 120; probeRender() end
-	check("先挂上 A 那套", runtime.sessions ~= nil and #runtime.sessions == #ARMOR_NODES,
+	check("先挂上尸体那套", runtime.sessions ~= nil and #runtime.sessions == #ARMOR_NODES,
 		string.format("会话=%s", tostring(runtime.sessions and #runtime.sessions)))
+	local writesBeforeDeath = engine.writes
 
-	-- 阵亡：A 的 unit 仍活着、仍被 avatar 资源枚举列出（尸体就是它），但不再有动画状态机。
+	-- 阵亡：玩家 A 的 unit **仍然活着**（尸体就是它，这是 HD2 的实际情况），护甲也留着。
+	-- 但尸体是 ragdoll ⇒ **不再有动画状态机** ⇒ `findAvatars` 不再把它算作玩家。
+	-- 这一步是 2.0.0 判"主人不在了"的**唯一**依据（旧版靠"出现新候选"判换人，多人局会误判）。
 	engine.anim[avatarA] = false
 
-	-- 新玩家 B 在 50 米外出现，带自己的 6 件。
+	-- 新玩家 B 在 50 米外出现。死掉那套护甲留在原点，离 B 有 50 m，
+	-- 应当被 `maxArmorDistance` 挡在门外，绝不重新驱动。
 	local avatarB = newUnit("t7avatarB", AVATAR_NODES, true, "#ID[t7avatarB]")
 	do
 		local mgName = SUPPORT_MG
@@ -420,67 +532,60 @@ do
 		dress(newArmors[index])
 		engine.pos[newArmors[index]] = { 50, 0, 0 }
 	end
+	avatar = avatarB
 	local combined = {}
 	for _, unit in ipairs(corpseArmors) do combined[#combined + 1] = unit end
 	for _, unit in ipairs(newArmors) do combined[#combined + 1] = unit end
 	armors = combined
-	-- 两个 avatar 都由资源枚举列出（A = 尸体、B = 新玩家）。
-	engine.extraAvatars = { avatarB }
-	local function ownedBy(units, owner)
-		local count = 0
-		for _, unit in ipairs(units) do
-			local session = runtime.sessionByUnit and runtime.sessionByUnit[unit]
-			if session ~= nil and session.owner == owner then count = count + 1 end
-		end
-		return count
-	end
 
 	for _ = 1, 120 do engine.time = engine.time + 1 / 120; probeRender() end
 	local text = readLog7()
-	check("T7 尸体 avatar 仍被枚举：尸体那套继续归尸体（R:1365、R:6794）",
-		ownedBy(corpseArmors, avatarA) == #ARMOR_NODES, string.format("归尸体 %d/%d", ownedBy(corpseArmors, avatarA), #ARMOR_NODES))
-	check("T7 新玩家那套归新玩家（R:6694-6862）",
-		ownedBy(newArmors, avatarB) == #ARMOR_NODES, string.format("归新玩家 %d/%d", ownedBy(newArmors, avatarB), #ARMOR_NODES))
-	check("T7 两套同时都有会话（IAS 每帧对 bindings 里每一项 bind_unit，R:7004）",
-		runtime.sessions ~= nil and #runtime.sessions == 2 * #ARMOR_NODES,
+	check("尸体那套护甲失去主人并被释放", text:find("释放了", 1, true) ~= nil,
+		"主人（尸体）不再算玩家时应当整组释放")
+	check("尸体被交还基准姿态", text:find("已交还", 1, true) ~= nil)
+	check("重挂到了新玩家身上",
+		runtime.sessions ~= nil and #runtime.sessions == #ARMOR_NODES,
 		string.format("会话=%s", tostring(runtime.sessions and #runtime.sessions)))
-	check("T7 没有「释放」尸体那套的动作（IAS 无此机制）", text:find("释放了", 1, true) == nil and text:find("已交还", 1, true) == nil)
+	local allNew = true
+	for _, session in ipairs(runtime.sessions or {}) do
+		if not tostring(session.unitTag):find("t7n", 1, true) then allNew = false end
+	end
+	check("挂的是新玩家那套，不是尸体", allNew,
+		tostring(runtime.sessions and runtime.sessions[1] and runtime.sessions[1].unitTag))
+	check("尸体那套护甲没有被重新挂上",
+		(text:find("离它所属玩家超过", 1, true) ~= nil), "应记录被距离过滤掉的尸体件")
 
-	-- 稳态：不会反复重挂（会话对象保持同一批；挂载日志不再增长）。IAS 每帧重绑只是原生按槽位续用状态。
-	local before = {}
-	for _, session in ipairs(runtime.sessions) do before[session] = true end
-	local attachLogs = countOf(text, "已挂载")
+	-- 死亡之后没再往尸体写姿态（只在新玩家身上写）。
+	check("新玩家有物理写入", engine.writes > writesBeforeDeath,
+		string.format("%d → %d", writesBeforeDeath, engine.writes))
+
+	-- 关键：尸体一直活着、护甲也一直在 ⇒ 不能每 1.2 秒又判一次"主人不在"再释放一遍。
+	-- 反复判 = 反复 release + 重挂（几百次引擎调用 + 姿态跳变），实机就是"特别卡顿 + 没物理"。
+	local function countOf(text, needle)
+		local count, pos = 0, 1
+		while true do
+			local found = string.find(text, needle, pos, true)
+			if not found then break end
+			count = count + 1
+			pos = found + #needle
+		end
+		return count
+	end
 	for _ = 1, 600 do engine.time = engine.time + 1 / 120; probeRender() end
 	text = readLog7()
-	local same = true
-	for _, session in ipairs(runtime.sessions or {}) do if not before[session] then same = false end end
-	check("T7 稳态下会话对象不变、不反复重挂", same and countOf(text, "已挂载") == attachLogs,
-		string.format("挂载日志 %d→%d", attachLogs, countOf(text, "已挂载")))
-
-	-- 尸体从枚举里消失：这套件 3 m 内没有 avatar ⇒ 不再绑定，状态丢弃（R:6794）。
-	engine.hidden[avatarA] = true
-	for _ = 1, 5 do engine.time = engine.time + 1 / 120; probeRender() end
-	local stillBound = 0
-	for _, unit in ipairs(corpseArmors) do if runtime.sessionByUnit[unit] ~= nil then stillBound = stillBound + 1 end end
-	check("T7 尸体 avatar 消失后，3 m 内无 avatar 的件不再绑定（R:6794）", stillBound == 0, string.format("残留 %d", stillBound))
-	check("T7 新玩家那套不受影响", ownedBy(newArmors, avatarB) == #ARMOR_NODES)
-	engine.hidden[avatarA] = nil
-	engine.extraAvatars = nil
-
-	pending("T7 死后 4 s 生成尸体副本、隐藏原件、原件移出名单（R:5190-6002）", "E12f-C2/D1 已在 corpse-freeze-test.lua 与 corpse-integration-test.lua 里用带 Network/GameSession 死亡与可写节点树的假引擎实测（本 harness 的假引擎没有网络身份，造不出 role 3）")
-	pending("T7 副本 4 s 铰接下落并定格（R:5248-5429）", "E12f-D1 已在 corpse-integration-test.lua 用真实 CorpseMotion + CorpseFreeze 端到端实测（本 harness 造不出 role 3）")
+	-- 数的是"整组释放"那一条：它每轮只该出现一次，之后再多的帧都不该重复触发。
+	check("释放只发生一次（不会反复重挂）", countOf(text, "释放了") == 1,
+		string.format("释放 %d 次", countOf(text, "释放了")))
+	check("之后仍挂在新玩家身上",
+		runtime.sessions ~= nil and #runtime.sessions == #ARMOR_NODES
+			and tostring(runtime.sessions[1].unitTag):find("t7n", 1, true) ~= nil,
+		tostring(runtime.sessions and runtime.sessions[1] and runtime.sessions[1].unitTag))
 
 	Runtime.uninstall()
 end
 
 -- ---------------------------------------------------------------------------
--- T8：unit 从枚举里消失之后没有"停写窗口"。（E12e：按 IAS 重写）
---
--- 旧版有一个我们自己的"会话死亡后停写 N 帧"窗口（driveHoldUntil / deathGraceFrames），理由是当时跨帧持有
--- 句柄、怕场景拆解时写到已释放对象。IAS 没有这个窗口：它不跨帧持有任何句柄，本帧用到的 unit 全部来自本帧枚举
--- （R:1417-1428），不在枚举里的 unit 本帧压根不会被碰到，其余的 unit 照常每帧处理（R:6862-6867、R:7004）。
--- 所以这里验两件事：消失的 unit 一次都没被写；其余 unit 在消失的下一帧就照常写，没有停写窗口。
-print("T8 unit 从枚举消失：它不被碰、其余的不停写（IAS 无停写窗口）")
+print("T8 会话死亡后的停写窗口（多人局换场景不再把骨写到已释放对象上）")
 do
 	rawset(_G, "render", function() end)
 
@@ -505,40 +610,113 @@ do
 
 	local runtime = Runtime.install(S, {
 		compat = Compat,
+		maxMatchedPerOwner = 0,   -- 这些用例验的是匹配/公平性，不是"每玩家最多几件"的上限
 		carriers = { { rig = RIG, path = "fake.patch_1.gpu_resources" } },
 		logPath = logPath8,
 		settleFrames = 2, snapshot = false, tunePath = "nonexistent-hd2pbx-tune.txt",
-		pollFrames = 1,
+		pollFrames = 1, validateFrames = 0,   -- 关掉名单校验，隔离出"死亡停写"这一条
+		maxArmorDistance = 10.0,
+		deathGraceFrames = 20,
 	})
 	local probeRender = rawget(_G, "render")
 	for _ = 1, 60 do engine.time = engine.time + 1 / 120; probeRender() end
 	check("T8 先全部挂上", runtime.sessions ~= nil and #runtime.sessions == #ARMOR_NODES,
 		string.format("会话=%s", tostring(runtime.sessions and #runtime.sessions)))
 
+	-- ① 正常帧确实在写骨（否则下面的"停写"断言是空转）
 	local baseline = engine.writes
 	for _ = 1, 5 do engine.time = engine.time + 1 / 120; probeRender() end
-	check("T8 正常帧会写骨（否则下面的断言是空转）", engine.writes > baseline, string.format("写入=%d", engine.writes - baseline))
+	check("T8 正常帧会写骨", engine.writes > baseline,
+		string.format("写入=%d", engine.writes - baseline))
 
-	-- 第 1 件护甲被销毁（alive=false ⇒ 资源枚举不再列出它）。
-	local victim = t8Armors[1]
-	engine.alive[victim] = false
-	local victimBefore = {}
-	for kind, count in pairs(engine.hits[victim] or {}) do victimBefore[kind] = count end
-	local writesBefore = engine.writes
+	-- ② 停写窗口内**一个骨都不写**。直接设窗口，把"是谁设的"和"设了之后怎样"分开测。
+	local heldFrom = runtime.frame
+	runtime.driveHoldUntil = heldFrom + 20
+	local writesAtHold = engine.writes
+	for _ = 1, 15 do engine.time = engine.time + 1 / 120; probeRender() end
+	check("T8 窗口内不写骨", engine.writes == writesAtHold,
+		string.format("窗口内写入=%d", engine.writes - writesAtHold))
+	check("T8 窗口内确实过了帧", runtime.frame > heldFrom,
+		string.format("frame=%d→%d", heldFrom, runtime.frame))
+
+	-- ③ 过了窗口必须恢复写入：停写不等于永久停手
+	for _ = 1, 40 do engine.time = engine.time + 1 / 120; probeRender() end
+	check("T8 窗口过后恢复写骨", engine.writes > writesAtHold,
+		string.format("恢复后写入=%d", engine.writes - writesAtHold))
+
+	-- ④ 真让一个会话死掉：pruneSessions 必须自己把窗口设上。
+	--    这是"多人局换场景"的入口条件——单人局是整组一起死，走的是另一条分支。
+	local beforeDeath = runtime.frame
+	engine.alive[t8Armors[1]] = false
 	engine.time = engine.time + 1 / 120; probeRender()
-	check("T8 消失的下一帧其余件照常写骨（没有停写窗口）", engine.writes > writesBefore,
-		string.format("下一帧写入=%d", engine.writes - writesBefore))
-	check("T8 运行时里没有停写窗口这个状态", runtime.driveHoldUntil == nil)
-	for _ = 1, 10 do engine.time = engine.time + 1 / 120; probeRender() end
-	local touched = {}
-	for _, kind in ipairs({ "nodes", "world", "pose", "write", "has", "node" }) do
-		local delta = ((engine.hits[victim] or {})[kind] or 0) - (victimBefore[kind] or 0)
-		if delta > 0 then touched[#touched + 1] = kind .. "+" .. delta end
+	check("T8 会话死亡会设置停写窗口", (runtime.driveHoldUntil or 0) > beforeDeath,
+		string.format("holdUntil=%s frame=%s",
+			tostring(runtime.driveHoldUntil), tostring(runtime.frame)))
+
+	Runtime.uninstall()
+end
+
+-- ---------------------------------------------------------------------------
+print("T9 加载空档：不逐条查存活，直接整组重挂")
+--
+-- 加载界面期间 render/update 不跑，而引擎正在销毁上一场景的 unit。
+-- 回来后的第一帧如果逐条 `Unit.alive`（session_health 内部就是它），
+-- 就是在"句柄可能已被释放"的窗口里发引擎调用 —— 2026-11-11 实机崩在 0x3e564b 读空指针。
+do
+	rawset(_G, "render", function() end)
+
+	local t9Avatar = newUnit("t9avatar", AVATAR_NODES, true, "#ID[t9avatar]")
+	do
+		local mgName = SUPPORT_MG
+		t9Avatar.ids[mgName] = true
+		t9Avatar.nodeOf[mgName] = 5
 	end
-	check("T8 消失的 unit 一次都没被碰（句柄只来自本帧枚举，R:1417-1428）", #touched == 0, table.concat(touched, " "))
-	check("T8 它的状态被丢弃，其余 5 件仍在", runtime.sessionByUnit[victim] == nil
-		and runtime.sessions ~= nil and #runtime.sessions == #ARMOR_NODES - 1,
+	local t9Armors = {}
+	for index, count in ipairs(ARMOR_NODES) do
+		t9Armors[index] = newUnit("t9a" .. index, count, false, "#ID[t9a" .. index .. "]")
+		dress(t9Armors[index])
+		engine.pos[t9Armors[index]] = { 0, 0, 0 }
+	end
+	avatar = t9Avatar
+	armors = t9Armors
+	engine.pos[t9Avatar] = { 0, 0, 0 }
+
+	local logPath9 = (os.getenv("LOCALAPPDATA") or ".") .. "\\hd2pbx_runtime_t9gap.txt"
+	pcall(os.remove, logPath9)
+
+	local runtime = Runtime.install(S, {
+		compat = Compat,
+		maxMatchedPerOwner = 0,   -- 这些用例验的是匹配/公平性，不是"每玩家最多几件"的上限
+		carriers = { { rig = RIG, path = "fake.patch_1.gpu_resources" } },
+		logPath = logPath9,
+		settleFrames = 2, snapshot = false, tunePath = "nonexistent-hd2pbx-tune.txt",
+		pollFrames = 1, validateFrames = 0,
+		maxArmorDistance = 10.0,
+	})
+	local probeRender = rawget(_G, "render")
+	for _ = 1, 60 do engine.time = engine.time + 1 / 120; probeRender() end
+	check("T9 先全部挂上", runtime.sessions ~= nil and #runtime.sessions == #ARMOR_NODES,
 		string.format("会话=%s", tostring(runtime.sessions and #runtime.sessions)))
+
+	-- 统计这一帧会发多少次 Unit.alive
+	local originalAlive = S.Unit.alive
+	local aliveCalls = 0
+	S.Unit.alive = function(unit) aliveCalls = aliveCalls + 1 return originalAlive(unit) end
+	engine.time = engine.time + 5.0          -- 模拟加载：时钟一次跳 5 秒
+	probeRender()
+	S.Unit.alive = originalAlive
+
+	check("T9 空档后整组重挂（会话清空）", runtime.sessions == nil,
+		string.format("会话=%s", tostring(runtime.sessions and #runtime.sessions)))
+	check("T9 空档帧没有再查存活", aliveCalls == 0, "Unit.alive 调用=" .. tostring(aliveCalls))
+	local text9 = ""
+	do
+		local handle = io.open(logPath9, "r")
+		if handle then text9 = handle:read("*a") or ""; handle:close() end
+	end
+	check("T9 留下空档日志", text9:find("检测到加载空档", 1, true) ~= nil)
+	check("T9 崩场景那套「会话失效」没有出现", text9:find("会话失效", 1, true) == nil,
+		"不应逐条判活")
 
 	Runtime.uninstall()
 end
@@ -578,10 +756,12 @@ do
 
 	local runtime = Runtime.install(S, {
 		compat = Compat,
+		maxMatchedPerOwner = 0,   -- 这些用例验的是匹配/公平性，不是"每玩家最多几件"的上限
 		carriers = { { rig = RIG, path = "fake.patch_1.gpu_resources" } },
 		logPath = logPath10,
 		settleFrames = 2, snapshot = false, tunePath = tunePath10,
 		pollFrames = 1, validateFrames = 0,
+		maxArmorDistance = 10.0,
 	})
 	local probeRender = rawget(_G, "render")
 	for _ = 1, 60 do engine.time = engine.time + 1 / 120; probeRender() end
@@ -608,12 +788,10 @@ do
 end
 
 -- ---------------------------------------------------------------------------
-print("T11 诊断开关 hardOff（discoverOnly 随自研发现流程一起删除，IAS 无对应物）")
+print("T11 细分开关 discoverOnly / hardOff")
 --
 -- 实机已达成的结论：写骨不是触发点（writeOff=1 仍崩）。
--- 于是继续往上游劈：连扫描都不做（hardOff）。
--- E12e：原来的 `discoverOnly`（只扫描不挂载）是挂在自研 discover/tryAttach 流程上的，那一整套已按 IAS 删除，
--- IAS 里也没有对应的"只发现不挂载"开关，所以这个开关和它的用例一起删掉。
+-- 于是继续往上游劈：① 只扫描不挂载；② 连扫描都不做。
 do
 	local function scenario(tag, tuneLine, expectLog)
 		rawset(_G, "render", function() end)
@@ -644,10 +822,12 @@ do
 
 		local runtime = Runtime.install(S, {
 			compat = Compat,
+			maxMatchedPerOwner = 0,   -- 这些用例验的是匹配/公平性，不是"每玩家最多几件"的上限
 			carriers = { { rig = RIG, path = "fake.patch_1.gpu_resources" } },
 			logPath = logPath,
 			settleFrames = 2, snapshot = false, tunePath = tunePath,
 			pollFrames = 1, validateFrames = 0,
+			maxArmorDistance = 10.0,
 		})
 		local probeRender = rawget(_G, "render")
 		for _ = 1, 90 do engine.time = engine.time + 1 / 120; probeRender() end
@@ -664,7 +844,72 @@ do
 		Runtime.uninstall()
 	end
 
+	scenario("discoverOnly", "discoverOnly = 1", "discoverOnly=1")
 	scenario("hardOff", "hardOff = 1", "hardOff=1")
+end
+
+-- ---------------------------------------------------------------------------
+print("T12 dropAllOnDeath：一见死亡就整组释放（不留句柄）")
+--
+-- 依据：discoverOnly（不持有句柄）不崩 ⇒ 崩因是攥着 unit 句柄跨过场景销毁。
+-- 默认行为是"只掉一部分就留着剩下的"（多人局不闪），但那批句柄正是悬空来源。
+do
+	rawset(_G, "render", function() end)
+
+	local t12Avatar = newUnit("t12avatar", AVATAR_NODES, true, "#ID[t12avatar]")
+	do
+		local mgName = SUPPORT_MG
+		t12Avatar.ids[mgName] = true
+		t12Avatar.nodeOf[mgName] = 5
+	end
+	local t12Armors = {}
+	for index, count in ipairs(ARMOR_NODES) do
+		t12Armors[index] = newUnit("t12a" .. index, count, false, "#ID[t12a" .. index .. "]")
+		dress(t12Armors[index])
+		engine.pos[t12Armors[index]] = { 0, 0, 0 }
+	end
+	avatar = t12Avatar
+	armors = t12Armors
+	engine.pos[t12Avatar] = { 0, 0, 0 }
+
+	local tunePath12 = (os.getenv("TEMP") or ".") .. "\\physbone-t12-dropall-tune.txt"
+	do
+		local handle = io.open(tunePath12, "w")
+		handle:write("dropAllOnDeath = 1\n")
+		handle:close()
+	end
+	local logPath12 = (os.getenv("LOCALAPPDATA") or ".") .. "\\hd2pbx_runtime_t12dropall.txt"
+	pcall(os.remove, logPath12)
+
+	local runtime = Runtime.install(S, {
+		compat = Compat,
+		maxMatchedPerOwner = 0,   -- 这些用例验的是匹配/公平性，不是"每玩家最多几件"的上限
+		carriers = { { rig = RIG, path = "fake.patch_1.gpu_resources" } },
+		logPath = logPath12,
+		settleFrames = 2, snapshot = false, tunePath = tunePath12,
+		pollFrames = 1, validateFrames = 0,
+		maxArmorDistance = 10.0,
+	})
+	local probeRender = rawget(_G, "render")
+	for _ = 1, 60 do engine.time = engine.time + 1 / 120; probeRender() end
+	check("T12 先全部挂上", runtime.sessions ~= nil and #runtime.sessions == #ARMOR_NODES,
+		string.format("会话=%s", tostring(runtime.sessions and #runtime.sessions)))
+
+	-- 只死一个（多人局里队友那套先被释放）
+	engine.alive[t12Armors[1]] = false
+	engine.time = engine.time + 1 / 120; probeRender()
+
+	check("T12 一个死亡就整组释放（不留剩的）", runtime.sessions == nil,
+		string.format("会话=%s", tostring(runtime.sessions and #runtime.sessions)))
+	local text12 = ""
+	do
+		local handle = io.open(logPath12, "r")
+		if handle then text12 = handle:read("*a") or ""; handle:close() end
+	end
+	check("T12 日志说明整组释放", text12:find("整组释放", 1, true) ~= nil)
+	pcall(os.remove, tunePath12)
+
+	Runtime.uninstall()
 end
 
 -- ---------------------------------------------------------------------------
@@ -685,6 +930,7 @@ do
 
 	local runtime = Runtime.install(S, {
 		compat = Compat,
+		maxMatchedPerOwner = 0,   -- 这些用例验的是匹配/公平性，不是"每玩家最多几件"的上限
 		carriers = { { rig = RIG, path = "fake.patch_1.gpu_resources" } },
 		logPath = logPath13,
 		settleFrames = 2, snapshot = false, tunePath = tunePath13,
@@ -706,6 +952,300 @@ do
 	check("T13 带运行时版本", dump:find("physbone runtime", 1, true) ~= nil)
 	pcall(os.remove, tunePath13)
 	pcall(os.remove, dumpPath13)
+
+	Runtime.uninstall()
+end
+
+-- ---------------------------------------------------------------------------
+print("T14 装填：每帧只打 1 件也要把两个玩家的件都挂满（不再被配额饿死）")
+--
+-- 这就是用户报的"只有自己有物理、队友全没有"的回归：旧实现按 owner.order 排序 + 固定件数额度，
+-- 自己的件先占满额度（实测 2 人局 12 个名额里自己 9 件、队友 3 件）。
+-- 现在改成"按 unit 缓存 + 每帧新打分 N 件"，进度单调，所以队友迟早会被轮到。
+do
+	rawset(_G, "render", function() end)
+
+	local a14 = newUnit("t14avatarA", AVATAR_NODES, true, "#ID[t14avatarA]")
+	local b14 = newUnit("t14avatarB", AVATAR_NODES, true, "#ID[t14avatarB]")
+	for _, av in ipairs({ a14, b14 }) do
+		local mgName = SUPPORT_MG
+		av.ids[mgName] = true
+		av.nodeOf[mgName] = 5
+	end
+	engine.pos[a14] = { 0, 0, 0 }
+	engine.pos[b14] = { 10, 0, 0 }
+
+	-- 每人 7 件：**总数 14 件 > 旧实现的配额度**（`max(12, 4×2) = 12`）。
+	-- 旧实现按 owner.order 排序 + 固定额度 ⇒ 自己的 7 件先吃满 12 个名额，队友只拿到 5 件。
+	-- 这一条就是用来把那种"饿死队友"钉死的。
+	local PIECES_PER_PLAYER = 7
+	local gear = {}
+	local counts = { { 171, 148, 132 }, { 121, 108, 96 } }
+	local owners = { a14, b14 }
+	for who = 1, 2 do
+		for slot = 1, PIECES_PER_PLAYER do
+			local unit = newUnit(("t14%s%d"):format(who == 1 and "a" or "b", slot),
+				counts[who][((slot - 1) % 3) + 1], false, "#ID[t14p" .. who .. slot .. "]")
+			dress(unit)
+			engine.pos[unit] = engine.pos[owners[who]]
+			gear[#gear + 1] = unit
+		end
+	end
+	-- 假引擎的 unitsArray() 只吐一个 `avatar` 全局；第二个玩家必须混在 armors 里才能被扫到
+	-- （findAvatars 是在整份 units 里找"有动画状态机 + support_mg"的，找到后会被排除出候选）。
+	avatar = a14
+	local unitsList = { b14 }
+	for _, unit in ipairs(gear) do unitsList[#unitsList + 1] = unit end
+	armors = unitsList
+
+	local tunePath14 = (os.getenv("TEMP") or ".") .. "\\physbone-t14-fill-tune.txt"
+	do
+		local handle = io.open(tunePath14, "w")
+		handle:write("writeOff = 0\n")
+		handle:close()
+	end
+
+	local runtime = Runtime.install(S, {
+		compat = Compat,
+		maxMatchedPerOwner = 0,   -- 这些用例验的是匹配/公平性，不是"每玩家最多几件"的上限
+		carriers = { { rig = RIG, path = "fake.patch_1.gpu_resources" } },
+		logPath = (os.getenv("LOCALAPPDATA") or ".") .. "\\hd2pbx_runtime_t14fill.txt",
+		settleFrames = 2, snapshot = false, tunePath = tunePath14,
+		pollFrames = 1, validateFrames = 0,
+		maxArmorDistance = 15.0,
+		scoreUnitsPerFrame = 1,      -- 故意压到每帧只打 1 件：最容易饿死队友的设置
+	})
+	local probeRender = rawget(_G, "render")
+	for _ = 1, 400 do engine.time = engine.time + 1 / 120; probeRender() end
+
+	check("T14 十四件全部挂上", runtime.sessions ~= nil and #runtime.sessions == 14,
+		string.format("会话=%s", tostring(runtime.sessions and #runtime.sessions)))
+	local perOwner = {}
+	for _, session in ipairs(runtime.sessions or {}) do
+		local key = session.ownerOrder or 99
+		perOwner[key] = (perOwner[key] or 0) + 1
+	end
+	check("T14 自己名下 7 件全在", (perOwner[1] or 0) == PIECES_PER_PLAYER, "玩家1=" .. tostring(perOwner[1]))
+	check("T14 队友名下 7 件也全在（旧实现的典型值是被配额截到 5）",
+		(perOwner[2] or 0) == PIECES_PER_PLAYER, "玩家2=" .. tostring(perOwner[2]))
+	pcall(os.remove, tunePath14)
+
+	Runtime.uninstall()
+end
+
+-- ---------------------------------------------------------------------------
+print("T15 负结果会过期：骨骼晚就绪的件必须能被重新打分挂上")
+--
+-- 实机踩到（2026-11-12）：unit 刚生成时骨骼还没就绪，第一拍打分 0 命中；把这条当永久结论，
+-- 这个 unit 就再也不会被重试 —— 现象是"只有先就绪的头盔有物理，护甲的件永远没有"，
+-- 换护甲后连头盔也没了（新 unit 又被提前判死）。所以负结论必须带过期 + 退避。
+do
+	rawset(_G, "render", function() end)
+
+	local av15 = newUnit("t15avatar", AVATAR_NODES, true, "#ID[t15avatar]")
+	do
+		local mgName = SUPPORT_MG
+		av15.ids[mgName] = true
+		av15.nodeOf[mgName] = 5
+	end
+	engine.pos[av15] = { 0, 0, 0 }
+
+	local late = newUnit("t15late", 148, false, "#ID[t15late]")
+	dress(late)
+	engine.pos[late] = { 0, 0, 0 }
+	local readyIds = late.ids
+	late.ids = {}          -- 先装"骨骼还没就绪"
+
+	avatar = av15
+	armors = { late }
+
+	local tunePath15 = (os.getenv("TEMP") or ".") .. "\\physbone-t15-neg-tune.txt"
+	do
+		local handle = io.open(tunePath15, "w")
+		handle:write("writeOff = 0\n")
+		handle:close()
+	end
+
+	local runtime = Runtime.install(S, {
+		compat = Compat,
+		maxMatchedPerOwner = 0,   -- 这些用例验的是匹配/公平性，不是"每玩家最多几件"的上限
+		carriers = { { rig = RIG, path = "fake.patch_1.gpu_resources" } },
+		logPath = (os.getenv("LOCALAPPDATA") or ".") .. "\\hd2pbx_runtime_t15neg.txt",
+		settleFrames = 2, snapshot = false, tunePath = tunePath15,
+		pollFrames = 1, validateFrames = 0,
+		maxArmorDistance = 10.0,
+		scoreUnitsPerFrame = 8,        -- 不设小额度的干扰，专测负结果过期
+		negativeRetryFrames = 5,
+	})
+	local probeRender = rawget(_G, "render")
+	for _ = 1, 12 do engine.time = engine.time + 1 / 120; probeRender() end
+	check("T15 骨骼没就绪时挂不上", runtime.sessions == nil,
+		string.format("会话=%s", tostring(runtime.sessions and #runtime.sessions)))
+
+	late.ids = readyIds             -- 骨骼就绪
+	for _ = 1, 60 do engine.time = engine.time + 1 / 120; probeRender() end
+	local entry = runtime.rigMatches and runtime.rigMatches[late]
+	local entryText = entry == nil and "nil"
+		or ("none=" .. tostring(entry.none) .. " retryAt=" .. tostring(entry.retryAt)
+			.. " tries=" .. tostring(entry.tries))
+	check("T15 负结果过期后能重新打分并挂上",
+		runtime.sessions ~= nil and #runtime.sessions == 1,
+		string.format("会话=%s frame=%s 缓存=%s",
+			tostring(runtime.sessions and #runtime.sessions), tostring(runtime.frame), entryText))
+	pcall(os.remove, tunePath15)
+
+	Runtime.uninstall()
+end
+
+-- ---------------------------------------------------------------------------
+print("T16 队首挡路的死锁：前面一堆永远不可能命中的件，后面的真护甲必须照样挂上")
+--
+-- 实机现场（2026-11-12，2.1.27，进任务后全员没物理）：
+--   跳过 47 个离它所属玩家超过 5.0 m 的护甲件（尸体/人台）
+--   [等待] 装填中：已打分 2 件、未轮到 15 件     ← 连着 8 分钟一模一样
+-- 原因：每拍只处理 N 件，重试门（30 帧）比两次尝试的间隔（等待期 60 帧）短，
+-- 于是队首那 N 件每拍都重新轮到、把额度吃干，后面的件**永远**轮不到。
+-- 进任务后玩家身边多出十几件枪/背包/尸体，队首正好全是这类件 ⇒ 一个都不挂。
+--
+-- 这个用例把那个时间形状钉住：poll 60 帧 > 重试门 30 帧，队首 12 件不可能命中，
+-- 真护甲排最后一件。
+do
+	rawset(_G, "render", function() end)
+
+	local av16 = newUnit("t16avatar", AVATAR_NODES, true, "#ID[t16avatar]")
+	do
+		local mgName = SUPPORT_MG
+		av16.ids[mgName] = true
+		av16.nodeOf[mgName] = 5
+	end
+	engine.pos[av16] = { 0, 0, 0 }
+
+	-- 12 件"永远不可能全命中"的件（枪/背包/尸体）：有节点、离玩家近、但一根骨都不含。
+	local junk = {}
+	for index = 1, 12 do
+		local unit = newUnit("t16junk" .. index, 120, false, "#ID[t16junk" .. index .. "]")
+		engine.pos[unit] = { 0.5 + index * 0.01, 0, 0 }
+		junk[index] = unit
+	end
+	-- 真护甲：离得最远 ⇒ 排序排到最后（这正是实机里"排在队尾"的形状）。
+	local real = newUnit("t16real", 148, false, "#ID[t16real]")
+	dress(real)
+	engine.pos[real] = { 4.0, 0, 0 }
+
+	avatar = av16
+	local unitsList = {}
+	for _, unit in ipairs(junk) do unitsList[#unitsList + 1] = unit end
+	unitsList[#unitsList + 1] = real
+	armors = unitsList
+
+	local tunePath16 = (os.getenv("TEMP") or ".") .. "\\physbone-t16-order-tune.txt"
+	do
+		local handle = io.open(tunePath16, "w")
+		handle:write("writeOff = 0\n")
+		handle:close()
+	end
+
+	-- 两组配置，验的是**两个独立**的修复点：
+	--   A：关掉预筛（probeUnitsPerFrame=0）⇒ 只剩"按最久没处理过的先来"这一条能救场，
+	--      证明顺序本身修好了（否则队首那 4 件每拍都重新轮到，13 件永远轮不完）；
+	--   B：开着预筛 ⇒ 不可能命中的件被挡在真打分之前（`bestScoredEver` 始终为 nil）。
+	local function runCase16(label, extra, frames)
+		local runtime = Runtime.install(S, {
+			compat = Compat,
+			maxMatchedPerOwner = 0,   -- 这些用例验的是匹配/公平性，不是"每玩家最多几件"的上限
+			carriers = { { rig = RIG, path = "fake.patch_1.gpu_resources" } },
+			logPath = (os.getenv("LOCALAPPDATA") or ".") .. "\\hd2pbx_runtime_t16order.txt",
+			settleFrames = 2, snapshot = false, tunePath = tunePath16,
+			pollFrames = 60,            -- ⚠️ 比重试门（30 帧）长：老实现必死在这里
+			waitSlowAfter = 200,        -- 与实机一致：等过 200 帧才减速
+			validateFrames = 0,
+			maxArmorDistance = 15.0,
+			negativeRetryFrames = 30,
+			scoreUnitsPerFrame = extra.scoreUnitsPerFrame or 2,
+			probeUnitsPerFrame = extra.probeUnitsPerFrame,
+		})
+		local probeRender = rawget(_G, "render")
+		for _ = 1, frames do engine.time = engine.time + 1 / 120; probeRender() end
+		check(label .. " 排在队尾的真护甲还是挂上了",
+			runtime.sessions ~= nil and #runtime.sessions == 1,
+			string.format("会话=%s frame=%s",
+				tostring(runtime.sessions and #runtime.sessions), tostring(runtime.frame)))
+		local best = runtime.bestScoredEver
+		Runtime.uninstall()
+		return best
+	end
+
+	-- A：只靠顺序（预筛关掉）。13 件 ÷ 4 件/拍 ⇒ 第 4 拍轮到真护甲。
+	local bestA = runCase16("T16-A 不靠预筛", { probeUnitsPerFrame = 0, scoreUnitsPerFrame = 4 }, 900)
+	check("T16-A 关掉预筛时不可能命中的件确实被真打分过（否则这条用例没咬到顺序）",
+		bestA ~= nil, bestA ~= nil and string.format("%d/%d", bestA.score, bestA.total) or "nil")
+
+	-- B：靠预筛（它把"能不能全命中"的判定降到每件 ~1 次调用）。
+	local bestB = runCase16("T16-B 开预筛", { probeUnitsPerFrame = 8 }, 400)
+	check("T16-B 不可能命中的件没有被真打分（预筛挡掉了）", bestB == nil,
+		bestB ~= nil and string.format("bestScoredEver=%d/%d", bestB.score, bestB.total) or "nil")
+	pcall(os.remove, tunePath16)
+
+	Runtime.uninstall()
+end
+
+-- ---------------------------------------------------------------------------
+print("T17 异常态普查：预筛一件都过不了时要落「候选是谁 + has_node/node 交叉验证」")
+--
+-- 这条保护的是**诊断本身**。2026-11-12 实机进任务后日志只有一句
+-- 「预筛 8 件（过 0）」，看不到候选是什么资源、也看不出 has_node 到底在说真话还是在骗人，
+-- 于是只能靠猜（那一次猜错了两版）。普查必须真的触发、而且只触发一次（不刷屏）。
+do
+	rawset(_G, "render", function() end)
+
+	local av17 = newUnit("t17avatar", AVATAR_NODES, true, "#ID[t17avatar]")
+	do
+		local mgName = SUPPORT_MG
+		av17.ids[mgName] = true
+		av17.nodeOf[mgName] = 5
+	end
+	engine.pos[av17] = { 0, 0, 0 }
+
+	-- 三件"有节点、一根骨都没有"的候选：预筛必然全挂 ⇒ 触发普查。
+	local junk = {}
+	for index = 1, 3 do
+		local unit = newUnit("t17junk" .. index, 171, false, "#ID[t17junk" .. index .. "]")
+		engine.pos[unit] = { 0.4 + index * 0.01, 0, 0 }
+		junk[index] = unit
+	end
+
+	avatar = av17
+	armors = junk
+
+	local logPath17 = (os.getenv("LOCALAPPDATA") or ".") .. "\\hd2pbx_runtime_t17census.txt"
+	os.remove(logPath17)
+	local runtime = Runtime.install(S, {
+		compat = Compat,
+		maxMatchedPerOwner = 0,   -- 这些用例验的是匹配/公平性，不是"每玩家最多几件"的上限
+		carriers = { { rig = RIG, path = "fake.patch_1.gpu_resources" } },
+		logPath = logPath17,
+		settleFrames = 2, snapshot = false, tunePath = "nonexistent-hd2pbx-tune.txt",
+		pollFrames = 20, validateFrames = 0,
+		maxArmorDistance = 15.0,
+		scoreUnitsPerFrame = 2,
+	})
+	local probeRender = rawget(_G, "render")
+	for _ = 1, 400 do engine.time = engine.time + 1 / 120; probeRender() end
+
+	local text = ""
+	do
+		local handle = io.open(logPath17, "r")
+		if handle ~= nil then text = handle:read("*a") or ""; handle:close() end
+	end
+	check("T17 异常态落普查行", text:find("[physbone][普查]", 1, true) ~= nil)
+	check("T17 普查给出候选件数与节点直方图",
+		text:find("近距 3 件", 1, true) ~= nil and text:find("171节×3", 1, true) ~= nil)
+	check("T17 普查做 has_node / node 交叉验证并带对照组",
+		text:find("对照组 has_node(名)=", 1, true) ~= nil and text:find(" node=", 1, true) ~= nil
+			and text:find("has_node(id)=", 1, true) ~= nil)
+	check("T17 普查给出该件的完整打分（差几根骨）", text:find("该件完整打分", 1, true) ~= nil)
+	local _, censusLines = text:gsub("%[physbone%]%[普查%]", "")
+	check("T17 普查只落一次（不刷屏）", censusLines == 3, string.format("%d 行", censusLines))
 
 	Runtime.uninstall()
 end
@@ -746,10 +1286,12 @@ do
 
 	local runtime = Runtime.install(S, {
 		compat = Compat,
+		maxMatchedPerOwner = 0,   -- 这些用例验的是匹配/公平性，不是"每玩家最多几件"的上限
 		carriers = { { rig = RIG, path = "fake.patch_1.gpu_resources" } },
 		logPath = (os.getenv("LOCALAPPDATA") or ".") .. "\\hd2pbx_runtime_t18names.txt",
 		settleFrames = 2, snapshot = false, tunePath = tunePath18,
 		pollFrames = 2, validateFrames = 0,
+		maxArmorDistance = 10.0,
 	})
 	local probeRender = rawget(_G, "render")
 	for _ = 1, 60 do engine.time = engine.time + 1 / 120; probeRender() end
@@ -788,6 +1330,7 @@ do
 	os.remove(logPath19)
 	local runtime = Runtime.install(S, {
 		compat = Compat,
+		maxMatchedPerOwner = 0,   -- 这些用例验的是匹配/公平性，不是"每玩家最多几件"的上限
 		carriers = { { rig = RIG, path = "fake.patch_1.gpu_resources" } },
 		logPath = logPath19,
 		settleFrames = 2, snapshot = false, tunePath = "nonexistent-hd2pbx-tune.txt",
@@ -829,16 +1372,12 @@ do
 end
 
 -- ---------------------------------------------------------------------------
-print("T20 同款件各自按 IAS 的 3 m 归属规则绑定；没有人台启发式（IAS 行为）")
+print("T20 去掉上限之后：未知阶段不猜测，玩家一动就收敛到「穿在身上」的那件")
 --
--- 旧版（用户 2026-11-12 定调的"行为判据"）：玩家不动就全挂，玩家一动就只留"跟着动"的那一件、放掉其余。
--- 那是我们自己的 identity_watch / 活动量判据，IAS 里没有。IAS 的归属规则（R = ias-1.6.4 runtime.lua 行号）：
---   · 每件护甲是一个 profile（一个 16 位 hash）；每帧对每件取根探针 {1,0} 到每个 avatar 的最小距离（R:6702-6725）；
---   · 最近 avatar 的 d2 < 9.0（3 m，R:6794）且次近比最近远出 0.20（R:1815、R:6813-6857）才绑定；
---   · 没有"静止的是人台"这类启发式：3 m 内的件就是这个 avatar 的件，不管它动不动；3 m 外的不绑。
--- 这里 20 件各是一个 profile（测试假引擎给每件分配不同的 16 位 hash）：第 1 件贴着玩家（0.2 m），
--- 其余摆在 1.5+0.12*index m。按 IAS 规则：距离 < 3.0 m 的绑（第 1 件 + 第 2..12 件 = 12 件），
--- 第 13..20 件（>= 3.06 m）不绑；玩家走到 x=3.0 之后，20 件全部落在 3 m 内，全部绑定——静止的件不会被放掉。
+-- 用户 2026-11-12 定调：件数闸/距离闸这些"限制"掩盖了真正的问题（目标错了）。
+-- 所以这里验的是**没有上限**时的行为：
+--   · 玩家不动 ⇒ 没有活动量数据 ⇒ 同款 20 件**全部挂上**（宁可短暂多驱动，也不靠猜测否决目标）；
+--   · 玩家走起来 ⇒ 只有穿在身上的那件跟着动 ⇒ 其余 19 件被 `identity_watch` 放掉。
 do
 	rawset(_G, "render", function() end)
 
@@ -876,27 +1415,16 @@ do
 		logPath = logPath20,
 		settleFrames = 2, snapshot = false, tunePath = tunePath20,
 		pollFrames = 2, validateFrames = 0,
+		maxArmorDistance = 10.0,
 	})
 	local probeRender = rawget(_G, "render")
 	for _ = 1, 80 do engine.time = engine.time + 1 / 120; probeRender() end
 
-	local function bound(units)
-		local count = 0
-		for _, unit in ipairs(units) do if runtime.sessionByUnit[unit] ~= nil then count = count + 1 end end
-		return count
-	end
-	local function boundSet(units)
-		local out = {}
-		for index, unit in ipairs(units) do if runtime.sessionByUnit[unit] ~= nil then out[#out + 1] = index end end
-		return table.concat(out, ",")
-	end
-
-	-- 玩家不动：3 m 内（< 3.0）的 12 件绑定，其余 8 件不绑（R:6794）。
+	-- 玩家不动 ⇒ 没有活动量数据 ⇒ **不猜测**：20 件同款全部先挂上（"去掉上限"的直接证据）。
 	local count = runtime.sessions and #runtime.sessions or 0
-	check("T20 3 m 内的 12 件全部绑定、3 m 外的 8 件不绑（R:6794）", count == 12 and bound(units20) == 12 and runtime.sessionByUnit[units20[13]] == nil,
-		string.format("会话=%d 绑定=%s", count, boundSet(units20)))
+	check("T20 未知阶段不猜测：同一款 20 件全部挂上", count == 20, string.format("会话=%d", count))
 
-	-- 玩家走起来：IAS 没有"静止就放掉"，静止的件只要还在 3 m 内就一直绑着；走到 x=3.0 后 20 件都在 3 m 内。
+	-- 玩家走起来：只有"穿在身上"的那件会跟着动 ⇒ 其余 19 件必须被放掉。
 	for step = 1, 60 do
 		local x = step * 0.05
 		engine.pos[av20] = { x, 0, 0 }
@@ -905,30 +1433,26 @@ do
 		probeRender()
 	end
 	local settled = runtime.sessions and #runtime.sessions or 0
-	check("T20 玩家走动后静止的件不会被放掉：20 件全在 3 m 内，全部绑定", settled == 20 and bound(units20) == 20,
-		string.format("会话=%d 绑定=%s", settled, boundSet(units20)))
-	check("T20 跟着玩家走的那一件始终绑定", runtime.sessionByUnit[units20[1]] ~= nil)
-
-	local logText20 = ""
-	do
-		local handle = io.open(logPath20, "r")
-		if handle ~= nil then logText20 = handle:read("*a") or ""; handle:close() end
-	end
-	check("T20 日志里没有「玩家动它不动」的放手（IAS 无此机制）", logText20:find("玩家动它不动", 1, true) == nil
-		and logText20:find("识别", 1, true) == nil)
+	local keptTags = {}
+	for _, session in ipairs(runtime.sessions or {}) do keptTags[#keptTags + 1] = tostring(session.unitTag) end
+	check("T20 玩家动过之后就只剩跟随的那件", settled == 1,
+		string.format("会话=%d %s", settled, table.concat(keptTags, ",")))
+	check("T20 留下的正是穿在身上那件", settled == 1 and runtime.sessions[1].unitTag == "#ID[t20dup1]",
+		table.concat(keptTags, ","))
 
 	pcall(os.remove, tunePath20)
 	Runtime.uninstall()
 end
 
 -- ---------------------------------------------------------------------------
-print("T21 贴身的同款件全部归这个玩家，IAS 没有「静止的是人台」判据（IAS 行为）")
+print("T21 身份判据（行为）：玩家动它才动的才是玩家那件，静止的人台要放掉")
 --
--- 旧版（用户 2026-11-12）：同资源的件骨头一样，只能靠行为分辨——玩家动它才动的是玩家那件，静止的人台要放掉。
--- 那是我们自己的 identity_watch / 活动量判据；IAS 没有：它只看根探针到最近 avatar 的距离（R:6702-6725），
--- 最近 avatar 的 d2 < 9.0（R:6794）且次近余量 > 0.20（R:1815）就绑，不看这件动不动。
--- 所以 4 件都贴着唯一的玩家（0.2 m）时，IAS 会把 4 件全部绑给他：包括"身上那件"和 3 个"人台"。
--- 这是 IAS 的真实行为（军械库里人台和玩家离得近时同样如此），这里按它断言，不再替它猜谁是人台。
+-- 用户 2026-11-12 点出的方向：算力不是瓶颈，"驱动了不该驱动的模型"才是。
+-- 而同资源的护甲件**骨头完全一样**，只能靠行为分辨：玩家身上那件挂在玩家骨架上，
+-- 玩家一动它就动；军械库里的人台是死的。这条用例把"跟随判据 + 事后纠正"钉死。
+--
+-- ⚠️ 这里故意关掉距离闸（attachMaxDistance=0），于是**只有行为判据能筛**：
+-- 4 件都贴着玩家、骨头都一样，区别只在"动不动"。
 do
 	rawset(_G, "render", function() end)
 
@@ -965,10 +1489,14 @@ do
 	end
 	local runtime = Runtime.install(S, {
 		compat = Compat,
+		maxMatchedPerOwner = 0,   -- 这些用例验的是匹配/公平性，不是"每玩家最多几件"的上限
 		carriers = { { rig = RIG, path = "fake.patch_1.gpu_resources" } },
 		logPath = logPath21,
 		settleFrames = 2, snapshot = false, tunePath = tunePath21,
 		pollFrames = 2, validateFrames = 0,
+		maxArmorDistance = 10.0,
+		attachMaxDistance = 0,      -- 关掉距离闸：只让行为判据说话
+		maxMatchedPerOwner = 8,
 	})
 	local probeRender = rawget(_G, "render")
 
@@ -987,14 +1515,12 @@ do
 		if handle ~= nil then text = handle:read("*a") or ""; handle:close() end
 	end
 	local count = runtime.sessions and #runtime.sessions or 0
-	local bound = 0
-	for _, unit in ipairs({ worn, stands[1], stands[2], stands[3] }) do
-		if runtime.sessionByUnit[unit] ~= nil then bound = bound + 1 end
-	end
-	check("T21 4 件贴身件全部绑给这个玩家（R:6702-6725、R:6794）", count == 4 and bound == 4, string.format("会话=%d 绑定=%d", count, bound))
-	check("T21 人台没有被「静止」放掉（IAS 无此判据）", runtime.sessionByUnit[stands[1]] ~= nil
-		and runtime.sessionByUnit[stands[2]] ~= nil and runtime.sessionByUnit[stands[3]] ~= nil)
-	check("T21 日志里没有「静止」识别（IAS 无此机制）", text:find("静止=", 1, true) == nil and text:find("玩家动它不动", 1, true) == nil)
+	local tags = {}
+	for _, session in ipairs(runtime.sessions or {}) do tags[#tags + 1] = tostring(session.unitTag) end
+	check("T21 最后只剩「跟着玩家动」的那一件", count == 1, string.format("会话=%d %s", count, table.concat(tags, ",")))
+	check("T21 留下的正是那件（不是人台）",
+		count == 1 and runtime.sessions[1].unitTag == "#ID[t21worn]", table.concat(tags, ","))
+	check("T21 识别日志里有「静止」的件", text:find("静止=[1-9]", 1) ~= nil)
 
 	pcall(os.remove, tunePath21)
 	Runtime.uninstall()
@@ -1069,6 +1595,7 @@ do
 		logPath = logPath22,
 		settleFrames = 2, snapshot = false, tunePath = "nonexistent-hd2pbx-tune.json",
 		pollFrames = 2, validateFrames = 0,
+		maxArmorDistance = 10.0,
 	})
 	local probeRender = rawget(_G, "render")
 	for _ = 1, 80 do engine.time = engine.time + 1 / 120; probeRender() end
@@ -1077,11 +1604,10 @@ do
 	for _, session in ipairs(runtime.sessions or {}) do
 		byTag[tostring(session.unitTag)] = #session.sessions
 	end
-	-- unitTag 现在就是资源 id（IAS 的 profile 哈希），不再是测试里随手起的名字。
-	check("T22 只带 5% 骨的小件也挂上了", byTag[small.resource] == 1,
-		string.format("链=%s", tostring(byTag[small.resource])))
-	check("T22 带 20% 骨的大件挂上了它自己那 4 条链", byTag[big.resource] == 4,
-		string.format("链=%s", tostring(byTag[big.resource])))
+	check("T22 只带 5% 骨的小件也挂上了", byTag["#ID[t22small]"] == 1,
+		string.format("链=%s", tostring(byTag["#ID[t22small]"])))
+	check("T22 带 20% 骨的大件挂上了它自己那 4 条链", byTag["#ID[t22big]"] == 4,
+		string.format("链=%s", tostring(byTag["#ID[t22big]"])))
 	local total = 0
 	for _, count in pairs(byTag) do total = total + count end
 	check("T22 合计链数远小于「两件都带全量」（5 ≪ 40）", total == 5, string.format("合计=%d", total))
@@ -1173,7 +1699,7 @@ do
 		carriers = { { rig = RIG23, path = "fake.patch_1.gpu_resources" } },
 		logPath = logPath23,
 		settleFrames = 2, snapshot = false, tunePath = tunePath23,
-		pollFrames = 2, validateFrames = 0,
+		pollFrames = 2, validateFrames = 0, maxArmorDistance = 10.0,
 	})
 	local probeRender = rawget(_G, "render")
 	-- 走起来：裙摆要有速度才肯推（静止时斜坡为 0）
@@ -1274,7 +1800,7 @@ do
 		carriers = { { rig = RIG, path = "fake.patch_1.gpu_resources" } },
 		logPath = logPath24,
 		settleFrames = 2, snapshot = false, tunePath = "nonexistent-hd2pbx-tune.txt",
-		pollFrames = 2, validateFrames = 0,
+		pollFrames = 2, validateFrames = 0, maxArmorDistance = 10.0,
 	})
 	local probeRender = rawget(_G, "render")
 	for _ = 1, 60 do engine.time = engine.time + 1 / 120; probeRender() end
@@ -1303,12 +1829,7 @@ do
 		local handle = io.open(logPath24, "r")
 		if handle ~= nil then text24 = handle:read("*a") or ""; handle:close() end
 	end
-	-- IAS 没有"指针判死"这个机制，也就没有对应的日志：句柄只来自本帧枚举（R:1417-1428），
-	-- 不在枚举里的 unit 本帧压根不会被碰到（上面的计数已证明），它的状态在下一次对账时直接丢弃。
-	check("T24 不再有「指针判死」日志（IAS 无此机制）", text24:find("指针判死", 1, true) == nil
-		and text24:find("活体列表", 1, true) == nil)
-	check("T24 消失的 unit 的状态被丢弃，没消失的那件仍在",
-		runtime.sessionByUnit[vanished] == nil and runtime.sessionByUnit[kept24] ~= nil)
+	check("T24 日志里写明「指针判死」这一类", text24:find("活体列表", 1, true) ~= nil)
 
 	Runtime.uninstall()
 end
@@ -1362,7 +1883,7 @@ do
 		carriers = { { rig = RIG, path = "fake.patch_1.gpu_resources" } },
 		logPath = logPath25,
 		settleFrames = 2, snapshot = false, tunePath = tunePath25,
-		pollFrames = 2, validateFrames = 0,
+		pollFrames = 2, validateFrames = 0, maxArmorDistance = 10.0,
 		identProbePath = probeState25,
 	})
 	local probeRender = rawget(_G, "render")
@@ -1396,7 +1917,7 @@ do
 		carriers = { { rig = RIG, path = "fake.patch_1.gpu_resources" } },
 		logPath = logPath25b,
 		settleFrames = 2, snapshot = false, tunePath = tunePath25,
-		pollFrames = 2, validateFrames = 0,
+		pollFrames = 2, validateFrames = 0, maxArmorDistance = 10.0,
 		identProbePath = probeState25,
 	})
 	local probeRenderB = rawget(_G, "render")
@@ -1449,7 +1970,7 @@ do
 		carriers = { { rig = RIG, path = "fake.patch_1.gpu_resources" } },
 		logPath = logPath26,
 		settleFrames = 2, snapshot = false, tunePath = "nonexistent-hd2pbx-tune.txt",
-		pollFrames = 2, validateFrames = 0,
+		pollFrames = 2, validateFrames = 0, maxArmorDistance = 10.0,
 	})
 	local probeRender = rawget(_G, "render")
 	for _ = 1, 40 do engine.time = engine.time + 1 / 120; probeRender() end
@@ -1476,69 +1997,12 @@ do
 		local handle = io.open(logPath26, "r")
 		if handle ~= nil then text26 = handle:read("*a") or ""; handle:close() end
 	end
-	-- IAS 没有 avatar 的指针判死：avatar 名单每帧来自 units_by_resource（R:1365），它消失了名单里就没有它；
-	-- 它那件护甲 3 m 内没有 avatar（R:6794）⇒ 本帧不绑定，状态丢弃。
-	check("T26 不再有「指针判死」日志（IAS 无此机制）", text26:find("avatar 已不在活体列表里", 1, true) == nil)
-	check("T26 avatar 消失后，它那件护甲不再绑定", runtime.sessionByUnit[wear] == nil)
-
-	-- 它重新出现：下一次枚举就重新绑上（IAS 每帧重算，不保存"属于谁"）。
-	engine.hidden[av26] = nil
-	for _ = 1, 3 do engine.time = engine.time + 1 / 120; probeRender() end
-	check("T26 avatar 重新出现后护甲重新绑定（每帧重算）", runtime.sessionByUnit[wear] ~= nil)
+	check("T26 日志里写明 avatar 被指针判死", text26:find("avatar 已不在活体列表里", 1, true) ~= nil)
 
 	engine.hidden[av26] = nil
 	S.World.debug_camera_pose = savedDebugPose
 	S.Matrix4x4.translation = savedTranslation
 	Runtime.uninstall()
-end
-
-print("T27 IAS 可选链在探测和挂载前过滤")
-do
-	local entries = { { "Back", 0 }, { "Bang", 1 }, { "Ahoge", 1 },
-		{ "ACC", 2 }, { "Breast", 3 }, { "Butt", 4 } }
-	local rig = { version = 2, bones = {} }
-	local names = {}
-	local wear = newUnit("t27wear", 171, false, "#ID[t27wear]")
-	wear.ids.head, wear.nodeOf.head = true, 9
-	for _, entry in ipairs(entries) do
-		local short, group = entry[1], entry[2]
-		local name = "ias_phys_fixture/" .. short
-		local index = #rig.bones + 1
-		names[name], names[S.Application.string_to_id32(name)] = group, group
-		wear.ids[name], wear.nodeOf[name] = true, 9 + index
-		rig.bones[index] = { name = name, index = index, parent = 0, parentName = "head",
-			pos = { 0, 0, 0 }, flags = 0x1021 + 256 * group, params = RIG.bones[1].params }
-	end
-	armors = { wear }
-	local hasNode = S.Unit.has_node
-	for _, case in ipairs({ { expected = 1 }, { mask = 4, expected = 2 }, { mask = 15, expected = 6 } }) do
-		local forbidden = 0
-		local function enabled(group)
-			return group == 0 or math.floor((case.mask or 0) / 2 ^ (group - 1)) % 2 == 1
-		end
-		S.Unit.has_node = function(unit, key)
-			local group = names[key]
-			if group ~= nil and not enabled(group) then forbidden = forbidden + 1 end
-			return hasNode(unit, key)
-		end
-		local runtime = Runtime.install(S, {
-			compat = Compat, iasPhysicsGroups = case.mask,
-			carriers = { { rig = rig, path = "ias.patch_1.gpu_resources" } },
-			log = false, snapshot = false, settleFrames = 1, pollFrames = 1,
-			tunePath = "nonexistent-hd2pbx-tune.txt",
-		})
-		for _ = 1, 20 do engine.time = engine.time + 1 / 60; render() end
-		local chains = runtime.sessions and runtime.sessions[1] and runtime.sessions[1].sessions or {}
-		local allowed = #chains == case.expected
-		for _, chain in ipairs(chains) do
-			local name = chain.chain[1].name
-			allowed = allowed and enabled(names[name]) and chain.nodes[1] == wear.nodeOf[name]
-		end
-		check("T27 mask=" .. tostring(case.mask) .. " 只挂启用组且不查询关闭组", allowed and forbidden == 0,
-			string.format("链=%d 禁用查询=%d", #chains, forbidden))
-		Runtime.uninstall()
-	end
-	S.Unit.has_node = hasNode
 end
 
 print("")

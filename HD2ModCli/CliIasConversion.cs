@@ -1,40 +1,37 @@
-using System.Globalization;
-using HD2GameItemAssets;
-using HD2SourceMigration.IasConversion;
+using HD2ModCore.Ias;
+using HD2ModCore.Infrastructure;
+using HD2ModManager.Services.Ias;
 
 namespace HD2ModCli;
 
 internal static class CliIasConversion
 {
-	internal static async Task<int> ConvertAsync(string sample, string? gameData, string? output)
+	internal static async Task<int> ConvertAsync(string sample, string? gameData, string? output,
+		string? targetArmor, string? targetHelmet, string? managerRoot, bool mergeHelmet)
 	{
 		if (string.IsNullOrWhiteSpace(gameData) || string.IsNullOrWhiteSpace(output))
 			throw new CliUserException("MissingIasPath", "ias convert <sample> 需要 --game-data <目录> 和 --output <目录>。");
-		var matchSlot = await CliIasSlotAuthority.ReadAsync(gameData).ConfigureAwait(false);
-		var result = await new IasDp8Converter(HashBone, matchSlot).ConvertAsync(sample, gameData, output).ConfigureAwait(false);
+		HD2SourceMigration.IasConversion.IasStandardResult result;
+		try
+		{
+			var root = managerRoot ?? Hd2ModCliLocator.ResolveManagerRoot();
+			var installed = IasComponentStore.GetInstalled(new StoragePaths(root));
+			if (installed is null)
+				throw new CliUserException("MissingIasComponents", "找不到已安装的官方 IAS 组件，无法读取材质默认模板。请先在管理器安装 IAS，并用 --manager-root <管理器目录> 指向该安装。");
+			result = await IasModuleService.ConvertStandardAsync(sample, gameData, output, installed, CancellationToken.None,
+				targetArmor, targetHelmet, mergeHelmet).ConfigureAwait(false);
+		}
+		catch (Exception error) when (error is IOException or InvalidDataException or System.Text.Json.JsonException
+			or InvalidOperationException or ArgumentException)
+		{
+			throw new CliUserException("IasConversionFailed", $"IAS 普通 Mod 转换失败：{error.Message}");
+		}
 		Console.WriteLine(result.ModDirectory);
-		Console.WriteLine($"本体 {result.BaseUnits} 个 Unit，四个选项合计 {result.OptionUnits} 个 Unit。");
+		Console.WriteLine($"本体 {result.BaseUnits} 个 Unit，选项合计 {result.OptionUnits} 个 Unit。");
 		foreach (var texture in result.ExternalTextures)
 			Console.WriteLine($"外部贴图 {texture.Id:x16} {texture.GameArchive ?? "未找到"}");
 		foreach (var material in result.ExternalMaterials)
 			Console.WriteLine($"外部父材质 {material.Id:x16} {material.GameArchive ?? "未找到"}");
-		var targets = result.ShoulderTargets;
-		Console.WriteLine(FormattableString.Invariant(
-			$"肩关节目标（锁骨局部，米）左 ({targets.Left.X:F4}, {targets.Left.Y:F4}, {targets.Left.Z:F4}) 右 ({targets.Right.X:F4}, {targets.Right.Y:F4}, {targets.Right.Z:F4})；左肩需挪动 {targets.LeftShift.Length * 100:F1} cm"));
-		foreach (var (name, local) in result.LegTargets)
-			Console.WriteLine(FormattableString.Invariant($"腿关节目标 {name} ({local.X:F4}, {local.Y:F4}, {local.Z:F4})"));
 		return 0;
 	}
-
-	internal static async Task<int> PreviewAsync(string mod, string? gameData, string? output)
-	{
-		if (string.IsNullOrWhiteSpace(gameData) || string.IsNullOrWhiteSpace(output))
-			throw new CliUserException("MissingIasPath", "ias preview <mod> 需要 --game-data <目录> 和 --output <目录>。");
-		await IasDp8Preview.ExportAsync(mod, gameData, output).ConfigureAwait(false);
-		return 0;
-	}
-
-	internal static uint HashBone(string name) =>
-		uint.TryParse(name, NumberStyles.None, CultureInfo.InvariantCulture, out var hash)
-			? hash : (uint)(StingrayHash.Murmur64A(name) >> 32);
 }

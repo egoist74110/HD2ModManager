@@ -28,58 +28,24 @@ TEST_DIR = ROOT / "HD2PhysBoneCompat" / "test"
 SRC_DIR = ROOT / "HD2PhysBoneCompat" / "src"
 
 # 需要外部产物/夹具的用例：它们在本仓里一直是红的，不算回归（见移植记录的"未验证"一节）。
-KNOWN_EXTERNAL = {"conform-stub-test.lua"}
+KNOWN_EXTERNAL = {"conform-stub-test.lua", "lift-probe-test.lua"}
 # 被别的用例 require 的库（不是用例本身）。`mp_harness.lua` 名字像库，其实是一整套
 # 多人局场景（它自己 os.exit），以前被错列在这里，于是那 24 项检查从来没跑过。
 LIBRARY_FILES: set[str] = set()
 # 这几个是驱动 runtime 而不是 compat 的。
-RUNTIME_TESTS = {"corpse-freeze-test.lua", "corpse-integration-test.lua", "ias-roster-test.lua", "runtime-harness-test.lua", "log-budget-test.lua", "lift-probe-test.lua", "mp_harness.lua", "snapshot-test.lua",
+RUNTIME_TESTS = {"runtime-harness-test.lua", "log-budget-test.lua", "mp_harness.lua", "snapshot-test.lua",
                  # 读的是**源码文本**的静态护栏，必须给它 runtime 路径（给 compat 会直接判失败）
                  "skirt-guard-test.lua",
                  # 调度器：驱动的是 runtime 的 redistribute/schedule_budget 钩子
                  "schedule-test.lua"}
 
 
-def find_lua() -> str | None:
+def find_lua() -> str:
     for name in ("luajit", "lua51", "lua5.1", "lua"):
         found = shutil.which(name)
         if found:
             return found
-    return None
-
-
-LUPA_RUNNER = r"""
-import sys
-from pathlib import Path
-from lupa import LuaRuntime
-
-test_path, mod_path = sys.argv[1], sys.argv[2]
-lua = LuaRuntime(unpack_returned_tuples=True)
-lua.execute('''
-math.atan2 = math.atan2 or math.atan
-unpack = unpack or table.unpack
-loadstring = loadstring or load
-local _next = next
-next = function(t, k)
-    if k ~= nil and rawget(t, k) == nil then return nil end
-    return _next(t, k)
-end
-''')
-arg_tbl = lua.table()
-arg_tbl[0] = test_path
-arg_tbl[1] = mod_path
-lua.globals().arg = arg_tbl
-code = [0]
-def py_exit(c=0):
-    code[0] = int(c or 0)
-    raise SystemExit(code[0])
-lua.globals().os.exit = py_exit
-try:
-    lua.execute(Path(test_path).read_text(encoding="utf-8"))
-except SystemExit:
-    pass
-sys.exit(code[0])
-"""
+    raise SystemExit("找不到 Lua 5.1 解释器（luajit / lua51 / lua5.1 / lua 任一即可）")
 
 
 def main() -> int:
@@ -89,40 +55,18 @@ def main() -> int:
     args = parser.parse_args()
 
     lua = find_lua()
-    use_lupa = False
-    if lua is None:
-        try:
-            import lupa  # noqa: F401
-            use_lupa = True
-        except ImportError:
-            raise SystemExit("找不到 Lua 5.1 解释器（luajit / lua51 / lua5.1 / lua），且未安装 Python lupa")
-
     tests = sorted(p for p in TEST_DIR.glob("*.lua") if p.name not in LIBRARY_FILES)
     if args.filter:
         tests = [p for p in tests if args.filter in p.name]
     if not tests:
         raise SystemExit("没有匹配的用例")
 
-    # 运行时默认把日志写到 %LOCALAPPDATA%\hd2physbone.log——那是**游戏**的日志。
-    # 用例不改 LOCALAPPDATA 就会往里混进假的「已安装 / 首次生效」行，实机排查时分不清（2026-11-22 踩过）。
-    import os
-    import tempfile
-    import uuid
-    # Windows applies a restrictive ACL to mkdir(0700). In a restricted worker the
-    # child can execute the Lua harness but cannot write or read logs under that ACL.
-    sandbox = Path(tempfile.gettempdir()) / f"hd2pbx-regress-{uuid.uuid4().hex}"
-    sandbox.mkdir()
-    env = dict(os.environ, LOCALAPPDATA=str(sandbox), TEMP=str(sandbox), TMP=str(sandbox))
-
     rows: list[tuple[str, str, int, int, int]] = []
     for test in tests:
         module = SRC_DIR / ("physbone_runtime.lua" if test.name in RUNTIME_TESTS else "physbone_compat.lua")
-        cmd = ([sys.executable, "-c", LUPA_RUNNER, str(test), str(module.relative_to(ROOT))]
-               if use_lupa else [lua, str(test), str(module.relative_to(ROOT))])
         result = subprocess.run(
-            cmd,
+            [lua, str(test), str(module.relative_to(ROOT))],
             cwd=ROOT,
-            env=env,
             capture_output=True,
             text=True,
             encoding="utf-8",
@@ -142,7 +86,7 @@ def main() -> int:
         rows.append((test.name, status, passed, failed, result.returncode))
         if args.verbose or status == "FAIL":
             print(f"--- {test.name} ({status}) ---")
-            print(out.strip()[-30000:])
+            print(out.strip()[-3000:])
 
     width = max(len(row[0]) for row in rows)
     for name, status, passed, failed, code in rows:

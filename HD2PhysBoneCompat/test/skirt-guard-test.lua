@@ -89,22 +89,29 @@ if apply ~= nil then
 	check("选中判据不再写死 hips", not only_hips,
 		only_hips and "skirt_apply 里还写着 find(\"hips\")" or "")
 	check("走 skirt_eligible", apply:find("skirt_eligible(", 1, true) ~= nil)
-	-- E12f-C3：判活只查本帧枚举（零引擎调用），不再逐会话 Unit.alive
-	check("skirt_apply 判活走 Roster.isLive（本帧枚举）", apply:find("Roster.isLive(runtime, session.unit)", 1, true) ~= nil)
-	check("skirt_apply 不再调 unit_alive", apply:find("unit_alive", 1, true) == nil)
 end
 
--- ⑤ 身份探针里的 API 保持在探针内。E7 的两个已知签名仅允许用于挂接及原骨链恢复。
+-- ⑤ **未知签名的引擎 API 不许出现在产品路径上**
 --
 -- 2026-11-12 实机：我为了探"身份判据"，在默认路径上成组调了
 -- Unit.bones / scene_graph_parent / scene_graph_link / is_a / is_child，
 -- 进舰船几秒后游戏崩了（0xc0000005，参数 0x0 0x0）。`pcall` 拦不住原生 AV。
 -- 所以这些调用只允许待在**显式开关控制、默认关闭**的探针函数里：
+--   · `probe_identity_api`（开关 `probeIdentity`，默认关）
 --   · `probe_identity_link`（开关 `probeIdentityLink`，默认关）
--- （E12e：另一个探针 `probe_identity_api`（开关 `probeIdentity`）只挂在已按 IAS 删除的 tryAttach 上，随之删除。）
-local PROBE_APIS = { "%.bones%(", "%.scene_graph_parent%(", "%.scene_graph_link%(",
-	"%.is_child%(", "%.is_a%(" }
-local PROBE_HOMES = { "probe_identity_link" }
+local function count_plain(text, needle)
+	local count, at = 0, 1
+	while true do
+		local found = text:find(needle, at, true)
+		if found == nil then return count end
+		count = count + 1
+		at = found + #needle
+	end
+end
+
+local PROBE_APIS = { "Unit.bones(", "Unit.scene_graph_parent(", "Unit.scene_graph_link(",
+	"Unit.is_child(", "Unit.is_a(" }
+local PROBE_HOMES = { "probe_identity_api", "probe_identity_link" }
 local homeBodies = {}
 for _, name in ipairs(PROBE_HOMES) do
 	local body = body_of(name)
@@ -112,36 +119,27 @@ for _, name in ipairs(PROBE_HOMES) do
 	homeBodies[name] = body ~= nil and strip_comments(body) or ""
 end
 local wholeStripped = strip_comments(source)
-local function link_body(name)
-	return assert(wholeStripped:match("function IndependentLink%." .. name .. "%(.-\nend"))
-end
--- E12f-C2：尸体副本（CorpseFreeze）照 IAS 用 scene_graph_parent / scene_graph_link 压平副本的节点树（IAS R:5662-5686）。
--- 只作用于**我们自己 spawn 出来的副本**，从不碰原件；整段默认关（corpseFreeze 开关，默认 0）。
-local freezeBody = wholeStripped:match("local CorpseFreeze = Roster%.freeze.-local function corpse_frame") or ""
-check("找得到尸体副本段（危险 API 的另一处合法容身处）", #freezeBody > 1000)
-local linkBodies = {
-	["%.scene_graph_parent%("] = link_body("attach") .. link_body("restore") .. freezeBody,
-	["%.scene_graph_link%("] = link_body("restore") .. freezeBody,
-}
 for _, api in ipairs(PROBE_APIS) do
-	local _, total = wholeStripped:gsub(api, "")
+	local total = count_plain(wholeStripped, api)
 	local inside = 0
 	for _, name in ipairs(PROBE_HOMES) do
-		local _, n = homeBodies[name]:gsub(api, "")
-		inside = inside + n
+		inside = inside + count_plain(homeBodies[name], api)
 	end
-	local _, link = (linkBodies[api] or ""):gsub(api, "")
-	check(string.format("%s 只在允许入口（%d/%d）", api, inside + link, total), total == inside + link)
+	check(string.format("%s 只在探针里（%d/%d）", api, inside, total), total == inside)
 end
-check("身份链探针有开关（probeIdentityLink）",
-	wholeStripped:find("probeIdentityLink", 1, true) ~= nil)
+check("两组探针都有开关（probeIdentity / probeIdentityLink）",
+	wholeStripped:find("probeIdentity", 1, true) ~= nil
+		and wholeStripped:find("probeIdentityLink", 1, true) ~= nil)
 check("身份链探针默认关闭（只在开关非 0 时才调）",
 	wholeStripped:find("identSwitch ~= nil and identSwitch ~= 0", 1, true) ~= nil)
+check("身份 API 探针默认关闭（只在开关非 0 时才调）",
+	wholeStripped:find("probeSwitch ~= nil and probeSwitch ~= 0", 1, true) ~= nil
+		and wholeStripped:find("probeSwitch == nil or", 1, true) == nil)
 -- 2.1.44：心跳不能拿 driveFrames 取模 —— 补挂每次成功都把它归零，挂满之后心跳就永远打不出来。
 check("心跳用独立计数 beatFrames（不被补挂归零）",
 	wholeStripped:find("(runtime.beatFrames % heartbeat) == 0", 1, true) ~= nil
 		and wholeStripped:find("(runtime.driveFrames % heartbeat)", 1, true) == nil)
-check("beatFrames 只在安装时归零",
+check("beatFrames 只在安装时归零（tryAttach 不碰它）",
 	select(2, wholeStripped:gsub("beatFrames = 0", "")) == 1)
 -- 调参文件里 0 一律表示关（devLog / skirt 都是这个约定）。心跳不能例外：
 -- `math.max(1, …)` 会把 0 变成"每帧一条"，一场长局刷几万行，正好烧光心跳要省的预算。

@@ -41,6 +41,7 @@ public sealed record ModCompileOutcome(
 
 	/// <summary>当用户在 128 MiB 超限弹窗里选择一键关闭多余组件时，返回已同步持久化到 <c>wardrobe.json</c> 的新 <c>disabled</c> 集合。</summary>
 	public IReadOnlyDictionary<string, IReadOnlyCollection<int>>? UpdatedDisabledSections { get; init; }
+
 }
 
 /// <summary>
@@ -186,7 +187,7 @@ public static class ModCompileService
 
 	/// <inheritdoc cref="WriteMergedCustomModel(string, List{string})"/>
 	/// <param name="applied">这次真的写进生效层了吗（没写进去时界面不许说"已开启"）。</param>
-	internal static string? WriteMergedCustomModel(string modDirectory, List<string> notes, out bool applied)
+	internal static string? WriteMergedCustomModel(string modDirectory, List<string> notes, out bool applied, string? overwriteDirectory = null)
 	{
 		ArgumentNullException.ThrowIfNull(notes);
 		applied = false;
@@ -227,7 +228,7 @@ public static class ModCompileService
 		head["pieceType"] = layer;
 		head["movedFrom"] = $"slot{HeadSlot}/layer0";
 
-		var overwrite = ModNodePayloadLayout.GetOverwriteDirectory(modDirectory);
+		var overwrite = overwriteDirectory ?? ModNodePayloadLayout.GetOverwriteDirectory(modDirectory);
 		Directory.CreateDirectory(overwrite);
 		var destination = Path.Combine(overwrite, VpkCustomModelFile.FileName);
 		// 库里的产物是只读的：不清属性写不进去，异常会被上层吞成"没合并"。

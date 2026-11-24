@@ -52,6 +52,7 @@ namespace HD2ModManager.Services
         RebuildVpk,
         InformationCenter,
         Other,
+        IasOperation,
     }
 
     public sealed class BackgroundTaskItem : INotifyPropertyChanged
@@ -69,6 +70,7 @@ namespace HD2ModManager.Services
         private int _attentionViewCount;
         private readonly CancellationTokenSource _cancellation = new();
         private readonly bool _canCancel;
+        private string? _cancellationReason;
 
         public string Id { get; } = Guid.NewGuid().ToString("N");
         public BackgroundTaskKind Kind { get; }
@@ -108,7 +110,7 @@ namespace HD2ModManager.Services
         public int AttentionViewCount { get => _attentionViewCount; private set => SetField(ref _attentionViewCount, value); }
         public bool IsActive => Status is BackgroundTaskStatus.Queued or BackgroundTaskStatus.Running;
         public CancellationToken CancellationToken => _cancellation.Token;
-        public bool CanCancel => _canCancel && !IsInformationCenter && IsActive;
+        public bool CanCancel => _canCancel && !IsInformationCenter && IsActive && !_cancellation.IsCancellationRequested;
         public bool CanRetry => !IsInformationCenter && Retry is not null && !IsActive;
         public bool IsInformationCenter { get; }
         public BackgroundTaskPresentation Presentation { get; }
@@ -134,6 +136,7 @@ namespace HD2ModManager.Services
             BackgroundTaskKind.Deployment => "⇄",
             BackgroundTaskKind.DeactivateProfile => "■",
             BackgroundTaskKind.RebuildVpk => "↻",
+            BackgroundTaskKind.IasOperation => "⇄",
             _ => "•",
         };
 
@@ -210,14 +213,14 @@ namespace HD2ModManager.Services
             OnPropertyChanged(nameof(HasReport));
         }
 
-        public void MarkCompleted()
+        public void MarkCompleted(string stage = "已完成")
         {
             if (!IsActive) return;
             RecordDiagnosticTransition(DiagnosticResult.Completed);
             Status = BackgroundTaskStatus.Completed;
             FinishedAt = DateTime.UtcNow;
             Progress = 1d;
-            Stage = "已完成";
+            Stage = stage;
             IsUnread = IsForeground;
             OnPropertyChanged(nameof(IsActive));
             OnPropertyChanged(nameof(StatusText));
@@ -243,13 +246,13 @@ namespace HD2ModManager.Services
             OnPropertyChanged(nameof(CanRetry));
         }
 
-        public void MarkCanceled()
+        public void MarkCanceled(string stage = "已取消")
         {
             if (!IsActive) return;
             RecordDiagnosticTransition(DiagnosticResult.Canceled);
-            Status = BackgroundTaskStatus.Canceled;
             FinishedAt = DateTime.UtcNow;
-            Stage = "已取消";
+            Stage = _cancellationReason ?? stage;
+            Status = BackgroundTaskStatus.Canceled;
             IsUnread = IsForeground;
             OnPropertyChanged(nameof(IsActive));
             OnPropertyChanged(nameof(StatusText));
@@ -271,9 +274,10 @@ namespace HD2ModManager.Services
                 durationMs: result != DiagnosticResult.Started && StartedAt is { } start ? (long)(DateTime.UtcNow - start).TotalMilliseconds : null);
         }
 
-        public void Cancel()
+        public void Cancel(string? reason = null)
         {
             if (!IsActive) return;
+            _cancellationReason = reason ?? _cancellationReason;
             _cancellation.Cancel();
             if (Status == BackgroundTaskStatus.Queued)
             {
@@ -281,7 +285,8 @@ namespace HD2ModManager.Services
             }
             else
             {
-                UpdateStage("正在取消");
+                UpdateStage(_cancellationReason ?? "正在取消");
+                OnPropertyChanged(nameof(CanCancel));
             }
         }
 

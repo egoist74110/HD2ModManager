@@ -589,6 +589,12 @@ public static class VpkRebuildService
 			? 0
 			: FindSourceVpks(modDirectory).Count;
 
+	/// <summary>Mod 根上的来源 VPK 路径（只读枚举；与重构建用的是同一口径）。</summary>
+	public static IReadOnlyList<string> FindSourceVpkPaths(string modDirectory)
+		=> string.IsNullOrWhiteSpace(modDirectory) || !Directory.Exists(modDirectory)
+			? []
+			: FindSourceVpks(modDirectory);
+
 	private static List<string> FindSourceVpks(string modDirectory)
 		=> Directory.EnumerateFiles(modDirectory, "*.vpk", SearchOption.TopDirectoryOnly)
 			.Where(path => !IsVolume(path))

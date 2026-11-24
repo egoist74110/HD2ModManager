@@ -9,6 +9,11 @@
 
   <ItemGroup>
     <ProjectReference Include="..\HD2ModCore\HD2ModCore.csproj" />
+    <Compile Include="..\HD2ModManager\Services\Ias\IIasModuleService.cs" Link="Ias\IIasModuleService.cs" />
+    <Compile Include="..\HD2ModManager\Services\Ias\IasEquipmentCatalog.cs" Link="Ias\IasEquipmentCatalog.cs" />
+    <Compile Include="..\HD2ModManager\Services\Ias\IasLibraryCandidateReader.cs" Link="Ias\IasLibraryCandidateReader.cs" />
+    <Compile Include="..\HD2ModManager\Services\Ias\IasModuleService.cs" Link="Ias\IasModuleService.cs" />
+    <Compile Include="..\HD2ModManager\Services\GameProcessProbe.cs" Link="Ias\GameProcessProbe.cs" />
     <!-- 源模型（求生之路 2 / Source 引擎）只读解析层：纯文件格式，不认识 HD2。 -->
     <ProjectReference Include="..\HD2SourceModel\HD2SourceModel.csproj" />
     <!-- 源模型 → HD2 骨架的重定向层：唯一同时认识两侧的地方。 -->
@@ -82,4 +87,5 @@
     </ItemGroup>
   </Target>
 
+  <Import Project="..\HD2IasWorker\IasWorkerArtifacts.targets" />
 </Project>

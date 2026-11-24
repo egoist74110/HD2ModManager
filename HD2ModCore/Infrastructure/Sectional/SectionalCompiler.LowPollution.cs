@@ -23,6 +23,7 @@ public static partial class SectionalCompiler
 
 	private static async ValueTask<LowPollutionOutcome> CompileLowPollutionOwnModelAsync(
 		string modDirectory,
+		string prepared,
 		VpkHostContext context,
 		string payload,
 		string sourcePatch,
@@ -142,8 +143,7 @@ public static partial class SectionalCompiler
 					.BakeAsync(staged, documented, EmptySections, cancellationToken)
 					.ConfigureAwait(false);
 
-				var materialized = OverwriteMaterializer.Materialize(
-					modDirectory, selection, staged, ManagedOverwriteMarkers.VpkRekey);
+				var materialized = OverwriteMaterializer.StageOwnModel(modDirectory, selection, staged, prepared);
 				if (!materialized.Succeeded)
 					return new LowPollutionOutcome(SectionalCompileResult.Failure(materialized.Error ?? "物化生效层失败。"), null);
 
@@ -154,10 +154,10 @@ public static partial class SectionalCompiler
 				var structure = bodyArms.Count == 0
 					? documented
 					: documented with { Units = [.. documented.Units.Where(unit => !bodyArms.Contains(unit.FileId))] };
-				await WriteStructureAsync(modDirectory, structure, components: null, cancellationToken).ConfigureAwait(false);
-				WriteLowPollutionRegistry(modDirectory, payload, plan, warnings);
+				await WriteStructureToDirectoryAsync(prepared, structure, components: null, cancellationToken).ConfigureAwait(false);
+				WriteLowPollutionRegistry(prepared, payload, plan, warnings);
 				WriteLowPollutionLayout(
-					modDirectory,
+					prepared,
 					plan,
 					LowPollutionFreshness.Fingerprint(payload, effectiveDisabled, headMergeIntoBody),
 					[.. npcVariants.Select(item => (item.Role, item.Unit))]);
@@ -255,7 +255,7 @@ public static partial class SectionalCompiler
 	/// 素体注册表：只留压缩 unit 的注册件，被吸收部位的注册件剪掉（与 <c>CustomModelSectionalCompaction</c> 同口径，不留悬空引用）。
 	/// 写进生效层，<c>sectional/</c> 那份是权威留档、一个字节都不动。
 	/// </summary>
-	private static void WriteLowPollutionRegistry(string modDirectory, string payload, SectionalCompressionPlan plan, List<string> warnings)
+	private static void WriteLowPollutionRegistry(string overwrite, string payload, SectionalCompressionPlan plan, List<string> warnings)
 	{
 		var source = Path.Combine(payload, VpkCustomModelFile.FileName);
 		if (!File.Exists(source))
@@ -308,7 +308,7 @@ public static partial class SectionalCompiler
 		}
 
 		document["pieces"] = kept;
-		var destination = Path.Combine(ModNodePayloadLayout.GetOverwriteDirectory(modDirectory), VpkCustomModelFile.FileName);
+		var destination = Path.Combine(overwrite, VpkCustomModelFile.FileName);
 		VpkPayloadSwap.ClearReadOnlyForWrite(destination);
 		File.WriteAllText(destination, document.ToJsonString(new System.Text.Json.JsonSerializerOptions { WriteIndented = true }));
 	}
@@ -331,9 +331,9 @@ public static partial class SectionalCompiler
 	};
 
 	private static void WriteLowPollutionLayout(
-		string modDirectory, SectionalCompressionPlan plan, string fingerprint, IReadOnlyList<(string Role, string Unit)>? extraUnits = null)
+		string overwrite, SectionalCompressionPlan plan, string fingerprint, IReadOnlyList<(string Role, string Unit)>? extraUnits = null)
 	{
-		var destination = Path.Combine(ModNodePayloadLayout.GetOverwriteDirectory(modDirectory), LowPollutionLayoutFile.FileName);
+		var destination = Path.Combine(overwrite, LowPollutionLayoutFile.FileName);
 		VpkPayloadSwap.ClearReadOnlyForWrite(destination);
 		File.WriteAllText(destination, LowPollutionLayoutFile.Serialize(plan, fingerprint, extraUnits));
 	}

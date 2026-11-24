@@ -1,0 +1,23 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0-windows10.0.19041.0</TargetFramework>
+    <WindowsSdkPackageVersion>10.0.19041.57</WindowsSdkPackageVersion>
+    <PlatformTarget>x64</PlatformTarget>
+    <RollForward>Major</RollForward>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageDownload Include="Microsoft.WindowsAppSDK.Foundation" Version="[1.8.251104000]" />
+    <Compile Include="..\HD2ModCore\Ias\IasWorkerProtocol.cs" Link="IasWorkerProtocol.cs" />
+    <Content Include="$(NuGetPackageRoot)\microsoft.windowsappsdk.foundation\1.8.251104000\runtimes-framework\win-x64\native\Microsoft.WindowsAppRuntime.dll"
+      Link="Microsoft.WindowsAppRuntime.dll" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+    <Content Include="$(NuGetPackageRoot)\microsoft.windowsappsdk.foundation\1.8.251104000\license.txt"
+      Link="Microsoft.WindowsAppSDK.LICENSE.txt" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+  </ItemGroup>
+  <Target Name="GetIasWorkerArtifacts" Returns="@(IasWorkerArtifact)">
+    <ItemGroup>
+      <IasWorkerArtifact Include="$(TargetDir)*.dll;$(TargetDir)$(AssemblyName).exe;$(TargetDir)$(AssemblyName).runtimeconfig.json;$(TargetDir)$(AssemblyName).deps.json;$(TargetDir)Microsoft.WindowsAppSDK.LICENSE.txt" />
+    </ItemGroup>
+  </Target>
+</Project>
+

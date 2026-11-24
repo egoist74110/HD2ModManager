@@ -1,5 +1,6 @@
 using HD2ModCore.Application;
 using HD2ModCore.Domain;
+using HD2ModCore.Infrastructure.Sectional;
 
 namespace HD2ModCore.Infrastructure;
 
@@ -15,6 +16,7 @@ public sealed class ProfileApplyService : IProfileApplyService
 	private readonly ILuaDeploymentService _luaDeploymentService;
 	private readonly StoragePaths? _paths;
 	private readonly RuntimeArmorRegistryService? _armorRegistry;
+	private readonly Func<bool>? _effectiveLowPollutionMode;
 
 	public ProfileApplyService(
 		IModInformationCenter informationCenter,
@@ -24,10 +26,12 @@ public sealed class ProfileApplyService : IProfileApplyService
 		StoragePaths? paths = null,
 		OptionActivationStore? optionActivations = null,
 		ILuaDeploymentService? luaDeploymentService = null,
-		RuntimeArmorRegistryService? armorRegistry = null)
+		RuntimeArmorRegistryService? armorRegistry = null,
+		Func<bool>? effectiveLowPollutionMode = null)
 	{
 		_paths = paths;
 		_armorRegistry = armorRegistry;
+		_effectiveLowPollutionMode = effectiveLowPollutionMode;
 		_informationCenter = informationCenter ?? throw new ArgumentNullException(nameof(informationCenter));
 		_planner = planner ?? throw new ArgumentNullException(nameof(planner));
 		_executor = executor ?? throw new ArgumentNullException(nameof(executor));
@@ -73,6 +77,8 @@ public sealed class ProfileApplyService : IProfileApplyService
 		// 映射优先（规划 §12.3）：声明目标已被映射页映射的 Mod，本次部署不部署它的 patch。
 		var coverageIssues = new List<CoreIssue>();
 		effectiveProfile = await ApplyMappingPriorityAsync(effectiveProfile, snapshot, modsRootDirectory, coverageIssues, cancellationToken).ConfigureAwait(false);
+		if (_effectiveLowPollutionMode?.Invoke() == false)
+			effectiveProfile = ExcludeCompressedModels(effectiveProfile, snapshot, modsRootDirectory, coverageIssues);
 		var activeNodeIds = effectiveProfile.Entries.Select(entry => entry.NodeId).ToHashSet();
 		var index = new PatchFileIndex(
 			allFacts.BuiltUtc,
@@ -111,6 +117,24 @@ public sealed class ProfileApplyService : IProfileApplyService
 			UseFastLinkValidation = capability.Method.Value is DeploymentMethod.HardLink or DeploymentMethod.SymbolicLink,
 		};
 		return await _executor.ExecuteAsync(plan, cancellationToken).ConfigureAwait(false);
+	}
+
+	internal static Profile ExcludeCompressedModels(Profile profile, LibrarySnapshot snapshot, string modsRootDirectory, List<CoreIssue> issues)
+	{
+		var entries = new List<ProfileEntry>();
+		foreach (var entry in profile.Entries)
+		{
+			if (snapshot.Nodes.TryGetValue(entry.NodeId, out var node)
+				&& LowPollutionArtifactCache.HasCompressedOutput(ModNodePayloadLayout.GetOverwriteDirectory(Path.Combine(modsRootDirectory, node.RelativePath))))
+			{
+				// 设置页可先触发部署。压缩生效层还没恢复时跳过整组，由部署器撤下旧补丁。
+				issues.Add(new CoreIssue(CoreIssueSeverity.Warning, "CompressedModelWhileLowPollutionDisabled",
+					$"「{node.Metadata.Name}」仍为压缩产物，本次部署已跳过。请在护甲映射页应用以恢复普通产物。", NodeId: node.Id));
+				continue;
+			}
+			entries.Add(entry);
+		}
+		return profile with { Entries = entries };
 	}
 
 	/// <summary>

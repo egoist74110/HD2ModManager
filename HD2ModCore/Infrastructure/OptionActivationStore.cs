@@ -116,6 +116,19 @@ public sealed class OptionActivationStore
 		}
 	}
 
+	// 外部事务恢复了原始文件后，只把磁盘状态同步回内存，保留文件原样。
+	public async Task ReloadAsync(CancellationToken cancellationToken = default)
+	{
+		var snapshot = await TryLoadReadOnlySnapshotAsync(_path, cancellationToken).ConfigureAwait(false);
+		lock (_gate)
+		{
+			_states = snapshot.Options.ToDictionary(
+				option => option.Key,
+				option => option.Value.ToDictionary(host => host.Key, host => host.Value, StringComparer.OrdinalIgnoreCase),
+				StringComparer.OrdinalIgnoreCase);
+		}
+	}
+
 	public async Task SetEnabledHostsAsync(string optionId, IEnumerable<string> hosts, CancellationToken cancellationToken = default)
 	{
 		var normalized = hosts.Where(value => !string.IsNullOrWhiteSpace(value)).ToHashSet(StringComparer.OrdinalIgnoreCase);

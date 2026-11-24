@@ -50,6 +50,7 @@ namespace HD2ModManager.Services
         public bool? BuiltInLuaEnabled { get; set; }
         // 物理骨骼模式（PhysicsMode 的整数值）。null 表示尚未设置 ⇒ 默认关闭。
         public int? PhysicsMode { get; set; }
+            public Ias.IasVpkTargets? IasVpkTargets { get; set; }
             public string? DefaultExportPath { get; set; }
             // VPK 构建时的角色头部缩放比例。null = 从没设过 ⇒ 用 DefaultHeadScale。
             //
@@ -61,13 +62,15 @@ namespace HD2ModManager.Services
             public bool? LegRefit { get; set; }
             // 低污染模式（P6）：VPK 模型 Mod 编译到自身素体时压缩成 2/3 个 unit。默认关；切换后需一键重构建才生效。
             public bool LowPollutionMode { get; set; } = false;
-            // 手臂姿态修正（实验）：运行时在无武器下垂时内收、持枪时 2-bone IK 保持手腕，默认关闭。
-            public bool ArmPoseEnabled { get; set; } = false;
-            public int IasPhysicsGroups { get; set; }
         }
 
         public const string DefaultAssetMetadataRepository = GitHubAssetMetadataSyncService.DefaultRepositoryRawBaseUrl;
         public const string DefaultExportPath = "Output";
+
+        internal static Ias.IasVpkTargets? GetIasVpkTargets() => LoadAll()?.IasVpkTargets;
+
+        internal static void SetIasVpkTargets(Ias.IasVpkTargets targets) =>
+            Update(model => model.IasVpkTargets = targets);
 
         /// <summary>
         /// 头部缩放比例的默认值 = <b>现行比例</b> <c>8/7 ≈ 1.142857</c>。
@@ -439,8 +442,6 @@ namespace HD2ModManager.Services
             GetBuiltInLuaEnabled();
             GetArmorMappingMode();
             GetPhysicsMode();
-            GetArmPoseEnabled();
-            LuaDeploymentService.IasPhysicsGroups = LoadAll()?.IasPhysicsGroups ?? 0;
             // 求解器也必须在启动时同步一次。
             // 教训（2026-11-01）：物理那几项曾经只读静态字段、启动时漏同步一项，
             // 结果"配了也不生效"，而日志里什么线索都没有。
@@ -475,48 +476,6 @@ namespace HD2ModManager.Services
             try
             {
                 Update(model => model.PhysicsMode = (int)mode);
-                return true;
-            }
-            catch { return false; }
-        }
-
-        public static bool GetArmPoseEnabled()
-        {
-            bool enabled;
-            try
-            {
-                enabled = LoadAll()?.ArmPoseEnabled ?? false;
-            }
-            catch
-            {
-                enabled = false;
-            }
-            LuaDeploymentService.ArmPoseEnabled = enabled;
-            return enabled;
-        }
-
-        public static bool SetArmPoseEnabled(bool enabled)
-        {
-            LuaDeploymentService.ArmPoseEnabled = enabled;
-            try
-            {
-                Update(model => model.ArmPoseEnabled = enabled);
-                return true;
-            }
-            catch { return false; }
-        }
-
-        public static bool SetIasPhysicsGroup(int bit, bool enabled)
-        {
-            try
-            {
-                var next = 0;
-                Update(model =>
-                {
-                    next = enabled ? model.IasPhysicsGroups | bit : model.IasPhysicsGroups & ~bit;
-                    model.IasPhysicsGroups = next;
-                });
-                LuaDeploymentService.IasPhysicsGroups = next;
                 return true;
             }
             catch { return false; }

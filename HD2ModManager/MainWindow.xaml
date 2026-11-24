@@ -81,6 +81,9 @@
         <DataTemplate DataType="{x:Type localVM:ArmorRegistryPageViewModel}">
             <views:ArmorRegistryPageView/>
         </DataTemplate>
+        <DataTemplate DataType="{x:Type localVM:IasPageViewModel}">
+            <views:IasPageView/>
+        </DataTemplate>
 
         <!--
             顶栏 4 个导航按钮的外观已移入 Controls/Nav/NavBarHost.xaml。

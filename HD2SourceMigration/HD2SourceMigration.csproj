@@ -48,6 +48,13 @@
     <EmbeddedResource Include="Retarget\body_pose_profile.json" />
   </ItemGroup>
 
+  <ItemGroup>
+    <Content Include="IasPackaging\Scripts\**\*" Link="tools\ias\%(RecursiveDir)%(Filename)%(Extension)"
+             CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" ExcludeFromSingleFile="true" />
+    <Content Include="..\HD2ModManager\Resources\AssetMetadata\bonehash.txt" Link="tools\ias\bonehash.txt"
+             CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" ExcludeFromSingleFile="true" />
+  </ItemGroup>
+
   <!--
     HD2 的材质模板（10 份 .material，二进制 Stingray 资源，合计约 7 KB）。
     它们是**HD2 自己的材质定义**，不是第三方模型的属性，因此和内嵌的姿态参考表一样

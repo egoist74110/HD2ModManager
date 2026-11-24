@@ -221,6 +221,8 @@ public static class SectionalSplitter
 	/// 可选的 12 位十六进制前缀（常由 <see cref="DeriveUnitIdPrefix"/> 算出）。
 	/// 传入时每个输出目标写到 <c>&lt;prefix&gt;&lt;4位序号&gt;</c> 私有 unit id 下，原版 unit id 不再进入产物。
 	/// </param>
+	/// <param name="patchSourceNames">来源 patch 文件名到条目名的映射。</param>
+	/// <param name="allowSourceOwnedBones">IAS 使用现有合并器保留来源 Unit 自带的骨骼与父链。</param>
 	public static async ValueTask<SectionalSplitResult> ExecuteAsync(
 		string sourcePatchOrDirectory,
 		string gameDataDirectory,
@@ -229,7 +231,8 @@ public static class SectionalSplitter
 		IReadOnlyDictionary<string, SectionalSourceUnitIntent>? unitIntents = null,
 		IReadOnlyDictionary<string, string>? unitSourceNames = null,
 		string? outputUnitIdPrefix = null,
-		IReadOnlyDictionary<string, string>? patchSourceNames = null)
+		IReadOnlyDictionary<string, string>? patchSourceNames = null,
+		bool allowSourceOwnedBones = false)
 	{
 		ArgumentException.ThrowIfNullOrWhiteSpace(sourcePatchOrDirectory);
 		ArgumentException.ThrowIfNullOrWhiteSpace(gameDataDirectory);
@@ -406,7 +409,8 @@ public static class SectionalSplitter
 				inputsByMesh,
 				avatar,
 				cullingBounds: CanonicalCullingBoundsMode.UnionWithComputed,
-				uniqueSlotPerSection: true);
+				uniqueSlotPerSection: true,
+				allowTargetOwnedBones: allowSourceOwnedBones);
 			if (!appended.IsValid || appended.Edit is null)
 			{
 				foreach (var diagnostic in appended.Diagnostics)

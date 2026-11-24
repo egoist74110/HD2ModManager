@@ -37,12 +37,21 @@ public sealed class Bc7Encoder
 	public static string DescribeSearchLocations()
 		=> string.Join("、", RelativeCandidates);
 
-	public Bc7Encoder(string texConvPath)
+	private readonly string? temporaryRoot;
+	private readonly Action<TimeSpan>? recordBc7;
+
+	public Bc7Encoder(string texConvPath) : this(texConvPath, null)
+	{
+	}
+
+	internal Bc7Encoder(string texConvPath, string? temporaryRoot, Action<TimeSpan>? recordBc7 = null)
 	{
 		ArgumentException.ThrowIfNullOrWhiteSpace(texConvPath);
 		if (!File.Exists(texConvPath))
 			throw new FileNotFoundException($"找不到 texconv.exe：{texConvPath}", texConvPath);
 		TexConvPath = Path.GetFullPath(texConvPath);
+		this.temporaryRoot = temporaryRoot;
+		this.recordBc7 = recordBc7;
 	}
 
 	public string TexConvPath { get; }
@@ -82,9 +91,14 @@ public sealed class Bc7Encoder
 	public byte[] EncodeToBc7(byte[] sourceDds, bool srgb, int mipCount = 1)
 	{
 		var format = srgb ? "BC7_UNORM_SRGB" : "BC7_UNORM";
-		var output = Transcode(sourceDds, format, mipCount);
-		ValidateBc7Output(output, srgb);
-		return output;
+		var start = Stopwatch.GetTimestamp();
+		try
+		{
+			var output = Transcode(sourceDds, format, mipCount);
+			ValidateBc7Output(output, srgb);
+			return output;
+		}
+		finally { recordBc7?.Invoke(Stopwatch.GetElapsedTime(start)); }
 	}
 
 	/// <summary>
@@ -101,7 +115,7 @@ public sealed class Bc7Encoder
 		if (sourceDds.Length < 128)
 			throw new InvalidDataException($"输入 DDS 只有 {sourceDds.Length} 字节，连头都不够。");
 
-		var workDirectory = Path.Combine(Path.GetTempPath(), "hd2-bc7-" + Guid.NewGuid().ToString("N"));
+		var workDirectory = Path.Combine(temporaryRoot ?? Path.GetTempPath(), "hd2-bc7-" + Guid.NewGuid().ToString("N"));
 		Directory.CreateDirectory(workDirectory);
 		try
 		{

@@ -51,7 +51,7 @@
         <DataTemplate x:Key="NavItem.Primary">
             <Button Style="{StaticResource NavItemButton}"
                     Command="{Binding Command}"
-                    ToolTip="{Binding Label}"
+                    ToolTip="{Binding ToolTip}"
                     AutomationProperties.Name="{Binding Label}"
                     Visibility="{Binding IsVisible, Converter={StaticResource BoolToVis}}">
                 <Grid>

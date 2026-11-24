@@ -196,7 +196,8 @@ public static class Legacy2SectionalConverter
 					unitIntents,
 					unitSourceNames,
 					outputUnitIdPrefix: SectionalSplitter.DeriveUnitIdPrefix(modelKey),
-					patchSourceNames: patchSourceNames)
+					patchSourceNames: patchSourceNames,
+					allowSourceOwnedBones: document.IasSourceVersion == 1)
 				.ConfigureAwait(false);
 			if (!split.IsValid)
 			{

@@ -9,5 +9,6 @@ namespace HD2ModManager.Enums
         ProfileLibrarySplit,
         Settings,
         ArmorRegistry,
+        Ias,
     }
 }

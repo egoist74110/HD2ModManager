@@ -3,6 +3,7 @@ using System.Collections.ObjectModel;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
+using System.Net.Http;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Windows.Media;
@@ -10,9 +11,11 @@ using HD2ModCore.Application;
 using HD2ModCore.Domain;
 using HD2ModCore.Infrastructure;
 using HD2ModCore.Infrastructure.Diagnostics;
+using HD2ModCore.Ias;
 using HD2ModManager.Controls.Actions;
 using HD2ModManager.Enums;
 using HD2ModManager.Services;
+using HD2ModManager.Services.Ias;
 
 namespace HD2ModManager.ViewModels
 {
@@ -70,6 +73,11 @@ namespace HD2ModManager.ViewModels
         private ProfilePageViewModel? _profileWorkspacePage;
         private LibraryPageViewModel? _libraryWorkspacePage;
         private ArmorRegistryPageViewModel? _armorRegistryWorkspacePage;
+        private IasPageViewModel? _iasWorkspacePage;
+        private IIasModuleService? _iasService;
+        private IasOperationQueue? _iasQueue;
+        private HttpClient? _iasHttp;
+        private readonly OptionActivationStore _iasOptionActivations;
         private WorkspaceMode _currentMode;
         private WorkspacePageType _leftPageType;
         private WorkspacePageType _rightPageType;
@@ -152,6 +160,7 @@ namespace HD2ModManager.ViewModels
         public RelayCommand ShowSplitCommand { get; }
         public RelayCommand ShowSettingsCommand { get; }
         public RelayCommand ShowArmorRegistryCommand { get; }
+        public RelayCommand ShowIasCommand { get; }
         public RelayCommand ApplyChangesCommand { get; }
         public RelayCommand ValidateModLibraryCommand { get; }
         public RelayCommand RebuildAllVpkModsCommand { get; }
@@ -192,6 +201,11 @@ namespace HD2ModManager.ViewModels
         public bool IsSplitActive => CurrentMode == WorkspaceMode.ProfileLibrarySplit;
         public bool IsSettingsActive => CurrentMode == WorkspaceMode.Settings;
         public bool IsArmorRegistryActive => CurrentMode == WorkspaceMode.ArmorRegistry;
+        public bool IsIasActive => CurrentMode == WorkspaceMode.Ias;
+        public IasPageViewModel? IasWindowDropPage => ResolveIasWindowDropPage(CurrentMode, _iasWorkspacePage);
+
+        public static IasPageViewModel? ResolveIasWindowDropPage(WorkspaceMode mode, IasPageViewModel? page)
+            => mode == WorkspaceMode.Ias ? page : null;
         // Page type alone is insufficient: two different Mod detail pages both
         // use ModDetails, but they still need to occupy two visible slots.
         public bool IsSplitView => RightPage is not null
@@ -239,6 +253,7 @@ namespace HD2ModManager.ViewModels
             var informationCenter = CoreServices.CreateModInformationCenter(storagePaths, informationReader);
             _informationCenter = informationCenter;
             var optionActivations = CoreServices.CreateOptionActivationStore(storagePaths);
+            _iasOptionActivations = optionActivations;
             _libraryService = new ModLibraryService(
                 System.IO.Path.Combine(configDir, "library.json"),
                 informationCenter,
@@ -260,7 +275,8 @@ namespace HD2ModManager.ViewModels
                 storagePaths,
                 SettingsService.GetGameDataFolder,
                 informationCenter,
-                optionActivations: optionActivations);
+                optionActivations: optionActivations,
+                effectiveLowPollutionMode: SettingsService.GetEffectiveLowPollutionMode);
             _deploymentCoordinator.StatusChanged += OnDeploymentStatusChanged;
             _profileService.ActiveProfileDeploymentRequired += (_, _) => _deploymentCoordinator.NotifyActiveProfileChanged();
             _profileService.ActiveProfileDeactivationRequired += (_, _) => _ = _deploymentCoordinator.DeactivateAsync();
@@ -312,6 +328,7 @@ namespace HD2ModManager.ViewModels
             ShowSplitCommand = new RelayCommand(() => Navigate(WorkspaceMode.ProfileLibrarySplit));
             ShowSettingsCommand = new RelayCommand(() => Navigate(WorkspaceMode.Settings));
             ShowArmorRegistryCommand = new RelayCommand(OpenArmorRegistry);
+            ShowIasCommand = new RelayCommand(() => Navigate(WorkspaceMode.Ias));
             ApplyChangesCommand = new RelayCommand(QueueActiveProfileDeployment);
             ValidateModLibraryCommand = new RelayCommand(ValidateModLibrary);
             RebuildAllVpkModsCommand = new RelayCommand(_ => BeginBulkVpkRebuild());
@@ -565,6 +582,7 @@ namespace HD2ModManager.ViewModels
                 WorkspaceMode.LibraryOnly => (WorkspacePageType.Library, null),
                 WorkspaceMode.Settings => (WorkspacePageType.Settings, null),
                 WorkspaceMode.ArmorRegistry => (WorkspacePageType.ArmorRegistry, null),
+                WorkspaceMode.Ias => (WorkspacePageType.Ias, null),
                 _ => (WorkspacePageType.Home, null),
             };
             CommitNavigation(left, right, mode);
@@ -1030,6 +1048,10 @@ namespace HD2ModManager.ViewModels
 
         public void EndArmorRegistryWorkspaceEdit() => _armorRegistryWorkspacePage?.EndExternalWorkspaceEdit();
 
+        public Task StopIasQueueBeforeCloseAsync() => Task.WhenAll(
+            _iasQueue?.StopAsync() ?? Task.CompletedTask,
+            _iasWorkspacePage?.StopPageOperationForCloseAsync() ?? Task.CompletedTask);
+
         public Task SaveArmorRegistryWorkspaceBeforeCloseAsync()
             => _armorRegistryWorkspacePage?.FlushWorkspaceAsync() ?? Task.CompletedTask;
 
@@ -1110,12 +1132,13 @@ namespace HD2ModManager.ViewModels
                 threshold: 6);
             _importQueue.Enqueue(paths);
             ShowQueueSummary();
-
+            var cancellation = _lifetimeCancellation.Token;
             using var queuePerf = UiPerformanceDiagnostics.Measure(
                 "Import.ProcessQueue",
                 thresholdMilliseconds: 150,
                 details: () => $"paths={paths.Length}");
-            await _importProcessGate.WaitAsync();
+            try { await _importProcessGate.WaitAsync(cancellation); }
+            catch (OperationCanceledException) when (cancellation.IsCancellationRequested) { return; }
             // **导入期间让护甲注册工作区停手。**
             //
             // VPK 导入会用独立进程（`hd2mod vpk2patch`）把新导入的素体写进
@@ -1143,10 +1166,9 @@ namespace HD2ModManager.ViewModels
                 var importedModIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
                 var affectedNodeIds = new HashSet<ModNodeId>();
                 var importedSources = new List<string>();
-                ImportTaskItem? item;
-                while ((item = _importQueue.DequeueNextQueued()) != null)
+                await foreach (var (item, iasPackage) in _importQueue.DequeueImportItemsAsync(cancellation))
                 {
-                    var inputType = Path.GetExtension(item.Path).ToLowerInvariant() switch
+                    var inputType = iasPackage is not null ? "Ias" : Path.GetExtension(item.Path).ToLowerInvariant() switch
                     {
                         ".vpk" => "Vpk", ".zip" or ".7z" or ".rar" => "Archive", ".patch" => "Patch", _ => "Other",
                     };
@@ -1172,13 +1194,21 @@ namespace HD2ModManager.ViewModels
                     try
                     {
                         task.MarkRunning("正在准备导入");
+                        var inputPath = item.Path;
+                        if (iasPackage is not null)
+                        {
+                            task.UpdateStage("正在将 IAS 包转换为普通 Mod");
+                            inputPath = await IasStandardDropImport.PrepareAsync(
+                                iasPackage, SettingsService.GetGameDataFolder(), SettingsService.CreateStoragePaths(), task.CancellationToken);
+                        }
                         // Commit each source immediately, but defer expensive derived-data
                         // production until the whole queue has been committed.
                         var created = await import.ImportPathAsync(
-                            item.Path,
+                            inputPath,
                             task.CancellationToken,
                             notifyLibraryChanged: false,
-                            refreshDerivedData: false);
+                            refreshDerivedData: false,
+                            allowVpkConversion: iasPackage is null);
                         diagnostic.Finish(created.Count == 0 ? DiagnosticResult.Failed : DiagnosticResult.Completed,
                             code: created.Count == 0 ? "NoImportableMod" : null, count: created.Count);
                         if (created.Count == 0)
@@ -1293,6 +1323,7 @@ namespace HD2ModManager.ViewModels
                     QueueCurrentPageRefresh("导入后库同步完成");
                 }
             }
+            catch (OperationCanceledException) when (cancellation.IsCancellationRequested) { }
             finally
             {
                 _importProcessGate.Release();
@@ -1319,6 +1350,7 @@ namespace HD2ModManager.ViewModels
         public async ValueTask DisposeAsync()
         {
             if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
+            await StopIasQueueBeforeCloseAsync();
             try
             {
                 if (_armorRegistryWorkspacePage is not null)
@@ -1339,6 +1371,7 @@ namespace HD2ModManager.ViewModels
 			_deploymentBufferTimer = null;
             DismissToolBottomBars();
             DisposeCurrentPages();
+            _iasHttp?.Dispose();
             _importProcessGate.Dispose();
             _lifetimeCancellation.Dispose();
             await _derivedState.DisposeAsync().ConfigureAwait(false);
@@ -1357,9 +1390,11 @@ namespace HD2ModManager.ViewModels
             (_profileWorkspacePage as IDisposable)?.Dispose();
             if (!ReferenceEquals(_libraryWorkspacePage, _profileWorkspacePage)) (_libraryWorkspacePage as IDisposable)?.Dispose();
             (_armorRegistryWorkspacePage as IDisposable)?.Dispose();
+            _iasWorkspacePage?.Dispose();
             _profileWorkspacePage = null;
             _libraryWorkspacePage = null;
             _armorRegistryWorkspacePage = null;
+            _iasWorkspacePage = null;
         }
 
         private void DisposePageIfTransient(PageViewModel? page, PageViewModel? retainedElsewhere)
@@ -1368,7 +1403,8 @@ namespace HD2ModManager.ViewModels
                 || ReferenceEquals(page, retainedElsewhere)
                 || ReferenceEquals(page, _profileWorkspacePage)
                 || ReferenceEquals(page, _libraryWorkspacePage)
-                || ReferenceEquals(page, _armorRegistryWorkspacePage)) return;
+                || ReferenceEquals(page, _armorRegistryWorkspacePage)
+                || ReferenceEquals(page, _iasWorkspacePage)) return;
             (page as IDisposable)?.Dispose();
         }
 
@@ -2480,9 +2516,71 @@ namespace HD2ModManager.ViewModels
                 WorkspacePageType.PatchResourceRepackaging => new PatchResourceRepackagingPageViewModel(_libraryService, SelectedModId ?? string.Empty, _notificationService, _backgroundTasks),
                 WorkspacePageType.HelmetToArmorMergePlan => new HelmetToArmorMergePlanPageViewModel(_libraryService, SelectedModId ?? string.Empty, _notificationService, _backgroundTasks),
                 WorkspacePageType.ArmorRegistry => CreateArmorRegistryPage(),
+                WorkspacePageType.Ias => CreateIasPage(),
                 _ => new HomePageViewModel(_profileService, _libraryService, _importQueue, _applyStatus, _backgroundTasks),
             };
             return page;
+        }
+
+        private IasPageViewModel CreateIasPage()
+        {
+            _iasService ??= CreateIasService();
+            _iasQueue ??= new IasOperationQueue(_backgroundTasks, _iasService);
+            return _iasWorkspacePage ??= new IasPageViewModel(_iasService,
+                new Views.IasPageDialogs(), _notificationService, FindIasCreatedModName, OpenIasCreatedMod, _iasQueue,
+                SettingsService.GetIasVpkTargets(), SettingsService.SetIasVpkTargets);
+        }
+
+        private IIasModuleService CreateIasService()
+        {
+#if DEBUG
+            if (Environment.GetEnvironmentVariable("HD2MM_IAS_FAKE") == "1")
+                return new FakeIasModuleService(Environment.GetEnvironmentVariable("HD2MM_IAS_FAKE_STATUS"));
+#endif
+            _iasHttp ??= IasUpdateHttp.Create(() => AppUpdateService.Instance?.Updater.View().Prefs.Network
+                ?? IasUpdateHttp.ReadSettings(SettingsService.CreateStoragePaths().AppRootDirectory));
+            return new IasModuleService(SettingsService.CreateStoragePaths, () =>
+            {
+                var data = SettingsService.GetGameDataFolder();
+                return string.IsNullOrWhiteSpace(data) ? null : Path.GetDirectoryName(Path.TrimEndingDirectorySeparator(Path.GetFullPath(data)));
+            }, _iasHttp, () => _libraryService.LoadAsync(buildDerivedData: true, _lifetimeCancellation.Token),
+                getPhysicsMode: SettingsService.GetPhysicsMode,
+                getMappingMode: () => LuaDeploymentService.EffectiveMappingMode,
+                getBuiltInLuaEnabled: SettingsService.GetBuiltInLuaEnabled,
+                turnOffManagerFeatures: TurnOffIasConflictingFeaturesAsync,
+                optionActivations: _iasOptionActivations,
+                readArmorIcons: async (catalog, ct) => (await ArmorRegistryPageViewModel
+                    .ReadArmorDisplayFactsAsync(_libraryService, catalog, ct).ConfigureAwait(false))
+                    .ToDictionary(pair => pair.Key, pair => pair.Value.ImagePath, StringComparer.OrdinalIgnoreCase));
+        }
+
+        private async Task TurnOffIasConflictingFeaturesAsync(bool physics, bool builtInLua)
+        {
+            var pages = new[] { LeftPage, RightPage }.OfType<SettingsPageViewModel>().Distinct().ToArray();
+            if (physics && SettingsService.GetPhysicsMode() != PhysicsMode.Off &&
+                !SettingsPageViewModel.SavePhysicsModeAndRequestDeployment(PhysicsMode.Off, _profileService))
+                throw new InvalidOperationException("无法保存管理器物理设置。");
+            if (physics)
+                foreach (var page in pages) page.RefreshPhysicsMode();
+
+            if (builtInLua && SettingsService.GetBuiltInLuaEnabled() &&
+                !SettingsPageViewModel.SaveBuiltInLuaEnabledAndRequestDeployment(false, _profileService))
+                throw new InvalidOperationException("无法保存管理器内置 Lua 设置。");
+            if (builtInLua)
+                foreach (var page in pages) page.RefreshBuiltInLuaEnabled();
+            await SettingsService.FlushAsync();
+        }
+
+        private string? FindIasCreatedModName(string id)
+            => Guid.TryParse(id, out var guid) && _libraryService.Snapshot.Nodes.TryGetValue(new ModNodeId(guid), out var node)
+                ? node.Metadata.Name : null;
+
+        private void OpenIasCreatedMod(string id)
+        {
+            if (FindIasCreatedModName(id) is null) return;
+            ClearTransientSelection();
+            SelectedModId = id;
+            OpenSinglePage(WorkspacePageType.ModDetails);
         }
 
         private ArmorRegistryPageViewModel CreateArmorRegistryPage()
@@ -2956,6 +3054,7 @@ namespace HD2ModManager.ViewModels
                 (WorkspacePageType.Profile, WorkspacePageType.Library, true) => WorkspaceMode.ProfileLibrarySplit,
                 (WorkspacePageType.Settings, WorkspacePageType.Settings, false) => WorkspaceMode.Settings,
                 (WorkspacePageType.ArmorRegistry, WorkspacePageType.ArmorRegistry, false) => WorkspaceMode.ArmorRegistry,
+                (WorkspacePageType.Ias, WorkspacePageType.Ias, false) => WorkspaceMode.Ias,
                 _ => CurrentMode,
             };
             // 这里是除 CommitNavigation 之外所有导航路径的共同收尾
@@ -2979,12 +3078,20 @@ namespace HD2ModManager.ViewModels
             WorkspacePageType.PatchResourceRepackaging => "Patch 资源重打包",
             WorkspacePageType.HelmetToArmorMergePlan => "头盔合并到盔甲并输出",
             WorkspacePageType.ArmorRegistry => "运行时护甲注册",
+            WorkspacePageType.Ias => "IAS",
             WorkspacePageType.SectionalEditor => "分件编辑",
             _ => "页面",
         };
 
         private void RaiseSlotFlags()
         {
+            if (_iasWorkspacePage is { } ias)
+            {
+                if (ReferenceEquals(LeftPage, ias) || ReferenceEquals(RightPage, ias))
+                    _ = ias.EnterAsync();
+                else
+                    ias.Leave();
+            }
             UpdateLibraryCompanionContext();
             OnPropertyChanged(nameof(IsSplitView));
             OnPropertyChanged(nameof(ShowRightSlot));
@@ -3054,6 +3161,7 @@ namespace HD2ModManager.ViewModels
             OnPropertyChanged(nameof(IsSplitActive));
             OnPropertyChanged(nameof(IsSettingsActive));
             OnPropertyChanged(nameof(IsArmorRegistryActive));
+            OnPropertyChanged(nameof(IsIasActive));
         }
     }
 }

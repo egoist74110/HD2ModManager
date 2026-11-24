@@ -41,18 +41,6 @@ public static class PhysBoneContainerEmbedder
 	/// <summary>模块名常量，运行时按这个名字取容器里的记录（与协议文档一致）。</summary>
 	public const string RigRecordName = "hd2_spring_rig.bin";
 
-	/// <summary>Embed one rig in a newly written model patch with its own GPU carrier.</summary>
-	internal static async Task EmbedNewPatchAsync(string patchPath, byte[] rig, CancellationToken cancellationToken)
-	{
-		var gpuPath = patchPath + ".gpu_resources";
-		var prefixLength = new FileInfo(gpuPath).Length;
-		var container = PhysBoneContainer.Build([new(RigRecordName, rig)], checked((ulong)prefixLength));
-		await PhysBoneCarrier.AppendContainerToFileAsync(gpuPath, container, cancellationToken).ConfigureAwait(false);
-		var written = await PhysBoneCarrier.TryReadContainerFromFileAsync(gpuPath, cancellationToken).ConfigureAwait(false);
-		if (written is null || !written.AsSpan().SequenceEqual(container))
-			throw new InvalidDataException($"Could not verify the physbone container in {gpuPath}.");
-	}
-
 	/// <summary>
 	/// 给 <paramref name="modDirectory"/> 下所有**含 Unit 的** patch 嵌入容器。
 	/// 没有 jiggle 骨、或者找不到模型 patch 时返回 <see cref="Outcome.Skip"/>（调用方当作正常的"不需要"）。

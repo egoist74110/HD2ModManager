@@ -1805,21 +1805,32 @@ namespace HD2ModManager.ViewModels
             get => SettingsService.GetBuiltInLuaEnabled();
             set
             {
-                var changed = value != SettingsService.GetBuiltInLuaEnabled();
-                if (SettingsService.SetBuiltInLuaEnabled(value) && changed)
-                    _profiles.RequestActiveProfileDeployment();
-                OnPropertyChanged(nameof(BuiltInLuaEnabled));
-                // 选项集合变了，下拉要重建；当前值也可能被收敛过，一并刷新。
-                OnPropertyChanged(nameof(ArmorMappingModeOptions));
-                OnPropertyChanged(nameof(ArmorMappingMode));
-                OnPropertyChanged(nameof(ArmorMappingModeDescription));
-                OnPropertyChanged(nameof(ArmorMappingModeHotSwitchNote));
-                OnPropertyChanged(nameof(PhysicsModeOptions));
-                OnPropertyChanged(nameof(PhysicsMode));
-                OnPropertyChanged(nameof(PhysicsModeDescription));
-                OnPropertyChanged(nameof(BuiltInLuaNote));
-                NotifyLowPollutionPrerequisite();
+                SaveBuiltInLuaEnabledAndRequestDeployment(value, _profiles);
+                RefreshBuiltInLuaEnabled();
             }
+        }
+
+        internal static bool SaveBuiltInLuaEnabledAndRequestDeployment(bool enabled, ProfileService profiles)
+        {
+            var changed = enabled != SettingsService.GetBuiltInLuaEnabled();
+            if (!SettingsService.SetBuiltInLuaEnabled(enabled)) return false;
+            if (changed) profiles.RequestActiveProfileDeployment();
+            return true;
+        }
+
+        internal void RefreshBuiltInLuaEnabled()
+        {
+            OnPropertyChanged(nameof(BuiltInLuaEnabled));
+            // 选项集合变了，下拉要重建；当前值也可能被收敛过，一并刷新。
+            OnPropertyChanged(nameof(ArmorMappingModeOptions));
+            OnPropertyChanged(nameof(ArmorMappingMode));
+            OnPropertyChanged(nameof(ArmorMappingModeDescription));
+            OnPropertyChanged(nameof(ArmorMappingModeHotSwitchNote));
+            OnPropertyChanged(nameof(PhysicsModeOptions));
+            OnPropertyChanged(nameof(PhysicsMode));
+            OnPropertyChanged(nameof(PhysicsModeDescription));
+            OnPropertyChanged(nameof(BuiltInLuaNote));
+            NotifyLowPollutionPrerequisite();
         }
 
         /// <summary>总开关下面那句说明：讲清"关掉之后会发生什么"。</summary>
@@ -1880,59 +1891,27 @@ namespace HD2ModManager.ViewModels
             get => SettingsService.GetPhysicsMode();
             set
             {
-                if (SettingsService.SetPhysicsMode(value))
-                    _profiles.RequestActiveProfileDeployment();
-                OnPropertyChanged(nameof(PhysicsMode));
-                OnPropertyChanged(nameof(PhysicsModeDescription));
-                NotifyLowPollutionPrerequisite();
+                SavePhysicsModeAndRequestDeployment(value, _profiles);
+                RefreshPhysicsMode();
             }
+        }
+
+        internal static bool SavePhysicsModeAndRequestDeployment(PhysicsMode mode, ProfileService profiles)
+        {
+            if (!SettingsService.SetPhysicsMode(mode)) return false;
+            profiles.RequestActiveProfileDeployment();
+            return true;
+        }
+
+        internal void RefreshPhysicsMode()
+        {
+            OnPropertyChanged(nameof(PhysicsMode));
+            OnPropertyChanged(nameof(PhysicsModeDescription));
+            NotifyLowPollutionPrerequisite();
         }
 
         /// <summary>物理模式的一句话说明。</summary>
         public string PhysicsModeDescription => PhysicsMode.Description();
-
-        /// <summary>实验性手臂姿态修正（默认关闭）。</summary>
-        public bool ArmPoseEnabled
-        {
-            get => SettingsService.GetArmPoseEnabled();
-            set
-            {
-                if (SettingsService.SetArmPoseEnabled(value) && PhysicsMode.UsesRuntimeLua())
-                    _profiles.RequestActiveProfileDeployment();
-                OnPropertyChanged(nameof(ArmPoseEnabled));
-            }
-        }
-
-        public bool IasFringePhysics
-        {
-            get => (LuaDeploymentService.IasPhysicsGroups & 1) != 0;
-            set => SetIasPhysicsGroup(1, value, nameof(IasFringePhysics));
-        }
-
-        public bool IasAccessoryPhysics
-        {
-            get => (LuaDeploymentService.IasPhysicsGroups & 2) != 0;
-            set => SetIasPhysicsGroup(2, value, nameof(IasAccessoryPhysics));
-        }
-
-        public bool IasChestPhysics
-        {
-            get => (LuaDeploymentService.IasPhysicsGroups & 4) != 0;
-            set => SetIasPhysicsGroup(4, value, nameof(IasChestPhysics));
-        }
-
-        public bool IasHipPhysics
-        {
-            get => (LuaDeploymentService.IasPhysicsGroups & 8) != 0;
-            set => SetIasPhysicsGroup(8, value, nameof(IasHipPhysics));
-        }
-
-        private void SetIasPhysicsGroup(int bit, bool enabled, string property)
-        {
-            if (SettingsService.SetIasPhysicsGroup(bit, enabled) && PhysicsMode.UsesRuntimeLua())
-                _profiles.RequestActiveProfileDeployment();
-            OnPropertyChanged(property);
-        }
 
     public bool AutoUpdateAssetMetadata
         {

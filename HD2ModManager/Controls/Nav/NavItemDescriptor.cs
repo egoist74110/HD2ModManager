@@ -28,6 +28,7 @@ public enum NavIconKey
     Library,
     Settings,
     ArmorRegistry,
+    Ias,
 }
 
 // 逻辑层递交的一个顶栏按钮。
@@ -38,6 +39,7 @@ public sealed class NavItemDescriptor : INotifyPropertyChanged
     private bool _isActive;
     private string? _badge;
     private ICommand? _command;
+    private readonly string? _toolTipText;
 
     public NavItemDescriptor(string id, string label, NavIconKey iconKey, ICommand? command = null)
     {
@@ -53,6 +55,10 @@ public sealed class NavItemDescriptor : INotifyPropertyChanged
     public NavIconKey IconKey { get; }
 
     public NavItemRole Role { get; init; } = NavItemRole.Primary;
+
+    public string? ToolTipText { init => _toolTipText = value; }
+
+    public string ToolTip => _toolTipText ?? Label;
 
     public string Label { get => _label; set => Set(ref _label, value); }
 
@@ -74,6 +80,8 @@ public sealed class NavItemDescriptor : INotifyPropertyChanged
         if (EqualityComparer<T>.Default.Equals(field, value)) return;
         field = value;
         PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(propertyName));
+        if (propertyName == nameof(Label) && _toolTipText is null)
+            PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(ToolTip)));
         if (propertyName == nameof(Badge)) PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(HasBadge)));
     }
 }

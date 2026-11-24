@@ -1,0 +1,18 @@
+<Window x:Class="HD2ModManager.Views.IasPageDialog"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:local="clr-namespace:HD2ModManager.Views"
+        SizeToContent="WidthAndHeight" ResizeMode="NoResize" ShowInTaskbar="False"
+        WindowStartupLocation="CenterOwner" Background="{StaticResource SurfaceCard}">
+    <StackPanel Margin="20,18,20,16" Width="420">
+        <StackPanel x:Name="ConfirmationPanel" Visibility="Collapsed">
+            <TextBlock x:Name="ConfirmationText" TextWrapping="Wrap" FontSize="14" LineHeight="21" Foreground="{StaticResource TextPrimary}"/>
+            <CheckBox x:Name="ConfirmationOption" IsChecked="False" Style="{StaticResource AppToggleSwitch}" Margin="0,12,0,0"/>
+        </StackPanel>
+
+        <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,18,0,0">
+            <Button x:Name="ConfirmButton" Style="{StaticResource AppPrimaryButton}" MinWidth="84" IsDefault="True" Click="OnConfirm"/>
+            <Button x:Name="DismissButton" Content="取消" Style="{StaticResource AppSecondaryButton}" MinWidth="84" Margin="8,0,0,0" IsCancel="True"/>
+        </StackPanel>
+    </StackPanel>
+</Window>

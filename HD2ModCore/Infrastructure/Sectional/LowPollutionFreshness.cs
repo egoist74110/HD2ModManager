@@ -141,9 +141,11 @@ public static class LowPollutionFreshness
 		string payloadDirectory,
 		IReadOnlyDictionary<string, IReadOnlyCollection<int>>? disabledSections,
 		bool headMergeIntoBody,
-		string reason)
+		string reason,
+		string? overwriteDirectory = null)
 	{
-		var path = Path.Combine(ModNodePayloadLayout.GetOverwriteDirectory(modDirectory), UnsupportedMarkerFileName);
+		var overwrite = overwriteDirectory ?? ModNodePayloadLayout.GetOverwriteDirectory(modDirectory);
+		var path = Path.Combine(overwrite, UnsupportedMarkerFileName);
 		VpkPayloadSwap.ClearReadOnlyForWrite(path);
 		File.WriteAllText(path, System.Text.Json.JsonSerializer.Serialize(new
 		{
@@ -249,7 +251,8 @@ public static class LowPollutionFreshness
 	/// <summary>对本次映射用到的素体逐个判断。素体不在目录里的不出现在结果里（映射本来就会失败）。</summary>
 	public static async Task<IReadOnlyList<LowPollutionPrepItem>> PlanAsync(
 		string modsDirectory, IEnumerable<string> modelKeys, bool lowPollution, CancellationToken cancellationToken = default,
-		IReadOnlyDictionary<string, IReadOnlySet<uint>>? npcByModel = null)
+		IReadOnlyDictionary<string, IReadOnlySet<uint>>? npcByModel = null,
+		VpkHostContext? cacheContext = null)
 	{
 		var catalog = CustomModelCatalog.Collect(modsDirectory);
 		var items = new List<LowPollutionPrepItem>();
@@ -258,9 +261,82 @@ public static class LowPollutionFreshness
 			cancellationToken.ThrowIfCancellationRequested();
 			if (!catalog.Entries.TryGetValue(key, out var entry)) continue;
 			var wardrobe = await VpkModWardrobeService.ReadAsync(entry.ModDirectory, cancellationToken).ConfigureAwait(false);
-			items.Add(Assess(key, entry.ModDirectory, lowPollution, wardrobe,
-				npcByModel is not null && npcByModel.TryGetValue(key, out var mapped) ? mapped : null));
+			var npcs = npcByModel is not null && npcByModel.TryGetValue(key, out var mapped) ? mapped : null;
+			if (cacheContext is not null && (lowPollution || LowPollutionArtifactCache.Participates(entry.ModDirectory)))
+			{
+				var context = cacheContext with { NpcItemIds = npcs is null ? [] : [.. npcs] };
+				var reason = await CheckActiveArtifactAsync(entry.ModDirectory, wardrobe, lowPollution, context, cancellationToken).ConfigureAwait(false);
+				var own = RuntimeArmorRegistryService.CustomModelArchiveId(key);
+				var name = Path.GetFileName(Path.TrimEndingDirectorySeparator(entry.ModDirectory));
+				var ownTarget = string.IsNullOrWhiteSpace(wardrobe.TargetArmorArchiveId)
+					|| string.Equals(wardrobe.TargetArmorArchiveId, own, StringComparison.OrdinalIgnoreCase);
+				items.Add(reason is null
+					? new(key, entry.ModDirectory, name, LowPollutionPrepStatus.UpToDate, "当前形态的输入与完整产物均匹配")
+					: ownTarget
+						? new(key, entry.ModDirectory, name, LowPollutionPrepStatus.NeedsRecompile, reason)
+						: new(key, entry.ModDirectory, name, LowPollutionPrepStatus.Blocked, $"需要重编（{reason}），请先在详情页切回「自己的素体」"));
+			}
+			else
+				items.Add(Assess(key, entry.ModDirectory, lowPollution, wardrobe, npcs));
 		}
 		return items;
+	}
+
+	private static async ValueTask<string?> CheckActiveArtifactAsync(
+		string modDirectory, VpkWardrobeFile wardrobe, bool lowPollution, VpkHostContext context, CancellationToken cancellationToken)
+	{
+		var overwrite = ModNodePayloadLayout.GetOverwriteDirectory(modDirectory);
+		if (LowPollutionArtifactCache.Read(overwrite) is not { } stamp || stamp.LowPollution != lowPollution)
+			return LowPollutionArtifactCache.Mismatch(overwrite, lowPollution, null, cancellationToken);
+		var inputs = await ReadArtifactInputsAsync(modDirectory, wardrobe, lowPollution, context, cancellationToken).ConfigureAwait(false);
+		return LowPollutionArtifactCache.Mismatch(overwrite, lowPollution, inputs, cancellationToken);
+	}
+
+	/// <summary>重新核对当前输入，命中时整目录换入。缓存未命中时，调用方沿用原来的编译入口。</summary>
+	public static async ValueTask<bool> TryActivateCachedAsync(
+		LowPollutionPrepItem item, VpkHostContext context, CancellationToken cancellationToken = default)
+	{
+		var directory = item.ModDirectory;
+		var slot = LowPollutionArtifactCache.Slot(directory, context.LowPollutionMode);
+		if (!Directory.Exists(slot)) return false;
+		var gate = LowPollutionArtifactCache.Gate(directory);
+		await gate.WaitAsync(cancellationToken).ConfigureAwait(false);
+		try
+		{
+			if (!LowPollutionArtifactCache.OwnsSlot(slot) || LowPollutionArtifactCache.Read(slot) is null) return false;
+			var wardrobe = await VpkModWardrobeService.ReadAsync(directory, cancellationToken).ConfigureAwait(false);
+			var own = RuntimeArmorRegistryService.CustomModelArchiveId(item.ModelKey);
+			if (!string.IsNullOrWhiteSpace(wardrobe.TargetArmorArchiveId)
+				&& !string.Equals(wardrobe.TargetArmorArchiveId, own, StringComparison.OrdinalIgnoreCase))
+				throw new InvalidOperationException("这个 Mod 的目标已变更，请先切回「自己的素体」。");
+			var inputs = await ReadArtifactInputsAsync(directory, wardrobe, context.LowPollutionMode, context, cancellationToken).ConfigureAwait(false);
+			if (!LowPollutionArtifactCache.Matches(slot, context.LowPollutionMode, inputs, cancellationToken)) return false;
+			LowPollutionArtifactCache.Publish(directory, slot, context.LowPollutionMode, inputs, cancellationToken);
+			return true;
+		}
+		finally
+		{
+			gate.Release();
+		}
+	}
+
+	private static async ValueTask<LowPollutionArtifactCache.Inputs?> ReadArtifactInputsAsync(
+		string modDirectory, VpkWardrobeFile wardrobe, bool lowPollution, VpkHostContext context, CancellationToken cancellationToken)
+	{
+		try
+		{
+			var payload = ModNodePayloadLayout.TryGetExistingVpkPatchDirectory(modDirectory);
+			if (payload is null) return null;
+			var patch = await SectionalCompiler.ResolveUnitPatchAsync(payload, cancellationToken).ConfigureAwait(false);
+			if (patch is null) return null;
+			var sourceMap = await WardrobeSectionMapFile.ReadAsync(Path.Combine(payload, WardrobeSectionMapFile.FileName), cancellationToken)
+				.ConfigureAwait(false);
+			return await LowPollutionArtifactCache.CaptureAsync(modDirectory, payload, patch, sourceMap,
+				wardrobe.State.Disabled, wardrobe.HeadMergeIntoBody, lowPollution, context, OverwriteSelection.Default, cancellationToken).ConfigureAwait(false);
+		}
+		catch (Exception exception) when (LowPollutionArtifactCache.IsCacheReadFailure(exception))
+		{
+			return null;
+		}
 	}
 }

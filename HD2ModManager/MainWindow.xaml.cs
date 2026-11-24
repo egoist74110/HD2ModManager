@@ -8,6 +8,7 @@ using System.Windows.Input;
 using System.Windows.Media;
 using System.Windows.Media.Animation;
 using System.Windows.Shell;
+using System.Windows.Threading;
 using HD2ModManager.Enums;
 using HD2ModManager.Services;
 using HD2ModManager.ViewModels;
@@ -20,6 +21,7 @@ namespace HD2ModManager
     /// </summary>
     public partial class MainWindow : Window
     {
+        private DispatcherOperation? _iasDragLeave;
         private BottomBarLayoutSnapshot _pendingBottomBarLayout = BottomBarLayoutSnapshot.Empty;
         private BottomBarLayoutSnapshot _appliedBottomBarLayout = BottomBarLayoutSnapshot.Empty;
         private bool _bottomBarLayoutUpdateQueued;
@@ -117,6 +119,15 @@ namespace HD2ModManager
             StateChanged += MainWindow_StateChanged; // 处理最大化时的阴影切换
             Title = HD2ModManager.Resources.Strings.App_Title;
             AllowDrop = true;
+            PreviewDragOver += (sender, args) =>
+            {
+                if (DataContext is ShellViewModel { IsIasActive: true }) MainWindow_DragOver(sender, args);
+            };
+            PreviewDrop += (sender, args) =>
+            {
+                if (DataContext is ShellViewModel { IsIasActive: true }) MainWindow_Drop(sender, args);
+            };
+            PreviewDragLeave += MainWindow_IasDragLeave;
             DragOver += MainWindow_DragOver;
             Drop += MainWindow_Drop;
             PreviewKeyDown += MainWindow_PreviewKeyDown;
@@ -200,6 +211,7 @@ namespace HD2ModManager
             try
             {
                 await shell.SaveArmorRegistryWorkspaceBeforeCloseAsync();
+                await shell.StopIasQueueBeforeCloseAsync();
                 _workspaceCloseAllowed = true;
                 // Close must run after the current Closing event has unwound.
                 _ = Dispatcher.BeginInvoke(new Action(Close));
@@ -664,6 +676,22 @@ namespace HD2ModManager
 
         private void MainWindow_DragOver(object sender, DragEventArgs e)
         {
+            if (DataContext is ShellViewModel { IsIasActive: true } iasShell)
+            {
+                _iasDragLeave?.Abort();
+                _iasDragLeave = null;
+                var page = iasShell.IasWindowDropPage;
+                e.Effects = DragDropEffects.None;
+                if (e.Data.GetData(DataFormats.FileDrop) is string[] { Length: > 0 } paths)
+                {
+                    if (page?.UpdateWindowDrop(paths) == true && e.AllowedEffects.HasFlag(DragDropEffects.Copy))
+                        e.Effects = DragDropEffects.Copy;
+                }
+                else page?.ClearWindowDrop();
+                e.Handled = true;
+                return;
+            }
+
             if (e.Data.GetDataPresent(DataFormats.FileDrop))
             {
                 e.Effects = DragDropEffects.Copy;
@@ -677,12 +705,37 @@ namespace HD2ModManager
 
         private async void MainWindow_Drop(object sender, DragEventArgs e)
         {
+            if (DataContext is ShellViewModel { IsIasActive: true } iasShell)
+            {
+                e.Handled = true;
+                e.Effects = DragDropEffects.None;
+                if (iasShell.IasWindowDropPage is { } page)
+                {
+                    var paths = e.Data.GetData(DataFormats.FileDrop) as string[];
+                    if (e.AllowedEffects.HasFlag(DragDropEffects.Copy) && paths is { Length: > 0 } && page.UpdateWindowDrop(paths))
+                    {
+                        e.Effects = DragDropEffects.Copy;
+                        await page.HandleWindowDropAsync(paths);
+                    }
+                    else page.ClearWindowDrop();
+                }
+                return;
+            }
+
             if (!e.Data.GetDataPresent(DataFormats.FileDrop)) return;
             var files = (string[])e.Data.GetData(DataFormats.FileDrop);
             if (DataContext is HD2ModManager.ViewModels.ShellViewModel shell)
             {
                 await shell.ProcessImportQueueAsync(files);
             }
+        }
+
+        private void MainWindow_IasDragLeave(object sender, DragEventArgs e)
+        {
+            if (DataContext is not ShellViewModel { IasWindowDropPage: { } page }) return;
+            _iasDragLeave?.Abort();
+            // 子控件之间也会触发 DragLeave，等同一轮拖动事件结束再清掉提示。
+            _iasDragLeave = Dispatcher.InvokeAsync(page.ClearWindowDrop, DispatcherPriority.Background);
         }
 
         private void MainWindow_PreviewKeyDown(object sender, System.Windows.Input.KeyEventArgs e)

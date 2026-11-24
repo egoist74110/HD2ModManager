@@ -177,7 +177,8 @@ public static class ExternalPackageAdoptionPlanner
 		if (string.IsNullOrWhiteSpace(name)) return true;
 		return name.StartsWith('.')
 			|| ModNodePayloadLayout.IsVpkPatchDirectoryName(name)
-			|| ModNodePayloadLayout.IsOverwriteDirectoryName(name);
+			|| ModNodePayloadLayout.IsOverwriteDirectoryName(name)
+			|| ModNodePayloadLayout.IsInactiveOverwriteDirectoryName(name);
 	}
 
 	/// <summary>

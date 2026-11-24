@@ -1,5 +1,6 @@
 using HD2ModCore.Decoration;
 using HD2ModCore.Domain;
+using HD2ModCore.Infrastructure.Sectional;
 
 namespace HD2ModCore.Infrastructure;
 
@@ -81,6 +82,35 @@ public static class OverwriteMaterializer
 		OverwriteSelection selection,
 		string? unitLayerPatchPath = null,
 		string marker = ManagedOverwriteMarkers.VpkRekey)
+		=> MaterializeCoreEntry(modDirectory, selection, unitLayerPatchPath, marker, preparedOverwrite: null);
+
+	internal static OverwriteMaterializationResult StageOwnModel(
+		string modDirectory, OverwriteSelection selection, string unitLayerPatchPath, string preparedOverwrite)
+		=> MaterializeUnderGate(modDirectory, selection, unitLayerPatchPath, ManagedOverwriteMarkers.VpkRekey, preparedOverwrite);
+
+	internal static OverwriteMaterializationResult MaterializeDuringCompile(
+		string modDirectory, OverwriteSelection selection, string unitLayerPatchPath, string marker)
+		=> MaterializeUnderGate(modDirectory, selection, unitLayerPatchPath, marker, preparedOverwrite: null);
+
+	private static OverwriteMaterializationResult MaterializeCoreEntry(
+		string modDirectory, OverwriteSelection selection, string? unitLayerPatchPath, string marker, string? preparedOverwrite)
+	{
+		ArgumentException.ThrowIfNullOrWhiteSpace(modDirectory);
+		var gate = LowPollutionArtifactCache.Gate(modDirectory);
+		if (!gate.Wait(0))
+			return OverwriteMaterializationResult.Failure("这个 Mod 正在更新生效层，请稍后重试。");
+		try
+		{
+			return MaterializeUnderGate(modDirectory, selection, unitLayerPatchPath, marker, preparedOverwrite);
+		}
+		finally
+		{
+			gate.Release();
+		}
+	}
+
+	private static OverwriteMaterializationResult MaterializeUnderGate(
+		string modDirectory, OverwriteSelection selection, string? unitLayerPatchPath, string marker, string? preparedOverwrite)
 	{
 		ArgumentException.ThrowIfNullOrWhiteSpace(modDirectory);
 		ArgumentNullException.ThrowIfNull(selection);
@@ -142,7 +172,13 @@ public static class OverwriteMaterializer
 
 		try
 		{
-			return MaterializeCore(modDirectory, unitLayer, materials, marker, warnings);
+			if (preparedOverwrite is not null)
+			{
+				var written = InstallLayers(preparedOverwrite, unitLayer, materials);
+				ManagedOverwriteDirectory.Commit(preparedOverwrite, marker);
+				return new OverwriteMaterializationResult(true, written, warnings, null);
+			}
+			return MaterializeCore(modDirectory, unitLayer, materials, marker, warnings, keepLowPollutionMetadata: stashDirectory is not null);
 		}
 		finally
 		{
@@ -244,7 +280,8 @@ public static class OverwriteMaterializer
 		string unitLayer,
 		IReadOnlyList<string> materialLayers,
 		string marker,
-		List<string> warnings)
+		List<string> warnings,
+		bool keepLowPollutionMetadata)
 	{
 		var overwrite = ModNodePayloadLayout.GetOverwriteDirectory(modDirectory);
 		// 老库里的生效层是 P3-1 之前写的，没有归属标记。它里面有本归档的 unit patch，
@@ -255,6 +292,9 @@ public static class OverwriteMaterializer
 			SectionalPatchManifestFile.ReadArchiveHex16(
 				ModNodePayloadLayout.TryGetExistingVpkPatchDirectory(modDirectory) ?? modDirectory),
 			marker);
+
+		if (keepLowPollutionMetadata && LowPollutionArtifactCache.Participates(modDirectory))
+			return RefreshOwnModelMaterials(modDirectory, overwrite, unitLayer, materialLayers, marker, warnings);
 
 		string? backup;
 		try
@@ -269,10 +309,7 @@ public static class OverwriteMaterializer
 
 		try
 		{
-			var written = new List<string>();
-			written.AddRange(OverwritePatchInstaller.Install(overwrite, unitLayer).WrittenFiles);
-			foreach (var material in materialLayers)
-				written.AddRange(OverwritePatchInstaller.Install(overwrite, material).WrittenFiles);
+			var written = InstallLayers(overwrite, unitLayer, materialLayers);
 			ManagedOverwriteDirectory.Commit(overwrite, marker);
 			ManagedOverwriteDirectory.DiscardBackup(backup);
 			return new OverwriteMaterializationResult(true, written, warnings, null);
@@ -285,6 +322,56 @@ public static class OverwriteMaterializer
 			ManagedOverwriteDirectory.Rollback(overwrite, backup);
 			return OverwriteMaterializationResult.Failure(
 				$"物化生效层失败：{exception.Message}", warnings);
+		}
+	}
+
+	private static OverwriteMaterializationResult RefreshOwnModelMaterials(
+		string modDirectory, string overwrite, string unitLayer, IReadOnlyList<string> materials, string marker, List<string> warnings)
+	{
+		var prepared = overwrite + ".stage-" + Guid.NewGuid().ToString("N");
+		try
+		{
+			var written = InstallLayers(prepared, unitLayer, materials);
+			CopyLowPollutionMetadata(overwrite, prepared);
+			ManagedOverwriteDirectory.Commit(prepared, marker);
+			LowPollutionArtifactCache.RefreshMaterials(modDirectory, overwrite, prepared, materials);
+			ManagedOverwriteDirectory.ReplacePrepared(overwrite, prepared, retainBackupAt: null,
+				backupContainsCopies: LowPollutionArtifactCache.Read(overwrite) is not null);
+			return new OverwriteMaterializationResult(true, written, warnings, null);
+		}
+		catch (Exception exception) when (LowPollutionArtifactCache.IsCacheReadFailure(exception))
+		{
+			return OverwriteMaterializationResult.Failure($"物化生效层失败：{exception.Message}", warnings);
+		}
+		finally
+		{
+			ManagedOverwriteDirectory.DiscardPrepared(prepared);
+		}
+	}
+
+	private static IReadOnlyList<string> InstallLayers(string overwrite, string unitLayer, IReadOnlyList<string> materialLayers)
+	{
+		var written = new List<string>(OverwritePatchInstaller.Install(overwrite, unitLayer).WrittenFiles);
+		foreach (var material in materialLayers)
+			written.AddRange(OverwritePatchInstaller.Install(overwrite, material).WrittenFiles);
+		return written;
+	}
+
+	private static void CopyLowPollutionMetadata(string backup, string overwrite)
+	{
+		var layout = LowPollutionLayoutFile.FileName;
+		var unsupported = LowPollutionFreshness.UnsupportedMarkerFileName;
+		if (!File.Exists(Path.Combine(backup, layout)) && !File.Exists(Path.Combine(backup, unsupported))
+			&& LowPollutionArtifactCache.Read(backup) is null)
+			return;
+
+		// 只换材质时，沿用的是同一份 unit。布局、注册表和结构表也要随 unit 留在生效层。
+		string[] names = [layout, unsupported, VpkCustomModelFile.FileName, WardrobeSectionMapFile.FileName, SectionGroupFile.FileName];
+		foreach (var name in names)
+		{
+			var source = Path.Combine(backup, name);
+			if (File.Exists(source))
+				File.Copy(source, Path.Combine(overwrite, name));
 		}
 	}
 }

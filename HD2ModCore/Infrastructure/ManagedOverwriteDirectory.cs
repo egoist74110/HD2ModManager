@@ -61,26 +61,79 @@ public static class ManagedOverwriteDirectory
 	/// 返回备份路径（原本不存在或原本是空目录时为 <c>null</c>）。
 	/// </summary>
 	/// <exception cref="InvalidOperationException">目录存在、**有内容**、且不是管理器生成的。</exception>
-	public static string? Prepare(string directory)
+	public static string? Prepare(string directory) => Prepare(directory, createEmpty: true);
+
+	private static string? Prepare(string directory, bool createEmpty)
 	{
 		ArgumentException.ThrowIfNullOrWhiteSpace(directory);
 		if (!Directory.Exists(directory))
 		{
-			Directory.CreateDirectory(directory);
+			if (createEmpty) Directory.CreateDirectory(directory);
 			return null;
 		}
 		// 空目录直接接管：它不可能装着用户的东西（上次派生中断留下的壳就是这种形状）。
 		// 只认标记会把这种壳判成"别人的"，于是一个能自己长好的状态变成必须人工清理。
 		if (!IsManaged(directory) && !Directory.EnumerateFileSystemEntries(directory).Any())
+		{
+			if (!createEmpty) Directory.Delete(directory);
 			return null;
+		}
 		if (!IsManaged(directory))
 			throw new InvalidOperationException(
 				"这个 Mod 的 Overwrite 目录不是管理器生成的，已拒绝覆盖。"
 				+ "如果里面有你手工放进去的文件，请先把它移走再重试。");
 		var backup = directory + ".backup-" + Guid.NewGuid().ToString("N");
 		Directory.Move(directory, backup);
-		Directory.CreateDirectory(directory);
+		try
+		{
+			if (createEmpty) Directory.CreateDirectory(directory);
+		}
+		catch
+		{
+			Directory.Move(backup, directory);
+			throw;
+		}
 		return backup;
+	}
+
+	/// <summary>发布已写完整的生效层。旧层可作为另一形态保留，任一移动失败就还原。</summary>
+	internal static void ReplacePrepared(string directory, string prepared, string? retainBackupAt, bool backupContainsCopies = false)
+	{
+		if (!IsManaged(prepared)) throw new InvalidOperationException("准备好的生效层缺少托管标记。");
+		var backup = Prepare(directory, createEmpty: false);
+		var installed = false;
+		try
+		{
+			Directory.Move(prepared, directory);
+			installed = true;
+			if (backup is not null && retainBackupAt is not null)
+				Directory.Move(backup, retainBackupAt);
+		}
+		catch
+		{
+			if (installed) Directory.Move(directory, prepared);
+			Rollback(directory, backup);
+			throw;
+		}
+		if (backupContainsCopies) DiscardPrepared(backup);
+		else DiscardBackup(backup);
+	}
+
+	/// <summary>清理全由编译或材质物化复制出来的目录，包括继承到的只读属性。</summary>
+	internal static void DiscardPrepared(string? directory)
+	{
+		if (directory is null) return;
+		try
+		{
+			if (!Directory.Exists(directory) || (File.GetAttributes(directory) & FileAttributes.ReparsePoint) != 0) return;
+			foreach (var path in Directory.EnumerateFiles(directory))
+				if ((File.GetAttributes(path) & FileAttributes.ReparsePoint) == 0)
+					VpkPayloadSwap.ClearReadOnly(path);
+		}
+		catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or System.Security.SecurityException)
+		{
+		}
+		DiscardBackup(directory);
 	}
 
 	/// <summary>这次派生成功了：盖上归属标记、丢掉备份。</summary>

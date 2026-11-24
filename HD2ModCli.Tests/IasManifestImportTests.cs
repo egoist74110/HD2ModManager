@@ -10,11 +10,11 @@ public sealed class IasManifestImportTests
 	[Fact]
 	public async Task SerializeManifest_ImportsIntoVanillaManagerWithOnlyPrimaryOptionsEnabled()
 	{
-		var aliases = IasDp8Routes.Slots.ToDictionary(slot => slot.Source, slot => slot.Source + 1);
-		var lines = new List<string> { "manifest_version=6", $"archive={IasDp8Routes.SourceBody}" };
-		AddOptions("Torso_Armor", "coat", "外套", "穿外套", "脱外套");
-		AddOptions("LeftLeg", "shoes", "鞋子", "穿鞋", "脱鞋");
-		var plan = IasDp8Routes.Plan(aliases, lines);
+		IasOptionGroup[] groups =
+		[
+			new("外套", [new("穿外套", "coat/on", []), new("脱外套", "coat/off", [])]),
+			new("鞋子", [new("穿鞋", "shoes/on", []), new("脱鞋", "shoes/off", [])]),
+		];
 
 		var root = Path.Combine(Path.GetTempPath(), "hd2clitests", Guid.NewGuid().ToString("N"));
 		var appRoot = Path.Combine(root, "app");
@@ -24,9 +24,9 @@ public sealed class IasManifestImportTests
 		{
 			var dir = Path.Combine(package, folder);
 			Directory.CreateDirectory(dir);
-			await File.WriteAllTextAsync(Path.Combine(dir, $"{IasDp8Routes.TargetBody}.patch_0"), folder);
+			await File.WriteAllTextAsync(Path.Combine(dir, "0000000000000001.patch_0"), folder);
 		}
-		await File.WriteAllTextAsync(Path.Combine(package, "manifest.json"), IasDp8Converter.SerializeManifest(plan));
+		await File.WriteAllTextAsync(Path.Combine(package, "manifest.json"), IasStandardConverter.SerializeManifest("IAS 夹具", groups));
 
 		try
 		{
@@ -47,10 +47,10 @@ public sealed class IasManifestImportTests
 			var snapshot = states.CreateSnapshot();
 
 			var coat = Assert.Single(imported.Snapshot.Nodes.Values, node => node.Metadata.Name == "外套");
-			var coatOn = Assert.Single(imported.Snapshot.Nodes.Values, node => node.Metadata.Name == "穿外套（默认）");
+			var coatOn = Assert.Single(imported.Snapshot.Nodes.Values, node => node.Metadata.Name == "穿外套");
 			var coatOff = Assert.Single(imported.Snapshot.Nodes.Values, node => node.Metadata.Name == "脱外套");
 			var shoes = Assert.Single(imported.Snapshot.Nodes.Values, node => node.Metadata.Name == "鞋子");
-			var shoesOn = Assert.Single(imported.Snapshot.Nodes.Values, node => node.Metadata.Name == "穿鞋（默认）");
+			var shoesOn = Assert.Single(imported.Snapshot.Nodes.Values, node => node.Metadata.Name == "穿鞋");
 			var shoesOff = Assert.Single(imported.Snapshot.Nodes.Values, node => node.Metadata.Name == "脱鞋");
 
 			var rootKey = rootNode.Id.Value.ToString("N");
@@ -66,21 +66,5 @@ public sealed class IasManifestImportTests
 			try { if (Directory.Exists(root)) Directory.Delete(root, recursive: true); } catch { }
 		}
 
-		void AddOptions(string part, string group, string name, string onName, string offName)
-		{
-			lines.AddRange([
-				$"free_part={group},{part},on",
-				$"free_part_display_name={group},{name}",
-				$"free_option={group},off,1",
-				$"free_option={group},on,0",
-				$"free_option_display_name={group},on,{onName}",
-				$"free_option_display_name={group},off,{offName}",
-			]);
-			foreach (var slot in IasDp8Routes.Slots.Where(slot => slot.Part == part))
-			{
-				lines.Add($"free_route={group},on,{slot.Source:x16},{aliases[slot.Source]:x16},{aliases[slot.Source]:x16}");
-				lines.Add($"free_route={group},off,{slot.Source:x16},{aliases[slot.Source]:x16},{aliases[slot.Source] + 1:x16}");
-			}
-		}
 	}
 }

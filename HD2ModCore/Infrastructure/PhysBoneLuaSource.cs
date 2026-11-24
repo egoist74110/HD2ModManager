@@ -34,12 +34,7 @@ public static class PhysBoneLuaSource
 	/// 而且要求它必须是首行——所以这里不能有任何前导空行或 BOM。
 	/// </param>
 	/// <param name="mode">boot / external，只影响日志里的措辞。</param>
-	/// <param name="armPoseEnabled">是否在安装时开启运行时手臂姿态修正（默认关闭）。</param>
-	/// <param name="jointPoseOptions">
-	/// 关节修正数据的 Lua 片段（<see cref="JointPoseData.ToLuaOptions"/>），只在 <paramref name="armPoseEnabled"/> 时注入。
-	/// </param>
-	public static string ComposeStandalonePackage(string? addonId = null, string mode = "external", bool armPoseEnabled = false,
-		string? jointPoseOptions = null, int iasPhysicsGroups = 0)
+	public static string ComposeStandalonePackage(string? addonId = null, string mode = "external")
 	{
 		var compat = LoadCompat();
 		var runtime = LoadRuntime();
@@ -68,15 +63,8 @@ public static class PhysBoneLuaSource
 		builder.AppendLine("\tlocal engine = rawget(_G, 'stingray')");
 		builder.AppendLine("\tif engine == nil then return end");
 		builder.Append("\tPhysBoneRuntime.install(engine, { compat = PhysBoneCompat, mode = '")
-			.Append(mode).Append("'");
-		if (armPoseEnabled)
-		{
-			builder.Append(", armPose = true");
-			if (!string.IsNullOrWhiteSpace(jointPoseOptions))
-				builder.Append(", ").Append(jointPoseOptions);
-		}
-		builder.Append(", iasPhysicsGroups = ").Append((iasPhysicsGroups & 15).ToString(System.Globalization.CultureInfo.InvariantCulture));
-		builder.AppendLine(" })");
+			.Append(mode)
+			.AppendLine("' })");
 		builder.AppendLine("end)");
 		builder.AppendLine("if not ok then");
 		builder.AppendLine("\tlocal real = rawget(_G, 'print')");

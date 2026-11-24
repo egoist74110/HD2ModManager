@@ -33,23 +33,14 @@ local Fake = {}
 Fake.__index = Fake
 
 local function newFake()
-	local self = setmetatable({ units = {}, nextIndex = 1, clock = 0, hashes = {}, nextHash = 0 }, Fake)
+	local self = setmetatable({ units = {}, nextIndex = 1, clock = 0 }, Fake)
 	-- 噪声 unit：节点数不够，必须被判"不是目标"，用来确认扫描没有把所有人都当候选。
 	for _ = 1, 40 do self:addUnit({ nodes = 10 }) end
 	return self
 end
 
--- 每件转换后的护甲有一个 16 位十六进制资源 id（IAS 的 profile 哈希）；名单在 install 时就定死。
-function Fake:newHash()
-	self.nextHash = self.nextHash + 1
-	local hash = string.format("%016x", 0xa5000000 + self.nextHash)
-	self.hashes[#self.hashes + 1] = hash
-	return hash
-end
-
 function Fake:addUnit(spec)
 	local unit = {
-		hash = spec.armour and (spec.hash or self:newHash()) or nil,
 		id = self.nextIndex,
 		nodes = spec.nodes or 110,
 		alive = true,
@@ -72,10 +63,9 @@ function Fake:removeUnit(unit)
 	unit.alive = false
 end
 
-function Fake:playerAt(name, x, chains, hash)
+function Fake:playerAt(name, x, chains)
 	local avatar = self:addUnit({ name = name .. "-avatar", avatar = true, position = vector(x, 0, 0) })
-	local armor = self:addUnit({ name = name .. "-armor", anim = false, mg = true, position = vector(x + 0.1, 0, 0), chains = chains,
-		armour = true, hash = hash })
+	local armor = self:addUnit({ name = name .. "-armor", anim = false, mg = true, position = vector(x + 0.1, 0, 0), chains = chains })
 	return avatar, armor
 end
 
@@ -88,8 +78,7 @@ function Fake:stingray()
 		has_animation_state_machine = function(unit) return unit.anim end,
 		has_node = function(unit, _) return unit.mg end,
 		world_position = function(unit, _) return unit.position end,
-		-- 真引擎的名字里带资源 id（16 位十六进制）；非护甲 unit 没有。
-		debug_name = function(unit) return "#ID[" .. (unit.hash or tostring(unit.id)) .. "]" end,
+		debug_name = function(unit) return "#ID[" .. tostring(unit.id) .. "]" end,
 	}
 	local World = {
 		units = function(_) return self_.units end,
@@ -98,13 +87,8 @@ function Fake:stingray()
 			local found = {}
 			for index = 1, #self_.units do
 				local unit = self_.units[index]
-				if unit.alive then
-					if type(resource) == "table" then
-						-- IdString64.from_hex(哈希) 的键：按护甲的资源 id 匹配。
-						if unit.hash ~= nil and resource.hex == unit.hash then found[#found + 1] = unit end
-					elseif unit.avatarResource and resource == "content/fac_helldivers/cha_avatar/avatar_helldiver" then
-						found[#found + 1] = unit
-					end
+				if unit.alive and unit.avatarResource and resource == "content/fac_helldivers/cha_avatar/avatar_helldiver" then
+					found[#found + 1] = unit
 				end
 			end
 			return found
@@ -115,13 +99,12 @@ function Fake:stingray()
 	}
 	return {
 		Application = {
-			worlds = function() if self_.noWorlds then return nil end return { 1 } end,
+			worlds = function() return { 1 } end,
 			string_to_id32 = id32,
 			time_since_launch = function() return self_.clock end,
 		},
 		World = World,
 		Unit = Unit,
-		IdString64 = { from_hex = function(hex) return { hex = hex } end },
 		Vector3 = { to_elements = function(v) return v.x, v.y, v.z end },
 		Matrix4x4 = { translation = function(_) return vector(0, 0, 0) end },
 	}
@@ -140,7 +123,6 @@ local function newCompat()
 	local compat = { attached = {}, released = {}, dtByUnit = {}, calls = {} }
 	compat.unit_alive = function(_, unit) return unit ~= nil and unit.alive == true end
 	compat.begin_frame = function() end
-	compat.filter_ias_groups = function(rig) return rig, 0 end
 	compat.select_rig = function(_, units, _)
 		local unit = units[1]
 		return { rig = { bones = { { name = "hair" } } }, path = "data/fake.gpu_resources", full = true, score = 1, total = #unit.name }
@@ -188,7 +170,6 @@ local function freshRuntime(fake, compat, options)
 		compat = compat,
 		log = false,
 		carriers = { { rig = { bones = { { name = "hair" } } }, path = "fake" } },
-		profileHashes = fake.hashes,   -- IAS 的 profile 表：转换器写出的全部转换件哈希
 		settleFrames = 1, snapshot = false, tunePath = "nonexistent-hd2pbx-tune.txt",
 		pollFrames = 1,
 		validateFrames = 3,
@@ -248,13 +229,12 @@ do
 	local compat = newCompat()
 	fake:playerAt("p1", 0)
 	fake:playerAt("p2", 10)
-	local lateHash = fake:newHash()   -- 名单是启动时装载的静态数据：晚来的护甲哈希也得在名单里
 	local runtime = freshRuntime(fake, compat)
 	fake:advance(60)
 	local before = sessionUnits(runtime)
 	check(#runtime.sessions == 2, "先挂上两个人", #runtime.sessions)
 
-	local _, armor3 = fake:playerAt("p3", 20, nil, lateHash)
+	local _, armor3 = fake:playerAt("p3", 20)
 	fake:advance(40)
 	local after = sessionUnits(runtime)
 
@@ -300,9 +280,7 @@ do
 
 	fake:removeUnit(avatar2)
 	fake:advance(40)
-	-- E12e（IAS 模型）：avatar 不在本帧枚举里 ⇒ 这件护甲没有主人 ⇒ 状态直接丢弃、不碰句柄（IAS 没有"先交还姿态"这一步；
-	-- 尸体怎么处理是单独的决定，见 docs/agent/ias-runtime-lifecycle-map-20261123.md §4-4）。
-	check(#compat.released == 0, "主人不在了 ⇒ 状态丢弃，不再对 unit 发任何释放调用", table.concat(compat.released, ","))
+	check(#compat.released >= 1, "主人不在了但 unit 还活着 ⇒ 释放并交还姿态", table.concat(compat.released, ","))
 	check(#runtime.sessions == 1, "他自己的会话被收掉，别人不受影响", #runtime.sessions)
 end
 
@@ -380,7 +358,7 @@ do
 	local fake = newFake()
 	local compat = newCompat()
 	for index = 1, 4 do fake:playerAt("p" .. index, (index - 1) * 10, 60) end
-	local runtime = freshRuntime(fake, compat, { maxChainsPerFrame = 160, otherPlayerStride = 2 })
+	local runtime = freshRuntime(fake, compat, { maxChainsPerFrame = 160, otherPlayerStride = 2, zeroLimit = 5 })
 	fake:advance(80)
 	local attachCount = #compat.attached
 	fake:advance(60)
@@ -388,97 +366,13 @@ do
 	check(runtime.sessions ~= nil and #runtime.sessions == 4, "四个会话仍在", runtime.sessions ~= nil and #runtime.sessions or 0)
 end
 
--- ================================================================ 场景 5b：没有看门狗（E12e-B4）
-io.stdout:write("\n[场景 5b] 零处理帧不丢会话：IAS 没有按帧计数的看门狗（只有已锁存的试验开关 R:3914/3967/4007，从不丢会话）\n")
-do
-	local fake = newFake()
-	local compat = newCompat()
-	fake:playerAt("p1", 0, 6)
-	local runtime = freshRuntime(fake, compat, {})
-	fake:advance(80)
-	local attachCount = #compat.attached
-	-- 此后求解器一条骨都不处理（written=0、skippedSame=0）：
-	-- 以前连续 45 帧就会 `runtime.sessions = nil` 并重挂；现在什么都不该发生。
-	compat.update = function(session, dt, _)
-		compat.dtByUnit[#compat.dtByUnit + 1] = { unit = session.unit.name, dt = dt }
-		session.engineCalls, session.skippedSame = 0, 0
-		return 0
-	end
-	local session = runtime.sessions and runtime.sessions[1]
-	compat.dtByUnit = {}
-	fake:advance(200)
-	check(#compat.attached == attachCount, "200 帧零处理：没有重挂", #compat.attached - attachCount)
-	check(runtime.sessions ~= nil and #runtime.sessions == 1 and runtime.sessions[1] == session, "会话原封不动还在")
-	check(#compat.dtByUnit == 200, "每帧仍在驱动", #compat.dtByUnit)
-end
-
--- ================================================================ 场景 5b2：本帧枚举失败不碰上一帧的句柄（E12e-B5）
-io.stdout:write("\n[场景 5b2] 本帧枚举失败：会话还是上一帧的，不写骨（IAS 句柄只来自本回调枚举、不跨帧，R:894-896、R:1417-1422）\n")
-do
-	local fake = newFake()
-	local compat = newCompat()
-	fake:playerAt("p1", 0, 6)
-	local runtime = freshRuntime(fake, compat, {})
-	fake:advance(80)
-	local driven = 0
-	local update = compat.update
-	compat.update = function(session, dt, ...)
-		driven = driven + 1
-		return update(session, dt, ...)
-	end
-	fake:advance(5)
-	check(driven > 0, "枚举正常时照常驱动", driven)
-	fake.noWorlds = true
-	driven = 0
-	fake:advance(30)
-	check(driven == 0, "Application.worlds 取不到 ⇒ 30 帧一次都不写骨", driven)
-	fake.noWorlds = nil
-	fake:advance(5)
-	check(driven > 0, "枚举恢复后继续驱动", driven)
-end
-
--- ================================================================ 场景 5c：没有动画状态机的 avatar 照常跑物理（E12e-B4）
-io.stdout:write("\n[场景 5c] avatar 没有动画状态机：物理继续写、不重置（IAS 角色类 0 照常 bind_unit，R:6975/R:7004）\n")
-do
-	local fake = newFake()
-	local compat = newCompat()
-	local avatar = fake:playerAt("p1", 0, 6)
-	avatar.anim = false
-	local resets = 0
-	compat.reset_physics = function(session, dt, ...)
-		resets = resets + 1
-		return compat.update(session, dt, ...)
-	end
-	local machineReads = 0
-	local makeStingray = fake.stingray
-	fake.stingray = function(self_, ...)
-		local stingray = makeStingray(self_, ...)
-		local readMachine = stingray.Unit.has_animation_state_machine
-		stingray.Unit.has_animation_state_machine = function(unit)
-			machineReads = machineReads + 1
-			return readMachine(unit)
-		end
-		return stingray
-	end
-	local runtime = freshRuntime(fake, compat, {})
-	fake:advance(80)
-	compat.dtByUnit = {}
-	machineReads, resets = 0, 0
-	fake:advance(60)
-	local own = 0
-	for _, entry in ipairs(compat.dtByUnit) do if entry.unit == "p1-armor" then own = own + 1 end end
-	check(own == 60, "没有状态机的本人：60 帧每帧都写", own)
-	check(resets == 0, "没有状态机：不触发重置", resets)
-	check(machineReads == 0, "物理闸不再每帧读 has_animation_state_machine", machineReads)
-	check(runtime.sessions ~= nil and #runtime.sessions == 1, "会话仍在")
-end
-
--- ================================================================ 场景 6：没有 units_by_resource
-io.stdout:write("\n[场景 6] 引擎没有 units_by_resource：IAS 同样没有回退扫描，什么都不挂也不报错\n")
+-- ================================================================ 场景 6：没有 units_by_resource 的兜底
+io.stdout:write("\n[场景 6] 老引擎没有 units_by_resource：退回全量扫描，照样要找到所有玩家\n")
 do
 	local fake = newFake()
 	local compat = newCompat()
 	for index = 1, 3 do fake:playerAt("p" .. index, (index - 1) * 10) end
+	local runtime = freshRuntime(fake, compat)
 	-- 模拟"这个版本的引擎没有这个函数"：直接抽掉它。
 	local stingray = fake:stingray()
 	stingray.World.units_by_resource = nil
@@ -486,13 +380,13 @@ do
 	rawset(_G, "render", function() end)
 	runtimeModule.install(stingray, {
 		compat = compat, log = false,
-		carriers = { { rig = { bones = { { name = "hair" } } }, path = "fake" } }, profileHashes = fake.hashes,
+		carriers = { { rig = { bones = { { name = "hair" } } }, path = "fake" } },
 		settleFrames = 1, snapshot = false, tunePath = "nonexistent-hd2pbx-tune.txt", pollFrames = 1, validateFrames = 3, heartbeatFrames = 1000000, minNodes = 90,
 	})
-	local runtime = rawget(_G, "__hd2physbone_runtime")
-	local ok = pcall(fake.advance, fake, 60)
-	check(ok, "渲染回调不抛错")
-	check(#(runtime.sessions or {}) == 0, "没有枚举接口就没有 avatar、没有会话", #(runtime.sessions or {}))
+	runtime = rawget(_G, "__hd2physbone_runtime")
+	fake:advance(60)
+	check(runtime.cache.avatarSource == "scan", "确实走了全量扫描那条路", runtime.cache.avatarSource)
+	check(#runtime.sessions == 3, "三个人都挂上了（不再只认一个）", #runtime.sessions)
 end
 
 -- ================================================================ 场景 7：单人局不回归
@@ -501,7 +395,7 @@ do
 	local fake = newFake()
 	local compat = newCompat()
 	fake:playerAt("p1", 0)
-	fake:addUnit({ name = "p1-armor-b", anim = false, mg = true, position = vector(0.2, 0, 0), chains = 4, armour = true })
+	fake:addUnit({ name = "p1-armor-b", anim = false, mg = true, position = vector(0.2, 0, 0), chains = 4 })
 	local runtime = freshRuntime(fake, compat)
 	fake:advance(60)
 	check(#runtime.sessions == 2, "两件护甲都挂上", #runtime.sessions)
@@ -553,7 +447,7 @@ do
 		local opts = {
 			compat = compat,
 			logPath = path,
-			carriers = { { rig = { bones = { { name = "hair" } } }, path = "fake" } }, profileHashes = fake.hashes,
+			carriers = { { rig = { bones = { { name = "hair" } } }, path = "fake" } },
 			settleFrames = 1, snapshot = false, tunePath = "nonexistent-hd2pbx-tune.txt",
 			pollFrames = 1,
 			validateFrames = 3,

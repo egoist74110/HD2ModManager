@@ -36,6 +36,7 @@ public sealed class SourceMaterialSource
 	private readonly List<string> failures;
 	private readonly HashSet<string> ownedVmts;
 	private readonly HashSet<string> ownedVtfs;
+	private readonly Action<string>? onAssetRead;
 
 	private SourceMaterialSource(
 		IReadOnlyList<string> vpkPaths,
@@ -45,7 +46,8 @@ public sealed class SourceMaterialSource
 		List<string> failures,
 		string? primaryVpkPath,
 		HashSet<string> ownedVmts,
-		HashSet<string> ownedVtfs)
+		HashSet<string> ownedVtfs,
+		Action<string>? onAssetRead = null)
 	{
 		VpkPaths = vpkPaths;
 		this.vmts = vmts;
@@ -55,6 +57,7 @@ public sealed class SourceMaterialSource
 		PrimaryVpkPath = primaryVpkPath;
 		this.ownedVmts = ownedVmts;
 		this.ownedVtfs = ownedVtfs;
+		this.onAssetRead = onAssetRead;
 	}
 
 	/// <summary>实际参与索引的 VPK 路径（按传入顺序，去重后）。作用域视图里只有主 VPK 一个。</summary>
@@ -80,6 +83,10 @@ public sealed class SourceMaterialSource
 	public IReadOnlyList<string> Failures => failures;
 
 	public static SourceMaterialSource Open(IEnumerable<string> vpkPaths)
+		=> Open(vpkPaths, onAssetRead: null);
+
+	/// <summary>可选回调记录实际读取的 VPK。并行材质转换时，回调可能被并发调用。</summary>
+	public static SourceMaterialSource Open(IEnumerable<string> vpkPaths, Action<string>? onAssetRead)
 	{
 		ArgumentNullException.ThrowIfNull(vpkPaths);
 		var ordered = new List<string>();
@@ -105,7 +112,7 @@ public sealed class SourceMaterialSource
 			ordered, vmts, vtfs, vtfPaths, failures,
 			primaryVpkPath: null,
 			ownedVmts: new HashSet<string>(StringComparer.OrdinalIgnoreCase),
-			ownedVtfs: new HashSet<string>(StringComparer.OrdinalIgnoreCase));
+			ownedVtfs: new HashSet<string>(StringComparer.OrdinalIgnoreCase), onAssetRead: onAssetRead);
 	}
 
 	/// <summary>把一个目录（或一组目录）下所有 VPK 展开成路径列表，再交给 <see cref="Open"/>。</summary>
@@ -223,7 +230,7 @@ public sealed class SourceMaterialSource
 		// 主 VPK 本身打不开时，`failures` 已经有它；整批的旧失败也一并带过来，别丢信息。
 		failures.AddRange(this.failures);
 
-		return new SourceMaterialSource([full], vmts, vtfs, vtfPaths, failures, full, ownedVmts, ownedVtfs);
+		return new SourceMaterialSource([full], vmts, vtfs, vtfPaths, failures, full, ownedVmts, ownedVtfs, onAssetRead);
 	}
 
 	/// <summary>按材质裸名读 <c>.vmt</c> 字节。名字可带或不带 <c>.vmt</c> 后缀。</summary>
@@ -352,7 +359,7 @@ public sealed class SourceMaterialSource
 		return Path.GetFileNameWithoutExtension(normalized);
 	}
 
-	private static bool TryRead(
+	private bool TryRead(
 		IReadOnlyDictionary<string, (string VpkPath, string EntryPath)> index, string name, out byte[] bytes)
 	{
 		bytes = [];
@@ -364,6 +371,7 @@ public sealed class SourceMaterialSource
 		if (entry is null)
 			return false;
 		bytes = archive.Read(entry);
+		onAssetRead?.Invoke(location.VpkPath);
 		return true;
 	}
 }

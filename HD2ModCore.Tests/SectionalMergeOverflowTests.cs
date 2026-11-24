@@ -5,6 +5,7 @@ using HD2ModAdaptation.PatchReconstruction.UnitMesh;
 using HD2ModAdaptation.PatchReconstruction.UnitMesh.Canonical;
 using HD2ModCore.Domain;
 using HD2ModCore.Infrastructure;
+using HD2ModCore.Infrastructure.KitInstance;
 using HD2ModCore.Infrastructure.Sectional;
 using AdaptationAssetKey = HD2ModAdaptation.PatchReconstruction.AssetKey;
 
@@ -210,6 +211,283 @@ public sealed class SectionalMergeOverflowTests : IDisposable
 	}
 
 	[Fact]
+	public async Task DualCache_SwitchesCompleteArtifactsAndRecompilesOnlyChangedModels()
+	{
+		var a = await CreateSyntheticSevenSlotSectionalModAsync("custom-dual-a");
+		var b = await CreateSyntheticSevenSlotSectionalModAsync("custom-dual-b");
+		const string firstKey = "custom-dual-a";
+		const string secondKey = "custom-dual-b";
+		const string patchName = "9ba626afa44a3aa3.patch_0";
+		var wardrobe = new VpkWardrobeFile(true,
+			new VpkWardrobeState(new Dictionary<string, IReadOnlyCollection<int>> { ["39851901bad30002"] = [1] }),
+			HeadMergeIntoBody: true);
+		await VpkModWardrobeService.WriteAsync(a.ModDirectory, wardrobe);
+		var context = new VpkHostContext(a.GameDataDirectory, a.Paths)
+		{
+			MergeUnitOverride = SimulateOverflowWhenBothVariantsEnabledAsync,
+		};
+
+		async Task<LowPollutionRecompileResult> Apply(bool enabled, bool npc = false)
+		{
+			var mode = context with { LowPollutionMode = enabled };
+			var npcByModel = LowPollutionFreshness.NpcItemIdsByModel(enabled && npc
+				? [new RuntimeArmorRegistryMapping(KitNpcRecords.FemaleCaptainItemId, null, firstKey)]
+				: []);
+			VpkHostContext ContextOf(LowPollutionPrepItem item) => mode with
+			{
+				NpcItemIds = npcByModel.TryGetValue(item.ModelKey, out var mapped) ? [.. mapped] : [],
+			};
+			var plan = await LowPollutionFreshness.PlanAsync(a.Paths.ModsDirectory, [firstKey, secondKey], enabled,
+				npcByModel: npcByModel, cacheContext: mode);
+			var run = await LowPollutionRecompiler.RunAsync(plan, async (item, token) =>
+			{
+				var compiled = await ModCompileService.CompileAsync(item.ModelKey, item.ModDirectory, ContextOf(item), cancellationToken: token);
+				return (compiled.Ok, compiled.Error ?? string.Empty);
+			}, progress: null, tryRestore: (item, token) => LowPollutionFreshness.TryActivateCachedAsync(item, ContextOf(item), token));
+			Assert.Empty(run.Failed);
+			return run;
+		}
+
+		var aOverwrite = ModNodePayloadLayout.GetOverwriteDirectory(a.ModDirectory);
+		var aPayload = ModNodePayloadLayout.GetVpkPatchDirectory(a.ModDirectory);
+		var compressedSlot = LowPollutionArtifactCache.Slot(a.ModDirectory, true);
+		var ordinarySlot = LowPollutionArtifactCache.Slot(a.ModDirectory, false);
+		var parser = CoreServices.CreatePatchFileNameParser();
+		var id = ModNodeId.New();
+		var relative = Path.GetFileName(a.ModDirectory);
+		var node = new ModNode(id, relative, new ModNodeMetadata(relative, null, DateTimeOffset.UtcNow, null), [], []);
+		var profile = new Profile(ProfileId.New(), "切换验证", DateTimeOffset.UtcNow, null, [new ProfileEntry(id, 0)]);
+		var snapshot = new LibrarySnapshot(1, DateTimeOffset.UtcNow, new Dictionary<ModNodeId, ModNode> { [id] = node }, [profile]);
+
+		Assert.Equal(2, (await Apply(true, npc: true)).RecompileCount);
+		Assert.True(File.Exists(Path.Combine(aOverwrite, LowPollutionLayoutFile.FileName)));
+		Assert.Empty(ProfileApplyService.ExcludeCompressedModels(profile, snapshot, a.Paths.ModsDirectory, []).Entries);
+		var npcLayout = await File.ReadAllBytesAsync(Path.Combine(aOverwrite, LowPollutionLayoutFile.FileName));
+		var compressedUnit = await File.ReadAllBytesAsync(Path.Combine(aOverwrite, patchName));
+		Assert.Equal(2, (await Apply(false)).RecompileCount);
+		Assert.False(File.Exists(Path.Combine(aOverwrite, LowPollutionLayoutFile.FileName)));
+		Assert.True(File.Exists(Path.Combine(compressedSlot, LowPollutionLayoutFile.FileName)));
+		Assert.Equal(profile.Entries, ProfileApplyService.ExcludeCompressedModels(profile, snapshot, a.Paths.ModsDirectory, []).Entries);
+		var ordinaryUnit = await File.ReadAllBytesAsync(Path.Combine(aOverwrite, patchName));
+		Assert.NotEqual(ordinaryUnit, compressedUnit);
+		var deployable = ModDeployableFiles.Resolve(a.ModDirectory, parser);
+		Assert.All(deployable.FilesByName.Values, path => Assert.Equal(aOverwrite, Path.GetDirectoryName(path)));
+		Assert.Equal(ordinaryUnit, await File.ReadAllBytesAsync(deployable.FilesByName[patchName]));
+		Assert.DoesNotContain(LowPollutionLayoutFile.FileName, deployable.FilesByName.Keys);
+		var imported = await new ObjectTreeImporter(parser).ImportFolderAsync(a.ModDirectory);
+		Assert.DoesNotContain(imported.Nodes.Values, item => item.RelativePath.Contains(LowPollutionArtifactCache.DirectoryName, StringComparison.Ordinal));
+
+		foreach (var enabled in new[] { true, false, true, false, true })
+		{
+			var switched = await Apply(enabled, npc: true);
+			Assert.Equal(0, switched.RecompileCount);
+			Assert.Equal(2, switched.Restored.Count);
+			Assert.Equal(enabled ? compressedUnit : ordinaryUnit, await File.ReadAllBytesAsync(Path.Combine(aOverwrite, patchName)));
+			Assert.True(File.Exists(Path.Combine(aOverwrite, WardrobeSectionMapFile.FileName)));
+		}
+		Assert.Equal(npcLayout, await File.ReadAllBytesAsync(Path.Combine(aOverwrite, LowPollutionLayoutFile.FileName)));
+		Assert.True(File.Exists(Path.Combine(ordinarySlot, SectionGroupFile.FileName)));
+		Assert.True(File.Exists(Path.Combine(ordinarySlot, VpkCustomModelFile.FileName)));
+		Assert.Equal(2, (await Apply(true, npc: true)).UpToDate.Count);
+
+		var beforeSidecarChange = await Apply(false);
+		Assert.Equal(0, beforeSidecarChange.RecompileCount);
+		var sourceGpu = Path.Combine(aPayload, patchName + ".gpu_resources");
+		await using (var stream = new FileStream(sourceGpu, FileMode.Append))
+			stream.WriteByte(0x5a);
+		Assert.Equal(firstKey, Assert.Single((await Apply(true, npc: true)).Recompiled).ModelKey);
+
+		var sections = Path.Combine(aPayload, WardrobeSectionMapFile.FileName);
+		var sourceMap = await WardrobeSectionMapFile.ReadAsync(sections);
+		await WardrobeSectionMapFile.WriteAsync(sections, sourceMap with { Patch = sourceMap.Patch with { Path = "moved-source.patch_0" } });
+		Assert.Equal(2, (await Apply(true, npc: true)).UpToDate.Count);
+		await using (var stream = new FileStream(Path.Combine(aPayload, patchName), FileMode.Append))
+			stream.WriteByte(0x69);
+		Assert.Equal(firstKey, Assert.Single((await Apply(true, npc: true)).Recompiled).ModelKey);
+
+		await VpkModWardrobeService.WriteAsync(a.ModDirectory, wardrobe with
+		{
+			State = new VpkWardrobeState(new Dictionary<string, IReadOnlyCollection<int>>
+			{
+				["39851901bad30002"] = [1],
+				["39851901bad30003"] = [1],
+			}),
+		});
+		Assert.Equal(firstKey, Assert.Single((await Apply(true, npc: true)).Recompiled).ModelKey);
+		Assert.Equal(firstKey, Assert.Single((await Apply(true, npc: false)).Recompiled).ModelKey);
+
+		Assert.Equal(firstKey, Assert.Single((await Apply(false)).Recompiled).ModelKey);
+		var materialName = "9ba626afa44a3aa3.patch_1";
+		await WriteSyntheticPatchArchiveAsync(Path.Combine(aPayload, materialName), [new(new AdaptationAssetKey(0xeac0b497876ade78, 1), [0x12], [], [])]);
+		Assert.Null(ModSettingsFile.TryWrite(a.ModDirectory, new ModSettingsFile.Document(ModSettingsFile.CurrentSchema, [materialName])));
+		var materialized = OverwriteMaterializer.Materialize(a.ModDirectory, OverwriteSelection.Default);
+		Assert.True(materialized.Succeeded, materialized.Error);
+		Assert.True(File.Exists(Path.Combine(aOverwrite, SectionGroupFile.FileName)));
+		Assert.True(File.Exists(Path.Combine(aOverwrite, materialName)));
+		Assert.False(Directory.Exists(compressedSlot));
+		Assert.Equal(2, (await Apply(false)).UpToDate.Count);
+		Assert.Equal(firstKey, Assert.Single((await Apply(true)).Recompiled).ModelKey);
+		Assert.True(File.Exists(Path.Combine(aOverwrite, materialName)));
+		Assert.True(File.Exists(Path.Combine(ordinarySlot, materialName)));
+		Assert.Equal(0, (await Apply(false)).RecompileCount);
+
+		var deletion = await new ModStorageDeletionService(a.Paths).DeleteAsync(relative);
+		Assert.Equal(ModStorageDeletionState.DeletedImmediately, deletion.State);
+		Assert.False(Directory.Exists(a.ModDirectory));
+		Assert.False(Directory.Exists(compressedSlot));
+		Assert.True(Directory.Exists(b.ModDirectory));
+	}
+
+	[Fact]
+	public async Task DualCache_GameInputFingerprintReadsAvatarAndNativeUnitPayloads()
+	{
+		var fixture = await CreateSyntheticSevenSlotSectionalModAsync();
+		var avatar = new byte[0x60];
+		BinaryPrimitives.WriteUInt32LittleEndian(avatar.AsSpan(0x34), 0x40);
+		var avatarPath = Path.Combine(fixture.GameDataDirectory, CanonicalAvatarRigReader.AvatarArchiveName);
+		WriteGameUnit(avatarPath, CanonicalAvatarRigReader.AvatarUnitFileId, avatar, []);
+		var npc = KitNpcRecords.All.Single(record => record.RequiresNativeShell);
+		var shellPath = Path.Combine(fixture.GameDataDirectory, npc.RootArchiveId);
+		var (shellToc, shellGpu) = BuildMinimalReadableTwoSectionUnitPayload();
+		WriteGameUnit(shellPath, npc.RootUnitId, shellToc, shellGpu);
+
+		var payload = ModNodePayloadLayout.GetVpkPatchDirectory(fixture.ModDirectory);
+		var map = await WardrobeSectionMapFile.ReadAsync(Path.Combine(payload, WardrobeSectionMapFile.FileName));
+		var context = new VpkHostContext(fixture.GameDataDirectory, fixture.Paths) { NpcItemIds = [npc.ItemId] };
+		async ValueTask<string> ReadGameKey()
+		{
+			var inputs = await LowPollutionArtifactCache.CaptureAsync(fixture.ModDirectory, payload,
+				Path.Combine(payload, "9ba626afa44a3aa3.patch_0"), map, disabled: null, headMerge: true,
+				lowPollution: true, context, OverwriteSelection.Default, default);
+			Assert.NotNull(inputs);
+			return inputs.Game;
+		}
+
+		var original = await ReadGameKey();
+		avatar[0x44] = 1;
+		WriteGameUnit(avatarPath, CanonicalAvatarRigReader.AvatarUnitFileId, avatar, []);
+		var changedAvatar = await ReadGameKey();
+		Assert.NotEqual(original, changedAvatar);
+		WriteGameUnit(shellPath, npc.RootUnitId, shellToc, shellGpu, unknown3: 1);
+		Assert.NotEqual(changedAvatar, await ReadGameKey());
+	}
+
+	private static void WriteGameUnit(string path, ulong unitId, byte[] toc, byte[] gpu, uint unknown3 = 0)
+	{
+		const int entryOffset = 60 + 32;
+		const int dataOffset = entryOffset + 80;
+		var archive = new byte[dataOffset + toc.Length];
+		BinaryPrimitives.WriteUInt32LittleEndian(archive, 4026531857);
+		BinaryPrimitives.WriteUInt32LittleEndian(archive.AsSpan(4), 1);
+		BinaryPrimitives.WriteUInt32LittleEndian(archive.AsSpan(8), 1);
+		BinaryPrimitives.WriteUInt64LittleEndian(archive.AsSpan(68), PatchUnitMeshReader.UnitTypeId);
+		BinaryPrimitives.WriteUInt64LittleEndian(archive.AsSpan(76), 1);
+		BinaryPrimitives.WriteUInt64LittleEndian(archive.AsSpan(entryOffset), unitId);
+		BinaryPrimitives.WriteUInt64LittleEndian(archive.AsSpan(entryOffset + 8), PatchUnitMeshReader.UnitTypeId);
+		BinaryPrimitives.WriteUInt64LittleEndian(archive.AsSpan(entryOffset + 16), dataOffset);
+		BinaryPrimitives.WriteUInt32LittleEndian(archive.AsSpan(entryOffset + 56), (uint)toc.Length);
+		BinaryPrimitives.WriteUInt32LittleEndian(archive.AsSpan(entryOffset + 64), (uint)gpu.Length);
+		BinaryPrimitives.WriteUInt32LittleEndian(archive.AsSpan(entryOffset + 72), unknown3);
+		toc.CopyTo(archive, dataOffset);
+		File.WriteAllBytes(path, archive);
+		if (gpu.Length != 0) File.WriteAllBytes(path + ".gpu_resources", gpu);
+	}
+
+	[Fact]
+	public void PreparedOverwrite_RestoresBothDirectoriesWhenSavingOutgoingArtifactFails()
+	{
+		var active = Path.Combine(_root, "Overwrite");
+		var incoming = Path.Combine(_root, "incoming");
+		var blocked = Path.Combine(_root, "occupied");
+		foreach (var directory in new[] { active, incoming, blocked }) Directory.CreateDirectory(directory);
+		ManagedOverwriteDirectory.Commit(active, HD2ModCore.Decoration.ManagedOverwriteMarkers.VpkRekey);
+		ManagedOverwriteDirectory.Commit(incoming, HD2ModCore.Decoration.ManagedOverwriteMarkers.VpkRekey);
+		File.WriteAllText(Path.Combine(active, "ordinary"), "old");
+		File.WriteAllText(Path.Combine(incoming, "compressed"), "new");
+		Assert.ThrowsAny<IOException>(() => ManagedOverwriteDirectory.ReplacePrepared(active, incoming, blocked));
+		Assert.Equal("old", File.ReadAllText(Path.Combine(active, "ordinary")));
+		Assert.Equal("new", File.ReadAllText(Path.Combine(incoming, "compressed")));
+		Assert.Empty(Directory.EnumerateDirectories(_root, "Overwrite.backup-*"));
+	}
+
+	[Fact]
+	public async Task LowPollutionRecompile_MaterialRefreshKeepsBothKindsOfFreshResults()
+	{
+		var compressed = await CreateSyntheticSevenSlotSectionalModAsync("custom-compressed");
+		var unsupported = await CreateSyntheticSevenSlotSectionalModAsync("custom-unsupported");
+		var enabled = new Dictionary<string, IReadOnlyCollection<int>> { ["39851901bad30002"] = [1] };
+		await VpkModWardrobeService.WriteAsync(compressed.ModDirectory,
+			new VpkWardrobeFile(true, new VpkWardrobeState(enabled), HeadMergeIntoBody: true));
+		var context = new VpkHostContext(compressed.GameDataDirectory, compressed.Paths)
+		{
+			LowPollutionMode = true,
+			MergeUnitOverride = SimulateOverflowWhenBothVariantsEnabledAsync,
+		};
+		var mods = Path.GetDirectoryName(compressed.ModDirectory)!;
+		string[] keys = ["custom-compressed", "custom-unsupported"];
+
+		async Task<LowPollutionRecompileResult> Apply(bool lowPollution = true, bool mapNpc = false)
+		{
+			var npcByModel = LowPollutionFreshness.NpcItemIdsByModel(mapNpc
+				? [new RuntimeArmorRegistryMapping(KitNpcRecords.FemaleCaptainItemId, null, keys[0])]
+				: []);
+			var plan = await LowPollutionFreshness.PlanAsync(mods, keys, lowPollution, npcByModel: npcByModel);
+			return await LowPollutionRecompiler.RunAsync(plan, async (item, token) =>
+			{
+				var compileContext = context with
+				{
+					LowPollutionMode = lowPollution,
+					NpcItemIds = npcByModel.TryGetValue(item.ModelKey, out var npcs) ? [.. npcs.Order()] : [],
+				};
+				var result = await ModCompileService.CompileAsync(item.ModelKey, item.ModDirectory,
+					compileContext, cancellationToken: token);
+				return (result.Ok, result.Error ?? string.Empty);
+			}, progress: null);
+		}
+
+		var first = await Apply();
+		Assert.Empty(first.Failed);
+		Assert.Equal(2, first.Recompiled.Count);
+		var unchanged = await Apply();
+		Assert.Empty(unchanged.Recompiled);
+		Assert.Equal(2, unchanged.UpToDate.Count);
+
+		Assert.True(File.Exists(Path.Combine(compressed.ModDirectory, "Overwrite", LowPollutionLayoutFile.FileName)));
+		Assert.True(File.Exists(Path.Combine(unsupported.ModDirectory, "Overwrite", LowPollutionFreshness.UnsupportedMarkerFileName)));
+		foreach (var directory in new[] { compressed.ModDirectory, unsupported.ModDirectory })
+		{
+			var structure = Path.Combine(directory, "Overwrite", WardrobeSectionMapFile.FileName);
+			var previous = await File.ReadAllBytesAsync(structure);
+			var refreshed = OverwriteMaterializer.Materialize(directory, OverwriteSelection.Empty);
+			Assert.True(refreshed.Succeeded, refreshed.Error);
+			Assert.Equal(previous, await File.ReadAllBytesAsync(structure));
+		}
+
+		var afterMaterials = await Apply();
+		Assert.Empty(afterMaterials.Recompiled);
+		Assert.Equal(2, afterMaterials.UpToDate.Count);
+
+		var sections = Path.Combine(compressed.ModDirectory, ModNodePayloadLayout.VpkPatchDirectoryName, WardrobeSectionMapFile.FileName);
+		var document = await WardrobeSectionMapFile.ReadAsync(sections, default);
+		var changed = document.Units.Select(unit => unit.Slot == "helmet" ? unit with { BodyType = "Slim" } : unit).ToArray();
+		await WardrobeSectionMapFile.WriteAsync(sections, document with { Units = changed }, default);
+		var afterSourceChange = await Apply();
+		Assert.Empty(afterSourceChange.Failed);
+		Assert.Equal("custom-compressed", Assert.Single(afterSourceChange.Recompiled).ModelKey);
+		Assert.Equal("custom-unsupported", Assert.Single(afterSourceChange.UpToDate).ModelKey);
+
+		var afterMappingChange = await Apply(mapNpc: true);
+		Assert.Empty(afterMappingChange.Failed);
+		Assert.Equal("custom-compressed", Assert.Single(afterMappingChange.Recompiled).ModelKey);
+		Assert.Equal(2, (await Apply(mapNpc: true)).UpToDate.Count);
+
+		var disabled = await Apply(lowPollution: false);
+		Assert.Empty(disabled.Failed);
+		Assert.Equal(2, disabled.Recompiled.Count);
+		Assert.Equal(2, (await Apply(lowPollution: false)).UpToDate.Count);
+	}
+
+	[Fact]
 	public async Task CompileAsync_WhenOverflowCanceled_AbortsWithoutWritingOverwriteOrWardrobe()
 	{
 		var (modDir, storagePaths, gameDataDir) = await CreateSyntheticSevenSlotSectionalModAsync();
@@ -293,10 +571,11 @@ public sealed class SectionalMergeOverflowTests : IDisposable
 			[]);
 	}
 
-	private async Task<(string ModDirectory, StoragePaths Paths, string GameDataDirectory)> CreateSyntheticSevenSlotSectionalModAsync()
+	private async Task<(string ModDirectory, StoragePaths Paths, string GameDataDirectory)> CreateSyntheticSevenSlotSectionalModAsync(
+		string modelKey = "custom-airi")
 	{
 		var modsRoot = Path.Combine(_root, "mods");
-		var modDir = Path.Combine(modsRoot, "AiriTestMod");
+		var modDir = Path.Combine(modsRoot, modelKey == "custom-airi" ? "AiriTestMod" : modelKey);
 		var payloadDir = Path.Combine(modDir, ModNodePayloadLayout.VpkPatchDirectoryName);
 		var gameDataDir = Path.Combine(_root, "gamedata");
 		Directory.CreateDirectory(payloadDir);
@@ -358,7 +637,7 @@ public sealed class SectionalMergeOverflowTests : IDisposable
 			$"{{\"slot\":{item.RegistrySlot},\"pieceType\":0,\"body\":3,\"unit\":\"{item.UnitId}\"}}"));
 		await File.WriteAllTextAsync(
 			Path.Combine(payloadDir, VpkCustomModelFile.FileName),
-			$"{{\"schema\":\"hd2mod.custom-model/1\",\"key\":\"custom-airi\",\"name\":\"AiriTestMod\",\"pieces\":[{piecesJson}]}}");
+			$"{{\"schema\":\"hd2mod.custom-model/1\",\"key\":\"{modelKey}\",\"name\":\"AiriTestMod\",\"pieces\":[{piecesJson}]}}");
 
 		return (modDir, new StoragePaths(_root, modsRoot), gameDataDir);
 	}

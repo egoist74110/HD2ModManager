@@ -1,6 +1,11 @@
 using System;
 using System.Collections.ObjectModel;
+using System.Collections.Generic;
 using System.Linq;
+using System.Runtime.CompilerServices;
+using System.Threading;
+using System.Threading.Tasks;
+using HD2ModCore.Ias;
 
 namespace HD2ModManager.Services
 {
@@ -12,6 +17,7 @@ namespace HD2ModManager.Services
         public ImportTaskStatus Status { get; set; } = ImportTaskStatus.Queued;
         public string? Error { get; set; }
         public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
+        internal ImportTaskItem[]? DropBatch { get; set; }
     }
 
     public class ImportQueueService
@@ -26,9 +32,37 @@ namespace HD2ModManager.Services
 
         public void Enqueue(params string[] paths)
         {
-            foreach (var p in paths.Where(p => !string.IsNullOrWhiteSpace(p)))
+            var items = paths.Where(path => !string.IsNullOrWhiteSpace(path))
+                .Select(path => new ImportTaskItem { Path = path }).ToArray();
+            if (items.Length == 0) return;
+            items[0].DropBatch = items;
+            foreach (var item in items)
             {
-                _tasks.Add(new ImportTaskItem { Path = p });
+                _tasks.Add(item);
+            }
+        }
+
+        internal async IAsyncEnumerable<(ImportTaskItem Item, IasStandardDropPackage? Package)> DequeueImportItemsAsync(
+            [EnumeratorCancellation] CancellationToken ct)
+        {
+            while (_tasks.FirstOrDefault(item => item.Status == ImportTaskStatus.Queued) is { } first)
+            {
+                var batch = first.DropBatch ?? [first];
+                var paths = batch.Select(item => item.Path).ToArray();
+                using var drop = await Task.Run(() => IasStandardDrop.InspectAsync(paths, ct), ct);
+                first.DropBatch = null;
+                var retained = drop.Items.Select(route => route.Index).ToHashSet();
+                for (var i = 0; i < batch.Length; i++)
+                {
+                    if (!retained.Contains(i)) _tasks.Remove(batch[i]);
+                }
+                foreach (var route in drop.Items)
+                {
+                    var item = batch[route.Index];
+                    item.Path = route.Path;
+                    MarkRunning(item);
+                    yield return (item, route.Package);
+                }
             }
         }
 

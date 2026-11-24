@@ -1,0 +1,22 @@
+<Project>
+  <PropertyGroup>
+    <IasWorkerProject>$(MSBuildThisFileDirectory)HD2IasWorker.csproj</IasWorkerProject>
+  </PropertyGroup>
+  <ItemGroup Condition="'$(OS)' == 'Windows_NT'">
+    <ProjectReference Include="$(IasWorkerProject)" ReferenceOutputAssembly="false"
+      SkipGetTargetFrameworkProperties="true" GlobalPropertiesToRemove="RuntimeIdentifier;SelfContained;PublishSingleFile;IncludeNativeLibrariesForSelfExtract;AppHostRelativeDotNet;AppHostDotNetSearch" />
+  </ItemGroup>
+  <Target Name="GetIasWorkerCopyInputs" Condition="'$(OS)' == 'Windows_NT'">
+    <MSBuild Projects="$(IasWorkerProject)" Targets="GetIasWorkerArtifacts"
+      Properties="Configuration=$(Configuration);Platform=$(Platform)" RemoveProperties="RuntimeIdentifier;SelfContained;PublishSingleFile;IncludeNativeLibrariesForSelfExtract;AppHostRelativeDotNet;AppHostDotNetSearch">
+      <Output TaskParameter="TargetOutputs" ItemName="IasWorkerCopyFile" />
+    </MSBuild>
+  </Target>
+  <Target Name="CopyIasWorkerToBuild" AfterTargets="Build" DependsOnTargets="GetIasWorkerCopyInputs" Condition="'$(OS)' == 'Windows_NT'">
+    <Copy SourceFiles="@(IasWorkerCopyFile)" DestinationFolder="$(TargetDir)ias-worker" SkipUnchangedFiles="true" />
+  </Target>
+  <Target Name="CopyIasWorkerToPublish" AfterTargets="Publish" DependsOnTargets="GetIasWorkerCopyInputs" Condition="'$(OS)' == 'Windows_NT'">
+    <Copy SourceFiles="@(IasWorkerCopyFile)" DestinationFolder="$(PublishDir)$(IasWorkerPublishPrefix)ias-worker" SkipUnchangedFiles="true" />
+  </Target>
+</Project>
+

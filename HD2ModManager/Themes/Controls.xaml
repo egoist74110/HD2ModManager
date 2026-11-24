@@ -535,6 +535,7 @@
     <Geometry x:Key="DialogIcon.Question">M8,1.5 A6.5,6.5 0 1 0 8,14.5 A6.5,6.5 0 1 0 8,1.5 M6,6.2 C6,3.9 10,3.9 10,6.2 C10,7.8 8,7.8 8,9.6 M8,11.4 L8,11.9</Geometry>
     <Geometry x:Key="NavIcon.Home">M2,7 L8,2 L14,7 L14,14 L10,14 L10,10 L6,10 L6,14 L2,14 Z</Geometry>
     <Geometry x:Key="NavIcon.ArmorRegistry">M3,2.5 L13,2.5 L13,13.5 L3,13.5 Z M5,5 L11,5 M5,8 L11,8 M5,11 L9,11</Geometry>
+    <Geometry x:Key="NavIcon.Ias">M8,1.5 L13.5,3.5 L13.5,8 C13.5,11 11,13.5 8,14.5 C5,13.5 2.5,11 2.5,8 L2.5,3.5 Z M5.5,8 L7.3,9.8 L10.5,6.4</Geometry>
     <Geometry x:Key="NavIcon.Settings">M8,4.5 A3.5,3.5 0 1 0 8,11.5 A3.5,3.5 0 1 0 8,4.5 M8,1.5 L8,3 M8,13 L8,14.5 M1.5,8 L3,8 M13,8 L14.5,8 M3.4,3.4 L4.5,4.5 M11.5,11.5 L12.6,12.6 M12.6,3.4 L11.5,4.5 M4.5,11.5 L3.4,12.6</Geometry>
     <Geometry x:Key="NavIcon.Profile">M3,2.5 L12,2.5 L14,5 L14,13.5 L2,13.5 L2,5 Z M5,7 L11,7 M5,10 L9,10</Geometry>
     <Geometry x:Key="NavIcon.Library">M2,4 L14,4 L14,13 L2,13 Z M2,7 L14,7 M6,4 L6,13</Geometry>

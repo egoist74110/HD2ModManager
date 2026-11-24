@@ -12,7 +12,7 @@ public sealed partial class Retargeter
 	{
 		if (_options.ArmScratch)
 			aligned = BuildArmScratchPose(aligned);
-		else if (_nativeSourceNames is null)
+		else
 		{
 			foreach (var (name, rotation) in _profile.InitialBasisRotations)
 				_basis[name] = rotation;
@@ -264,7 +264,7 @@ public sealed partial class Retargeter
 		{
 			var accumulated = Vec3.Zero;
 			var total = 0.0;
-			for (var j = 0; j < _weights[k].Length; j++)
+			for (var j = 0; j < 3; j++)
 			{
 				var weight = _weights[k][j];
 				if (weight <= 0)
@@ -406,7 +406,7 @@ public sealed partial class Retargeter
 		{
 			var bestBone = -1;
 			var bestWeight = -1.0;
-			for (var j = 0; j < _weights[k].Length; j++)
+			for (var j = 0; j < 3; j++)
 			{
 				if (_weights[k][j] <= bestWeight)
 					continue;
@@ -469,7 +469,7 @@ public sealed partial class Retargeter
 		{
 			var accumulated = Vec3.Zero;
 			var total = 0.0;
-			for (var j = 0; j < _weights[k].Length; j++)
+			for (var j = 0; j < 3; j++)
 			{
 				var weight = _weights[k][j];
 				if (weight <= 0)
@@ -536,7 +536,7 @@ public sealed partial class Retargeter
 		{
 			var accumulated = Vec3.Zero;
 			var total = 0.0;
-			for (var j = 0; j < _weights[k].Length; j++)
+			for (var j = 0; j < 3; j++)
 			{
 				var weight = _weights[k][j];
 				if (weight <= 0)

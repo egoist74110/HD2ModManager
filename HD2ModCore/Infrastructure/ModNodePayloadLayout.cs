@@ -54,6 +54,11 @@ public static class ModNodePayloadLayout
 		=> !string.IsNullOrWhiteSpace(name)
 			&& name.Equals(OverwriteDirectoryName, StringComparison.OrdinalIgnoreCase);
 
+	internal static bool IsInactiveOverwriteDirectoryName(string name)
+		=> name.Equals(Sectional.LowPollutionArtifactCache.DirectoryName, StringComparison.OrdinalIgnoreCase)
+			|| name.StartsWith(OverwriteDirectoryName + ".stage-", StringComparison.OrdinalIgnoreCase)
+			|| name.StartsWith(OverwriteDirectoryName + ".backup-", StringComparison.OrdinalIgnoreCase);
+
 	public static string GetVpkPatchDirectory(string nodeDirectory)
 	{
 		ArgumentException.ThrowIfNullOrWhiteSpace(nodeDirectory);

@@ -1,6 +1,5 @@
 using HD2ModAdaptation.PatchReconstruction.UnitMesh;
 using HD2ModAdaptation.PatchReconstruction.UnitMesh.Canonical;
-using HD2SourceMigration.Retarget;
 using HD2SourceMigration.Segmentation;
 using HD2SourceMigration.VpkConversion;
 using HD2SourceModel;
@@ -42,7 +41,7 @@ internal static class IasNativeMesh
 
 	internal static (IReadOnlyDictionary<int, RetargetedMesh> Meshes, IReadOnlyDictionary<int, ulong> Materials)
 		Convert(UnitMeshModel model, IasRigProfile profile, Hd2Rig target, UnitTransformInfo avatar,
-			Func<string, uint> hash, IasPhysicsMigration? physics = null)
+			Func<string, uint> hash, IasPhysicsMigration? physics = null, bool alignArms = true)
 	{
 		var transform = model.TransformInfo;
 		var byPaletteSlot = profile.Nodes.Select((node, index) => (node.Slot, index)).ToDictionary(item => item.Slot, item => item.index);
@@ -55,8 +54,10 @@ internal static class IasNativeMesh
 			return new Hd2RigBone(index, node.Name, node.Parent, stored);
 		}).ToArray();
 		var semanticBySlot = new Dictionary<int, int>();
-		var resolved = Retargeter.RunNative(sourceBones, target);
+		var resolved = sourceBones.Where(bone => target.Find(bone.DisplayName) is not null)
+			.ToDictionary(bone => bone.Index, bone => target.Find(bone.DisplayName)!.Index);
 		physics?.Plan(sourceBones, target, resolved);
+		var armAlignment = alignArms ? new IasArmBindAlignment(profile, sourceBones, target, physics) : null;
 		var materials = new List<ulong>();
 		var meshes = new Dictionary<int, RetargetedMesh>();
 		foreach (var lod in model.RawMeshData.Where(mesh => mesh.LodIndex >= 0 &&
@@ -64,19 +65,19 @@ internal static class IasNativeMesh
 		{
 			var sourceVertices = new List<SourceVertex>();
 			var sourceWeights = new List<SourceVertexWeight[]>();
-			var rawWeights = physics is null ? null : new List<IReadOnlyList<(int Slot, float Weight)>>();
+			var rawWeights = physics is null && armAlignment is null ? null : new List<IReadOnlyList<(int Slot, float Weight)>>();
 			var surfaceComponents = new List<UnitVertexComponentValue[]>();
 			var buckets = new Dictionary<int, List<(int A, int B, int C)>>();
 			foreach (var mesh in lod)
 			{
 				var visibleSections = mesh.Sections.Where(section => section.Triangles.Count > 0).ToArray();
 				var materialBindings = CanonicalMaterialBindingResolver.Resolve(model, mesh, mesh);
-				// The sample's LOD4 is a shadow proxy with only an unbound SDK default slot.
+				// SDK 的 LOD4 阴影代理可只有一个未绑定的默认槽位。
 				if (mesh.LodIndex == 4 && materialBindings.IsValid && materialBindings.ResolvedSectionBindings.Count == 0)
 					continue;
 				if (!materialBindings.IsValid || materialBindings.ResolvedSectionBindings.Count != visibleSections.Length)
 					throw new InvalidDataException($"Unbound IAS visual material in mesh {mesh.MeshInfoIndex}, LOD {mesh.LodIndex}: {string.Join("; ", materialBindings.Diagnostics)}");
-				var meshInfo = model.Meshes.Single(info => info.Index == mesh.MeshInfoIndex);
+				var meshInfo = FindUnique(model.Meshes, info => info.Index == mesh.MeshInfoIndex, "网格索引");
 				var toWorld = Hd2RigReader.FromHd2RowVector(transform.Matrices[(int)meshInfo.TransformIndex].Values);
 				var normalToWorld = toWorld.Inverse().Transposed();
 				var materialMap = CanonicalVertexMaterialResolver.Resolve(mesh);
@@ -99,7 +100,7 @@ internal static class IasNativeMesh
 					surfaceComponents.Add(vertex.Components.Where(item => item.Type is 4 or 5).ToArray());
 					var weights = weightsByVertex[index];
 					rawWeights?.Add(weights);
-					sourceWeights.Add(FoldVertexWeights(weights, byPaletteSlot, semanticBySlot, profile, worldPos, null));
+					sourceWeights.Add(FoldVertexWeights(weights, byPaletteSlot, semanticBySlot, profile));
 				}
 				foreach (var binding in materialBindings.ResolvedSectionBindings)
 				{
@@ -144,9 +145,12 @@ internal static class IasNativeMesh
 					var physical = rawWeights[i].Where(item => physics.WeightTarget(item.Slot).HasValue)
 						.Select(item => new RetargetedInfluence(physics.WeightTarget(item.Slot)!.Value, item.Weight));
 					influences = MergeInfluences(physical.Concat(FoldVertexWeights(remaining, byPaletteSlot,
-						semanticBySlot, profile, positions[i], null).Select(NativeInfluence)));
+						semanticBySlot, profile).Select(NativeInfluence)));
 				}
-				output[i] = new(positions[i], normals[i], sourceVertices[i].U, sourceVertices[i].V, influences)
+				// 用折叠前的调色板权重，避免把自定义链的权重当作手臂骨的绑定差值。
+				var (position, normal) = armAlignment?.Transform(positions[i], normals[i], rawWeights![i])
+					?? (positions[i], normals[i]);
+				output[i] = new(position, normal, sourceVertices[i].U, sourceVertices[i].V, influences)
 				{
 					NativeSurfaceComponents = surfaceComponents[i],
 				};
@@ -166,8 +170,8 @@ internal static class IasNativeMesh
 		var weights = component.FloatValues.Length > 0 ? component.FloatValues : component.UIntValues.Select(weight => weight / 255f).ToArray();
 		if ((weights.Length != indices.Length && weights.Length != 1) || weights.Length > 4)
 			throw new InvalidDataException($"Invalid skin weight arity in mesh {mesh.MeshInfoIndex}.");
-		var info = model.BoneInfos.Single(bone => bone.Index == mesh.LodIndex);
-		var remap = info.Remaps.Single(item => item.MaterialIndex == material);
+		var info = FindUnique(model.BoneInfos, bone => bone.Index == mesh.LodIndex, "LOD 骨骼表");
+		var remap = FindUnique(info.Remaps, item => item.MaterialIndex == material, "材质骨骼映射");
 		var result = new List<(int Slot, float Weight)>(weights.Length);
 		for (var i = 0; i < weights.Length; i++)
 		{
@@ -220,116 +224,31 @@ internal static class IasNativeMesh
 	}
 
 	internal static UnitVertexComponentValue Component(UnitRawVertexRecord vertex, uint type) =>
-		vertex.Components.Single(item => item.Type == type && item.Index == 0);
+		FindUnique(vertex.Components, item => item.Type == type && item.Index == 0, "顶点流字段");
+
+	private static T FindUnique<T>(IEnumerable<T> values, Func<T, bool> matches, string field) where T : class
+	{
+		T? result = null;
+		foreach (var value in values)
+		{
+			if (!matches(value))
+				continue;
+			if (result is not null)
+				throw new InvalidDataException($"IAS Unit 的{field}重复。");
+			result = value;
+		}
+		return result ?? throw new InvalidDataException($"IAS Unit 缺少{field}。");
+	}
 
 	private static Vec3 Vector(IReadOnlyList<float> values) => new(values[0], values[1], values[2]);
-
-	internal sealed record ArmSideContext(
-		int ClavicleIndex, Vec3 Clavicle,
-		int ShoulderIndex, Vec3 Shoulder,
-		Vec3 Elbow, Vec3 Hand,
-		IReadOnlySet<int> NativeArmIndices);
-
-	internal sealed record TwistFoldEntry(int StartIndex, int EndIndex, float EndRatio);
-
-	internal sealed record ArmFoldContext(
-		int ChestIndex,
-		IReadOnlyList<ArmSideContext> Sides,
-		IReadOnlyDictionary<int, TwistFoldEntry> MisalignedTwists);
-
-	internal static ArmFoldContext? BuildArmFoldContext(IReadOnlyList<Hd2RigBone> sourceBones, Hd2Rig? target = null)
-	{
-		var byName = new Dictionary<string, int>(StringComparer.Ordinal);
-		for (var i = 0; i < sourceBones.Count; i++)
-			byName.TryAdd(sourceBones[i].DisplayName, i);
-		if (!byName.TryGetValue("chest", out var chestIndex))
-			return null;
-
-		var sides = new List<ArmSideContext>(2);
-		var twists = new Dictionary<int, TwistFoldEntry>();
-		Dictionary<string, int>? targetByName = null;
-		if (target is not null)
-		{
-			targetByName = new Dictionary<string, int>(StringComparer.Ordinal);
-			foreach (var b in target.Bones)
-				targetByName.TryAdd(b.DisplayName, b.Index);
-		}
-
-		foreach (var side in new[] { "l", "r" })
-		{
-			if (!byName.TryGetValue($"{side}_clavicle", out var clavicleIdx)
-				|| !byName.TryGetValue($"{side}_shoulder", out var shoulderIdx)
-				|| !byName.TryGetValue($"{side}_elbow", out var elbowIdx)
-				|| !byName.TryGetValue($"{side}_hand", out var handIdx))
-				continue;
-			var armSet = new HashSet<int> { clavicleIdx, shoulderIdx, elbowIdx, handIdx };
-			foreach (var suffix in new[] { "shoulder_twist", "hand_twist", "shoulderarmour" })
-			{
-				if (byName.TryGetValue($"{side}_{suffix}", out var extra))
-					armSet.Add(extra);
-			}
-			sides.Add(new(
-				clavicleIdx, sourceBones[clavicleIdx].WorldBind.Origin,
-				shoulderIdx, sourceBones[shoulderIdx].WorldBind.Origin,
-				sourceBones[elbowIdx].WorldBind.Origin,
-				sourceBones[handIdx].WorldBind.Origin,
-				armSet));
-
-			if (target is not null && targetByName is not null)
-			{
-				foreach (var (twistName, startName, endName) in new[]
-				{
-					($"{side}_shoulder_twist", $"{side}_shoulder", $"{side}_elbow"),
-					($"{side}_hand_twist", $"{side}_elbow", $"{side}_hand"),
-				})
-				{
-					if (!byName.TryGetValue(twistName, out var sTwist)
-						|| !byName.TryGetValue(startName, out var sStart)
-						|| !byName.TryGetValue(endName, out var sEnd)
-						|| !targetByName.TryGetValue(twistName, out var tTwist)
-						|| !targetByName.TryGetValue(startName, out var tStart)
-						|| !targetByName.TryGetValue(endName, out var tEnd))
-						continue;
-					var sRatio = SegmentRatio(
-						sourceBones[sTwist].WorldBind.Origin,
-						sourceBones[sStart].WorldBind.Origin,
-						sourceBones[sEnd].WorldBind.Origin);
-					var tRatio = SegmentRatio(
-						target.Bones[tTwist].WorldBind.Origin,
-						target.Bones[tStart].WorldBind.Origin,
-						target.Bones[tEnd].WorldBind.Origin);
-					var distDiff = Math.Abs(
-						(sourceBones[sTwist].WorldBind.Origin - sourceBones[sStart].WorldBind.Origin).Length
-						- (target.Bones[tTwist].WorldBind.Origin - target.Bones[tStart].WorldBind.Origin).Length);
-					if (Math.Abs(sRatio - tRatio) > 0.25 || distDiff > 0.05)
-					{
-						var endRatio = sRatio > 0.75 ? 0.5f : (float)sRatio;
-						twists[sTwist] = new(sStart, sEnd, endRatio);
-						armSet.Remove(sTwist);
-					}
-				}
-			}
-		}
-		return sides.Count > 0 || twists.Count > 0 ? new(chestIndex, sides, twists) : null;
-	}
-
-	private static double SegmentRatio(Vec3 p, Vec3 a, Vec3 b)
-	{
-		var ab = b - a;
-		var lenSq = Vec3.Dot(ab, ab);
-		return lenSq < 1e-12 ? 0.0 : Clamp01(Vec3.Dot(p - a, ab) / lenSq);
-	}
 
 	internal static SourceVertexWeight[] FoldVertexWeights(
 		IReadOnlyList<(int Slot, float Weight)> weights,
 		IReadOnlyDictionary<int, int> byPaletteSlot,
 		IDictionary<int, int> semanticBySlot,
-		IasRigProfile profile,
-		Vec3 worldPos,
-		ArmFoldContext? armContext)
+		IasRigProfile profile)
 	{
-		var resolved = new List<(int Semantic, bool IsCustom, float Weight)>(weights.Count);
-		var customChestWeight = 0f;
+		var resolved = new List<SourceVertexWeight>(weights.Count);
 		foreach (var item in weights)
 		{
 			if (!byPaletteSlot.TryGetValue(item.Slot, out var nodeIndex))
@@ -339,103 +258,9 @@ internal static class IasNativeMesh
 				semantic = profile.ResolveSemanticNode(nodeIndex);
 				semanticBySlot.Add(item.Slot, semantic);
 			}
-			var isCustom = (profile.Nodes[nodeIndex].Flags & 256) != 0;
-			if (!isCustom && armContext is not null && armContext.MisalignedTwists.TryGetValue(semantic, out var twistFold))
-			{
-				var endW = item.Weight * twistFold.EndRatio;
-				var startW = item.Weight - endW;
-				if (startW > 1e-6f)
-					resolved.Add((twistFold.StartIndex, false, startW));
-				if (endW > 1e-6f)
-					resolved.Add((twistFold.EndIndex, false, endW));
-			}
-			else if (isCustom && armContext is not null && semantic == armContext.ChestIndex)
-				customChestWeight += item.Weight;
-			else
-				resolved.Add((semantic, isCustom, item.Weight));
+			resolved.Add(new(semantic, item.Weight));
 		}
-
-		if (customChestWeight > 0f && armContext is not null)
-		{
-			var (bestSide, armFactor) = ComputeArmFoldFactor(worldPos, armContext);
-			if (armFactor > 0f && bestSide is not null)
-			{
-				var stayChest = customChestWeight * (1f - armFactor);
-				var moveArm = customChestWeight * armFactor;
-				if (stayChest > 1e-6f)
-					resolved.Add((armContext.ChestIndex, true, stayChest));
-
-				var armTotal = 0f;
-				foreach (var entry in resolved)
-				{
-					if (!entry.IsCustom && bestSide.NativeArmIndices.Contains(entry.Semantic))
-						armTotal += entry.Weight;
-				}
-				if (armTotal > 1e-4f)
-				{
-					var count = resolved.Count;
-					for (var i = 0; i < count; i++)
-					{
-						var entry = resolved[i];
-						if (!entry.IsCustom && bestSide.NativeArmIndices.Contains(entry.Semantic))
-							resolved.Add((entry.Semantic, false, moveArm * (entry.Weight / armTotal)));
-					}
-				}
-				else
-				{
-					resolved.Add((bestSide.ShoulderIndex, false, moveArm));
-				}
-			}
-			else
-			{
-				resolved.Add((armContext.ChestIndex, true, customChestWeight));
-			}
-		}
-
-		return resolved
-			.GroupBy(item => item.Semantic)
-			.Select(group => new SourceVertexWeight(group.Key, group.Sum(item => item.Weight)))
-			.Where(item => item.Weight > 0f)
-			.ToArray();
+		return resolved.GroupBy(item => item.BoneIndex)
+			.Select(group => new SourceVertexWeight(group.Key, group.Sum(item => item.Weight))).ToArray();
 	}
-
-	private static (ArmSideContext? Side, float Factor) ComputeArmFoldFactor(Vec3 p, ArmFoldContext context)
-	{
-		ArmSideContext? bestSide = null;
-		var bestDist = double.MaxValue;
-		foreach (var side in context.Sides)
-		{
-			var d = Math.Min(
-				DistanceToSegment(p, side.Shoulder, side.Elbow),
-				DistanceToSegment(p, side.Elbow, side.Hand));
-			if (d < bestDist)
-			{
-				bestDist = d;
-				bestSide = side;
-			}
-		}
-		if (bestSide is null)
-			return (null, 0f);
-
-		var clavicleAbsX = Math.Abs(bestSide.Clavicle.X);
-		var shoulderAbsX = Math.Abs(bestSide.Shoulder.X);
-		var lat = Clamp01((Math.Abs(p.X) - clavicleAbsX) / Math.Max(shoulderAbsX + 0.08 - clavicleAbsX, 0.02));
-		var armProx = Clamp01(1.0 - ((bestDist - 0.12) / 0.14));
-		var zGate = Clamp01((p.Z - (bestSide.Hand.Z - 0.08)) / 0.12);
-		var t = lat * armProx * zGate;
-		var smooth = (float)(t * t * (3.0 - (2.0 * t)));
-		return (bestSide, smooth);
-	}
-
-	private static double DistanceToSegment(Vec3 p, Vec3 a, Vec3 b)
-	{
-		var ab = b - a;
-		var lenSq = Vec3.Dot(ab, ab);
-		if (lenSq < 1e-12)
-			return (p - a).Length;
-		var t = Clamp01(Vec3.Dot(p - a, ab) / lenSq);
-		return (p - (a + (ab * t))).Length;
-	}
-
-	private static double Clamp01(double value) => value < 0.0 ? 0.0 : value > 1.0 ? 1.0 : value;
 }
