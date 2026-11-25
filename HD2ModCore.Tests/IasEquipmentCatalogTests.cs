@@ -4,6 +4,7 @@ using System.Text.Json;
 using HD2ModCore.Domain;
 using HD2ModCore.Infrastructure;
 using HD2ModCore.Infrastructure.Sectional;
+using HD2ModCore.Ias;
 using Xunit.Abstractions;
 using HD2ModManager.Services.Ias;
 using HD2SourceMigration.IasPackaging;
@@ -12,6 +13,51 @@ namespace HD2ModCore.Tests;
 
 public sealed class IasEquipmentCatalogTests(ITestOutputHelper output)
 {
+    private const string Dp8 = "59d238094a164c88";
+    private static readonly IasVpkTargets Preferred = new("body-1", Dp8);
+    private static readonly IasVpkTargetCatalog Bases = new(
+        [Choice("body-1", "首选护甲", false), Choice("body-2", "第二套护甲", false)],
+        [Choice(Dp8, "DP-8 头盔", true), Choice("helmet-2", "第二顶头盔", true)]);
+
+    [Fact]
+    public async Task VpkChangesOnlyTheOccupiedHelmetAndReportsBothNames()
+    {
+        var reserve = new Dictionary<string, string>();
+        IasArchiveOwner[] owners = [new("role", "2606520120", true, [Dp8])];
+        var warnings = await IasVpkAllocation.ConvertAsync(Preferred, Bases, owners, reserve, "Airi", targets =>
+        {
+            Assert.Equal(new IasVpkTargets("body-1", "helmet-2"), targets);
+            return Task.FromResult<IReadOnlyList<string>>([]);
+        });
+        Assert.Equal("DP-8 头盔已被『2606520120』占用，『Airi』改装到 第二顶头盔 上。", Assert.Single(warnings));
+    }
+
+    [Fact]
+    public async Task BatchReservationsPreventDuplicateTargetsAndExhaustionStopsBeforePacking()
+    {
+        var reserve = new Dictionary<string, string>();
+        var used = new List<IasVpkTargets>();
+        IasArchiveOwner[] owners = [new("disabled", "已停用", false, [Dp8, "body-1"])];
+        await IasVpkAllocation.ConvertAsync(Preferred, Bases, owners, reserve, "角色一", Convert);
+        await IasVpkAllocation.ConvertAsync(Preferred, Bases, owners, reserve, "角色二", Convert);
+        var error = await Assert.ThrowsAsync<InvalidDataException>(() =>
+            IasVpkAllocation.ConvertAsync(Preferred, Bases, owners, reserve, "第三个角色", Convert));
+
+        Assert.Equal([Preferred, new("body-2", "helmet-2")], used);
+        Assert.Contains("可用底子都被已启用角色占用，请先停用其中一个。占用者：『角色一』、『角色二』", error.Message);
+        Assert.DoesNotContain("已停用", error.Message);
+
+        Task<IReadOnlyList<string>> Convert(IasVpkTargets targets)
+        {
+            used.Add(targets);
+            return Task.FromResult<IReadOnlyList<string>>([]);
+        }
+    }
+
+    private static IasTargetChoice Choice(string archive, string name, bool helmet) =>
+        new(name, "轻甲", [new(1, archive, name,
+            helmet ? GameDataEquipmentKitKind.Helmet : GameDataEquipmentKitKind.Armor)]);
+
     [Fact]
     public void SelectionRoundTripsAndMissingArchiveDoesNotSilentlyFallBack()
     {

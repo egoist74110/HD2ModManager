@@ -198,6 +198,8 @@ public sealed class IasDeploymentService
 			?? throw new InvalidOperationException("找不到要切换的 IAS 角色。");
 		var profile = Active(snapshot);
 		var inProfile = HasManagedMod(profile);
+		if (enabled)
+			await RequireRegisteredArchivesFreeAsync(installed, tx, role.Id, token).ConfigureAwait(false);
 		await RunAsync(installed, tx, "set-enabled", role.Id, false, token, enabled).ConfigureAwait(false);
 		var states = await ReadRoleStatesAsync(installed, tx.Backup, [role], token).ConfigureAwait(false);
 		if (states[role.Id] != enabled) throw new InvalidOperationException("IAS 角色的启用状态未更新。");
@@ -247,6 +249,14 @@ public sealed class IasDeploymentService
 				foreach (var path in paths)
 					stamps.Add(await IasSourceStamp.CaptureAsync(path, $"IAS 导入源「{Path.GetFileName(path)}」", token).ConfigureAwait(false));
 			var package = await IasTiming.MeasureAsync("锁外准备 IAS 主包与配套包", () => readPackage(work)).ConfigureAwait(false);
+			using (AcquireIasLease())
+			{
+				var installed = GetInstalled() ?? throw new InvalidOperationException("请先安装 IAS。");
+				var archives = await ReadArchiveDataAsync<string[]>(installed, work, "companion-archives",
+					package.CompanionZip, token).ConfigureAwait(false);
+				var owners = await ReadArchiveOwnersAsync(installed, work, null, token).ConfigureAwait(false);
+				await RequireArchivesFreeAsync(archives, owners, null, token).ConfigureAwait(false);
+			}
 			var sources = Path.GetDirectoryName(package.Main)!;
 			for (var i = 0; i < paths.Count; i++)
 				if (File.Exists(paths[i]))
@@ -272,6 +282,7 @@ public sealed class IasDeploymentService
 				throw new InvalidDataException("IAS worker 未返回角色标识。");
 			var roles = GetRoles();
 			if (roles.Any(role => role.Id == id)) throw new InvalidOperationException("这个 IAS 角色已安装。");
+			await RequireRegisteredArchivesFreeAsync(installed, tx, id, token).ConfigureAwait(false);
 			var roleSources = Sources(id);
 			IasFileTree.Copy(Path.GetDirectoryName(package.Main)!, roleSources);
 			var imported = await IasTiming.MeasureAsync("导入模组库", () => tx.ImportAsync(snapshot, package.Main, package.Name, RoleLabel, null, token)).ConfigureAwait(false);
@@ -353,7 +364,20 @@ public sealed class IasDeploymentService
 	private async Task<LibrarySnapshot> RegenerateAsync(IasInstalled installed, IasModTransaction tx,
 		LibrarySnapshot snapshot, CancellationToken token, bool addToProfile = true)
 	{
-		var export = await RunAsync(installed, tx, "regenerate", null, true, token).ConfigureAwait(false);
+		string? export;
+		try { export = await RunAsync(installed, tx, "regenerate", null, true, token).ConfigureAwait(false); }
+		catch (InvalidOperationException error) when (OfficialConflictArchive(error.Message) is not null)
+		{
+			var archive = OfficialConflictArchive(error.Message)!;
+			IasArchiveOwner[] owners;
+			try { owners = await ReadArchiveOwnersAsync(installed, tx.Backup, null, token).ConfigureAwait(false); }
+			catch (Exception lookupError) when (lookupError is not OperationCanceledException)
+			{
+				throw new InvalidOperationException($"启用的角色占用同一装备（{archive}），请先停用其中一个。\n{error.Message}", error);
+			}
+			var message = await ArchiveConflictMessageAsync(archive, OwnersOf(owners, archive), token).ConfigureAwait(false);
+			throw new InvalidOperationException(message, error);
+		}
 		if (string.IsNullOrWhiteSpace(export)) throw new InvalidDataException("IAS worker 未生成 data 包。");
 		export = IasFileTree.Under(tx.Export, Path.GetRelativePath(tx.Export, export));
 		var id = ManagedModId;
@@ -366,6 +390,90 @@ public sealed class IasDeploymentService
 		var states = roles.Count > 0 ? await ReadRoleStatesAsync(installed, tx.Backup, roles, token).ConfigureAwait(false)
 			: new Dictionary<string, bool>(StringComparer.Ordinal);
 		return SyncProfile(imported.Snapshot, profile, root.Value, roles, states);
+	}
+
+	public async Task<IReadOnlyList<IasArchiveOwner>> GetArchiveOccupancyAsync(CancellationToken token)
+	{
+		using var lease = AcquireIasLease();
+		var installed = GetInstalled() ?? throw new InvalidOperationException("请先安装 IAS。");
+		var work = At("temp/occupancy-" + Guid.NewGuid().ToString("N"));
+		Directory.CreateDirectory(work);
+		try { return await ReadArchiveOwnersAsync(installed, work, null, token).ConfigureAwait(false); }
+		finally { IasFileTree.Delete(work); }
+	}
+
+	public async Task PreflightArchivesAsync(IReadOnlyList<string> archives, CancellationToken token)
+	{
+		if (archives.Count == 0) return;
+		var owners = await GetArchiveOccupancyAsync(token).ConfigureAwait(false);
+		await RequireArchivesFreeAsync(archives, owners, null, token).ConfigureAwait(false);
+	}
+
+	private async Task RequireRegisteredArchivesFreeAsync(IasInstalled installed, IasModTransaction tx, string id,
+		CancellationToken token)
+	{
+		var owners = await ReadArchiveOwnersAsync(installed, tx.Backup, id, token).ConfigureAwait(false);
+		var candidate = owners.SingleOrDefault(owner => owner.Id == id)
+			?? throw new InvalidDataException($"官方 IAS 角色库中找不到 {id}。");
+		await RequireArchivesFreeAsync(candidate.Archives, owners, id, token).ConfigureAwait(false);
+	}
+
+	private async Task RequireArchivesFreeAsync(IReadOnlyList<string> archives, IReadOnlyList<IasArchiveOwner> owners,
+		string? excluding, CancellationToken token)
+	{
+		foreach (var archive in archives)
+		{
+			var matches = OwnersOf(owners, archive, excluding);
+			if (matches.Length != 0)
+				throw new InvalidOperationException(await ArchiveConflictMessageAsync(archive, matches, token).ConfigureAwait(false));
+		}
+	}
+
+	private static string[] OwnersOf(IReadOnlyList<IasArchiveOwner> owners, string archive, string? excluding = null) =>
+		owners.Where(owner => owner.Enabled && owner.Id != excluding &&
+			owner.Archives.Contains(archive, StringComparer.OrdinalIgnoreCase)).Select(owner => owner.Name).Distinct().ToArray();
+
+	private async Task<string> ArchiveConflictMessageAsync(string archive, string[] owners, CancellationToken token)
+	{
+		string? name = null;
+		try
+		{
+			var catalog = await CoreServices.CreateRuntimeArmorRegistryService(_paths).ReadArmorCatalogAsync(token).ConfigureAwait(false);
+			name = catalog.FirstOrDefault(entry => entry.ArchiveId.Equals(archive, StringComparison.OrdinalIgnoreCase))?.DisplayName;
+		}
+		catch (Microsoft.Data.Sqlite.SqliteException) { /* 索引不可用时保留 Archive。 */ }
+		var equipment = name is null ? archive : $"{name} / {archive}";
+		var roles = owners.Length == 0 ? "启用的角色占用同一装备" :
+			$"与已启用角色{string.Join("、", owners.Select(owner => $"『{owner}』"))}占用同一装备";
+		return $"{roles}（{equipment}），请先停用其中一个。";
+	}
+
+	internal static string? OfficialConflictArchive(string message)
+	{
+		const string prefix = "启用的 Mod 占用同一装备 Archive，请取消勾选其中一个：";
+		var offset = message.IndexOf(prefix, StringComparison.Ordinal);
+		if (offset < 0 || message.Length - offset - prefix.Length < 16) return null;
+		var archive = message.AsSpan(offset + prefix.Length, 16);
+		return archive.IndexOfAnyExcept("0123456789abcdefABCDEF") < 0 ? archive.ToString() : null;
+	}
+
+	private async Task<IasArchiveOwner[]> ReadArchiveOwnersAsync(IasInstalled installed, string backup, string? includeRole,
+		CancellationToken token)
+	{
+		var owners = await ReadArchiveDataAsync<IasArchiveOwner[]>(installed, backup, "archive-occupancy", includeRole, token)
+			.ConfigureAwait(false);
+		var names = GetRoles().ToDictionary(role => role.Id, role => role.Name, StringComparer.Ordinal);
+		return owners.Select(owner => names.TryGetValue(owner.Id, out var name) ? owner with { Name = name } : owner).ToArray();
+	}
+
+	private async Task<T> ReadArchiveDataAsync<T>(IasInstalled installed, string backup, string command, string? argument,
+		CancellationToken token)
+	{
+		var request = new IasWorkerRequest(command, _game, installed.ComponentsDirectory, At("library"), backup,
+			string.Empty, string.Empty, installed.Version, argument);
+		var value = await RunWorkerAsync(request, token).ConfigureAwait(false);
+		return JsonSerializer.Deserialize<T>(value ?? "null")
+			?? throw new InvalidDataException("IAS worker 未返回装备 Archive 信息。");
 	}
 
 	private LibrarySnapshot SyncProfile(LibrarySnapshot snapshot, Profile profile, Guid dataId, IReadOnlyList<IasRole> roles,

@@ -3,6 +3,7 @@ using HD2GameItemAssets;
 using HD2ModCore.Domain;
 using HD2ModCore.Infrastructure;
 using HD2ModCore.Infrastructure.Sectional;
+using HD2ModCore.Ias;
 using HD2SourceMigration.IasPackaging;
 
 namespace HD2ModManager.Services.Ias;
@@ -90,5 +91,51 @@ internal sealed class IasEquipmentCatalog(
         var weight = kit?.Pieces.Where(piece => piece.Slot == slot).GroupBy(piece => piece.Weight)
             .OrderByDescending(group => group.Count()).ThenBy(group => group.Key).FirstOrDefault()?.Key;
         return weight switch { 0 => "轻甲", 1 => "中甲", 2 => "重甲", _ => "未分类" };
+    }
+}
+
+internal sealed record IasVpkAllocation(IasVpkTargets Targets, IReadOnlyList<string> Warnings)
+{
+    internal static async Task<IReadOnlyList<string>> ConvertAsync(IasVpkTargets preferred, IasVpkTargetCatalog catalog,
+        IReadOnlyList<IasArchiveOwner> occupancy, Dictionary<string, string> reserved, string role,
+        Func<IasVpkTargets, Task<IReadOnlyList<string>>> convert)
+    {
+        var allocation = Select(preferred, catalog, occupancy, reserved, role);
+        var warnings = await convert(allocation.Targets).ConfigureAwait(false);
+        reserved[allocation.Targets.Body!] = role;
+        reserved[allocation.Targets.Helmet!] = role;
+        return [.. allocation.Warnings, .. warnings];
+    }
+
+    internal static IasVpkAllocation Select(IasVpkTargets preferred, IasVpkTargetCatalog catalog,
+        IReadOnlyList<IasArchiveOwner> occupancy, IReadOnlyDictionary<string, string> reserved, string role)
+    {
+        var body = catalog.Armor.SelectMany(choice => choice.Members).ToArray();
+        var helmet = catalog.Helmet.SelectMany(choice => choice.Members).ToArray();
+        var owners = occupancy.Where(owner => owner.Enabled)
+            .SelectMany(owner => owner.Archives.Select(archive => (Archive: archive, owner.Name)))
+            .Concat(reserved.Select(pair => (Archive: pair.Key, Name: pair.Value)))
+            .ToLookup(pair => pair.Archive, pair => pair.Name, StringComparer.OrdinalIgnoreCase);
+        var warnings = new List<string>();
+        var bodyId = SelectSlot(body, preferred.Body!);
+        var helmetId = SelectSlot(helmet, preferred.Helmet!);
+        return new(new(bodyId, helmetId), warnings);
+
+        string SelectSlot(RuntimeArmorCatalogEntry[] choices, string preferredId)
+        {
+            var first = choices.FirstOrDefault(entry => entry.ArchiveId.Equals(preferredId, StringComparison.OrdinalIgnoreCase))
+                ?? throw new InvalidDataException($"底子装备 {preferredId} 在当前游戏护甲目录中已失效，请在 IAS 页重选后再拖入。");
+            if (!owners.Contains(first.ArchiveId)) return first.ArchiveId;
+            var available = choices.FirstOrDefault(entry => !owners.Contains(entry.ArchiveId));
+            if (available is null)
+            {
+                var blockers = string.Join("、", body.Concat(helmet).SelectMany(entry => owners[entry.ArchiveId])
+                    .Distinct().Select(name => $"『{name}』"));
+                throw new InvalidDataException($"可用底子都被已启用角色占用，请先停用其中一个。占用者：{blockers}。");
+            }
+            var occupiedBy = string.Join("、", owners[first.ArchiveId].Distinct().Select(name => $"『{name}』"));
+            warnings.Add($"{first.DisplayName}已被{occupiedBy}占用，『{role}』改装到 {available.DisplayName} 上。");
+            return available.ArchiveId;
+        }
     }
 }

@@ -836,6 +836,7 @@ internal static class VpkExtractor
 				tipBone = tipBoneByJiggleName[extra.Name].Name,
 				sourceStiffness = rawStiff,
 				sourceDamping = rawDamp,
+				sourceAngularDamping = p is { IsFlexible: true } ? Math.Max(p.YawDamping, p.PitchDamping) : (float?)null,
 				angleLimitRad = Math.Round(angleLimRad, 5),
 				flags = fact?.FlagNames ?? [],
 			});

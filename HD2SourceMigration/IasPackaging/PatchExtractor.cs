@@ -53,10 +53,8 @@ internal static class PatchExtractor
 
 		// 自动识别护甲和头盔的原版归档。
 		var partSlots = ReadPartCatalog(partCatalogPath);
-		var bindingTargets = ReadBindingTargets(bindingCatalogPath);
-
-		var bodyTarget = SelectBestArchive(bindingTargets.Values.Where(t => t.Domain == "body"), modUnits, "护甲");
-		var helmetTarget = SelectBestArchive(bindingTargets.Values.Where(t => t.Domain == "helmet"), modUnits, "头盔");
+		var (bodyTarget, helmetTarget) = SelectTargets(bindingCatalogPath,
+			modUnits.ToDictionary(pair => pair.Key, pair => pair.Value.Archive));
 		if (bodyTarget is null && helmetTarget is null)
 			throw new InvalidOperationException("Could not match mod Unit IDs to any supported IAS equipment archive.");
 
@@ -431,18 +429,35 @@ internal static class PatchExtractor
 			extras.OrderBy(s => s, StringComparer.Ordinal).ToArray());
 	}
 
+	private static IEnumerable<string> OrderedPatchFiles(IEnumerable<string> paths, bool flatten = false) =>
+		paths.Select(path => (Path: path, Match: PatchFileName.Match(Path.GetFileName(path))))
+			.Where(file => file.Match.Success)
+			.OrderBy(file => int.Parse(file.Match.Groups[1].Value, CultureInfo.InvariantCulture))
+			.ThenBy(file => flatten ? Path.GetFileName(file.Path) : file.Path, StringComparer.OrdinalIgnoreCase)
+			.Select(file => file.Path);
+
+	internal static async Task<IReadOnlyList<string>> ReadTargetArchivesAsync(IEnumerable<string> patchFiles, string bindingCatalogPath,
+		CancellationToken token)
+	{
+		var units = new Dictionary<ulong, string>();
+		var scanner = new PatchTocScanner();
+		// 按管理器平铺补丁后的文件名排序，对齐打包器的覆盖顺序。
+		foreach (var path in OrderedPatchFiles(patchFiles, flatten: true))
+		{
+			var toc = await File.ReadAllBytesAsync(path, token).ConfigureAwait(false);
+			var name = Path.GetFileName(path);
+			foreach (var entry in scanner.ScanEntries(toc, name))
+				if (entry.AssetKey.TypeId == UnitTypeId) units[entry.AssetKey.FileId] = name[..name.IndexOf('.')];
+		}
+		var (body, helmet) = SelectTargets(bindingCatalogPath, units);
+		return new[] { body, helmet }.OfType<BindingTargetInfo>().Select(target => target.Archive).ToArray();
+	}
+
 	private static Dictionary<AssetKey, RawPatchEntry> ReadModPatchEntries(string modDir, PatchTocScanner scanner,
 		SearchOption searchOption, CancellationToken cancellationToken)
 	{
-		var patchFiles = Directory.EnumerateFiles(modDir, "*.patch_*", searchOption)
-			.Select(path => (Path: path, Match: PatchFileName.Match(Path.GetFileName(path))))
-			.Where(file => file.Match.Success)
-			.OrderBy(file => int.Parse(file.Match.Groups[1].Value, CultureInfo.InvariantCulture))
-			.ThenBy(file => file.Path, StringComparer.OrdinalIgnoreCase)
-			.Select(file => file.Path);
-
 		var dict = new Dictionary<AssetKey, RawPatchEntry>();
-		foreach (var tocPath in patchFiles)
+		foreach (var tocPath in OrderedPatchFiles(Directory.EnumerateFiles(modDir, "*.patch_*", searchOption)))
 		{
 			cancellationToken.ThrowIfCancellationRequested();
 			var tocBytes = File.ReadAllBytes(tocPath);
@@ -495,8 +510,16 @@ internal static class PatchExtractor
 			JsonSerializer.Serialize(indexRows, new JsonSerializerOptions { WriteIndented = true }), cancellationToken).ConfigureAwait(false);
 	}
 
+	private static (BindingTargetInfo? Body, BindingTargetInfo? Helmet) SelectTargets(string bindingCatalogPath,
+		IReadOnlyDictionary<ulong, string> modUnits)
+	{
+		var targets = ReadBindingTargets(bindingCatalogPath).Values;
+		return (SelectBestArchive(targets.Where(t => t.Domain == "body"), modUnits, "护甲"),
+			SelectBestArchive(targets.Where(t => t.Domain == "helmet"), modUnits, "头盔"));
+	}
+
 	private static BindingTargetInfo? SelectBestArchive(IEnumerable<BindingTargetInfo> candidates,
-		IReadOnlyDictionary<ulong, RawPatchEntry> modUnits, string label)
+		IReadOnlyDictionary<ulong, string> modUnits, string label)
 	{
 		var matches = candidates.Select(target => (Target: target, Hits: target.OwnedUnits.Where(modUnits.ContainsKey).ToArray()))
 			.Where(match => match.Hits.Length != 0).ToArray();
@@ -505,7 +528,7 @@ internal static class PatchExtractor
 		var complete = matches.Where(match => match.Hits.Length == count).ToArray();
 		if (complete.Length == 1) return complete[0].Target;
 		var named = complete.Where(match => match.Hits.Any(id =>
-			modUnits[id].Archive.Equals(match.Target.Archive, StringComparison.OrdinalIgnoreCase))).ToArray();
+			modUnits[id].Equals(match.Target.Archive, StringComparison.OrdinalIgnoreCase))).ToArray();
 		if (named.Length == 1) return named[0].Target;
 		throw new InvalidDataException($"普通 Mod 的{label} Unit 无法唯一匹配 IAS 底子档案，请拆分来源：{string.Join("、",
 			matches.Select(match => match.Target.Archive))}。");

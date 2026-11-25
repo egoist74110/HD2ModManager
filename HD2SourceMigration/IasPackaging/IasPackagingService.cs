@@ -32,6 +32,11 @@ public sealed class IasPackagingService
 		IProgress<string>? progress = null, CancellationToken ct = default) =>
 		ConvertAsync(patchDirectory, options, isVpk: false, progress, ct);
 
+	public static Task<IReadOnlyList<string>> ReadPatchTargetArchivesAsync(IEnumerable<string> patchFiles, string sdkDirectory,
+		CancellationToken token) =>
+		PatchExtractor.ReadTargetArchivesAsync(patchFiles,
+			new IasPackagingDependencies("", sdkDirectory, null).BindingCatalog, token);
+
 	public Task<IasPackagingResult> ConvertL4d2VpkAsync(string vpkPath, IasPackagingOptions options,
 		IProgress<string>? progress = null, CancellationToken ct = default) =>
 		ConvertAsync(vpkPath, options, isVpk: true, progress, ct);

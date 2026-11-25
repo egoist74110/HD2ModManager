@@ -53,7 +53,6 @@ public sealed class IasPageViewModel : FullWorkspacePageViewModel
     private bool _confirmingQueueItem;
     private string[]? _hoverPaths;
     private bool _hoverHasSupportedFile;
-    private bool _hoverHasVpk;
     private string? _windowDropHint;
     private CancellationTokenSource? _refresh;
     private CancellationTokenSource? _chooseLibrary;
@@ -89,7 +88,7 @@ public sealed class IasPageViewModel : FullWorkspacePageViewModel
         ConvertCharacterCommand = new(character => ConvertAsync(character as IasCharacterRow), CanQueueConversion);
         CloseConversionCommand = new(_ => CloseConversion());
         StartConversionCommand = new(character => StartConversionAsync(character as IasCharacterRow), CanQueueConversion);
-        RemoveCharacterCommand = new(character => RemoveAsync(character as IasCharacterRow), CanActOnCharacter);
+        RemoveCharacterCommand = new(character => RemoveAsync(character as IasCharacterRow), CanQueueConversion);
         CancelCommand = new(_ => CancelOperation(), _ => CanCancel);
         CancelWaitingCommand = new(value =>
         {
@@ -147,7 +146,9 @@ public sealed class IasPageViewModel : FullWorkspacePageViewModel
     }
     private bool IsDisabledInProfile => ShowIasToggle && !_status.EnabledInActiveProfile;
     public bool IsReady => ShowIasToggle && _status.EnabledInActiveProfile;
-    public bool CanToggleCharacter => CanWrite && IsReady;
+    // 角色开关走 IAS 队列：队列里有操作在跑时照样能拨，排在后面执行；
+    // 但总开关/画面/卸载 IAS 这类独占操作进行中仍锁住（它们可能改变 IAS 是否可用）。
+    public bool CanToggleCharacter => CanQueue && _operation is null && IsReady;
     public bool CanAcceptDrop => CanQueue && IsReady;
     private bool CanChooseLibraryMod => CanAcceptDrop && _chooseLibrary is null;
     public bool ReShadeEnabled => _status.Graphics?.ReShadeEnabled == true;
@@ -317,11 +318,10 @@ public sealed class IasPageViewModel : FullWorkspacePageViewModel
         {
             _hoverPaths = paths;
             _hoverHasSupportedFile = paths.Any(IasPackageDetector.MayAccept);
-            _hoverHasVpk = paths.Any(path => File.Exists(path) && IasPackageDetector.IsVpk(path));
         }
         var accept = CanAcceptDrop && _hoverHasSupportedFile;
         SetWindowDropHint(!CanAcceptDrop ? DropStatusText
-            : !accept ? "不支持这些文件" : _hoverHasVpk ? "松开后加入 IAS 队列" : "松开后确认，排队添加 IAS 角色");
+            : !accept ? "不支持这些文件" : "松开后加入 IAS 队列");
         return accept;
     }
 
@@ -342,7 +342,6 @@ public sealed class IasPageViewModel : FullWorkspacePageViewModel
     public Task HandleWindowDropAsync(string[] paths)
     {
         var accept = UpdateWindowDrop(paths);
-        var confirm = !_hoverHasVpk;
         ClearWindowDrop();
         if (!accept) return Task.CompletedTask;
         var inputs = paths.Select(path => Path.TrimEndingDirectorySeparator(Path.GetFullPath(path)))
@@ -352,7 +351,8 @@ public sealed class IasPageViewModel : FullWorkspacePageViewModel
         var targets = _vpkTargetsResolved ? _currentVpkTargets with { Error = VpkTargetWarning }
             : _savedVpkTargets ?? new IasVpkTargets(null, null);
         return QueueAsync("添加 IAS 角色", name, inputs.Select(path => "file:" + path).ToArray(),
-            confirm ? new("添加 IAS 角色", $"把「{name}」加入队列？普通护甲 Mod 或求生 VPK 会转为 IAS 并安装。", "加入队列") : null,
+            // 拖入直接排队，不弹确认；有问题由识别/转换/安装结果在消息中心报告。
+            null,
             (progress, ct) => service.AddAsync(inputs, progress, ct, targets));
     }
 
@@ -386,12 +386,28 @@ public sealed class IasPageViewModel : FullWorkspacePageViewModel
     public async Task SetCharacterEnabledAsync(IasCharacterRow character, bool enabled)
     {
         if (!CanToggleCharacter || !Characters.Contains(character) || character.Enabled is null || character.Enabled == enabled) return;
+        var id = character.Id;
+        var service = _service;
+        var succeeded = false;
+        // 排队期间开关先显示目标位置；成功后保持到列表刷新换上新行，失败/取消/没排上才弹回。
         character.ShowPendingEnabled(enabled);
         try
         {
-            await RunOperationAsync((progress, ct) => _service.SetCharacterEnabledAsync(character.Id, enabled, progress, ct));
+            await QueueAsync(enabled ? "启用 IAS 角色" : "停用 IAS 角色", character.Name, ["role:" + id], null,
+                async (progress, ct) =>
+                {
+                    var result = await service.SetCharacterEnabledAsync(id, enabled, progress, ct);
+                    succeeded = result.Success;
+                    return result;
+                });
         }
-        finally { character.ShowPendingEnabled(null); }
+        finally
+        {
+            if (succeeded) _refreshPending = _active;
+            else character.ShowPendingEnabled(null);
+            NotifyState();
+            _ = RefreshPendingAsync();
+        }
     }
 
     public Task SetReShadeAsync(bool enabled)
@@ -544,13 +560,17 @@ public sealed class IasPageViewModel : FullWorkspacePageViewModel
         }
     }
 
+    // 卸载角色也走 IAS 队列：别的操作在跑时照样能点，排在后面依次执行。
     private Task RemoveAsync(IasCharacterRow? character)
-        => character is not null && CanActOnCharacter(character)
-            ? ConfirmAndRunAsync(new("卸载角色", $"卸载角色 {character.Name}？会从 IAS 和当前配置里移除。", "卸载"),
-                (_, progress, ct) => _service.RemoveCharacterAsync(character.Id, progress, ct))
-            : Task.CompletedTask;
+    {
+        if (character is null || !CanQueueConversion(character)) return Task.CompletedTask;
+        var id = character.Id;
+        var service = _service;
+        return QueueAsync("卸载 IAS 角色", character.Name, ["role:" + id],
+            new("卸载角色", $"卸载角色 {character.Name}？会从 IAS 和当前配置里移除。", "卸载"),
+            (progress, ct) => service.RemoveCharacterAsync(id, progress, ct));
+    }
 
-    private bool CanActOnCharacter(object? character) => CanWrite && ShowIasToggle && character is IasCharacterRow row && Characters.Contains(row);
     private bool CanQueueConversion(object? character) => CanQueue && ShowIasToggle &&
         character is IasCharacterRow row && Characters.Contains(row);
 

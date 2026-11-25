@@ -9,6 +9,8 @@ public enum IasWorkerErrorKind { ReShadeConflict }
 public sealed record IasWorkerResponse(bool Success, string? Value = null, string? Error = null,
 	IasWorkerErrorKind? ErrorKind = null);
 
+public sealed record IasArchiveOwner(string Id, string Name, bool Enabled, string[] Archives);
+
 public enum IasDlssMode { Off, FrameGeneration, NeuralRendering }
 
 public sealed record IasGraphicsState(bool ReShadeEnabled, IasDlssMode Dlss);

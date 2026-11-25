@@ -37,6 +37,7 @@ UNIT_TYPE = 0xE0A48D0BE9A7453F
 MATERIAL_TYPE = 0xEAC0B497876ADEDF
 COMPANION_NAME_LIMIT = 80
 COMPANION_FILENAME = "IAS_Companion.hd2irpack.zip"
+IAS_DEFAULT_FIXED_DT = 1.0 / 60.0  # AQ SDK physics_packaging 的默认步长
 
 
 def check_sdk(with_physics: bool) -> None:
@@ -131,6 +132,7 @@ def build_domain_chains(
     jiggle_rows: list[dict],
     weighted_bones_in_domain: set[str],
     domain_label: str,
+    fixed_dt: float = IAS_DEFAULT_FIXED_DT,
 ) -> list[dict]:
     """Decompose jiggle bone forest consumed by this domain into disjoint HD2PHY1 chains."""
     by_bone = {row["bone"]: row for row in jiggle_rows}
@@ -210,7 +212,7 @@ def build_domain_chains(
                 "limit_axis": [1.0, 0.0, 0.0],
             })
 
-        chains.append({
+        chain = {
             "name": f"{domain_label}_chain_{idx:02d}",
             "stiffness": round(ias_stiff, 4),
             "damping": round(ias_damp, 4),
@@ -221,7 +223,17 @@ def build_domain_chains(
             "root_swing": True,
             "local_bend": local_bend,
             "joints": joints,
-        })
+        }
+        if domain_label == "helmet":
+            # Source 角向阻尼是每秒的系数，IAS 阻尼是每个固定步的速度衰减比例。
+            # 底座弹簧的平移阻尼不参与旋转。没有角向数据时交给 HD2PHY1 的默认值。
+            angular = [float(by_bone[b]["sourceAngularDamping"]) for b in seq
+                       if by_bone[b].get("sourceAngularDamping") is not None]
+            if angular:
+                chain["damping"] = -math.expm1(-fixed_dt * max(0.0, sum(angular) / len(angular)))
+            else:
+                del chain["damping"]
+        chains.append(chain)
 
     return chains
 
@@ -361,9 +373,11 @@ def build_domain_package(
 
     if jiggle_rows:
         all_domain_weighted = set().union(*weighted_by_part.values()) if weighted_by_part else set()
-        dom_chains = build_domain_chains(jiggle_rows, all_domain_weighted, domain_kind.lower())
+        fixed_dt = float(authoring_project.get("fixed_dt", IAS_DEFAULT_FIXED_DT))
+        dom_chains = build_domain_chains(jiggle_rows, all_domain_weighted, domain_kind.lower(), fixed_dt)
         if dom_chains:
             phys_authoring = copy.deepcopy(authoring_project)
+            phys_authoring["fixed_dt"] = fixed_dt
             phys_authoring["chains"] = dom_chains
             phys_authoring["colliders"] = []
             phys_authoring["chain_links"] = []

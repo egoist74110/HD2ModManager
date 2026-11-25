@@ -492,6 +492,7 @@ public sealed class IasModuleService(
 
         string? sdk = null;
         string? vpkSetupError = null;
+        IasVpkTargetCatalog? vpkCatalog = null;
         if (conversions.Any(item => item.Kind == IasDropItemKind.L4d2Vpk))
         {
             var stage = ConversionStage(storage);
@@ -503,18 +504,12 @@ public sealed class IasModuleService(
                     () => IasAqSdk.GetAsync(storage, stage, ct)).ConfigureAwait(false);
                 var targets = await IasTiming.MeasureAsync("查找可用 IAS 底子",
                     () => IasPackagingService.GetVpkTargetsAsync(sdk, service.GameData, ct)).ConfigureAwait(false);
-                if (vpkTargets is { } selected && (selected.Body is null || selected.Helmet is null))
-                {
-                    var catalog = await IasEquipmentCatalog.ReadAsync(storage, ct).ConfigureAwait(false);
-                    vpkTargets = new(
-                        selected.Body ?? FirstNamed(false, targets.BodyArchives, "护甲"),
-                        selected.Helmet ?? FirstNamed(true, targets.HelmetArchives, "头盔"));
-
-                    string FirstNamed(bool helmet, IReadOnlyList<string> archives, string label) =>
-                        catalog.ByArchive(helmet, archives).FirstOrDefault()?.Primary?.ArchiveId ??
-                        throw new InvalidDataException($"IAS 绑定目录与游戏护甲目录没有可用的底子{label}。");
-                }
-                vpkTargets = IasVpkTargets.Resolve(vpkTargets, targets);
+                var catalog = await IasEquipmentCatalog.ReadAsync(storage, ct).ConfigureAwait(false);
+                vpkCatalog = new(catalog.ByArchive(false, targets.BodyArchives), catalog.ByArchive(true, targets.HelmetArchives));
+                var preferred = new IasVpkTargets(
+                    vpkTargets?.Body ?? vpkCatalog.Armor.FirstOrDefault()?.Primary?.ArchiveId,
+                    vpkTargets?.Helmet ?? vpkCatalog.Helmet.FirstOrDefault()?.Primary?.ArchiveId);
+                vpkTargets = IasVpkTargets.Resolve(preferred, targets);
             }
             catch (Exception error) when (error is not OperationCanceledException)
             {
@@ -542,17 +537,24 @@ public sealed class IasModuleService(
                 warnings.Add($"添加 IAS 主包与配套包失败：{error.Message}");
             }
         }
+        var reserved = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         return await AddDropConversionsAsync(conversions, count, warnings, noModels, async (conversion, token) =>
         {
-            if (conversion.Kind == IasDropItemKind.L4d2Vpk && vpkSetupError is not null)
-                throw new InvalidDataException(vpkSetupError);
-            return await ConvertAndAddAsync(service, storage, conversion.Path, conversion.Kind, progress, token, conversion.Name,
-                sdk, vpkTargets, async (current, commitToken) =>
+            var name = conversion.Name ?? DropName(conversion.Path);
+            if (conversion.Kind != IasDropItemKind.L4d2Vpk) return await Convert(null).ConfigureAwait(false);
+            if (vpkSetupError is not null) throw new InvalidDataException(vpkSetupError);
+            var occupancy = await service.GetArchiveOccupancyAsync(token).ConfigureAwait(false);
+            return await IasVpkAllocation.ConvertAsync(vpkTargets!, vpkCatalog!, occupancy, reserved, name, Convert)
+                .ConfigureAwait(false);
+
+            Task<IReadOnlyList<string>> Convert(IasVpkTargets? targets) =>
+                ConvertAndAddAsync(service, storage, conversion.Path, conversion.Kind, progress, token, name,
+                    sdk, targets, async (current, commitToken) =>
                 {
                     if (verifyLibrary is not null) await verifyLibrary(current, commitToken).ConfigureAwait(false);
                     foreach (var origin in conversion.Origins)
                         await origin.VerifyAsync(commitToken).ConfigureAwait(false);
-                }, conversion.MaterialVpks).ConfigureAwait(false);
+                }, conversion.MaterialVpks);
         }, ct).ConfigureAwait(false);
     }
 
@@ -699,8 +701,16 @@ public sealed class IasModuleService(
                     ? Path.GetFileName(Path.TrimEndingDirectorySeparator(input)) : Path.GetFileNameWithoutExtension(input))
             };
             var conversionProgress = new ConversionProgress(progress);
-            var converted = vpk ? await packaging.ConvertL4d2VpkAsync(input, options, conversionProgress, ct).ConfigureAwait(false)
-                : await packaging.ConvertPatchModAsync(PreparePatchInput(input, stage, ct, rootPatchesOnly), options, conversionProgress, ct).ConfigureAwait(false);
+            IasPackagingResult converted;
+            if (vpk)
+                converted = await packaging.ConvertL4d2VpkAsync(input, options, conversionProgress, ct).ConfigureAwait(false);
+            else
+            {
+                var patches = FindPatchInputs(input, ct, rootPatchesOnly);
+                converted = await ConvertPatchWithPreflightAsync(service, patches.Values, options.AqSdkDirectory!,
+                    () => packaging.ConvertPatchModAsync(PreparePatchInput(patches, stage, ct), options, conversionProgress, ct),
+                    ct).ConfigureAwait(false);
+            }
             if (!converted.IsSuccess) throw new InvalidDataException(string.Join("；", converted.Errors));
             await service.AddAsync([converted.MainModZip!, converted.CompanionZip!],
                 vpk ? IasRoleSource.L4d2Vpk : IasRoleSource.PatchMod, ct, async (snapshot, token) =>
@@ -714,10 +724,17 @@ public sealed class IasModuleService(
         finally { IasFileTree.Delete(stage); }
     }
 
-    private static string PreparePatchInput(string input, string work, CancellationToken ct, bool rootOnly = false)
+    internal static async Task<IasPackagingResult> ConvertPatchWithPreflightAsync(IasDeploymentService service,
+        IEnumerable<string> patchFiles, string sdk, Func<Task<IasPackagingResult>> convert, CancellationToken ct)
     {
-        var target = Path.Combine(work, "patch-input");
-        Directory.CreateDirectory(target);
+        var archives = await IasPackagingService.ReadPatchTargetArchivesAsync(patchFiles, sdk, ct).ConfigureAwait(false);
+        await service.PreflightArchivesAsync(archives, ct).ConfigureAwait(false);
+        return await convert().ConfigureAwait(false);
+    }
+
+    private static IReadOnlyDictionary<string, string> FindPatchInputs(string input, CancellationToken ct, bool rootOnly)
+    {
+        var files = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         var parser = CoreServices.CreatePatchFileNameParser();
         foreach (var file in Directory.EnumerateFiles(input, "*", new EnumerationOptions
         {
@@ -727,10 +744,20 @@ public sealed class IasModuleService(
             ct.ThrowIfCancellationRequested();
             var fileName = Path.GetFileName(file);
             if (!parser.TryParse(fileName, out _)) continue;
-            var destination = Path.Combine(target, fileName);
-            if (File.Exists(destination))
+            if (!files.TryAdd(fileName, file))
                 throw new InvalidDataException($"转换输入中有重名补丁：{fileName}。请先选择一个选项目录。");
-            File.Copy(file, destination);
+        }
+        return files;
+    }
+
+    private static string PreparePatchInput(IReadOnlyDictionary<string, string> patches, string work, CancellationToken ct)
+    {
+        var target = Path.Combine(work, "patch-input");
+        Directory.CreateDirectory(target);
+        foreach (var (name, path) in patches)
+        {
+            ct.ThrowIfCancellationRequested();
+            File.Copy(path, Path.Combine(target, name));
         }
         return target;
     }

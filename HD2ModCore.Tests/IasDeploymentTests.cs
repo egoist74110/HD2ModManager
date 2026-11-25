@@ -12,6 +12,135 @@ namespace HD2ModCore.Tests;
 public sealed class IasDeploymentTests
 {
 	private const string ReShadeConflict = "游戏 bin/dxgi.dll 无法识别为 ReShade，可能属于其他 Mod。请先核对这个文件的来源；本次安装未覆盖任何文件。";
+	private const string Dp8Helmet = "59d238094a164c88";
+
+	[Fact]
+	public async Task DirectPairChecksArchiveBeforeImport()
+	{
+		using var fixture = await Fixture.CreateAsync();
+		fixture.SetArchiveOwner("sdkgroup.existing", enabled: true, Dp8Helmet);
+		fixture.Worker.CandidateArchives = [Dp8Helmet];
+
+		var error = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+			fixture.Service.AddAsync(fixture.Pair, IasRoleSource.IasPackage, default));
+
+		Assert.Equal($"与已启用角色『sdkgroup.existing』占用同一装备（{Dp8Helmet}），请先停用其中一个。", error.Message);
+		Assert.Equal(new[] { "companion-archives", "archive-occupancy" }, fixture.Worker.Requests.Select(request => request.Command));
+		Assert.False(Directory.Exists(fixture.Snapshot));
+	}
+
+	[Fact]
+	public async Task DisabledOwnerAllowsAddButCannotBeEnabledOverNewOwner()
+	{
+		using var fixture = await Fixture.CreateAsync();
+		fixture.Worker.RoleArchives["sdkgroup.role"] = [Dp8Helmet];
+		var role = await fixture.Service.AddAsync(fixture.Pair, IasRoleSource.IasPackage, default);
+		await fixture.Service.SetCharacterEnabledAsync(role.Id, false, default);
+		Assert.Empty(await fixture.Service.GetArchiveOccupancyAsync(default));
+		await fixture.Service.PreflightArchivesAsync([Dp8Helmet], default);
+		fixture.SetArchiveOwner("sdkgroup.existing", enabled: true, Dp8Helmet);
+		fixture.Worker.Requests.Clear();
+
+		var error = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+			fixture.Service.SetCharacterEnabledAsync(role.Id, true, default));
+
+		Assert.Contains($"『sdkgroup.existing』占用同一装备（{Dp8Helmet}）", error.Message);
+		Assert.Equal("archive-occupancy", Assert.Single(fixture.Worker.Requests).Command);
+		Assert.False(Assert.Single(await fixture.Service.GetRolesWithStateAsync(default)).Enabled);
+	}
+
+	[Fact]
+	public async Task ArchiveAcquiredAfterPreflightIsRejectedBeforeRegenerate()
+	{
+		using var fixture = await Fixture.CreateAsync();
+		fixture.SetArchiveOwner("sdkgroup.existing", enabled: false, Dp8Helmet);
+		fixture.Worker.CandidateArchives = [Dp8Helmet];
+		fixture.Worker.RoleArchives["sdkgroup.role"] = [Dp8Helmet];
+		await fixture.Service.PreflightArchivesAsync([Dp8Helmet], default);
+
+		var error = await Assert.ThrowsAsync<InvalidOperationException>(() => fixture.Service.AddAsync(fixture.Pair,
+			IasRoleSource.PatchMod, default, (_, _) =>
+			{
+				fixture.SetArchiveOwner("sdkgroup.existing", enabled: true, Dp8Helmet);
+				return Task.CompletedTask;
+			}));
+
+		Assert.Contains($"『sdkgroup.existing』占用同一装备（{Dp8Helmet}）", error.Message);
+		Assert.Contains(fixture.Worker.Requests, request => request.Command == "import");
+		Assert.DoesNotContain(fixture.Worker.Requests, request => request.Command == "regenerate");
+		Assert.Empty(fixture.Service.GetRoles());
+		Assert.Equal("sdkgroup.existing", Assert.Single(await fixture.Service.GetArchiveOccupancyAsync(default)).Id);
+	}
+
+	[Fact]
+	public async Task OfficialArchiveFailureTranslatesOwnerAndEquipment()
+	{
+		using var fixture = await Fixture.CreateAsync();
+		Directory.CreateDirectory(Path.GetDirectoryName(fixture.Paths.DbPath)!);
+		using var readPool = new Microsoft.Data.Sqlite.SqliteConnection($"Data Source={fixture.Paths.DbPath};Mode=ReadOnly;Cache=Shared");
+		using (var db = new Microsoft.Data.Sqlite.SqliteConnection($"Data Source={fixture.Paths.DbPath};Pooling=False"))
+		{
+			db.Open();
+			using var command = db.CreateCommand();
+			command.CommandText = $"""
+				CREATE TABLE game_data_authority_kits (item_id, archive_id, display_name, kit_kind, set_id, dlc_id);
+				INSERT INTO game_data_authority_kits VALUES (1, '{Dp8Helmet}', 'DP-8 头盔', 1, 0, 0);
+				""";
+			command.ExecuteNonQuery();
+		}
+		fixture.SetArchiveOwner("sdkgroup.existing", enabled: true, Dp8Helmet);
+		fixture.Worker.RegenerateError = $"IAS worker regenerate 失败（退出码 1）：启用的 Mod 占用同一装备 Archive，请取消勾选其中一个：{Dp8Helmet}\n诊断日志：sandbox";
+
+		try
+		{
+			var error = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+				fixture.Service.AddAsync(fixture.Pair, IasRoleSource.IasPackage, default));
+			Assert.Equal($"与已启用角色『sdkgroup.existing』占用同一装备（DP-8 头盔 / {Dp8Helmet}），请先停用其中一个。", error.Message);
+			Assert.Contains("诊断日志：sandbox", error.InnerException!.Message);
+		}
+		finally { Microsoft.Data.Sqlite.SqliteConnection.ClearPool(readPool); }
+	}
+
+#if WINDOWS
+	[Fact]
+	public async Task PatchUnitTargetIsCheckedBeforeCallingPackager()
+	{
+		using var fixture = await Fixture.CreateAsync();
+		fixture.SetArchiveOwner("sdkgroup.existing", enabled: true, Dp8Helmet);
+		var sdk = Path.Combine(fixture.Root, "sdk");
+		var bindings = Directory.CreateDirectory(Path.Combine(sdk, "hd2_system")).FullName;
+		File.WriteAllText(Path.Combine(bindings, "resource_binding_targets.json"), $$"""
+			{"targets": {"{{Dp8Helmet}}": {"domain":"HELMET","equipment":[{"unit_ids":["a"]}]} } }
+			""");
+		var patch = Directory.CreateDirectory(Path.Combine(fixture.Root, "patch-input")).FullName;
+		// 补丁文件名与实际 Unit 目标不同，预检应以转换器选出的 Archive 为准。
+		using (var output = File.Create(Path.Combine(patch, "0000000000000002.patch_0")))
+		using (var writer = new BinaryWriter(output))
+		{
+			writer.Write(0xF0000011u);
+			writer.Write(1u);
+			writer.Write(1u);
+			writer.Write(new byte[60]);
+			writer.Write(0ul);
+			writer.Write(0xe0a48d0be9a7453ful);
+			writer.Write(1ul);
+			writer.Write(0ul);
+			writer.Write(10ul);
+			writer.Write(0xe0a48d0be9a7453ful);
+			writer.Write(new byte[64]);
+		}
+		var calls = 0;
+		var error = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+			HD2ModManager.Services.Ias.IasModuleService.ConvertPatchWithPreflightAsync(fixture.Service, Directory.GetFiles(patch), sdk, () =>
+			{
+				calls++;
+				throw new InvalidOperationException("不应进入打包器");
+			}, default));
+
+		Assert.Contains(Dp8Helmet, error.Message);
+		Assert.Equal(0, calls);
+	}
+#endif
 
 	[Fact]
 	public async Task GraphicsRequiresIasAndReShadeAndReplacesTheManagedDataAfterEachChange()
@@ -108,7 +237,8 @@ public sealed class IasDeploymentTests
 		using var fixture = await Fixture.CreateAsync();
 		var role = await fixture.Service.AddAsync(fixture.Pair, IasRoleSource.IasPackage, default);
 		Assert.Equal("sdkgroup.role", role.Id);
-		Assert.Equal(new[] { "import", "regenerate", "status" }, fixture.Worker.Requests.Select(request => request.Command));
+		Assert.Equal(new[] { "companion-archives", "archive-occupancy", "import", "archive-occupancy", "regenerate", "status" },
+			fixture.Worker.Requests.Select(request => request.Command));
 		var initial = await fixture.Service.LoadModsAsync(default);
 		Assert.Equal(2, initial.Nodes.Count);
 		Assert.Equal(fixture.ManagedId, fixture.Service.ManagedModId);
@@ -122,7 +252,7 @@ public sealed class IasDeploymentTests
 
 		await fixture.Service.RemoveAsync(role.Id, default);
 
-		Assert.Equal(new[] { "import", "regenerate", "status", "remove", "regenerate" }, fixture.Worker.Requests.Select(request => request.Command));
+		Assert.Equal(new[] { "remove", "regenerate" }, fixture.Worker.Requests.Skip(6).Select(request => request.Command));
 		var after = await fixture.Service.LoadModsAsync(default);
 		Assert.Single(after.Nodes);
 		Assert.Equal(fixture.ManagedId, Assert.Single(IasDeploymentService.Active(after)!.Entries).NodeId.Value);
@@ -665,6 +795,12 @@ public sealed class IasDeploymentTests
 		internal IasDeploymentService Service { get; private set; } = null!;
 		internal string[] Pair => [Path.Combine(Root, "Sample_IAS_MainMod.zip"), Path.Combine(Root, "Sample_IAS_Companion.hd2irpack.zip")];
 
+		internal void SetArchiveOwner(string id, bool enabled, params string[] archives)
+		{
+			Worker.RoleArchives[id] = archives;
+			File.WriteAllText(Path.Combine(IasLibrary, id + ".json"), enabled ? "true" : "false");
+		}
+
 		internal static async Task<Fixture> CreateAsync(bool shareOptionActivations = false)
 		{
 			var fixture = new Fixture();
@@ -734,6 +870,9 @@ public sealed class IasDeploymentTests
 		internal Action? BeforeRegenerateFailure { get; set; }
 		internal bool UseEmptyDataPatch { get; set; }
 		internal string? GraphicsError { get; set; }
+		internal string[] CandidateArchives { get; set; } = [];
+		internal Dictionary<string, string[]> RoleArchives { get; } = new(StringComparer.Ordinal);
+		internal string? RegenerateError { get; set; }
 		private string GraphicsPath => Path.Combine(runtime, "graphics.json");
 		private IasGraphicsState ReadGraphics() => File.Exists(GraphicsPath)
 			? JsonSerializer.Deserialize<IasGraphicsState>(File.ReadAllText(GraphicsPath))! : new(false, IasDlssMode.Off);
@@ -745,6 +884,16 @@ public sealed class IasDeploymentTests
 			Requests.Add(request);
 			switch (request.Command)
 			{
+				case "companion-archives":
+					Assert.True(File.Exists(request.Argument));
+					return Task.FromResult(new IasWorkerResponse(true, JsonSerializer.Serialize(CandidateArchives)));
+				case "archive-occupancy":
+					var owners = Directory.GetFiles(request.Library, "sdkgroup.*.json").Select(file =>
+					{
+						var id = Path.GetFileNameWithoutExtension(file);
+						return new IasArchiveOwner(id, id, bool.Parse(File.ReadAllText(file)), RoleArchives.GetValueOrDefault(id) ?? []);
+					}).Where(owner => owner.Enabled || owner.Id == request.Argument);
+					return Task.FromResult(new IasWorkerResponse(true, JsonSerializer.Serialize(owners)));
 				case "graphics-status":
 					return Task.FromResult(new IasWorkerResponse(true, JsonSerializer.Serialize(ReadGraphics())));
 				case "reshade-install":
@@ -790,6 +939,8 @@ public sealed class IasDeploymentTests
 					});
 					return Task.FromResult(new IasWorkerResponse(true, JsonSerializer.Serialize(new { Library = new { entries } })));
 				case "regenerate":
+					if (RegenerateError is not null)
+						return Task.FromResult(new IasWorkerResponse(false, Error: RegenerateError));
 					File.Delete(Path.Combine(runtime, "permanent"));
 					File.WriteAllText(Path.Combine(runtime, "new"), "replacement");
 					if (FailRegenerate)

@@ -121,7 +121,20 @@ sealed class OfficialIas
 		RequireField(libraryEntry, "enabled", typeof(bool), publicOnly: true);
 		RequireField(libraryState, "entries", libraryEntry.MakeArrayType(), publicOnly: true);
 
-		if (request.Command == "check-interface")
+		if (request.Command is "archive-occupancy" or "companion-archives")
+		{
+			var bundle = TypeOf("OwnedBundle");
+			var archiveReader = store.GetMethod("BundleArchives", BindingFlags.NonPublic | BindingFlags.Instance,
+				null, [bundle], null);
+			if (archiveReader?.ReturnType != typeof(HashSet<string>))
+				throw Missing("方法 HashSet<String> OwnedStore.BundleArchives(OwnedBundle)");
+			_methods.Add("BundleArchives", archiveReader);
+			RequireField(libraryEntry, "bundle", bundle);
+			RequireField(bundle, "name", str);
+			Bind(store, "ImportSdkZip", bundle, false, str);
+		}
+
+		if (request.Command is "check-interface" or "archive-occupancy" or "companion-archives")
 		{
 			_runtime = string.Empty;
 			return;
@@ -197,6 +210,18 @@ sealed class OfficialIas
 			case "status":
 				return JsonSerializer.Serialize(new { RuntimeDirectory = _runtime, Library = Call("LibraryStatus", Store()) },
 					new JsonSerializerOptions { IncludeFields = true });
+			case "archive-occupancy":
+				return JsonSerializer.Serialize(ReadArchiveOwners(argument));
+			case "companion-archives":
+				// 官方解析器会写 CAS。只在 worker 的一次性临时源库中执行。
+				var scratch = Directory.CreateTempSubdirectory("ias-companion-").FullName;
+				try
+				{
+					var reader = _store.Invoke([scratch, game]);
+					var bundle = Call("ImportSdkZip", reader, Required(argument))!;
+					return JsonSerializer.Serialize(BundleArchives(reader, bundle));
+				}
+				finally { Directory.Delete(scratch, recursive: true); }
 			case "restore":
 				var record = Required(argument);
 				using (var journal = JsonDocument.Parse(File.ReadAllBytes(record)))
@@ -215,6 +240,24 @@ sealed class OfficialIas
 				throw new InvalidDataException($"未知 IAS worker 命令：{_request.Command}");
 		}
 	}
+
+	private IEnumerable<IasArchiveOwner> ReadArchiveOwners(string? includeRole)
+	{
+		var store = Store();
+		var state = Call("LibraryStatus", store)!;
+		foreach (var entry in ((IEnumerable)Field(state, "entries")!).Cast<object>())
+		{
+			var id = (string)Field(entry, "id")!;
+			var enabled = (bool)Field(entry, "enabled")!;
+			if (!enabled && id != includeRole) continue;
+			var bundle = Field(entry, "bundle")
+				?? throw new InvalidDataException($"IAS 配套无效：{id}");
+			yield return new(id, (string?)Field(bundle, "name") ?? id, enabled, BundleArchives(store, bundle));
+		}
+	}
+
+	private string[] BundleArchives(object store, object bundle) =>
+		((HashSet<string>)Call("BundleArchives", store, bundle)!).Order(StringComparer.Ordinal).ToArray();
 
 	private IasGraphicsState ReadGraphics()
 	{

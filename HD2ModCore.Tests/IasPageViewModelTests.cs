@@ -177,7 +177,8 @@ public sealed class IasPageViewModelTests
         Assert.True(page.IsBusy);
         Assert.True(page.ShowIasToggle);
         Assert.False(page.CanToggleIas);
-        Assert.False(page.CanToggleCharacter);
+        // 角色开关走队列，忙时仍可拨；总开关仍是独占操作。
+        Assert.Equal(!total, page.CanToggleCharacter);
         Assert.False(total ? page.IasEnabled : row.IsChecked);
         pending.SetResult(new(false, "模拟部署失败", []));
         await operation;
@@ -316,7 +317,7 @@ public sealed class IasPageViewModelTests
     }
 
     [Fact]
-    public async Task OperationDisablesAllOtherCommandsAndCannotOverlap()
+    public async Task ExclusiveOperationDisablesOtherExclusiveCommandsAndCannotOverlap()
     {
         var pending = new TaskCompletionSource<IasOperationResult>(TaskCreationOptions.RunContinuationsAsynchronously);
         var reported = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -350,13 +351,13 @@ public sealed class IasPageViewModelTests
             Assert.False(page.UninstallCommand.CanExecute(null));
             Assert.True(page.ChooseLibraryModCommand.CanExecute(null));
             Assert.True(page.ConvertCharacterCommand.CanExecute(row));
-            Assert.False(page.RemoveCharacterCommand.CanExecute(row));
+            Assert.True(page.RemoveCharacterCommand.CanExecute(row));
             Assert.False(page.OpenOfficialPageCommand.CanExecute(null));
             Assert.False(page.OpenCreatedModCommand.CanExecute(null));
             Assert.True(page.CancelCommand.CanExecute(null));
             Assert.True(page.CanAcceptDrop);
             Assert.True(page.UpdateWindowDrop([AppContext.BaseDirectory]));
-            Assert.Contains("排队", page.DropText);
+            Assert.Contains("队列", page.DropText);
             Assert.Equal(0, service.AddCalls);
             await page.ExecutePrimaryAsync();
             Assert.Equal(1, service.InstallCalls);
@@ -400,25 +401,23 @@ public sealed class IasPageViewModelTests
         Assert.Equal(0, service.AddCalls);
     }
 
-    [Theory]
-    [InlineData(true)]
-    [InlineData(null)]
-    public async Task WindowDropConfirmsBeforeCallingService(bool? answer)
+    [Fact]
+    public async Task WindowDropQueuesWithoutConfirmation()
     {
         var service = new ServiceStub(IasStatusKind.Installed, "1.6.4");
-        var dialogs = new DialogStub(answer);
+        var dialogs = new DialogStub(null);
         using var page = CreatePage(service, dialogs);
         await page.EnterAsync();
         Assert.True(page.UpdateWindowDrop([AppContext.BaseDirectory]));
         Assert.True(page.IsWindowDropHighlighted);
+        Assert.Equal("松开后加入 IAS 队列", page.DropText);
         Assert.Equal(0, service.AddCalls);
-        Assert.Null(dialogs.LastConfirmation);
 
         await page.HandleWindowDropAsync([AppContext.BaseDirectory]);
 
-        Assert.Equal(answer.HasValue ? 1 : 0, service.AddCalls);
-        Assert.Equal("添加 IAS 角色", dialogs.LastConfirmation?.Title);
-        Assert.Equal(answer.HasValue, page.ResultSuccess);
+        Assert.Equal(1, service.AddCalls);
+        Assert.Equal(0, dialogs.Confirmations);
+        Assert.True(page.ResultSuccess);
         Assert.False(page.IsWindowDropHighlighted);
     }
 
@@ -488,8 +487,11 @@ public sealed class IasPageViewModelTests
         page.StartConversionCommand.Execute(row);
         panel.MergeHelmet = false;
         Assert.Null(row.Conversion);
+        page.RemoveCharacterCommand.Execute(row);
+        Assert.Equal(0, dialogs.Confirmations);
+        Assert.Empty(service.RemoveCalls);
         page.ChooseLibraryModCommand.Execute(null);
-        Assert.Equal(4, dialogs.Confirmations);
+        Assert.Equal(1, dialogs.Confirmations); // 只有「从库里选」确认；拖入不弹
         Assert.Equal(["Second.zip", "Cancelled.zip", row.Name, "库中护甲"], page.WaitingQueue.Select(item => item.Name));
         Assert.False(page.UninstallCommand.CanExecute(null));
         Assert.False(page.CanToggleIas);
@@ -511,6 +513,325 @@ public sealed class IasPageViewModelTests
         Assert.Equal([BackgroundTaskStatus.Running, BackgroundTaskStatus.Completed], secondStatuses);
         Assert.Contains(secondMessage, messages.RecentNotifications);
         Assert.DoesNotContain(notifications.History, item => item.Level == NotificationLevel.Error);
+    }
+
+    [Fact]
+    public async Task BusyPageQueuesRemovalAndUsesRoleIdAfterRefreshReplacesRow()
+    {
+        var install = new TaskCompletionSource<IasOperationResult>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var service = new ServiceStub(IasStatusKind.UpdateAvailable, "1.6.4")
+        {
+            Install = (_, _) => install.Task
+        };
+        var dialogs = new DialogStub(true);
+        using var page = CreatePage(service, dialogs);
+        await page.EnterAsync();
+        var row = Assert.Single(page.Characters);
+        IReadOnlyList<IasCharacterRow>? rowsAtRemoval = null;
+        service.Remove = (_, _) =>
+        {
+            rowsAtRemoval = page.Characters;
+            return Task.FromResult(new IasOperationResult(true, "已卸载", []));
+        };
+
+        var active = page.ExecutePrimaryAsync();
+        try
+        {
+            Assert.True(page.IsBusy);
+            Assert.True(page.RemoveCharacterCommand.CanExecute(row));
+            page.RemoveCharacterCommand.Execute(row);
+
+            Assert.Equal(new IasConfirmation("卸载角色", $"卸载角色 {row.Name}？会从 IAS 和当前配置里移除。", "卸载"),
+                dialogs.LastConfirmation);
+            var waiting = Assert.Single(page.WaitingQueue);
+            Assert.Equal("卸载 IAS 角色", waiting.Operation);
+            Assert.Equal(BackgroundTaskStatus.Queued, waiting.Task.Status);
+            Assert.Empty(service.RemoveCalls);
+            service.CharacterEnabled = false;
+        }
+        finally
+        {
+            install.SetResult(new(true, "已更新", []));
+            await active.WaitAsync(TimeSpan.FromSeconds(5));
+        }
+
+        Assert.Equal([row.Id], service.RemoveCalls);
+        var refreshedRow = Assert.Single(Assert.IsAssignableFrom<IReadOnlyList<IasCharacterRow>>(rowsAtRemoval));
+        Assert.NotSame(row, refreshedRow);
+        Assert.Equal(row.Id, refreshedRow.Id);
+        Assert.Empty(page.Characters);
+    }
+
+    [Fact]
+    public async Task TwoRoleRemovalsAreQueuedAndRunInOrder()
+    {
+        var firstResult = new TaskCompletionSource<IasOperationResult>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var service = new ServiceStub(IasStatusKind.Installed, "1.6.4")
+        {
+            AdditionalCharacter = new("second-role", "第二个角色", null, IasCharacterSource.IasPackage, DateTimeOffset.UnixEpoch, true),
+            Remove = (id, _) => id == "character" ? firstResult.Task : Task.FromResult(new IasOperationResult(true, "已卸载", []))
+        };
+        var notifications = new NotificationService();
+        var tasks = new BackgroundTaskService();
+        var messages = new MessageCenterService(notifications, tasks);
+        var queue = new IasOperationQueue(tasks, service);
+        var dialogs = new DialogStub(true);
+        using var page = CreatePage(service, dialogs, notifications, queue);
+        await page.EnterAsync();
+        var first = page.Characters[0];
+        var second = page.Characters[1];
+        var idle = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        queue.Changed += (_, _) => { if (!queue.HasWork) idle.TrySetResult(); };
+
+        page.RemoveCharacterCommand.Execute(first);
+        try
+        {
+            Assert.True(page.RemoveCharacterCommand.CanExecute(second));
+            page.RemoveCharacterCommand.Execute(second);
+
+            Assert.Equal(2, dialogs.Confirmations);
+            Assert.Equal([first.Id], service.RemoveCalls);
+            Assert.Equal(first.Name, page.CurrentQueueItem?.Name);
+            var waiting = Assert.Single(page.WaitingQueue);
+            Assert.Equal(second.Name, waiting.Name);
+            Assert.Equal(BackgroundTaskStatus.Queued, waiting.Task.Status);
+            Assert.Equal(2, messages.ActiveTasks.Count);
+            var firstMessage = Assert.Single(messages.ActiveTasks, item => item.Title == $"卸载 IAS 角色：{first.Name}");
+            var secondMessage = Assert.Single(messages.ActiveTasks, item => item.Title == $"卸载 IAS 角色：{second.Name}");
+            Assert.Same(page.CurrentQueueItem?.Task, firstMessage.Task);
+            Assert.Same(waiting.Task, secondMessage.Task);
+        }
+        finally
+        {
+            firstResult.SetResult(new(true, "已卸载", []));
+            await idle.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        }
+
+        Assert.Equal([first.Id, second.Id], service.RemoveCalls);
+        Assert.All(tasks.Tasks, task => Assert.Equal(BackgroundTaskStatus.Completed, task.Status));
+        Assert.Empty(page.Characters);
+    }
+
+    [Fact]
+    public async Task RoleToggleQueuesBehindRunningOperationWithoutConfirmation()
+    {
+        var pending = new TaskCompletionSource<IasOperationResult>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var service = new ServiceStub(IasStatusKind.Installed, "1.6.4") { Add = (_, _, _) => pending.Task, FinishPrimaryAction = true };
+        var dialogs = new DialogStub(true);
+        var tasks = new BackgroundTaskService();
+        var queue = new IasOperationQueue(tasks, service);
+        using var page = CreatePage(service, dialogs, queue: queue);
+        await page.EnterAsync();
+        var row = Assert.Single(page.Characters);
+        var active = page.HandleWindowDropAsync([AppContext.BaseDirectory]);
+        var idle = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        queue.Changed += (_, _) => { if (!queue.HasWork) idle.TrySetResult(); };
+        Task toggle;
+        try
+        {
+            Assert.True(page.IsBusy);
+            Assert.True(page.CanToggleCharacter);
+            toggle = page.SetCharacterEnabledAsync(row, false);
+
+            var waiting = Assert.Single(page.WaitingQueue);
+            Assert.Equal("停用 IAS 角色", waiting.Operation);
+            Assert.Equal(0, dialogs.Confirmations);
+            Assert.Empty(service.ToggleCalls);
+            Assert.False(row.IsChecked);
+        }
+        finally
+        {
+            pending.SetResult(new(true, "已添加", []));
+        }
+        await Task.WhenAll(active, toggle, idle.Task).WaitAsync(TimeSpan.FromSeconds(5));
+        for (var i = 0; i < 50 && page.Characters[0].Enabled != false; i++) await Task.Delay(20);
+
+        Assert.Equal([(row.Id, false)], service.ToggleCalls);
+        Assert.False(Assert.Single(page.Characters).IsChecked);
+        Assert.False(page.Characters[0].Enabled);
+    }
+
+    [Fact]
+    public async Task RoleToggleIsRejectedWhileSameRoleIsQueuedAndSnapsBack()
+    {
+        var pending = new TaskCompletionSource<IasOperationResult>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var service = new ServiceStub(IasStatusKind.Installed, "1.6.4") { Add = (_, _, _) => pending.Task };
+        var notifications = new NotificationService();
+        var notices = new List<string>();
+        notifications.Published += (_, item) => notices.Add(item.Message);
+        var queue = new IasOperationQueue(new BackgroundTaskService(), service);
+        using var page = CreatePage(service, new DialogStub(true), notifications, queue);
+        await page.EnterAsync();
+        var row = Assert.Single(page.Characters);
+        var active = page.HandleWindowDropAsync([AppContext.BaseDirectory]);
+        var idle = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        queue.Changed += (_, _) => { if (!queue.HasWork) idle.TrySetResult(); };
+        try
+        {
+            page.RemoveCharacterCommand.Execute(row);
+            await page.SetCharacterEnabledAsync(row, false);
+
+            var waiting = Assert.Single(page.WaitingQueue);
+            Assert.Equal("卸载 IAS 角色", waiting.Operation);
+            Assert.True(row.IsChecked);
+            Assert.Contains(notices, message => message.Contains("正在处理或等待"));
+            page.CancelWaitingCommand.Execute(waiting);
+        }
+        finally
+        {
+            pending.SetResult(new(true, "已添加", []));
+            await Task.WhenAll(active, idle.Task).WaitAsync(TimeSpan.FromSeconds(5));
+        }
+
+        Assert.Empty(service.ToggleCalls);
+        Assert.Empty(service.RemoveCalls);
+    }
+
+    [Fact]
+    public async Task CancellingRoleRemovalConfirmationDoesNotEnqueue()
+    {
+        var service = new ServiceStub(IasStatusKind.Installed, "1.6.4");
+        var dialogs = new DialogStub(null);
+        var tasks = new BackgroundTaskService();
+        using var page = CreatePage(service, dialogs, queue: new IasOperationQueue(tasks, service));
+        await page.EnterAsync();
+        var row = Assert.Single(page.Characters);
+
+        page.RemoveCharacterCommand.Execute(row);
+
+        Assert.Equal(1, dialogs.Confirmations);
+        Assert.False(page.HasQueue);
+        Assert.Empty(tasks.Tasks);
+        Assert.Empty(service.RemoveCalls);
+        Assert.Same(row, Assert.Single(page.Characters));
+    }
+
+    [Fact]
+    public async Task RepeatedRoleRemovalOnlyQueuesOnce()
+    {
+        var previous = new TaskCompletionSource<IasOperationResult>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var removal = new TaskCompletionSource<IasOperationResult>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var removalStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var service = new ServiceStub(IasStatusKind.Installed, "1.6.4")
+        {
+            Add = (_, _, _) => previous.Task,
+            Remove = (_, _) =>
+            {
+                removalStarted.SetResult();
+                return removal.Task;
+            }
+        };
+        var dialogs = new DialogStub(true);
+        var notifications = new NotificationService();
+        var duplicateNotices = new List<string>();
+        notifications.Published += (_, item) => duplicateNotices.Add(item.Message);
+        var tasks = new BackgroundTaskService();
+        var queue = new IasOperationQueue(tasks, service);
+        using var page = CreatePage(service, dialogs, notifications, queue);
+        await page.EnterAsync();
+        var row = Assert.Single(page.Characters);
+        var active = page.HandleWindowDropAsync([AppContext.BaseDirectory]);
+        var idle = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        queue.Changed += (_, _) => { if (!queue.HasWork) idle.TrySetResult(); };
+        try
+        {
+            page.RemoveCharacterCommand.Execute(row);
+            page.RemoveCharacterCommand.Execute(row);
+            Assert.Single(page.WaitingQueue);
+            Assert.Empty(service.RemoveCalls);
+            Assert.Single(duplicateNotices);
+
+            previous.SetResult(new(true, "已添加", []));
+            await removalStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            Assert.Equal("卸载 IAS 角色", page.CurrentQueueItem?.Operation);
+            page.RemoveCharacterCommand.Execute(row);
+
+            Assert.Empty(page.WaitingQueue);
+            Assert.Equal(1, dialogs.Confirmations);
+            Assert.Equal(2, tasks.Tasks.Count);
+            Assert.Equal(2, duplicateNotices.Count);
+            Assert.All(duplicateNotices, message => Assert.Contains("正在处理或等待", message));
+        }
+        finally
+        {
+            previous.TrySetResult(new(true, "已添加", []));
+            removal.SetResult(new(true, "已卸载", []));
+            await Task.WhenAll(active, idle.Task).WaitAsync(TimeSpan.FromSeconds(5));
+        }
+
+        Assert.Equal([row.Id], service.RemoveCalls);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task WaitingRoleRemovalCanBeCancelledFromPageOrMessageCenter(bool fromMessageCenter)
+    {
+        var pending = new TaskCompletionSource<IasOperationResult>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var service = new ServiceStub(IasStatusKind.Installed, "1.6.4") { Add = (_, _, _) => pending.Task };
+        var notifications = new NotificationService();
+        var tasks = new BackgroundTaskService();
+        var messages = new MessageCenterService(notifications, tasks);
+        using var page = CreatePage(service, new DialogStub(true), notifications, new IasOperationQueue(tasks, service));
+        await page.EnterAsync();
+        var row = Assert.Single(page.Characters);
+        var active = page.HandleWindowDropAsync([AppContext.BaseDirectory]);
+
+        try
+        {
+            page.RemoveCharacterCommand.Execute(row);
+            var waiting = Assert.Single(page.WaitingQueue);
+            var message = Assert.Single(messages.ActiveTasks, item => item.Title == $"卸载 IAS 角色：{row.Name}");
+            Assert.Same(waiting.Task, message.Task);
+            Assert.True(message.CanCancel);
+
+            if (fromMessageCenter) message.Task!.Cancel();
+            else page.CancelWaitingCommand.Execute(waiting);
+
+            Assert.Equal(BackgroundTaskStatus.Canceled, waiting.Task.Status);
+            Assert.Empty(page.WaitingQueue);
+            Assert.DoesNotContain(message, messages.ActiveTasks);
+            Assert.Equal("添加 IAS 角色", page.CurrentQueueItem?.Operation);
+            Assert.False(active.IsCompleted);
+        }
+        finally
+        {
+            pending.SetResult(new(true, "已添加", []));
+            await active.WaitAsync(TimeSpan.FromSeconds(5));
+        }
+
+        Assert.Empty(service.RemoveCalls);
+        Assert.Same(row, Assert.Single(page.Characters));
+    }
+
+    [Fact]
+    public async Task QueuedRoleRemovalChecksWhetherTheGameStartedBeforeExecution()
+    {
+        var pending = new TaskCompletionSource<IasOperationResult>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var service = new ServiceStub(IasStatusKind.Installed, "1.6.4") { Add = (_, _, _) => pending.Task };
+        var queue = new IasOperationQueue(new BackgroundTaskService(), service);
+        using var page = CreatePage(service, new DialogStub(true), queue: queue);
+        await page.EnterAsync();
+        var row = Assert.Single(page.Characters);
+        var active = page.HandleWindowDropAsync([AppContext.BaseDirectory]);
+        var idle = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        queue.Changed += (_, _) => { if (!queue.HasWork) idle.TrySetResult(); };
+        IasQueuedOperation waiting;
+        try
+        {
+            page.RemoveCharacterCommand.Execute(row);
+            waiting = Assert.Single(page.WaitingQueue);
+            service.GameRunning = true;
+        }
+        finally
+        {
+            pending.SetResult(new(true, "已添加", []));
+            await Task.WhenAll(active, idle.Task).WaitAsync(TimeSpan.FromSeconds(5));
+        }
+
+        Assert.Equal(BackgroundTaskStatus.Failed, waiting.Task.Status);
+        Assert.Empty(service.RemoveCalls);
+        Assert.Same(row, Assert.Single(page.Characters));
     }
 
     [Fact]
@@ -1109,6 +1430,11 @@ public sealed class IasPageViewModelTests
         public bool PhysicsOn { get; set; }
         public bool BuiltInLuaOn { get; set; }
         public bool CharacterEnabled { get; set; } = true;
+        public IasCharacterInfo? AdditionalCharacter { get; init; }
+        public List<string> RemoveCalls { get; } = [];
+        public List<(string Id, bool Enabled)> ToggleCalls { get; } = [];
+        public Func<string, CancellationToken, Task<IasOperationResult>>? Remove { get; set; }
+        private readonly HashSet<string> _removedCharacters = [];
         public IasGraphicsState Graphics { get; set; } = new(false, IasDlssMode.Off);
         public bool GraphicsRiskAcknowledged { get; private set; }
         public List<(bool Enabled, bool Acknowledge)> ReShadeCalls { get; } = [];
@@ -1150,7 +1476,12 @@ public sealed class IasPageViewModelTests
         public Task<IReadOnlyList<IasCharacterInfo>> GetCharactersAsync(CancellationToken ct)
         {
             CharacterReads++;
-            return Task.FromResult<IReadOnlyList<IasCharacterInfo>>([new("character", "Milfy SR-64", null, IasCharacterSource.IasPackage, DateTimeOffset.UnixEpoch, CharacterEnabled)]);
+            var characters = new List<IasCharacterInfo>();
+            if (!_removedCharacters.Contains("character"))
+                characters.Add(new("character", "Milfy SR-64", null, IasCharacterSource.IasPackage, DateTimeOffset.UnixEpoch, CharacterEnabled));
+            if (AdditionalCharacter is { } extra && !_removedCharacters.Contains(extra.Id))
+                characters.Add(extra);
+            return Task.FromResult<IReadOnlyList<IasCharacterInfo>>(characters);
         }
 
         public Task<IReadOnlyList<IasLibraryCandidate>> GetConvertibleLibraryModsAsync(CancellationToken ct) =>
@@ -1182,6 +1513,7 @@ public sealed class IasPageViewModelTests
 
         public async Task<IasOperationResult> SetCharacterEnabledAsync(string characterId, bool enabled, IProgress<IasPageProgress> progress, CancellationToken ct)
         {
+            ToggleCalls.Add((characterId, enabled));
             var result = Toggle is not null ? await Toggle : new(FinishPrimaryAction, "已处理角色开关。", []);
             if (result.Success) CharacterEnabled = enabled;
             return result;
@@ -1230,7 +1562,13 @@ public sealed class IasPageViewModelTests
             IasVpkTargets? vpkTargets = null) =>
             AddFromLibraryAsync2 is { } gated ? gated(modId, vpkTargets)
                 : Task.FromResult((AddFromLibrary ?? throw new NotSupportedException())(modId));
-        public Task<IasOperationResult> RemoveCharacterAsync(string characterId, IProgress<IasPageProgress> progress, CancellationToken ct) => throw new NotSupportedException();
+        public async Task<IasOperationResult> RemoveCharacterAsync(string characterId, IProgress<IasPageProgress> progress, CancellationToken ct)
+        {
+            RemoveCalls.Add(characterId);
+            var result = Remove is null ? new IasOperationResult(true, "已卸载", []) : await Remove(characterId, ct);
+            if (result.Success) _removedCharacters.Add(characterId);
+            return result;
+        }
         public Task<IasOperationResult> ConvertToStandardModAsync(string characterId, IProgress<IasPageProgress> progress, CancellationToken ct,
             string? targetArmor = null, string? targetHelmet = null, bool mergeHelmet = false) =>
             Task.FromResult((Convert ?? throw new NotSupportedException())(targetArmor, targetHelmet, mergeHelmet));
