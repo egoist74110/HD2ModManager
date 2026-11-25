@@ -97,9 +97,8 @@ public sealed class IasPackagingService
 					throw new ArgumentException($"输出目录必须位于输入或依赖目录之外：{directory}");
 			}
 
-			var scripts = Path.Combine(AppContext.BaseDirectory, "tools", "ias");
-			if (!File.Exists(Path.Combine(scripts, "ias_package.py")))
-				scripts = Path.Combine(AppContext.BaseDirectory, "data", "resources", "ias");
+			// 随程序分发在 data\resources\ias：应用内更新只认 bin、third_party、hd2mod-docs、data\resources，别的目录整包会被拒。
+			var scripts = Path.Combine(AppContext.BaseDirectory, "data", "resources", "ias");
 			var script = Path.Combine(scripts, "ias_package.py");
 			var bundledBoneHash = Path.Combine(scripts, "bonehash.txt");
 			var boneHash = options.BoneHashPath is not null ? NormalizePath(options.BoneHashPath, "骨名哈希表")

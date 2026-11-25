@@ -49,9 +49,9 @@
   </ItemGroup>
 
   <ItemGroup>
-    <Content Include="IasPackaging\Scripts\**\*" Link="tools\ias\%(RecursiveDir)%(Filename)%(Extension)"
+    <Content Include="IasPackaging\Scripts\**\*" Link="data\resources\ias\%(RecursiveDir)%(Filename)%(Extension)"
              CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" ExcludeFromSingleFile="true" />
-    <Content Include="..\HD2ModManager\Resources\AssetMetadata\bonehash.txt" Link="tools\ias\bonehash.txt"
+    <Content Include="..\HD2ModManager\Resources\AssetMetadata\bonehash.txt" Link="data\resources\ias\bonehash.txt"
              CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" ExcludeFromSingleFile="true" />
   </ItemGroup>
 
