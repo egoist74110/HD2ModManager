@@ -5,7 +5,10 @@ namespace HD2ModCore.Ias;
 
 public sealed record IasInputContents(
 	string OriginalPath, IReadOnlyList<string> Main, IReadOnlyList<string> Companions,
-	IReadOnlyList<string> Vpks, bool HasNamedMain);
+	IReadOnlyList<string> Vpks, bool HasNamedMain)
+{
+	public bool HasExplicitMain { get; init; }
+}
 
 // 解压与识别共用一个短暂存目录。调用方在添加或取消后统一清理。
 public sealed class IasDropWorkspace : IDisposable
@@ -43,8 +46,9 @@ public sealed class IasDropWorkspace : IDisposable
 		var companions = new List<string>();
 		var vpks = new List<string>();
 		var namedMain = false;
+		var explicitMain = false;
 		await ScanAsync(Path.GetFullPath(input), 0).ConfigureAwait(false);
-		return new(input, main, companions, vpks, namedMain);
+		return new(input, main, companions, vpks, namedMain) { HasExplicitMain = explicitMain };
 
 		async Task ScanAsync(string path, int depth)
 		{
@@ -86,6 +90,7 @@ public sealed class IasDropWorkspace : IDisposable
 				{
 					main.Add(directory);
 					namedMain |= IasPackageDetector.IsNamedMain(originalName);
+					explicitMain |= IasPackageDetector.HasExplicitMainName(originalName);
 				}
 				foreach (var file in files.Where(file => !IasPackageDetector.IsPatch(file)))
 					await ScanAsync(file, depth).ConfigureAwait(false);

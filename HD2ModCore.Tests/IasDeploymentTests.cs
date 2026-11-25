@@ -11,6 +11,68 @@ namespace HD2ModCore.Tests;
 
 public sealed class IasDeploymentTests
 {
+#if WINDOWS
+	[Theory]
+	[InlineData(0, IasPackageDetector.MissingCompanionHint)]
+	[InlineData(1, IasPackageDetector.MissingMainHint)]
+	public async Task IasPageReportsWhichHalfIsMissingWithoutAddingARole(int part, string hint)
+	{
+		using var fixture = await Fixture.CreateAsync();
+		var module = new HD2ModManager.Services.Ias.IasModuleService(() => fixture.Paths, () => fixture.Game, fixture.Http);
+		var result = await module.AddAsync([fixture.Pair[part]], new Progress<HD2ModManager.Services.Ias.IasPageProgress>(), default);
+
+		Assert.False(result.Success);
+		Assert.Equal(hint, result.Message);
+		Assert.Empty(fixture.Service.GetRoles());
+		Assert.Single((await fixture.Service.LoadModsAsync(default)).Nodes);
+	}
+
+	[Theory]
+	[InlineData(false)]
+	[InlineData(true)]
+	public async Task IasPageAddsPairedArchivesWithoutAHalfDropHint(bool combined)
+	{
+		using var fixture = await Fixture.CreateAsync();
+		var inputs = fixture.Pair;
+		if (combined)
+		{
+			var bundle = Path.Combine(fixture.Root, "pair.zip");
+			using var zip = ZipFile.Open(bundle, ZipArchiveMode.Create);
+			foreach (var path in inputs) zip.CreateEntryFromFile(path, Path.GetFileName(path));
+			inputs = [bundle];
+		}
+		var module = new HD2ModManager.Services.Ias.IasModuleService(() => fixture.Paths, () => fixture.Game, fixture.Http);
+		var result = await module.AddDroppedAsync(fixture.Service, fixture.Paths, inputs,
+			new Progress<HD2ModManager.Services.Ias.IasPageProgress>(), default, null);
+
+		Assert.True(result.Success, result.Message);
+		Assert.Empty(result.Warnings);
+		Assert.Single(fixture.Service.GetRoles());
+	}
+
+	[Theory]
+	[InlineData("ordinary.zip")]
+	[InlineData("main")]
+	public async Task IasPageKeepsOrdinaryPatchConversionForInputsWithoutAnExplicitMainName(string name)
+	{
+		using var fixture = await Fixture.CreateAsync();
+		// 空的缓存 SDK 让普通转换在读取目标时失败，不下载依赖或启动生成器。
+		Directory.CreateDirectory(Path.Combine(fixture.Ias, "dependencies", "aqsdk-86b7252"));
+		var path = Path.Combine(fixture.Root, name);
+		if (name.EndsWith(".zip", StringComparison.Ordinal))
+			File.Copy(fixture.Pair[0], path);
+		else
+			ZipFile.ExtractToDirectory(fixture.Pair[0], path);
+		var module = new HD2ModManager.Services.Ias.IasModuleService(() => fixture.Paths, () => fixture.Game, fixture.Http);
+		var result = await module.AddAsync([path], new Progress<HD2ModManager.Services.Ias.IasPageProgress>(), default);
+
+		Assert.False(result.Success);
+		Assert.StartsWith("添加「", result.Message);
+		Assert.Contains("」失败：", result.Message);
+		Assert.Empty(fixture.Service.GetRoles());
+	}
+#endif
+
 	private const string ReShadeConflict = "游戏 bin/dxgi.dll 无法识别为 ReShade，可能属于其他 Mod。请先核对这个文件的来源；本次安装未覆盖任何文件。";
 	private const string Dp8Helmet = "59d238094a164c88";
 

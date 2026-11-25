@@ -60,7 +60,8 @@ namespace HD2ModManager.Services
                 {
                     var item = batch[route.Index];
                     item.Path = route.Path;
-                    MarkRunning(item);
+                    if (route.Error is { } error) MarkFailed(item, error);
+                    else MarkRunning(item);
                     yield return (item, route.Package);
                 }
             }

@@ -1,6 +1,9 @@
 namespace HD2ModCore.Ias;
 
-public sealed record IasStandardImportItem(int Index, string Path, IasStandardDropPackage? Package = null);
+public sealed record IasStandardImportItem(int Index, string Path, IasStandardDropPackage? Package = null)
+{
+	public string? Error { get; init; }
+}
 
 public sealed class IasStandardDropPackage
 {
@@ -54,7 +57,8 @@ public sealed class IasStandardDrop : IDisposable
 		{
 			token.ThrowIfCancellationRequested();
 			var path = paths[i];
-			if (!await MayContainCompanionAsync(path, token).ConfigureAwait(false)) continue;
+			if (!IasPackageDetector.HasExplicitMainName(path) &&
+				!await MayContainCompanionAsync(path, token).ConfigureAwait(false)) continue;
 			var input = inputs[i] = await InspectCandidateAsync(path, token).ConfigureAwait(false);
 			if (input is { Main.Count: 1, Companions.Count: 1, Vpks.Count: 0 })
 				routes[i] = CreateRoute(i, paths[i], input.Main[0], input.Companions[0]);
@@ -82,6 +86,17 @@ public sealed class IasStandardDrop : IDisposable
 			}
 		}
 
+		for (var i = 0; i < paths.Count; i++)
+		{
+			if (routes[i] is not { Package: null } route) continue;
+			var error = inputs[i] switch
+			{
+				{ Main.Count: 0, Companions.Count: > 0, Vpks.Count: 0 } => IasPackageDetector.MissingMainHint,
+				{ Main.Count: 1, Companions.Count: 0, Vpks.Count: 0, HasExplicitMain: true } => IasPackageDetector.MissingCompanionHint,
+				_ => null
+			};
+			if (error is not null) routes[i] = route with { Error = error };
+		}
 		return routes.OfType<IasStandardImportItem>().ToArray();
 
 		IasStandardImportItem CreateRoute(int index, string path, string main, string companion) =>

@@ -1168,6 +1168,11 @@ namespace HD2ModManager.ViewModels
                 var importedSources = new List<string>();
                 await foreach (var (item, iasPackage) in _importQueue.DequeueImportItemsAsync(cancellation))
                 {
+                    if (item.Status == ImportTaskStatus.Failed && item.Error is { } dropError)
+                    {
+                        _notificationService.Show(dropError, NotificationLevel.Warning, TimeSpan.FromSeconds(12));
+                        continue;
+                    }
                     var inputType = iasPackage is not null ? "Ias" : Path.GetExtension(item.Path).ToLowerInvariant() switch
                     {
                         ".vpk" => "Vpk", ".zip" or ".7z" or ".rar" => "Archive", ".patch" => "Patch", _ => "Other",

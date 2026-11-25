@@ -430,7 +430,7 @@ public sealed class IasModuleService(
     /// 拖入与「从库里选」共用的添加流程。<paramref name="libraryName"/> 非空表示输入来自库里的求生 VPK Mod：
     /// 角色用 Mod 自己的名字；<paramref name="verifyLibrary"/> 在发布前再核一次库里那个 Mod 没被改动。
     /// </summary>
-    private async Task<IasOperationResult> AddDroppedAsync(IasDeploymentService service, StoragePaths storage,
+    internal async Task<IasOperationResult> AddDroppedAsync(IasDeploymentService service, StoragePaths storage,
         IReadOnlyList<string> paths, IProgress<IasPageProgress> progress, CancellationToken ct, IasVpkTargets? vpkTargets,
         string? libraryName = null, Func<LibrarySnapshot, CancellationToken, Task>? verifyLibrary = null)
     {
@@ -446,9 +446,16 @@ public sealed class IasModuleService(
             inputs.Add(await IasTiming.MeasureAsync("识别与解包拖入文件",
                 () => workspace.InspectAsync(path, ct)).ConfigureAwait(false));
         }
-        var direct = inputs.Where(item => item.Companions.Count != 0 || item.HasNamedMain).ToList();
-        if (direct.Any(item => item.Companions.Count != 0) && direct.All(item => item.Main.Count == 0))
+        var hasCompanion = inputs.Any(item => item.Companions.Count != 0);
+        var direct = inputs.Where(item => item.Companions.Count != 0 ||
+            (hasCompanion ? item.HasNamedMain : item.HasExplicitMain)).ToList();
+        if (hasCompanion && direct.All(item => item.Main.Count == 0))
             direct.AddRange(inputs.Where(item => item.Main.Count != 0));
+        var halfDropHint = hasCompanion && direct.All(item => item.Main.Count == 0)
+            ? IasPackageDetector.MissingMainHint
+            : !hasCompanion && direct.Count != 0 ? IasPackageDetector.MissingCompanionHint : null;
+        if (halfDropHint is not null && direct.Count == inputs.Count)
+            return new(false, halfDropHint, []);
 
         var conversions = new List<DropConversion>();
         var warnings = new List<string>();
@@ -520,7 +527,7 @@ public sealed class IasModuleService(
 
         ct.ThrowIfCancellationRequested();
         var count = 0;
-        if (direct.Count != 0)
+        if (direct.Count != 0 && halfDropHint is null)
         {
             progress.Report(new("正在添加 IAS 主包与配套包…", null, null, true));
             try
@@ -538,7 +545,7 @@ public sealed class IasModuleService(
             }
         }
         var reserved = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-        return await AddDropConversionsAsync(conversions, count, warnings, noModels, async (conversion, token) =>
+        var result = await AddDropConversionsAsync(conversions, count, warnings, noModels, async (conversion, token) =>
         {
             var name = conversion.Name ?? DropName(conversion.Path);
             if (conversion.Kind != IasDropItemKind.L4d2Vpk) return await Convert(null).ConfigureAwait(false);
@@ -556,6 +563,13 @@ public sealed class IasModuleService(
                         await origin.VerifyAsync(commitToken).ConfigureAwait(false);
                 }, conversion.MaterialVpks);
         }, ct).ConfigureAwait(false);
+        if (halfDropHint is null) return result;
+        if (result.Success) return result with { Warnings = [halfDropHint, .. result.Warnings] };
+        return result with
+        {
+            Message = halfDropHint,
+            Warnings = result.Warnings.Contains(result.Message) ? result.Warnings : [result.Message, .. result.Warnings]
+        };
     }
 
     internal sealed record DropConversion(string Path, IasDropItemKind Kind, string? Name,

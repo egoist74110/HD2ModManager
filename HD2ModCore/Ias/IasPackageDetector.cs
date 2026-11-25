@@ -7,6 +7,9 @@ public enum IasInputKind { IasPackage, PatchMod, L4d2Vpk, Unsupported, Archive }
 
 public static class IasPackageDetector
 {
+	public const string MissingMainHint = "这是 IAS 配套包（hd2irpack），需要和同一个 Mod 的主包一起拖进来。";
+	public const string MissingCompanionHint = "缺少 IAS 配套包（.hd2irpack.zip），请和主包一起拖进来。";
+
 	private static readonly SevenZipArchiveExtractor Extractor = new();
 	private static readonly Application.IPatchFileNameParser PatchParser = CoreServices.CreatePatchFileNameParser();
 
@@ -71,6 +74,14 @@ public static class IasPackageDetector
 		var name = Path.GetFileName(Path.TrimEndingDirectorySeparator(path));
 		return name.Equals("main", StringComparison.OrdinalIgnoreCase) ||
 			Path.GetFileNameWithoutExtension(name).EndsWith("IAS_MainMod", StringComparison.OrdinalIgnoreCase);
+	}
+
+	// main 是通用目录名，只能在已有配套包时作为配对线索。
+	internal static bool HasExplicitMainName(string path)
+	{
+		var stem = Path.GetFileNameWithoutExtension(Path.TrimEndingDirectorySeparator(path));
+		return stem.Equals("IAS_MainMod", StringComparison.OrdinalIgnoreCase) ||
+			stem.EndsWith("_IAS_MainMod", StringComparison.OrdinalIgnoreCase);
 	}
 
 	internal static bool IsArchive(string path, out bool isZip)
