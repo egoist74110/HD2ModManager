@@ -23,8 +23,8 @@ namespace HD2ModManager.Services
 
     public sealed class AppUpdateService : IAppUpdateHost, IDisposable
     {
-        /// <summary>检查更新的 GitHub 仓库（owner/name）。上游合并后改这一处即可。</summary>
-        public const string Repository = "AssestinaR/HD2ModManager";
+        /// <summary>检查更新的 GitHub 仓库（owner/name）。泡沫居二开版从自己的 fork 发版，不走上游。</summary>
+        public const string Repository = "egoist74110/HD2ModManager";
 
         private readonly NotificationService _notifications;
         private readonly string _runDir;

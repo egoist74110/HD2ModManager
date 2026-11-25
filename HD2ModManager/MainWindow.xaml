@@ -12,7 +12,7 @@
         AllowsTransparency="False"
         Icon="Resources/helldivers2.ico"
         Background="{StaticResource AppSurfaceBrush}"
-        Title="HD2 Mod Manager" Height="720" Width="1200" MinHeight="720" MinWidth="1200">
+        Title="HD2 Mod Manager · 泡沫居二开版" Height="720" Width="1200" MinHeight="720" MinWidth="1200">
     <Window.Resources>
         <localVM:NotificationBrushConverter x:Key="NotificationBrushConverter"/>
         <BooleanToVisibilityConverter x:Key="BoolToVis"/>
@@ -181,7 +181,8 @@
                 <ColumnDefinition Width="Auto"/>
             </Grid.ColumnDefinitions>
             <Grid Margin="16,0,18,0" VerticalAlignment="Center">
-                <TextBlock Text="HD2 Mod Manager" VerticalAlignment="Center" FontSize="18" FontWeight="SemiBold">
+                <TextBlock VerticalAlignment="Center" FontSize="18" FontWeight="SemiBold">
+                    <Run Text="HD2 Mod Manager"/><Run Text=" 泡沫居二开版" FontSize="13" FontWeight="Normal"/>
                     <TextBlock.Style>
                         <Style TargetType="TextBlock">
                             <Setter Property="Visibility" Value="Visible"/>

@@ -61,4 +61,4 @@ git push origin master --tags
 更新器按固定文件名找包：`HD2ModManager-<version>-win-x64-<variant>.zip`，Release 里必须同时有 `SHA256SUMS`。Release 说明正文会原样（纯文本）显示给用户。
 
 
-检查更新的仓库在 `HD2ModManager\Services\AppUpdateService.cs` 的 `Repository` 常量（目前是上游 `AssestinaR/HD2ModManager`；自己 fork 测试时改成自己的仓库）。
+检查更新的仓库在 `HD2ModManager\Services\AppUpdateService.cs` 的 `Repository` 常量（泡沫居二开版指向 fork `egoist74110/HD2ModManager`，版本号从 1.0.0 重新起算；上游 `AssestinaR/HD2ModManager` 的新版本不会再推给这个版本的用户）。
