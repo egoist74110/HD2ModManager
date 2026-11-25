@@ -36,6 +36,8 @@ from project_identity import owner_id, point_id, project_filename
 UNIT_TYPE = 0xE0A48D0BE9A7453F
 MATERIAL_TYPE = 0xEAC0B497876ADEDF
 COMPANION_NAME_LIMIT = 80
+# 游戏全局常驻的 Archive：共用材质/贴图放这里，任意一件装备单独穿都能找到。
+SHARED_RESOURCE_ARCHIVE = "9ba626afa44a3aa3"
 COMPANION_FILENAME = "IAS_Companion.hd2irpack.zip"
 IAS_DEFAULT_FIXED_DT = 1.0 / 60.0  # AQ SDK physics_packaging 的默认步长
 
@@ -515,13 +517,10 @@ def pack(raw_dir: Path, out_dir: Path, staging: Path, model_id: UUID, display_na
         }
 
     companion_members = []
-    material_archive = None
     physics_emitted = False
     for key, stock in (("body", stock_body), ("helmet", stock_helmet)):
         domain = authored_manifest.get(key)
         if domain and domain["authoredUnits"]:
-            if material_archive is None:
-                material_archive = domain["archive"]
             member, has_physics = build_domain_package(
                 project_id=project_id,
                 domain_meta=domain,
@@ -540,8 +539,9 @@ def pack(raw_dir: Path, out_dir: Path, staging: Path, model_id: UUID, display_na
     if not companion_members:
         raise ValueError("No model geometry matched IAS equipment slots.")
     if isolated_mats:
-        # 共用资源跟随本包确实写出的首个域，使用独立补丁层。
-        entries_to_patch_files(isolated_mats, staging / "main_mod" / f"{material_archive}.patch_2")
+        # 共用材质/贴图放进全局常驻的 9ba626afa44a3aa3（官方 IAS 包同样做法）。
+        # 放进某件装备自己的 Archive 时，只穿另一件（如只戴头盔）该 Archive 不加载，材质就缺失。
+        entries_to_patch_files(isolated_mats, staging / "main_mod" / f"{SHARED_RESOURCE_ARCHIVE}.patch_2")
     print(f"IAS_TIMING\tAQ SDK 资源隔离、骨架与配套编译\t{round((perf_counter() - started) * 1000)}")
 
     # IAS limits the Companion's visible name independently of the main mod title.
