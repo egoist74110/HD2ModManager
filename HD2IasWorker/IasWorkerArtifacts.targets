@@ -5,6 +5,7 @@
   <ItemGroup Condition="'$(OS)' == 'Windows_NT'">
     <ProjectReference Include="$(IasWorkerProject)" ReferenceOutputAssembly="false"
       SkipGetTargetFrameworkProperties="true" GlobalPropertiesToRemove="RuntimeIdentifier;SelfContained;PublishSingleFile;IncludeNativeLibrariesForSelfExtract;AppHostRelativeDotNet;AppHostDotNetSearch" />
+    <IasWorkerOnDemandFile Include="Microsoft.Windows.SDK.NET.dll;WinRT.Runtime.dll;Microsoft.WindowsAppRuntime.dll;Microsoft.WindowsAppSDK.LICENSE.txt" />
   </ItemGroup>
   <Target Name="GetIasWorkerCopyInputs" Condition="'$(OS)' == 'Windows_NT'">
     <MSBuild Projects="$(IasWorkerProject)" Targets="GetIasWorkerArtifacts"
@@ -15,8 +16,26 @@
   <Target Name="CopyIasWorkerToBuild" AfterTargets="Build" DependsOnTargets="GetIasWorkerCopyInputs" Condition="'$(OS)' == 'Windows_NT'">
     <Copy SourceFiles="@(IasWorkerCopyFile)" DestinationFolder="$(TargetDir)ias-worker" SkipUnchangedFiles="true" />
   </Target>
+  <!-- worker 的 Content 也会通过项目引用进入 SDK 的发布清单，包括单文件打包。 -->
+  <Target Name="ExcludeIasWorkerRuntimeFromPublish" AfterTargets="ComputeResolvedFilesToPublishList" Condition="'$(OS)' == 'Windows_NT'">
+    <ItemGroup>
+      <IasWorkerOnDemandPublishPath Include="@(IasWorkerOnDemandFile)">
+        <RelativePath>%(IasWorkerOnDemandFile.Identity)</RelativePath>
+      </IasWorkerOnDemandPublishPath>
+      <ResolvedFileToPublish Remove="@(IasWorkerOnDemandPublishPath)" MatchOnMetadata="RelativePath" MatchOnMetadataOptions="CaseInsensitive" />
+      <ResolvedFileToPublish Remove="@(IasWorkerOnDemandFile)" MatchOnMetadata="Filename;Extension" MatchOnMetadataOptions="CaseInsensitive" />
+    </ItemGroup>
+  </Target>
   <Target Name="CopyIasWorkerToPublish" AfterTargets="Publish" DependsOnTargets="GetIasWorkerCopyInputs" Condition="'$(OS)' == 'Windows_NT'">
-    <Copy SourceFiles="@(IasWorkerCopyFile)" DestinationFolder="$(PublishDir)$(IasWorkerPublishPrefix)ias-worker" SkipUnchangedFiles="true" />
+    <PropertyGroup>
+      <IasWorkerPublishDirectory>$(PublishDir)$(IasWorkerPublishPrefix)ias-worker</IasWorkerPublishDirectory>
+    </PropertyGroup>
+    <ItemGroup>
+      <IasWorkerPublishFile Include="@(IasWorkerCopyFile)" />
+      <IasWorkerPublishFile Remove="@(IasWorkerOnDemandFile)" MatchOnMetadata="Filename;Extension" MatchOnMetadataOptions="CaseInsensitive" />
+    </ItemGroup>
+    <Delete Files="@(IasWorkerOnDemandFile->'$(IasWorkerPublishDirectory)\%(Identity)');@(IasWorkerOnDemandFile->'$(PublishDir)%(Identity)')" />
+    <Copy SourceFiles="@(IasWorkerPublishFile)" DestinationFolder="$(IasWorkerPublishDirectory)" SkipUnchangedFiles="true" />
   </Target>
 </Project>
 

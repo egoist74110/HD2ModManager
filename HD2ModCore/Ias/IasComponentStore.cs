@@ -392,7 +392,7 @@ public sealed class IasComponentStore(StoragePaths paths, HttpClient httpClient,
 		Convert.ToHexString(await SHA256.HashDataAsync(input, token).ConfigureAwait(false))
 			.Equals(release.ZipSha256, StringComparison.OrdinalIgnoreCase);
 
-	private static async Task<long> CopyBoundedAsync(Stream input, Stream output, long limit, IncrementalHash? hash,
+	internal static async Task<long> CopyBoundedAsync(Stream input, Stream output, long limit, IncrementalHash? hash,
 		Action<long>? report, CancellationToken token)
 	{
 		var buffer = new byte[81920];

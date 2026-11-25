@@ -117,6 +117,8 @@ public sealed class IasDeploymentService
 				(release, package) = await ReadOfflineAsync(offlinePackage, tx.Work, token).ConfigureAwait(false);
 			}
 			RequireActive(snapshot);
+			if (_worker is IasProcessWorker processWorker)
+				await processWorker.EnsureRuntimeAsync(progress, token).ConfigureAwait(false);
 			if (installed?.Version != release.Version)
 			{
 				await _components.ExtractCoreAsync(release, package, progress, token).ConfigureAwait(false);
@@ -328,6 +330,7 @@ public sealed class IasDeploymentService
 	{
 		await _components.RemoveAsync(CancellationToken.None).ConfigureAwait(false);
 		IasFileTree.Delete(At("Runtime"));
+		IasFileTree.Delete(At("worker"));
 		IasFileTree.Delete(At("library/managed-mod.json"));
 		if (removeRoles) IasFileTree.Delete(At("library"));
 	}, captureComponents: true);

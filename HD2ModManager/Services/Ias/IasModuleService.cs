@@ -53,7 +53,7 @@ public sealed class IasModuleService(
             game = Path.Combine(paths.AppRootDirectory, "ias", "missing-game");
         }
         var worker = new IasProcessWorker(IasProcessWorker.Locate(AppContext.BaseDirectory),
-            Path.Combine(paths.AppRootDirectory, "ias", "worker"));
+            Path.Combine(paths.AppRootDirectory, "ias", "worker"), http);
         return new(paths, game, http, worker, IsGameRunning, optionActivations: optionActivations);
     }
 

@@ -4,7 +4,7 @@ using System.Text.Json;
 
 namespace HD2ModCore.Ias;
 
-public sealed class IasProcessWorker(string sourceDirectory, string workerDirectory) : IIasWorker
+public sealed class IasProcessWorker(string sourceDirectory, string workerDirectory, HttpClient? http = null) : IIasWorker
 {
 	private const string TempPrefix = "h2i-";
 	private const int MaxWindowsPath = 259;
@@ -12,6 +12,14 @@ public sealed class IasProcessWorker(string sourceDirectory, string workerDirect
 
 	public Task<IasWorkerResponse> RunAsync(IasWorkerRequest request, CancellationToken cancellationToken) =>
 		RunInTemporaryDirectoryAsync(start => RunProcessAsync(start, request, cancellationToken), cancellationToken);
+
+	internal async Task EnsureRuntimeAsync(IProgress<IasProgress>? progress, CancellationToken token)
+	{
+		using var fallback = http is null ? IasUpdateHttp.Create(() => Updates.UpdateNetworkSettings.Default) : null;
+		var client = http ?? fallback!;
+		await new IasWorkerRuntime(client, IasWorkerRuntime.RequiredPackages, IasUpdateHttp.PrefersMirror(client))
+			.EnsureAsync(sourceDirectory, workerDirectory, progress, token).ConfigureAwait(false);
+	}
 
 	internal async Task<IasWorkerResponse> RunInTemporaryDirectoryAsync(
 		Func<ProcessStartInfo, Task<IasWorkerResponse>> run, CancellationToken cancellationToken)
@@ -51,6 +59,7 @@ public sealed class IasProcessWorker(string sourceDirectory, string workerDirect
 			File.Copy(source, target, overwrite: true);
 		}
 		IasTiming.Record($"官方 IAS：{request.Command}：复制 worker", copy.Elapsed);
+		await EnsureRuntimeAsync(null, cancellationToken).ConfigureAwait(false);
 
 		using var limit = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
 		limit.CancelAfter(TimeSpan.FromMinutes(15));

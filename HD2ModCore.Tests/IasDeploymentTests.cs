@@ -267,9 +267,13 @@ public sealed class IasDeploymentTests
 		using var fixture = await Fixture.CreateAsync();
 		var role = await fixture.Service.AddAsync(fixture.Pair, IasRoleSource.IasPackage, default);
 		Assert.Contains(Assert.Single(role.ModIds), await ActiveEntriesAsync(fixture));
+		var worker = Path.Combine(fixture.Paths.AppRootDirectory, "ias", "worker");
+		Directory.CreateDirectory(worker);
+		await File.WriteAllTextAsync(Path.Combine(worker, "WinRT.Runtime.dll"), "模拟按需下载的运行库");
 
 		await fixture.Service.UninstallAsync(removeRoles: false, default);
 
+		Assert.False(Directory.Exists(worker));
 		Assert.Empty(await ActiveEntriesAsync(fixture));
 		var nodes = (await fixture.Service.LoadModsAsync(default)).Nodes;
 		Assert.Contains(nodes.Keys, id => id.Value == Assert.Single(role.ModIds));

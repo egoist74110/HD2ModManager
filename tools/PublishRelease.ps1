@@ -262,6 +262,10 @@ function Assert-ReleaseLayout {
         'third_party\hd2sdk\deps\texconv.exe',
         'third_party\hd2sdk\materials\basic.material',
         'bin\hd2mod.exe',
+        'bin\ias-worker\HD2IasWorker.exe',
+        'bin\ias-worker\HD2IasWorker.dll',
+        'bin\ias-worker\HD2IasWorker.deps.json',
+        'bin\ias-worker\HD2IasWorker.runtimeconfig.json',
         'bin\third_party\7zip\7z.exe',
         'bin\third_party\7zip\7z.dll',
         'hd2mod-docs\README.md',
@@ -307,11 +311,15 @@ function Assert-ReleaseLayout {
 function Assert-UpdatablePackage {
     param([string] $PackageDirectory, [string] $Version)
 
+    $onDemandIasFiles = @('Microsoft.Windows.SDK.NET.dll', 'WinRT.Runtime.dll', 'Microsoft.WindowsAppRuntime.dll', 'Microsoft.WindowsAppSDK.LICENSE.txt')
     $allowedFiles = @('HD2ModManager.exe', 'README.md', 'hd2mod.cmd', 'update-package.json')
     $allowedDirectories = @('bin\', 'third_party\', 'hd2mod-docs\', 'data\resources\')
     $root = (Resolve-Path -LiteralPath $PackageDirectory).Path.TrimEnd('\')
     foreach ($file in Get-ChildItem -LiteralPath $PackageDirectory -Recurse -File) {
         $relative = $file.FullName.Substring($root.Length + 1)
+        if ($onDemandIasFiles -contains $file.Name) {
+            throw "Release package contains an on-demand IAS worker file: $relative"
+        }
         $ok = $allowedFiles -contains $relative
         foreach ($directory in $allowedDirectories) {
             if ($relative.StartsWith($directory, [StringComparison]::OrdinalIgnoreCase)) { $ok = $true }

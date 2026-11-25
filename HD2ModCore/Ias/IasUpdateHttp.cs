@@ -6,8 +6,22 @@ namespace HD2ModCore.Ias;
 
 public static class IasUpdateHttp
 {
-	public static HttpClient Create(Func<UpdateNetworkSettings> settings) =>
-		new(new Handler(settings)) { Timeout = Timeout.InfiniteTimeSpan };
+	private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<HttpClient, Func<UpdateNetworkSettings>> Settings = new();
+
+	public static HttpClient Create(Func<UpdateNetworkSettings> settings)
+	{
+		var client = new HttpClient(new Handler(settings)) { Timeout = Timeout.InfiniteTimeSpan };
+		Settings.AddOrUpdate(client, settings);
+		return client;
+	}
+
+	/// <summary>这个客户端对应的下载来源设置是不是「优先使用镜像」（不是本类创建的客户端一律按否处理）。</summary>
+	internal static bool PrefersMirror(HttpClient client)
+	{
+		if (!Settings.TryGetValue(client, out var settings)) return false;
+		try { return settings().Mode == DownloadSourceMode.Mirror; }
+		catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or InvalidOperationException) { return false; }
+	}
 
 	public static UpdateNetworkSettings ReadSettings(string managerRoot)
 	{
@@ -47,6 +61,9 @@ public static class IasUpdateHttp
 		protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
 		{
 			var uri = request.RequestUri ?? throw new HttpRequestException("IAS 请求缺少地址。");
+			// NuGet 包使用固定地址和包哈希，镜像切换由运行库下载器处理。
+			if (IasWorkerRuntime.IsPackageRequest(uri))
+				return await SendRawAsync(uri.AbsoluteUri, null, cancellationToken).ConfigureAwait(false);
 			var source = _network.Source();
 			// 更新器的镜像支持 GitHub 仓库地址。该路径和 raw URL 对应同一个签名清单。
 			var url = uri == IasFeedClient.FeedUri && _network.Settings.Mode != DownloadSourceMode.Ask
