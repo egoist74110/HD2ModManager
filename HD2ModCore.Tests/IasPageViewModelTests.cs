@@ -1362,6 +1362,60 @@ public sealed class IasPageViewModelTests
         Assert.True(page.DlssFrameGeneration);
     }
 
+    [Theory]
+    [InlineData(true, 1)]
+    [InlineData(null, 0)]
+    public async Task DownloadFailureOffersSettingsForAnotherSource(bool? answer, int expectedOpens)
+    {
+        var service = new ServiceStub(IasStatusKind.UpdateAvailable, "1.6.4")
+        {
+            Install = (_, _) => Task.FromResult(new IasOperationResult(false, "更新 IAS失败：连接超时。", []) { DownloadFailed = true })
+        };
+        var dialogs = new DialogStub(answer);
+        var opens = 0;
+        using var page = new IasPageViewModel(service, dialogs, new NotificationService(), _ => null, _ => { },
+            new IasOperationQueue(new BackgroundTaskService(), service), openSettings: () => opens++);
+        await page.EnterAsync();
+
+        await page.ExecutePrimaryAsync();
+
+        Assert.Equal(1, dialogs.Confirmations);
+        Assert.Equal("去设置", dialogs.LastConfirmation!.ConfirmLabel);
+        Assert.Contains("设置 → 程序更新 → 下载来源", dialogs.LastConfirmation.Message);
+        Assert.Equal(expectedOpens, opens);
+    }
+
+    [Fact]
+    public async Task OrdinaryFailureDoesNotOfferDownloadSource()
+    {
+        var service = new ServiceStub(IasStatusKind.UpdateAvailable, "1.6.4")
+        {
+            Install = (_, _) => Task.FromResult(new IasOperationResult(false, "更新失败。", []))
+        };
+        var dialogs = new DialogStub(true);
+        var opens = 0;
+        using var page = new IasPageViewModel(service, dialogs, new NotificationService(), _ => null, _ => { },
+            new IasOperationQueue(new BackgroundTaskService(), service), openSettings: () => opens++);
+        await page.EnterAsync();
+
+        await page.ExecutePrimaryAsync();
+
+        Assert.Equal(0, dialogs.Confirmations);
+        Assert.Equal(0, opens);
+    }
+
+    [Fact]
+    public void DownloadFailureDetectsNetworkErrorsInsideWrappers()
+    {
+        Assert.True(IasDownloadFailure.Is(new HttpRequestException("下载 IAS 运行库失败")));
+        Assert.True(IasDownloadFailure.Is(new InvalidOperationException("包装", new TimeoutException("超时"))));
+        Assert.True(IasDownloadFailure.Is(new AggregateException(new IOException("x"),
+            new System.Net.Sockets.SocketException())));
+        Assert.False(IasDownloadFailure.Is(new InvalidDataException("NuGet 包的 SHA-512 不符。")));
+        Assert.False(IasDownloadFailure.Is(new IasGameRunningException()));
+        Assert.False(IasDownloadFailure.Is(null));
+    }
+
     private static IasPageViewModel CreatePage(ServiceStub service, DialogStub? dialogs = null,
         NotificationService? notifications = null, IasOperationQueue? queue = null)
         => new(service, dialogs ?? new DialogStub(null), notifications ?? new NotificationService(), _ => null, _ => { },

@@ -2533,7 +2533,8 @@ namespace HD2ModManager.ViewModels
             _iasQueue ??= new IasOperationQueue(_backgroundTasks, _iasService);
             return _iasWorkspacePage ??= new IasPageViewModel(_iasService,
                 new Views.IasPageDialogs(), _notificationService, FindIasCreatedModName, OpenIasCreatedMod, _iasQueue,
-                SettingsService.GetIasVpkTargets(), SettingsService.SetIasVpkTargets);
+                SettingsService.GetIasVpkTargets(), SettingsService.SetIasVpkTargets,
+                () => Navigate(WorkspaceMode.Settings));
         }
 
         private IIasModuleService CreateIasService()

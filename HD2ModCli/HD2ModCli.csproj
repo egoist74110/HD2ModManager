@@ -10,6 +10,7 @@
   <ItemGroup>
     <ProjectReference Include="..\HD2ModCore\HD2ModCore.csproj" />
     <Compile Include="..\HD2ModManager\Services\Ias\IIasModuleService.cs" Link="Ias\IIasModuleService.cs" />
+    <Compile Include="..\HD2ModManager\Services\Ias\IasDownloadFailure.cs" Link="Ias\IasDownloadFailure.cs" />
     <Compile Include="..\HD2ModManager\Services\Ias\IasEquipmentCatalog.cs" Link="Ias\IasEquipmentCatalog.cs" />
     <Compile Include="..\HD2ModManager\Services\Ias\IasLibraryCandidateReader.cs" Link="Ias\IasLibraryCandidateReader.cs" />
     <Compile Include="..\HD2ModManager\Services\Ias\IasModuleService.cs" Link="Ias\IasModuleService.cs" />

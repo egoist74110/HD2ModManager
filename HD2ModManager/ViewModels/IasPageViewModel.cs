@@ -30,6 +30,7 @@ public sealed class IasPageViewModel : FullWorkspacePageViewModel
     private readonly Func<string, string?> _findModName;
     private readonly Action<string> _openMod;
     private readonly Action<IasVpkTargets>? _saveVpkTargets;
+    private readonly Action? _openSettings;
     private IasVpkTargets? _savedVpkTargets;
     private IasVpkTargets _currentVpkTargets = new(null, null);
     private IasCharacterRow? _expandedCharacter;
@@ -66,8 +67,9 @@ public sealed class IasPageViewModel : FullWorkspacePageViewModel
 
     public IasPageViewModel(IIasModuleService service, IIasPageDialogs dialogs, NotificationService notifications,
         Func<string, string?> findModName, Action<string> openMod, IasOperationQueue queue,
-        IasVpkTargets? savedVpkTargets = null, Action<IasVpkTargets>? saveVpkTargets = null)
+        IasVpkTargets? savedVpkTargets = null, Action<IasVpkTargets>? saveVpkTargets = null, Action? openSettings = null)
     {
+        _openSettings = openSettings;
         _service = service;
         _dialogs = dialogs;
         _notifications = notifications;
@@ -862,12 +864,22 @@ public sealed class IasPageViewModel : FullWorkspacePageViewModel
         if (_disposed) return;
         ClearResult();
         _result = result;
+        if (result is { Success: false, DownloadFailed: true }) OfferChangeDownloadSource(result.Message);
         if (result.Success)
         {
             _resultExpiry = new CancellationTokenSource();
             _ = ExpireResultAsync(_resultExpiry);
         }
         NotifyState();
+    }
+
+    // 下载连不上时直接弹窗，让用户去设置里换下载来源（IAS 本体、官方清单、微软运行库都走这里）。
+    private void OfferChangeDownloadSource(string message)
+    {
+        var confirmation = new IasConfirmation("下载失败",
+            $"{message}\n\n{IasDownloadFailure.Hint}",
+            _openSettings is null ? "知道了" : "去设置", CancelLabel: "关闭");
+        if (_dialogs.Confirm(confirmation).HasValue) _openSettings?.Invoke();
     }
 
     private async Task ExpireResultAsync(CancellationTokenSource expiry)

@@ -111,4 +111,8 @@ public sealed record IasDropClassification(IReadOnlyList<(string Path, IasDropIt
 
 public sealed record IasPageProgress(string Title, double? Percent, string? Detail, bool CanCancel);
 
-public sealed record IasOperationResult(bool Success, string Message, IReadOnlyList<string> Warnings, string? CreatedModId = null);
+public sealed record IasOperationResult(bool Success, string Message, IReadOnlyList<string> Warnings, string? CreatedModId = null)
+{
+    /// <summary>失败原因是下载连不上（换下载来源可能解决）。</summary>
+    public bool DownloadFailed { get; init; }
+}

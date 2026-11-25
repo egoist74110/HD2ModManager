@@ -108,7 +108,10 @@ public sealed class IasOperationQueue(BackgroundTaskService tasks, IIasModuleSer
             }
             catch (Exception exception)
             {
-                result = new(false, $"{item.Operation}失败：{exception.Message}", []);
+                result = new(false, $"{item.Operation}失败：{exception.Message}", [])
+                {
+                    DownloadFailed = IasDownloadFailure.Is(exception)
+                };
                 task.MarkFailed(result.Message);
             }
             finally

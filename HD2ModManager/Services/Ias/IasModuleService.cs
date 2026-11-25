@@ -841,7 +841,10 @@ public sealed class IasModuleService(
         catch (IasGameRunningException error) { return new(false, error.Message, []); }
         catch (Exception error) when (error is not OperationCanceledException)
         {
-            return new(false, keepErrorMessage ? error.Message : $"{title}失败：{error.Message}", []);
+            return new(false, keepErrorMessage ? error.Message : $"{title}失败：{error.Message}", [])
+            {
+                DownloadFailed = IasDownloadFailure.Is(error)
+            };
         }
         if (result.Success && refreshLibrary is not null)
         {
