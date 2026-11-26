@@ -19,6 +19,7 @@ public sealed class IasArmorPanelViewModel(bool willSwapOccupants = true) : INot
         {
             if (_query == value) return;
             _query = value;
+            Changed(nameof(Query));
             Filter();
         }
     }

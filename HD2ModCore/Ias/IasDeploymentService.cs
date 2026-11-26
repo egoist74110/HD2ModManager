@@ -206,13 +206,19 @@ public sealed partial class IasDeploymentService
 		var profile = RequireActive(snapshot);
 		var installed = enabled ? await RequireCompatibleAsync(token).ConfigureAwait(false) :
 			GetInstalled() ?? throw new InvalidOperationException("请先安装 IAS。");
-		var id = ManagedModId ?? throw new InvalidOperationException("请先安装 IAS。");
+		var id = ManagedModId;
+		if (enabled && (id is null || !snapshot.Nodes.ContainsKey(new ModNodeId(id.Value))))
+		{
+			tx.EnsureRuntimeCaptured();
+			return (await RegenerateAsync(installed, tx, snapshot, token, addToProfile: true).ConfigureAwait(false), true);
+		}
+		if (id is null) throw new InvalidOperationException("请先安装 IAS。");
 		var roles = GetRoles();
 		Dictionary<string, bool>? activeRoles = null;
 		if (enabled)
 			activeRoles = roles.Count == 0 ? new(StringComparer.Ordinal) :
 				await ReadRoleStatesAsync(installed, tx.Backup, roles, token).ConfigureAwait(false);
-		return (SyncProfile(snapshot, profile, id, roles, activeRoles), true);
+		return (SyncProfile(snapshot, profile, id.Value, roles, activeRoles), true);
 	}, token, captureRuntime: false);
 
 	public Task<string> SetCharacterEnabledAsync(string id, bool enabled, CancellationToken token) => ChangeAsync(async (tx, snapshot) =>
@@ -375,9 +381,29 @@ public sealed partial class IasDeploymentService
 	private static bool ArePatchFilesMissing(ModNode node, string[] files)
 	{
 		if (node.PatchGroups.Count == 0) return false;
-		var names = files.Select(Path.GetFileName).ToHashSet(StringComparer.OrdinalIgnoreCase);
-		return node.PatchGroups.Any(group =>
-			!names.Contains($"{group.ArchiveHex16}.patch_{group.PatchIndex}"));
+		var actualCounts = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+		foreach (var file in files)
+		{
+			var name = Path.GetFileName(file);
+			var dot = name.IndexOf(".patch_", StringComparison.OrdinalIgnoreCase);
+			if (dot != 16) continue;
+			var indexSpan = name.AsSpan(dot + 7);
+			if (indexSpan.IsEmpty) continue;
+			var allDigits = true;
+			foreach (var ch in indexSpan)
+			{
+				if (ch is < '0' or > '9') { allDigits = false; break; }
+			}
+			if (!allDigits) continue;
+			var archive = name[..16];
+			actualCounts[archive] = actualCounts.GetValueOrDefault(archive) + 1;
+		}
+		foreach (var group in node.PatchGroups.GroupBy(item => item.ArchiveHex16, StringComparer.OrdinalIgnoreCase))
+		{
+			if (actualCounts.GetValueOrDefault(group.Key) < group.Count())
+				return true;
+		}
+		return false;
 	}
 
 	public async Task<IasRole> AddAsync(IReadOnlyList<string> paths, IasRoleSource source, CancellationToken token,
@@ -862,8 +888,19 @@ public sealed partial class IasDeploymentService
 	private LibrarySnapshot SetEntries(LibrarySnapshot snapshot, Profile profile, IEnumerable<ModNodeId> ids)
 	{
 		var result = _profiles.ReplaceEntries(snapshot, profile.Id, ids.Distinct().ToArray());
-		return result.Succeeded ? result.Snapshot : throw new InvalidOperationException($"无法更新当前配置：{result.Message}");
+		return result.Succeeded ? result.Snapshot : throw new InvalidOperationException($"无法更新当前配置：{DescribeProfileFailure(result)}");
 	}
+
+	internal static string DescribeProfileFailure(ProfileMutationResult result) => result.Failure switch
+	{
+		ProfileMutationFailure.ProfileNotFound => "找不到当前选中的配置，请重新选择配置后重试。",
+		ProfileMutationFailure.NodeNotFound => "有 Mod 已从模组库中删除，请刷新列表后重试。",
+		ProfileMutationFailure.ProfileEntryNodeMissing => "当前配置引用了已从模组库删除的 Mod，请先刷新或清理配置后重试。",
+		ProfileMutationFailure.ProfileContainsDuplicateEntries or ProfileMutationFailure.DuplicateEntrySelection => "当前配置中存在重复的 Mod 条目。",
+		ProfileMutationFailure.NodeKindNotSupported or ProfileMutationFailure.NodeNotDeployable or ProfileMutationFailure.ProfileContainsNonDeployableEntry =>
+			"当前配置中包含无法直接部署的 Mod 类型。",
+		_ => result.Message ?? "配置更新被拒绝。"
+	};
 
 	private Task ChangeAsync(Func<IasModTransaction, LibrarySnapshot, Task<(LibrarySnapshot Mods, bool Deploy)>> operation,
 		CancellationToken token, bool captureRuntime = true, bool captureComponents = false) => ChangeAsync(async (tx, snapshot) =>
@@ -1029,7 +1066,7 @@ public sealed partial class IasDeploymentService
 		{
 			var result = await CoreServices.CreateApplyExecutor().DeactivateAsync(_data, CancellationToken.None).ConfigureAwait(false);
 			if (!result.Success)
-				throw new InvalidOperationException($"无法撤回新部署的配置：{string.Join("；", result.Issues.Select(issue => issue.Message))}");
+				throw new InvalidOperationException(DeploymentFailureSummary.Format("无法撤回新部署的配置", result.Issues));
 		}
 	}
 
@@ -1079,7 +1116,7 @@ public sealed partial class IasDeploymentService
 		var result = await apply.ApplyAsync(profile, snapshot,
 			_paths.ModsDirectory, _data, token).ConfigureAwait(false);
 		if (!result.Success)
-			throw new InvalidOperationException($"无法部署 IAS 所在配置：{string.Join("；", result.Issues.Select(issue => issue.Message))}");
+			throw new InvalidOperationException(DeploymentFailureSummary.Format("无法部署 IAS 所在配置", result.Issues));
 	}
 
 	private static void Expand(IasInstalled installed, IasModTransaction tx, CancellationToken token)

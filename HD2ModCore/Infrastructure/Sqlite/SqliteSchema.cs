@@ -205,6 +205,7 @@ DROP TABLE IF EXISTS game_data_unit_part_scans;
 		await DropColumnIfPresentAsync(connection, "game_data_unit_parts", "authority_piece_type", cancellationToken).ConfigureAwait(false);
 
 		await SetMetaAsync(connection, "schema_version", SchemaVersion.ToString(), cancellationToken).ConfigureAwait(false);
+		await SetMetaAsync(connection, AuthoritySchemaMetaKey, AuthoritySchemaVersion, cancellationToken).ConfigureAwait(false);
 	}
 
 	private static async Task AddColumnIfMissingAsync(

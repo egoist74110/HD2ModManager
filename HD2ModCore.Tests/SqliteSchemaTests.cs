@@ -47,6 +47,43 @@ public sealed class SqliteSchemaTests
 		}
 	}
 
+	[Fact]
+	public async Task EnsureCreatedAsync_RecordsAuthoritySchemaOnFreshDatabase_AndPreservesAuthorityRowsOnReopen()
+	{
+		var root = Path.Combine(Path.GetTempPath(), "hd2-schema-tests", Guid.NewGuid().ToString("N"));
+		var paths = new StoragePaths(Path.Combine(root, "app"));
+		Directory.CreateDirectory(paths.IndexDirectory);
+		try
+		{
+			await using (var connection = new SqliteConnection($"Data Source={paths.DbPath};Pooling=False"))
+			{
+				await connection.OpenAsync();
+				await SqliteSchema.EnsureCreatedAsync(connection, CancellationToken.None);
+				Assert.Equal("2", await SqliteSchema.GetMetaAsync(connection, "authority_pieces_schema", CancellationToken.None));
+
+				await ExecuteAsync(connection, """
+					INSERT INTO game_data_authority_kits(item_id, dlc_id, set_id, kit_kind, archive_id, display_name)
+					VALUES(1, 0, 1, 0, 'aaaaaaaaaaaaaaaa', 'B-01 Tactical');
+					""");
+			}
+
+			// 模拟建完基础索引后，高级索引或目录服务再次调用 EnsureCreatedAsync：不得把刚写好的权威表 DROP 掉。
+			await using (var connection = new SqliteConnection($"Data Source={paths.DbPath};Pooling=False"))
+			{
+				await connection.OpenAsync();
+				await SqliteSchema.EnsureCreatedAsync(connection, CancellationToken.None);
+
+				await using var count = connection.CreateCommand();
+				count.CommandText = "SELECT count(*) FROM game_data_authority_kits;";
+				Assert.Equal(1L, Convert.ToInt64(await count.ExecuteScalarAsync(), CultureInfo.InvariantCulture));
+			}
+		}
+		finally
+		{
+			try { Directory.Delete(root, recursive: true); } catch { }
+		}
+	}
+
 	private static async Task<long> CountAuthorityColumnsAsync(SqliteConnection connection)
 	{
 		await using var command = connection.CreateCommand();

@@ -254,6 +254,46 @@ public sealed class IasConversionTests
 			Assert.All(vertex.Components[0].FloatValues, coordinate => Assert.InRange(coordinate, 0f, .0001f)));
 	}
 
+	[Fact]
+	public async Task 转换元数据沿用角色名介绍与图标并写入清单()
+	{
+		var root = Directory.CreateTempSubdirectory("ias-meta-");
+		try
+		{
+			var main = Path.Combine(root.FullName, "main");
+			var companion = Path.Combine(root.FullName, "companion");
+			Directory.CreateDirectory(main);
+			Directory.CreateDirectory(companion);
+			File.WriteAllText(Path.Combine(companion, "mod_group.json"), """{"name":"VRC-milfy-CE-07","description":"配套介绍"}""");
+			File.WriteAllBytes(Path.Combine(companion, "icon.png"), [1, 2, 3, 4]);
+			File.WriteAllText(Path.Combine(main, "manifest.json"), """{"name":"MainPkgName","description":"主包介绍","iconPath":"../escape.png"}""");
+
+			var fromCompanion = await IasStandardConverter.ReadPackageMetadataAsync(root.FullName, main, null, default);
+			Assert.Equal("VRC-milfy-CE-07", fromCompanion.Name);
+			Assert.Equal("主包介绍", fromCompanion.Description);
+			Assert.Equal(Path.Combine(companion, "icon.png"), fromCompanion.IconSourcePath);
+
+			var withPreferred = await IasStandardConverter.ReadPackageMetadataAsync(root.FullName, main, "自定义角色名", default);
+			Assert.Equal("自定义角色名", withPreferred.Name);
+
+			File.WriteAllBytes(Path.Combine(main, "preview.webp"), [5, 6]);
+			File.WriteAllText(Path.Combine(main, "manifest.json"), """{"name":"MainPkgName","iconPath":"preview.webp"}""");
+			var withMainIcon = await IasStandardConverter.ReadPackageMetadataAsync(root.FullName, main, null, default);
+			Assert.Equal("配套介绍", withMainIcon.Description);
+			Assert.Equal(Path.Combine(main, "preview.webp"), withMainIcon.IconSourcePath);
+
+			using var serialized = JsonDocument.Parse(IasStandardConverter.SerializeManifest(
+				"VRC-milfy-CE-07 · B-01（由 IAS 转换）", [], "主包介绍", "icon.png"));
+			Assert.Equal("VRC-milfy-CE-07 · B-01（由 IAS 转换）", serialized.RootElement.GetProperty("name").GetString());
+			Assert.Equal("主包介绍", serialized.RootElement.GetProperty("description").GetString());
+			Assert.Equal("icon.png", serialized.RootElement.GetProperty("iconPath").GetString());
+		}
+		finally
+		{
+			root.Delete(recursive: true);
+		}
+	}
+
 	private static void WriteName(BinaryWriter writer, string name)
 	{
 		var bytes = Encoding.UTF8.GetBytes(name);

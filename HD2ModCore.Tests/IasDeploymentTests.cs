@@ -517,6 +517,61 @@ public sealed class IasDeploymentTests
 		Assert.Equal(fixture.ManagedId, Assert.Single(await ActiveEntriesAsync(fixture)));
 	}
 
+	[Fact]
+	public async Task ReEnablingIasAfterManagedModDeletedRegeneratesAndRedeploys()
+	{
+		using var fixture = await Fixture.CreateAsync();
+		var role = await fixture.Service.AddAsync(fixture.Pair, IasRoleSource.IasPackage, default);
+		var deletedId = fixture.ManagedId;
+		await DeleteModFromLibraryAsync(fixture, deletedId);
+		var workerCalls = fixture.Worker.Requests.Count;
+		var deployments = fixture.DeployCalls;
+
+		await fixture.Service.SetEnabledInActiveProfileAsync(true, default);
+
+		Assert.Contains(fixture.Worker.Requests.Skip(workerCalls), request => request.Command == "regenerate");
+		var rebuiltId = Assert.NotNull(fixture.Service.ManagedModId);
+		Assert.NotEqual(deletedId, rebuiltId);
+		var entries = await ActiveEntriesAsync(fixture);
+		Assert.Contains(rebuiltId, entries);
+		Assert.Contains(Assert.Single(role.ModIds), entries);
+		Assert.Equal(deployments + 1, fixture.DeployCalls);
+	}
+
+	[Fact]
+	public async Task ReEnablingIasAfterRoleModDeletedSkipsMissingRoleWithoutGuidError()
+	{
+		using var fixture = await Fixture.CreateAsync();
+		var role = await fixture.Service.AddAsync(fixture.Pair, IasRoleSource.IasPackage, default);
+		var deletedRoleModId = Assert.Single(role.ModIds);
+		await DeleteModFromLibraryAsync(fixture, deletedRoleModId);
+
+		await fixture.Service.SetEnabledInActiveProfileAsync(false, default);
+		await fixture.Service.SetEnabledInActiveProfileAsync(true, default);
+
+		Assert.Equal(fixture.ManagedId, Assert.Single(await ActiveEntriesAsync(fixture)));
+
+		var error = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+			fixture.Service.SetCharacterEnabledAsync(role.Id, true, default));
+		Assert.Contains("Mod 库文件已删除", error.Message);
+		Assert.DoesNotContain(deletedRoleModId.ToString("N"), error.Message, StringComparison.OrdinalIgnoreCase);
+	}
+
+	private static async Task DeleteModFromLibraryAsync(Fixture fixture, Guid modId)
+	{
+		var store = new JsonModLibraryStore(fixture.Paths, allowLegacyMigration: false);
+		var snapshot = await fixture.Service.LoadModsAsync(default);
+		var target = new ModNodeId(modId);
+		if (snapshot.Nodes.TryGetValue(target, out var node))
+			IasFileTree.Delete(Path.Combine(fixture.Paths.ModsDirectory, node.RelativePath));
+		var nodes = snapshot.Nodes.Where(pair => pair.Key != target).ToDictionary(pair => pair.Key, pair => pair.Value);
+		var profiles = snapshot.Profiles.Select(profile => profile with
+		{
+			Entries = profile.Entries.Where(entry => entry.NodeId != target).ToArray()
+		}).ToArray();
+		await store.SaveAsync(snapshot with { Nodes = nodes, Profiles = profiles }, default);
+	}
+
 	[Theory]
 	[InlineData(true)]
 	[InlineData(false)]
@@ -649,7 +704,11 @@ public sealed class IasDeploymentTests
 		File.AppendAllText(patch, "-modified");
 		var changed = Assert.Single((await fixture.Service.ScanRolesAsync(default)).Registered);
 		Assert.NotEqual(registered.Revision, changed.Revision);
-		File.Delete(patch);
+		var renumbered = Path.Combine(directory, "a7c4c9d700000000.patch_2");
+		File.Move(patch, renumbered);
+		var normalized = Assert.Single((await fixture.Service.ScanRolesAsync(default)).Registered);
+		Assert.False(normalized.MissingFromLibrary);
+		File.Delete(renumbered);
 		var missing = Assert.Single((await fixture.Service.ScanRolesAsync(default)).Registered);
 		Assert.True(missing.MissingFromLibrary);
 		Assert.True(missing.Enabled);

@@ -753,6 +753,44 @@ public sealed class AssetArchiveIndexServiceTests
 	}
 
 	[Fact]
+	public async Task GetIndexStatusAsync_ReportsStaleWhenAuthorityKitsAreMissingDespiteMatchingFingerprint()
+	{
+		var root = Path.Combine(Path.GetTempPath(), "hd2coretests", Guid.NewGuid().ToString("N"));
+		var appRoot = Path.Combine(root, "app");
+		var gameData = Path.Combine(root, "game", "data");
+		Directory.CreateDirectory(appRoot); Directory.CreateDirectory(gameData);
+		try
+		{
+			const string archive = "aaaaaaaaaaaaaaaa";
+			File.WriteAllBytes(Path.Combine(gameData, archive), BuildToc(new[] { new AssetKey(20, 200) }));
+			var json = JsonSerializer.Serialize(new Dictionary<string, Dictionary<string, string>> { ["Armor"] = new() { [archive] = "Armor A" } });
+			var paths = new StoragePaths(appRoot);
+			var snapshot = new GameDataAuthoritySnapshot(
+				GameDataAuthoritySourceKind.DecryptedDataLibrary,
+				Path.Combine(gameData, "game", "generated_customization_armor_sets.dl_bin"),
+				"authority-fp-1",
+				DateTimeOffset.UtcNow,
+				[new GameDataAuthorityKit(1u, 0u, 1u, GameDataEquipmentKitKind.Armor, archive, "B-01 Tactical", [])],
+				[]);
+			var service = new AssetArchiveIndexService(paths, authorityProvider: new FixedAuthorityProvider(snapshot));
+			await service.BuildOrRebuildAsync(gameData, json);
+			Assert.Equal(GameDataIndexState.Current, (await service.GetIndexStatusAsync(gameData, json)).State);
+
+			SqliteConnection.ClearAllPools();
+			await using (var connection = new SqliteConnection($"Data Source={paths.DbPath};Pooling=False"))
+			{
+				await connection.OpenAsync();
+				await using var cmd = connection.CreateCommand();
+				cmd.CommandText = "DELETE FROM game_data_authority_kits;";
+				await cmd.ExecuteNonQueryAsync();
+			}
+
+			Assert.Equal(GameDataIndexState.Stale, (await service.GetIndexStatusAsync(gameData, json)).State);
+		}
+		finally { try { Directory.Delete(root, recursive: true); } catch { } }
+	}
+
+	[Fact]
 	public async Task Build_BundledSlimArchive_IsIndexed()
 	{
 		var root = Path.Combine(Path.GetTempPath(), "hd2coretests", Guid.NewGuid().ToString("N"));

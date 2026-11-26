@@ -13,6 +13,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from project_identity import owner_id, point_id
 
 UNIT = 0xe0a48d0be9a7453f
+PACKAGE = 0xad9c6d9ed1e5e77a
 MATERIALS = {0xeac0b497876adedf, 0xcd4238c6a0c69e32}
 RIG = 'HD2IndependentRig/'
 HEX = re.compile('[0-9a-f]{16}')
@@ -270,8 +271,9 @@ class Pair:
         self.catalog = catalog
         self.main = source / 'main'
         self.companion = source / 'companion'
-        self.manifest = load(self.main / 'manifest.json')
-        author = self.manifest.get('Author')
+        manifest_path = self.main / 'manifest.json'
+        self.manifest = load(manifest_path) if manifest_path.is_file() else None
+        author = self.manifest.get('Author') if isinstance(self.manifest, dict) else None
         self.author = author.strip() if isinstance(author, str) and author.strip() else None
         self.group = load(self.companion / 'mod_group.json')
         require(self.group['schema'] == 'HD2RuntimeGroup1' and re.fullmatch('[0-9a-f]{32}', self.group['id']),
@@ -327,7 +329,7 @@ class Pair:
                 set(self.routes) == set(self.old_slots.values()), '原身体隔离与原版槽位闭包不符')
         self.points = {uid for uid, alias in routes if point_id(self.project, self.old, int(uid, 16)) == int(alias, 16)}
         self.point_aliases = {int(self.routes[uid], 16) for uid in self.points}
-        self.patch, self.authored = self.read_main()
+        self.patch, self.authored, self.has_package = self.read_main()
         self.difference = []
         self.difference_name = None
         self.visible_uses = set(self.routes) - self.points
@@ -373,18 +375,22 @@ class Pair:
             if not match:
                 continue
             archive, = match.groups()
+            archive_id = int(archive, 16)
             rows = patch_keys(path)
-            require(all(typ in MATERIALS or typ == UNIT and archive in self.members for _, typ in rows),
-                    '主包含显式 Package、Composite 或未知资源类型')
+            require(all(typ in MATERIALS or (typ == UNIT and archive in self.members) or
+                        (typ == PACKAGE and uid == archive_id and archive in self.members) for uid, typ in rows),
+                    '主包含不支持的 Composite 或未知资源类型')
             require(all(typ != UNIT or f'{uid:016x}' not in self.catalog.native for uid, typ in rows),
                     '主包覆盖原版 Unit ID')
             if archive == self.old:
-                require(all(typ == UNIT for _, typ in rows), '身体 patch 混有非 Unit 资源')
-                body.append((path, {uid for uid, _ in rows}))
+                require(all(typ == UNIT or (typ == PACKAGE and uid == archive_id) for uid, typ in rows),
+                        '身体 patch 混有非 Unit/Package 资源')
+                has_package = any(typ == PACKAGE for _, typ in rows)
+                body.append((path, {uid for uid, typ in rows if typ == UNIT}, has_package))
         require(len(body) == 1, '只支持单个隔离身体 patch')
-        patch, all_units = body[0]
+        patch, all_units, has_package = body[0]
         require({int(v, 16) for v in self.routes.values()} <= all_units, '身体 patch 的隔离 Unit 悬空')
-        return patch, all_units - self.point_aliases
+        return patch, all_units - self.point_aliases, has_package
 
     def read_difference(self):
         from hd2_system.runtime_manifest import _stable_label
@@ -545,11 +551,13 @@ class Pair:
             read = json.loads(zipped.read('mod_group.json'))
             require(read == group and all(sha(zipped.read(row['path'])) == row['sha256']
                     for item in read['members'] for row in item['files']), '新配套组 SHA 回读不符')
-        manifest = dict(self.manifest)
-        author_note = f'原作者：{self.author}。' if self.author else ''
-        manifest.update(Guid=str(group_id), Name=f"{self.manifest['Name']}（由管理器换护甲）",
-                        Description=f"{author_note}由管理器换护甲。\n{self.manifest.get('Description', '')}".rstrip())
-        save(work / 'manifest.json', manifest)
+        if isinstance(self.manifest, dict):
+            manifest = dict(self.manifest)
+            author_note = f'原作者：{self.author}。' if self.author else ''
+            base_name = manifest.get('Name') or self.group['name']
+            manifest.update(Guid=str(group_id), Name=f"{base_name}（由管理器换护甲）",
+                            Description=f"{author_note}由管理器换护甲。\n{manifest.get('Description', '')}".rstrip())
+            save(work / 'manifest.json', manifest)
 
 
 def main():
@@ -562,7 +570,8 @@ def main():
         _, _, baseline = pair.plan(pair.old)
         result.update(OriginalArchive=pair.old, Author=pair.author, Archives=sorted(pair.members), SourceStock=baseline,
                       Patch=pair.patch.relative_to(pair.main).as_posix(),
-                      OldPoints=[f'{uid:016x}' for uid in sorted(pair.point_aliases)])
+                      OldPoints=[f'{uid:016x}' for uid in sorted(pair.point_aliases)],
+                      HasPackage=pair.has_package)
         fits, stock = {}, {}
         for target in request['Targets']:
             if target == pair.old:
@@ -577,10 +586,10 @@ def main():
                     pair.build_companion(target, item, native, work)
                     result['Donors'] = donors
             except (ValueError, KeyError, IndexError, struct.error) as error:
-                fits[target] = str(error) if isinstance(error, ValueError) else '目标闭包或配套格式不匹配'
+                fits[target] = str(error) if isinstance(error, ValueError) else f'目标闭包或配套格式不匹配（{type(error).__name__}: {error}）'
         result.update(Fits=fits, Stock=stock)
     except (ValueError, OSError, KeyError, TypeError, IndexError, ImportError, struct.error) as error:
-        result['Error'] = str(error) if isinstance(error, ValueError) else '缺少兼容的官方目录或配套格式'
+        result['Error'] = str(error) if isinstance(error, ValueError) else f'缺少兼容的官方目录或配套格式（{type(error).__name__}: {error}）'
     save(work / 'result.json', result)
 
 

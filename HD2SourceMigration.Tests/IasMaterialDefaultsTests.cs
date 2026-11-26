@@ -42,6 +42,66 @@ public sealed class IasMaterialDefaultsTests
 		Assert.Equal(texture, Assert.Single(References.ReadTextureIds(source)));
 	}
 
+	[Fact]
+	public void MigratesUnparentedMaterialWhenTemplateSlotMatchesUnambiguously()
+	{
+		var defaults = new IasMaterialDefaults();
+		defaults.Add(Parent, Material(0, (Slot, 100), (0xe67ac0c7u, 200)), Material(0, (Slot, 101), (0xe67ac0c7u, 201)));
+		var source = Material(0, (0xe67ac0c7u, 200), (Slot, 100), (99, 777));
+
+		var output = defaults.Migrate(source);
+
+		Assert.NotSame(source, output);
+		Assert.Equal(0UL, IasMaterialDefaults.ReadParent(output));
+		Assert.Equal(new ulong[] { 200, 101, 777 }, References.ReadTextureIds(output));
+	}
+
+	[Fact]
+	public void SkipsUnparentedMaterialSlotWhenTemplatesDisagree()
+	{
+		var defaults = new IasMaterialDefaults();
+		defaults.Add(Parent, Material(0, (Slot, 100)), Material(0, (Slot, 101)));
+		defaults.Add(Parent + 1, Material(0, (Slot, 100)), Material(0, (Slot, 102)));
+		var source = Material(0, (Slot, 100));
+
+		Assert.Same(source, defaults.Migrate(source));
+		Assert.Equal(100UL, Assert.Single(References.ReadTextureIds(source)));
+	}
+
+	[Fact]
+	public void MigratesMissingNonAuthoredSlotsFromCurrentParentOrTemplate()
+	{
+		var defaults = new IasMaterialDefaults();
+		defaults.Add(Parent, Material(0, (Slot, 100)), Material(0, (Slot, 101)));
+		var source = Material(456, (0xe67ac0c7u, 900), (20, 800), (Slot, 100), (30, 700));
+		var currentParentSlots = new Dictionary<uint, ulong>
+		{
+			[0xe67ac0c7u] = 901,
+			[20] = 801,
+			[30] = 701,
+		};
+		var missing = new HashSet<ulong> { 900, 800, 100 };
+
+		var output = defaults.MigrateMissing(source, missing.Contains, currentParentSlots);
+
+		Assert.NotSame(source, output);
+		Assert.Equal(new ulong[] { 900, 801, 101, 700 }, References.ReadTextureIds(output));
+	}
+
+	[Fact]
+	public void MigratesMissingKnownSlotWithOlderUnlistedTextureId()
+	{
+		var defaults = new IasMaterialDefaults();
+		defaults.Add(Parent, Material(0, (Slot, 100)), Material(0, (Slot, 101)));
+		var source = Material(0, (Slot, 555), (0xe67ac0c7u, 900));
+		var missing = new HashSet<ulong> { 555, 900 };
+
+		var output = defaults.MigrateMissing(source, missing.Contains);
+
+		Assert.NotSame(source, output);
+		Assert.Equal(new ulong[] { 101, 900 }, References.ReadTextureIds(output));
+	}
+
 	private static byte[] Material(ulong parent, params (uint Slot, ulong Texture)[] slots)
 	{
 		const int keysOffset = 136;

@@ -8,6 +8,7 @@ using System.Text.Json;
 using System.Text.RegularExpressions;
 using HD2ModAdaptation.PatchReconstruction;
 using HD2ModAdaptation.PatchReconstruction.UnitMesh;
+using HD2SourceMigration.IasConversion;
 
 namespace HD2SourceMigration.IasPackaging.BodyRetarget;
 
@@ -17,16 +18,18 @@ public sealed record IasBodyFit(string? OriginalArchive, string? Author, string[
 public sealed record IasBodyRetargetOutput(string MainZip, string CompanionZip, string[] Archives, string? Author,
 	string BodyPatch, string[] BodyKeys);
 
-public sealed class IasBodyRetargetService(string version, string generator, string sdk, string metadata, string gameData)
+public sealed class IasBodyRetargetService(string version, string generator, string sdk, string metadata, string gameData,
+	IReadOnlyDictionary<ulong, byte[]>? materialTemplates = null)
 {
 	public static bool IsSupportedVersion(string? version) => version is "1.6.4" or "1.6.5";
 
 	private const ulong Unit = PatchUnitMeshReader.UnitTypeId;
+	private const ulong Package = 0xad9c6d9ed1e5e77aUL;
 
 	private sealed record Donor(string Unit, string Archive, string Sha, int Nodes, string? Point);
 	private sealed record Plan(string? OriginalArchive, string? Author, string[]? Archives, Dictionary<string, string?>? Fits,
 		string? Error, string? Patch, string[]? OldPoints, Dictionary<string, Donor[]>? Stock, Donor[]? Donors,
-		Donor[]? SourceStock = null);
+		Donor[]? SourceStock = null, bool HasPackage = false);
 
 	public async Task<IasBodyFit> AnalyzeAsync(string source, IReadOnlyList<string> targets, string work, CancellationToken ct)
 	{
@@ -34,7 +37,7 @@ public sealed class IasBodyRetargetService(string version, string generator, str
 		var fits = plan.Fits ?? new(StringComparer.OrdinalIgnoreCase);
 		if (plan.Error is null)
 		{
-			var stock = new StockReader(gameData);
+			var stock = new StockReader(gameData, materialTemplates);
 			try
 			{
 				await ReadBodyAsync(source, plan, ct).ConfigureAwait(false);
@@ -47,7 +50,10 @@ public sealed class IasBodyRetargetService(string version, string generator, str
 			}
 			foreach (var (target, donors) in plan.Stock ?? [])
 			{
-				try { await stock.ValidateAsync(donors, ct).ConfigureAwait(false); }
+				try
+				{
+					await stock.ValidateAsync(donors, ct).ConfigureAwait(false);
+				}
 				catch (Exception error) when (Expected(error)) { fits[target] = error.Message; }
 			}
 		}
@@ -62,8 +68,8 @@ public sealed class IasBodyRetargetService(string version, string generator, str
 		if (plan.Donors is null || plan.OriginalArchive is null || plan.Archives is null)
 			throw new InvalidDataException("目标应为不同的身体护甲。");
 
-		var (patch, original, oldPoints) = await ReadBodyAsync(source, plan, ct).ConfigureAwait(false);
-		var stock = new StockReader(gameData);
+		var (patch, originalUnits, oldPoints, oldPackages) = await ReadBodyAsync(source, plan, ct).ConfigureAwait(false);
+		var stock = new StockReader(gameData, materialTemplates);
 		await stock.ValidateAsync(plan.SourceStock!, ct).ConfigureAwait(false);
 		await stock.ValidateAsync(plan.Donors, ct).ConfigureAwait(false);
 		var reader = new GameDataUnitMeshReader(stock.Resolver);
@@ -77,9 +83,17 @@ public sealed class IasBodyRetargetService(string version, string generator, str
 			additions.Add(new(new(Unit, Hex(donor.Point!)), point.TocData, [], point.GpuData));
 		}
 		await stock.ValidateClosureAsync(source, [target, .. plan.Archives], additions, ct).ConfigureAwait(false);
-		var authored = original.Where(entry => !oldPoints.Contains(entry)).ToArray();
+		var authored = originalUnits.Where(entry => !oldPoints.Contains(entry)).ToArray();
+		var removed = oldPoints.Concat(oldPackages).ToArray();
+		if (plan.HasPackage)
+		{
+			var stockPackage = await stock.ReadStockPackageAsync(target, ct).ConfigureAwait(false);
+			var updatedPackage = AppendPackageDependencies(stockPackage,
+				authored.Select(entry => entry.AssetKey).Concat(additions.Select(entry => entry.AssetKey)));
+			additions.Add(new(new(Package, Hex(target)), updatedPackage, [], []));
+		}
 		var changed = await new PatchArchiveWriter().WriteAsync(patch, Path.Combine(work, "patch"), [], additions,
-			oldPoints, preserveOriginalStream: false, cancellationToken: ct).ConfigureAwait(false);
+			removed, preserveOriginalStream: false, cancellationToken: ct).ConfigureAwait(false);
 		await VerifyPatchAsync(changed.TocFilePath, authored, additions, ct).ConfigureAwait(false);
 
 		var name = target + Path.GetExtension(patch);
@@ -99,7 +113,9 @@ public sealed class IasBodyRetargetService(string version, string generator, str
 			.Where(file => !excluded.Contains(file.Name)).ToList();
 		var newName = Path.Combine(Path.GetDirectoryName(code)!, name);
 		files.AddRange([(newName, checkedPatch), (newName + ".stream", checkedPatch + ".stream"),
-			(newName + ".gpu_resources", checkedPatch + ".gpu_resources"), ("manifest.json", Path.Combine(work, "manifest.json"))]);
+			(newName + ".gpu_resources", checkedPatch + ".gpu_resources")]);
+		var manifestPath = Path.Combine(work, "manifest.json");
+		if (File.Exists(manifestPath)) files.Add(("manifest.json", manifestPath));
 		if (files.Select(file => file.Name).Distinct(StringComparer.OrdinalIgnoreCase).Count() != files.Count)
 			throw new InvalidDataException("新旧主包路径重叠。");
 		await using (var stream = new FileStream(output, FileMode.CreateNew, FileAccess.Write, FileShare.None))
@@ -124,20 +140,33 @@ public sealed class IasBodyRetargetService(string version, string generator, str
 		}
 	}
 
-	private static async Task<(string Patch, IReadOnlyList<PatchTocEntry> Entries, PatchTocEntry[] Points)> ReadBodyAsync(
+	private static async Task<(string Patch, PatchTocEntry[] Units, PatchTocEntry[] Points, PatchTocEntry[] Packages)> ReadBodyAsync(
 		string source, Plan plan, CancellationToken ct)
 	{
 		var path = Path.Combine(source, "main", plan.Patch!);
 		var entries = await new PatchTocScanner().ScanEntriesAsync(path, ct).ConfigureAwait(false);
-		if (entries.Any(entry => entry.AssetKey.TypeId != Unit || entry.UsesEmptyStreamCompatibilityOverride))
+		var oldArchiveId = Hex(plan.OriginalArchive!);
+		if (entries.Any(entry => entry.UsesEmptyStreamCompatibilityOverride ||
+			(entry.AssetKey.TypeId != Unit && !(entry.AssetKey.TypeId == Package && entry.AssetKey.FileId == oldArchiveId))))
 			throw new InvalidDataException("身体 patch 不是受支持的隔离 Unit 格式。");
+		var packages = entries.Where(entry => entry.AssetKey.TypeId == Package).ToArray();
+		if (packages.Length > 1 || (packages.Length == 1) != plan.HasPackage)
+			throw new InvalidDataException("身体 patch 的 Package 条目与规划不符。");
+		var units = entries.Where(entry => entry.AssetKey.TypeId == Unit).ToArray();
 		var remove = plan.OldPoints!.Select(Hex).ToHashSet();
-		var points = entries.Where(entry => remove.Contains(entry.AssetKey.FileId)).ToArray();
+		var points = units.Where(entry => remove.Contains(entry.AssetKey.FileId)).ToArray();
 		if (points.Length != remove.Count) throw new InvalidDataException("原隐藏 Unit 闭包不符。");
 		var reader = new PatchEntryPayloadReader();
 		foreach (var entry in entries)
 		{
 			var data = await reader.ReadPayloadAsync(entry, ct).ConfigureAwait(false);
+			if (entry.AssetKey.TypeId == Package)
+			{
+				if (data.StreamData.Length != 0 || data.GpuResourceData.Length != 0)
+					throw new InvalidDataException("身体 Package 带有未知外部载荷。");
+				ValidatePackagePayload(data.TocData);
+				continue;
+			}
 			if (data.TocData.Length < 24 || BinaryPrimitives.ReadUInt64LittleEndian(data.TocData.AsSpan(16)) != 0)
 				throw new InvalidDataException("身体 Unit 引用了不支持的 Composite。");
 			if (remove.Contains(entry.AssetKey.FileId))
@@ -146,7 +175,44 @@ public sealed class IasBodyRetargetService(string version, string generator, str
 				RequirePoint(data.TocData, data.GpuResourceData, $"{entry.AssetKey.FileId:x16}");
 			}
 		}
-		return (path, entries, points);
+		return (path, units, points, packages);
+	}
+
+	private static void ValidatePackagePayload(ReadOnlySpan<byte> data)
+	{
+		if (data.Length < 16) throw new InvalidDataException("Package 资源头不完整。");
+		var count = BinaryPrimitives.ReadUInt32LittleEndian(data[8..]);
+		if (count > 1_000_000 || data.Length != 16 + count * 16)
+			throw new InvalidDataException("Package 资源索引越界。");
+	}
+
+	public static byte[] AppendPackageDependencies(byte[] stockPackage, IEnumerable<AssetKey> dependencies)
+	{
+		ValidatePackagePayload(stockPackage);
+		var count = (int)BinaryPrimitives.ReadUInt32LittleEndian(stockPackage.AsSpan(8, 4));
+		var existing = new HashSet<AssetKey>(count);
+		for (var i = 0; i < count; i++)
+		{
+			var offset = 16 + i * 16;
+			var typeId = BinaryPrimitives.ReadUInt64LittleEndian(stockPackage.AsSpan(offset, 8));
+			var fileId = BinaryPrimitives.ReadUInt64LittleEndian(stockPackage.AsSpan(offset + 8, 8));
+			if (!existing.Add(new(typeId, fileId)))
+				throw new InvalidDataException("原版 Package 包含重复依赖，无法安全扩展。");
+		}
+		var added = dependencies.Where(dep => !existing.Contains(dep)).Distinct()
+			.OrderBy(dep => dep.TypeId).ThenBy(dep => dep.FileId).ToArray();
+		if (added.Any(dep => dep.TypeId == 0 || dep.FileId == 0))
+			throw new InvalidDataException("Package 新增依赖 ID 无效。");
+		var result = new byte[stockPackage.Length + added.Length * 16];
+		stockPackage.CopyTo(result, 0);
+		BinaryPrimitives.WriteUInt32LittleEndian(result.AsSpan(8, 4), checked((uint)(count + added.Length)));
+		for (var i = 0; i < added.Length; i++)
+		{
+			var offset = stockPackage.Length + i * 16;
+			BinaryPrimitives.WriteUInt64LittleEndian(result.AsSpan(offset, 8), added[i].TypeId);
+			BinaryPrimitives.WriteUInt64LittleEndian(result.AsSpan(offset + 8, 8), added[i].FileId);
+		}
+		return result;
 	}
 
 	private static void RequirePoint(byte[] toc, byte[] gpu, string id)
@@ -164,10 +230,23 @@ public sealed class IasBodyRetargetService(string version, string generator, str
 		if (entries.Count != authored.Length + additions.Count || entries.Where((entry, index) =>
 			entry.EntryIndex != index + 1 || entry.GpuResourceSize != 0 && entry.GpuResourceOffset % 64 != 0).Any())
 			throw new InvalidDataException("身体 patch 条目序号或 GPU 对齐回读不符。");
+		var expectedCounts = entries.GroupBy(entry => entry.AssetKey.TypeId)
+			.ToDictionary(group => group.Key, group => (ulong)group.Count());
 		var toc = await File.ReadAllBytesAsync(patch, ct).ConfigureAwait(false);
-		if (BinaryPrimitives.ReadUInt32LittleEndian(toc.AsSpan(4)) != 1 ||
-			BinaryPrimitives.ReadUInt64LittleEndian(toc.AsSpan(80)) != Unit ||
-			BinaryPrimitives.ReadUInt64LittleEndian(toc.AsSpan(88)) != (ulong)entries.Count)
+		var typeCount = BinaryPrimitives.ReadUInt32LittleEndian(toc.AsSpan(4));
+		if (typeCount != expectedCounts.Count || toc.Length < 72 + typeCount * 32)
+			throw new InvalidDataException("身体 patch 类型表计数回读不符。");
+		var actualCounts = new Dictionary<ulong, ulong>((int)typeCount);
+		for (var index = 0; index < typeCount; index++)
+		{
+			var offset = 72 + index * 32;
+			var typeId = BinaryPrimitives.ReadUInt64LittleEndian(toc.AsSpan(offset + 8));
+			var count = BinaryPrimitives.ReadUInt64LittleEndian(toc.AsSpan(offset + 16));
+			if (!actualCounts.TryAdd(typeId, count))
+				throw new InvalidDataException("身体 patch 类型表计数回读不符。");
+		}
+		if (actualCounts.Count != expectedCounts.Count ||
+			expectedCounts.Any(pair => !actualCounts.TryGetValue(pair.Key, out var actual) || actual != pair.Value))
 			throw new InvalidDataException("身体 patch 类型表计数回读不符。");
 		var keyed = entries.ToDictionary(entry => entry.AssetKey);
 		var reader = new PatchEntryPayloadReader();
@@ -230,13 +309,118 @@ public sealed class IasBodyRetargetService(string version, string generator, str
 			?? throw new InvalidDataException("IAS 配套分析未返回结果。");
 	}
 
-	private sealed class StockReader(string gameData)
+	private sealed class StockReader(string gameData, IReadOnlyDictionary<ulong, byte[]>? materialTemplates = null)
 	{
 		private const ulong Material = MaterialDependencyResolver.MaterialTypeId;
 		private const ulong Texture = MaterialDependencyResolver.TextureTypeId;
+		private const ulong Bone = PatchUnitMeshReader.BoneTypeId;
 		internal GameDataPackageResolver Resolver { get; } = new(gameData);
+		private readonly PatchTocScanner _scanner = new();
 		private readonly Dictionary<string, Dictionary<AssetKey, PatchTocEntry>> _archives = new(StringComparer.Ordinal);
 		private readonly Dictionary<(string Archive, string Unit), (string Hash, uint Nodes)> _units = new();
+		private readonly Dictionary<string, byte[]> _packages = new(StringComparer.OrdinalIgnoreCase);
+		private readonly Dictionary<AssetKey, (string Archive, PatchTocEntry Entry)> _globalIndex = new();
+		private readonly HashSet<string> _indexedArchives = new(StringComparer.OrdinalIgnoreCase);
+		private string[]? _allArchives;
+		private int _globalCursor;
+
+		private async Task<Dictionary<AssetKey, PatchTocEntry>> ReadArchiveEntriesAsync(string archiveName, CancellationToken ct)
+		{
+			if (!_archives.TryGetValue(archiveName, out var entries))
+			{
+				var archive = await Resolver.GetPackageTocAsync(archiveName, ct).ConfigureAwait(false)
+					?? throw new InvalidDataException($"当前游戏缺少原版 Archive {archiveName}。");
+				entries = new Dictionary<AssetKey, PatchTocEntry>();
+				var indexed = _indexedArchives.Add(archiveName);
+				foreach (var entry in _scanner.ScanEntries(archive.Data, archiveName, archive.UsesSlimEntryOffset))
+				{
+					if (entry.AssetKey.TypeId is Unit or Package) entries[entry.AssetKey] = entry;
+					if (indexed && entry.AssetKey.TypeId is Unit or Package or Material or Texture or Bone)
+						_globalIndex.TryAdd(entry.AssetKey, (archiveName, entry));
+				}
+				_archives.Add(archiveName, entries);
+			}
+			return entries;
+		}
+
+		private async Task IndexArchiveAsync(string archiveName, bool ignoreErrors, CancellationToken ct)
+		{
+			if (!_indexedArchives.Add(archiveName)) return;
+			GameDataPackageToc? toc;
+			try { toc = await Resolver.GetPackageTocAsync(archiveName, ct).ConfigureAwait(false); }
+			catch (Exception error) when (ignoreErrors && Expected(error)) { return; }
+			if (toc is null) return;
+			foreach (var entry in _scanner.ScanEntries(toc.Data, archiveName, toc.UsesSlimEntryOffset))
+			{
+				if (entry.AssetKey.TypeId is Unit or Package or Material or Texture or Bone)
+					_globalIndex.TryAdd(entry.AssetKey, (archiveName, entry));
+			}
+		}
+
+		private async Task<Dictionary<AssetKey, byte[]>> FindPayloadsIncrementalAsync(
+			HashSet<AssetKey> wanted, IReadOnlyList<string> preferred, CancellationToken ct)
+		{
+			var found = new Dictionary<AssetKey, byte[]>();
+			if (wanted.Count == 0) return found;
+			var remaining = new HashSet<AssetKey>(wanted);
+			await CollectFromIndexAsync().ConfigureAwait(false);
+			foreach (var archive in preferred)
+			{
+				if (remaining.Count == 0) return found;
+				ct.ThrowIfCancellationRequested();
+				await IndexArchiveAsync(archive, ignoreErrors: false, ct).ConfigureAwait(false);
+				await CollectFromIndexAsync().ConfigureAwait(false);
+			}
+			if (remaining.Count == 0) return found;
+			_allArchives ??= (await Resolver.GetPackageNamesAsync(ct).ConfigureAwait(false))
+				.Where(name => name.Length == 16).Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
+			while (remaining.Count > 0 && _globalCursor < _allArchives.Length)
+			{
+				ct.ThrowIfCancellationRequested();
+				await IndexArchiveAsync(_allArchives[_globalCursor++], ignoreErrors: true, ct).ConfigureAwait(false);
+				await CollectFromIndexAsync().ConfigureAwait(false);
+			}
+			return found;
+
+			async Task CollectFromIndexAsync()
+			{
+				foreach (var key in remaining.ToArray())
+				{
+					if (!_globalIndex.TryGetValue(key, out var hit)) continue;
+					var bytes = await Resolver.GetPackageResourceAsync(hit.Archive, hit.Entry.TocDataOffset, hit.Entry.TocDataSize, ct)
+						.ConfigureAwait(false);
+					if (bytes is not { Length: > 0 }) continue;
+					found[key] = bytes;
+					remaining.Remove(key);
+				}
+			}
+		}
+
+		internal async Task<byte[]> ReadStockPackageAsync(string archiveName, CancellationToken ct)
+		{
+			if (_packages.TryGetValue(archiveName, out var cached)) return cached;
+			var key = new AssetKey(Package, Hex(archiveName));
+			var entries = await ReadArchiveEntriesAsync(archiveName, ct).ConfigureAwait(false);
+			if (entries.TryGetValue(key, out var entry) && entry.TocDataSize > 0)
+			{
+				var bytes = await Resolver.GetPackageResourceAsync(archiveName, entry.TocDataOffset, entry.TocDataSize, ct)
+					.ConfigureAwait(false);
+				if (bytes is { Length: > 0 })
+				{
+					ValidatePackagePayload(bytes);
+					_packages[archiveName] = bytes;
+					return bytes;
+				}
+			}
+			var found = await FindPayloadsIncrementalAsync([key], [archiveName], ct).ConfigureAwait(false);
+			if (found.TryGetValue(key, out var fallback))
+			{
+				ValidatePackagePayload(fallback);
+				_packages[archiveName] = fallback;
+				return fallback;
+			}
+			throw new InvalidDataException($"当前游戏缺少原版 Package {archiveName}。");
+		}
 
 		internal async Task ValidateAsync(IEnumerable<Donor> donors, CancellationToken ct)
 		{
@@ -244,14 +428,7 @@ public sealed class IasBodyRetargetService(string version, string generator, str
 			{
 				if (!_units.TryGetValue((donor.Archive, donor.Unit), out var verified))
 				{
-					if (!_archives.TryGetValue(donor.Archive, out var entries))
-					{
-						var archive = await Resolver.GetPackageTocAsync(donor.Archive, ct).ConfigureAwait(false)
-							?? throw new InvalidDataException($"当前游戏缺少原版 Archive {donor.Archive}。");
-						entries = new PatchTocScanner().ScanEntries(archive.Data, donor.Archive, archive.UsesSlimEntryOffset)
-							.Where(entry => entry.AssetKey.TypeId == Unit).ToDictionary(entry => entry.AssetKey);
-						_archives.Add(donor.Archive, entries);
-					}
+					var entries = await ReadArchiveEntriesAsync(donor.Archive, ct).ConfigureAwait(false);
 					if (!entries.TryGetValue(new(Unit, Hex(donor.Unit)), out var entry))
 						throw new InvalidDataException($"当前游戏缺少原版 Unit {donor.Unit}。");
 					var bytes = await Resolver.GetPackageResourceAsync(donor.Archive, entry.TocDataOffset, entry.TocDataSize, ct)
@@ -274,53 +451,116 @@ public sealed class IasBodyRetargetService(string version, string generator, str
 		{
 			var scanner = new PatchTocScanner();
 			var entries = new Dictionary<AssetKey, PatchTocEntry>();
+			var entryArchives = new Dictionary<AssetKey, string>();
+			var sourceMaterials = new Dictionary<AssetKey, byte[]>();
 			var refs = new HashSet<AssetKey>();
-			foreach (var path in Directory.EnumerateFiles(Path.Combine(source, "main"), "*", new EnumerationOptions
+			var patchFiles = Directory.EnumerateFiles(Path.Combine(source, "main"), "*", new EnumerationOptions
 			{
 				RecurseSubdirectories = true, AttributesToSkip = FileAttributes.ReparsePoint
-			}).Where(path => Regex.IsMatch(Path.GetFileName(path), "^[0-9a-f]{16}\\.patch_[0-9]+$", RegexOptions.CultureInvariant)))
+			}).Select(path => (Path: path, Match: Regex.Match(Path.GetFileName(path), "^([0-9a-f]{16})\\.patch_([0-9]+)$", RegexOptions.CultureInvariant)))
+				.Where(item => item.Match.Success)
+				.OrderBy(item => item.Match.Groups[1].Value, StringComparer.OrdinalIgnoreCase)
+				.ThenBy(item => int.Parse(item.Match.Groups[2].Value, CultureInfo.InvariantCulture))
+				.ThenBy(item => item.Path, StringComparer.OrdinalIgnoreCase)
+				.ToArray();
+			foreach (var (path, match) in patchFiles)
 			{
+				var archiveName = match.Groups[1].Value;
 				var toc = await File.ReadAllBytesAsync(path, ct).ConfigureAwait(false);
 				foreach (var entry in scanner.ScanEntries(toc, path, usesSlimEntryOffset: true))
 				{
-					if (!entries.TryAdd(entry.AssetKey, entry))
-						throw new InvalidDataException($"两件套有重叠资源键 {entry.AssetKey.FileId:x16}，无法确认闭包。");
-					AddReferences(entry.AssetKey.TypeId, toc.AsSpan(checked((int)entry.TocDataOffset), checked((int)entry.TocDataSize)), refs);
+					if (entryArchives.TryGetValue(entry.AssetKey, out var previousArchive) &&
+						!string.Equals(previousArchive, archiveName, StringComparison.OrdinalIgnoreCase))
+						throw new InvalidDataException($"两件套有跨 Archive 重叠资源键 {entry.AssetKey.FileId:x16}，无法确认闭包。");
+					entries[entry.AssetKey] = entry;
+					entryArchives[entry.AssetKey] = archiveName;
+					if (entry.AssetKey.TypeId == Material)
+						sourceMaterials[entry.AssetKey] = toc.AsSpan(checked((int)entry.TocDataOffset), checked((int)entry.TocDataSize)).ToArray();
+					else
+						AddReferences(entry.AssetKey.TypeId, toc.AsSpan(checked((int)entry.TocDataOffset), checked((int)entry.TocDataSize)), refs);
 				}
 			}
 			foreach (var point in points) AddReferences(Unit, point.TocData, refs);
+
+			var preferred = archives.Append("9ba626afa44a3aa3").Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
+
+			IasMaterialDefaults? defaults = null;
+			if (sourceMaterials.Count > 0 && materialTemplates is { Count: > 0 })
+			{
+				var parentKeys = materialTemplates.Keys.Select(id => new AssetKey(Material, id)).ToHashSet();
+				var parentPayloads = await FindPayloadsIncrementalAsync(parentKeys, preferred, ct).ConfigureAwait(false);
+				defaults = new IasMaterialDefaults();
+				foreach (var (parent, template) in materialTemplates)
+				{
+					if (parentPayloads.TryGetValue(new(Material, parent), out var current))
+						defaults.Add(parent, template, current);
+				}
+			}
+
+			var migratedMaterials = new List<byte[]>(sourceMaterials.Count);
+			foreach (var material in sourceMaterials.Values)
+			{
+				var effective = defaults is not null ? defaults.Migrate(material) : material;
+				migratedMaterials.Add(effective);
+				AddReferences(Material, effective, refs);
+			}
+
 			refs.ExceptWith(entries.Keys);
 			if (refs.Count == 0) return;
 
-			var preferred = archives.Append("9ba626afa44a3aa3").Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
-			var candidates = preferred.Concat((await Resolver.GetPackageNamesAsync(ct).ConfigureAwait(false))
-				.Where(name => name.Length == 16)).Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
 			var materialTextures = new HashSet<AssetKey>();
-			await FindAsync(refs, materialTextures).ConfigureAwait(false);
-			materialTextures.ExceptWith(entries.Keys);
-			await FindAsync(materialTextures, []).ConfigureAwait(false);
-
-			async Task FindAsync(HashSet<AssetKey> pending, HashSet<AssetKey> more)
+			await FindAsync(refs, materialTextures, throwIfMissing: defaults is null).ConfigureAwait(false);
+			if (refs.Count > 0 && defaults is not null)
 			{
-				foreach (var archive in candidates)
+				var missingTextures = refs.Where(key => key.TypeId == Texture).Select(key => key.FileId).ToHashSet();
+				if (missingTextures.Count > 0)
 				{
-					if (pending.Count == 0) return;
-					ct.ThrowIfCancellationRequested();
-					GameDataPackageToc? stock;
-					try { stock = await Resolver.GetPackageTocAsync(archive, ct).ConfigureAwait(false); }
-					catch (Exception error) when (Expected(error) && !preferred.Contains(archive)) { continue; }
-					if (stock is null) continue;
-					foreach (var entry in scanner.ScanEntries(stock.Data, archive, stock.UsesSlimEntryOffset))
+					var parentIds = migratedMaterials.Select(m => IasMaterialDefaults.ReadParent(m))
+						.Where(id => id != 0).Distinct().Select(id => new AssetKey(Material, id)).ToHashSet();
+					var parentPayloads = parentIds.Count > 0
+						? await FindPayloadsIncrementalAsync(parentIds, preferred, ct).ConfigureAwait(false)
+						: [];
+					var parentSlotMap = parentPayloads.ToDictionary(pair => pair.Key.FileId, pair => IasMaterialDefaults.ReadSlots(pair.Value));
+					var replacements = new HashSet<AssetKey>();
+					var stillReferenced = new HashSet<ulong>();
+					var refReader = new StingrayMaterialReferenceReader();
+					foreach (var material in migratedMaterials)
 					{
-						if (!pending.Contains(entry.AssetKey)) continue;
-						var bytes = await Resolver.GetPackageResourceAsync(archive, entry.TocDataOffset, entry.TocDataSize, ct)
-							.ConfigureAwait(false);
-						if (bytes is not { Length: > 0 }) continue;
-						pending.Remove(entry.AssetKey);
-						if (entry.AssetKey.TypeId == Material) AddReferences(Material, bytes, more);
+						var parent = IasMaterialDefaults.ReadParent(material);
+						parentSlotMap.TryGetValue(parent, out var parentSlots);
+						var fixedMaterial = defaults.MigrateMissing(material, missingTextures.Contains, parentSlots);
+						foreach (var texId in refReader.ReadTextureIds(fixedMaterial))
+							if (texId != 0) stillReferenced.Add(texId);
+						if (ReferenceEquals(fixedMaterial, material)) continue;
+						var beforeSlots = IasMaterialDefaults.ReadSlots(material);
+						var afterSlots = IasMaterialDefaults.ReadSlots(fixedMaterial);
+						foreach (var (slot, afterTex) in afterSlots)
+						{
+							if (beforeSlots.TryGetValue(slot, out var beforeTex) && beforeTex != afterTex && missingTextures.Contains(beforeTex) && afterTex != 0)
+								replacements.Add(new(Texture, afterTex));
+						}
 					}
+					foreach (var texId in missingTextures)
+						if (!stillReferenced.Contains(texId)) refs.Remove(new(Texture, texId));
+					replacements.ExceptWith(entries.Keys);
+					if (replacements.Count > 0)
+						await FindAsync(replacements, [], throwIfMissing: true).ConfigureAwait(false);
 				}
-				if (pending.Count != 0)
+				if (refs.Count != 0)
+					throw new InvalidDataException($"游戏和两件套缺少资源闭包：{string.Join("、", refs.Take(3).Select(key => $"{key.TypeId:x16}/{key.FileId:x16}"))}。");
+			}
+			materialTextures.ExceptWith(entries.Keys);
+			await FindAsync(materialTextures, [], throwIfMissing: true).ConfigureAwait(false);
+
+			async Task FindAsync(HashSet<AssetKey> pending, HashSet<AssetKey> more, bool throwIfMissing)
+			{
+				var found = await FindPayloadsIncrementalAsync(pending, preferred, ct).ConfigureAwait(false);
+				foreach (var (key, bytes) in found)
+				{
+					pending.Remove(key);
+					if (key.TypeId == Material) AddReferences(Material, bytes, more);
+				}
+				if (throwIfMissing && pending.Count != 0)
 					throw new InvalidDataException($"游戏和两件套缺少资源闭包：{string.Join("、", pending.Take(3).Select(key => $"{key.TypeId:x16}/{key.FileId:x16}"))}。");
 			}
 		}

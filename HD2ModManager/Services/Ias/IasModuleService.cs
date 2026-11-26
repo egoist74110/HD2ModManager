@@ -892,21 +892,27 @@ public sealed class IasModuleService(
         string? targetArmor = null, string? targetHelmet = null, bool mergeHelmet = false) =>
         ExecuteAsync("转为普通 Mod", progress, ct, async (service, _) =>
         {
+            var roleName = service.GetRoles().SingleOrDefault(role => role.Id == characterId)?.Name;
             var id = await service.ToStandardAsync(characterId,
                 (source, output, token) => ConvertStandardPackageAsync(source, service.GameData, output,
-                    service.GetInstalled(), token, targetArmor, targetHelmet, mergeHelmet),
+                    service.GetInstalled(), token, targetArmor, targetHelmet, mergeHelmet, roleName),
                 ct).ConfigureAwait(false);
-            return new(true, "已转换为普通 Mod 并导入库。", [], id.ToString("D"));
+            var snapshot = await service.LoadModsAsync(ct).ConfigureAwait(false);
+            var createdName = snapshot.Nodes.TryGetValue(new(id), out var node) ? node.Metadata.Name : null;
+            var message = string.IsNullOrWhiteSpace(createdName)
+                ? "已转换为普通 Mod 并导入库。"
+                : $"已转换为普通 Mod 并导入库：{createdName}";
+            return new(true, message, [], id.ToString("D"));
         });
 
     internal static async Task<string> ConvertStandardPackageAsync(string source, string gameData, string output,
         IasInstalled? installed, CancellationToken ct,
-        string? targetArmor = null, string? targetHelmet = null, bool mergeHelmet = false) =>
-        (await ConvertStandardAsync(source, gameData, output, installed, ct, targetArmor, targetHelmet, mergeHelmet).ConfigureAwait(false)).ModDirectory;
+        string? targetArmor = null, string? targetHelmet = null, bool mergeHelmet = false, string? displayName = null) =>
+        (await ConvertStandardAsync(source, gameData, output, installed, ct, targetArmor, targetHelmet, mergeHelmet, displayName).ConfigureAwait(false)).ModDirectory;
 
     public static async Task<IasStandardResult> ConvertStandardAsync(string source, string gameData, string output,
         IasInstalled? installed, CancellationToken ct,
-        string? targetArmor = null, string? targetHelmet = null, bool mergeHelmet = false)
+        string? targetArmor = null, string? targetHelmet = null, bool mergeHelmet = false, string? displayName = null)
     {
         if (installed is null)
             throw new InvalidOperationException("找不到已安装的官方 IAS 组件，无法读取材质默认模板。请先在管理器安装 IAS。");
@@ -922,7 +928,7 @@ public sealed class IasModuleService(
                 (unit, hidden) => match(unit, hidden).Select(slot =>
                     new IasTargetSlot(slot.Unit, slot.Cell, slot.Body, slot.WriteOrder) { IsTorso = slot.IsTorso }).ToArray()));
         }, templates);
-        return await converter.ConvertAsync(source, gameData, output, ct, mergeHelmet).ConfigureAwait(false);
+        return await converter.ConvertAsync(source, gameData, output, ct, mergeHelmet, displayName).ConfigureAwait(false);
     }
 
     public static uint HashBone(string name) =>

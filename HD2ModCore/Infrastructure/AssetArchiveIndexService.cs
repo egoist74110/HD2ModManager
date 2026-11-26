@@ -88,10 +88,32 @@ public sealed class AssetArchiveIndexService : IAssetArchiveIndexService
 			return new GameDataIndexStatus(GameDataIndexState.Missing, null, Path.GetFullPath(gameDataDirectory), currentFingerprint);
 		}
 		var state = string.Equals(stored.SourceFingerprint, currentFingerprint, StringComparison.OrdinalIgnoreCase)
+			&& (authority.Kits.Count == 0 || await HasPersistedAuthorityKitsAsync(cancellationToken).ConfigureAwait(false))
 			? GameDataIndexState.Current
 			: GameDataIndexState.Stale;
 
 		return new GameDataIndexStatus(state, stored, Path.GetFullPath(gameDataDirectory), currentFingerprint);
+	}
+
+	private async ValueTask<bool> HasPersistedAuthorityKitsAsync(CancellationToken cancellationToken)
+	{
+		if (!File.Exists(_paths.DbPath)) return false;
+		try
+		{
+			var options = new SqliteConnectionStringBuilder
+			{
+				DataSource = _paths.DbPath, Mode = SqliteOpenMode.ReadOnly, Cache = SqliteCacheMode.Shared, DefaultTimeout = 30,
+			};
+			await using var connection = new SqliteConnection(options.ToString());
+			await connection.OpenAsync(cancellationToken).ConfigureAwait(false);
+			await using var command = connection.CreateCommand();
+			command.CommandText = "SELECT 1 FROM game_data_authority_kits LIMIT 1;";
+			return await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false) is not null;
+		}
+		catch (SqliteException)
+		{
+			return false;
+		}
 	}
 
 	public ValueTask<GameDataIndexFingerprint?> GetFingerprintAsync(CancellationToken cancellationToken = default)

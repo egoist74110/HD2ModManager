@@ -12,6 +12,7 @@ internal sealed class IasModTransaction : IDisposable
 	private IasSnapshot.Manifest _manifest;
 	private readonly Dictionary<string, string?> _writes = new(StringComparer.OrdinalIgnoreCase);
 	private readonly Dictionary<string, IReadOnlyDictionary<string, OptionHostState>> _optionChanges = new(StringComparer.OrdinalIgnoreCase);
+	private bool _runtimeCaptured;
 	private bool _finished;
 	internal string Work { get; }
 	internal string Backup { get; }
@@ -38,11 +39,7 @@ internal sealed class IasModTransaction : IDisposable
 			new IasSnapshot(preparing, root, paths, game).Save(_manifest);
 			Directory.CreateDirectory(Path.GetDirectoryName(_previous)!);
 			Directory.Move(preparing, _previous);
-			if (captureRuntime)
-			{
-				Capture("Runtime");
-				Capture("library");
-			}
+			if (captureRuntime) EnsureRuntimeCaptured();
 			if (captureComponents) Capture("components");
 			Directory.CreateDirectory(Backup);
 			Directory.CreateDirectory(Export);
@@ -258,6 +255,14 @@ internal sealed class IasModTransaction : IDisposable
 		if (exists && !IasSnapshot.Exists(copy)) throw new IOException($"无法保存 IAS 快照：{target}");
 		_manifest.Entries.Add(entry with { Exists = exists });
 		_snapshot.Save(_manifest);
+	}
+
+	internal void EnsureRuntimeCaptured()
+	{
+		if (_runtimeCaptured) return;
+		Capture("Runtime");
+		Capture("library");
+		_runtimeCaptured = true;
 	}
 
 	internal void CaptureShaderToggler()

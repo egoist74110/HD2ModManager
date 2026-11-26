@@ -81,8 +81,10 @@ internal sealed class IasBodyRetargeter(StoragePaths storage, string game, HttpC
     {
         var sdk = IasBodyRetargetService.IsSupportedVersion(installed.Version)
             ? await IasAqSdk.GetAsync(storage, Path.Combine(work, "sdk"), ct, http).ConfigureAwait(false) : "";
+        var templates = IasBodyRetargetService.IsSupportedVersion(installed.Version)
+            ? await IasMaterialTemplates.ReadAsync(installed, ct).ConfigureAwait(false) : null;
         return new(installed.Version, Path.Combine(installed.ComponentsDirectory, "expanded", "Generator"),
-            sdk, Metadata(installed), Path.Combine(game, "data"));
+            sdk, Metadata(installed), Path.Combine(game, "data"), templates);
     }
 
     private static string Metadata(IasInstalled installed) =>

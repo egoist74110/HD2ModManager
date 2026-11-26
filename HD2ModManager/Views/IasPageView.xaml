@@ -254,7 +254,7 @@
                     <Expander Header="查看更新说明" Margin="20,8,0,0" IsEnabled="{Binding ElementName=OfficialButton, Path=IsEnabled}"
                               Visibility="{Binding HasReleaseNotes, Converter={StaticResource BoolToVis}}">
                         <Border Background="{StaticResource AppSurfaceBrush}" CornerRadius="6" Padding="10" Margin="0,6,0,0">
-                            <ScrollViewer MaxHeight="220" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
+                            <ScrollViewer MaxHeight="220" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled" scroll:SmoothScrollBehavior.IsEnabled="True">
                                 <TextBlock Text="{Binding ReleaseNotes}" TextWrapping="Wrap"/>
                             </ScrollViewer>
                         </Border>
@@ -454,60 +454,214 @@
                                                 Visibility="{Binding IsRegistered, Converter={StaticResource BoolToVis}}"
                                                 Command="{Binding DataContext.RemoveCharacterCommand, RelativeSource={RelativeSource AncestorType=local:IasPageView}}" CommandParameter="{Binding}"/>
                                     </Grid>
-                                    <Border Margin="0,6,0,0" Padding="12" CornerRadius="6" Background="{StaticResource AppSurfaceBrush}"
+                                    <Border Margin="0,8,0,0" Padding="16,14,16,14" CornerRadius="10"
+                                            Background="{StaticResource SurfaceCard}"
+                                            BorderBrush="{StaticResource StrokeSubtle}" BorderThickness="1"
                                             Visibility="{Binding IsArmorOpen, Converter={StaticResource BoolToVis}}">
+                                        <Border.Resources>
+                                            <Style x:Key="IasGroupExpander" TargetType="Expander">
+                                                <Setter Property="Margin" Value="0,0,0,4"/>
+                                                <Setter Property="Template">
+                                                    <Setter.Value>
+                                                        <ControlTemplate TargetType="Expander">
+                                                            <StackPanel>
+                                                                <ToggleButton x:Name="Head" IsChecked="{Binding IsExpanded, Mode=TwoWay, RelativeSource={RelativeSource TemplatedParent}}" Cursor="Hand" Focusable="False">
+                                                                    <ToggleButton.Template>
+                                                                        <ControlTemplate TargetType="ToggleButton">
+                                                                            <Border Background="Transparent" Padding="2,4,2,6">
+                                                                                <StackPanel Orientation="Horizontal">
+                                                                                    <TextBlock x:Name="Arrow" Text="&#x25B6;" FontSize="9" Width="14" VerticalAlignment="Center" Foreground="{StaticResource TextSecondary}"/>
+                                                                                    <ContentPresenter TextElement.FontWeight="SemiBold" TextElement.Foreground="{StaticResource TextSecondary}"/>
+                                                                                </StackPanel>
+                                                                            </Border>
+                                                                            <ControlTemplate.Triggers>
+                                                                                <Trigger Property="IsChecked" Value="True"><Setter TargetName="Arrow" Property="Text" Value="&#x25BC;"/></Trigger>
+                                                                            </ControlTemplate.Triggers>
+                                                                        </ControlTemplate>
+                                                                    </ToggleButton.Template>
+                                                                    <ContentPresenter ContentSource="Header" RecognizesAccessKey="False"/>
+                                                                </ToggleButton>
+                                                                <ContentPresenter x:Name="Body" Visibility="Collapsed"/>
+                                                            </StackPanel>
+                                                            <ControlTemplate.Triggers>
+                                                                <Trigger Property="IsExpanded" Value="True"><Setter TargetName="Body" Property="Visibility" Value="Visible"/></Trigger>
+                                                            </ControlTemplate.Triggers>
+                                                        </ControlTemplate>
+                                                    </Setter.Value>
+                                                </Setter>
+                                            </Style>
+                                            <Style x:Key="IasArmorChoiceCard" TargetType="RadioButton">
+                                                <Setter Property="Cursor" Value="Hand"/>
+                                                <Setter Property="Margin" Value="0,0,8,8"/>
+                                                <Setter Property="HorizontalAlignment" Value="Stretch"/>
+                                                <Setter Property="HorizontalContentAlignment" Value="Stretch"/>
+                                                <Setter Property="Focusable" Value="True"/>
+                                                <Setter Property="Template">
+                                                    <Setter.Value>
+                                                        <ControlTemplate TargetType="RadioButton">
+                                                            <Border x:Name="Card" CornerRadius="8" BorderThickness="1" Padding="12,9"
+                                                                    BorderBrush="{StaticResource StrokeSubtle}" Background="{StaticResource SurfaceCard}">
+                                                                <Grid>
+                                                                    <Grid.ColumnDefinitions>
+                                                                        <ColumnDefinition Width="Auto"/>
+                                                                        <ColumnDefinition Width="*"/>
+                                                                    </Grid.ColumnDefinitions>
+                                                                    <Grid Width="16" Height="16" VerticalAlignment="Top" Margin="0,2,10,0">
+                                                                        <Ellipse x:Name="Ring" Stroke="{StaticResource StrokeControl}" StrokeThickness="1.5"/>
+                                                                        <Ellipse x:Name="Dot" Width="8" Height="8" Fill="{StaticResource Accent}" Visibility="Collapsed"/>
+                                                                    </Grid>
+                                                                    <ContentPresenter Grid.Column="1" VerticalAlignment="Center"/>
+                                                                </Grid>
+                                                            </Border>
+                                                            <ControlTemplate.Triggers>
+                                                                <Trigger Property="IsMouseOver" Value="True">
+                                                                    <Setter TargetName="Card" Property="BorderBrush" Value="{StaticResource StrokeFocus}"/>
+                                                                    <Setter TargetName="Card" Property="Background" Value="{StaticResource SurfaceInteractiveHover}"/>
+                                                                </Trigger>
+                                                                <Trigger Property="IsChecked" Value="True">
+                                                                    <Setter TargetName="Card" Property="BorderBrush" Value="{StaticResource Accent}"/>
+                                                                    <Setter TargetName="Card" Property="Background" Value="{StaticResource SurfaceSelected}"/>
+                                                                    <Setter TargetName="Ring" Property="Stroke" Value="{StaticResource Accent}"/>
+                                                                    <Setter TargetName="Dot" Property="Visibility" Value="Visible"/>
+                                                                </Trigger>
+                                                                <Trigger Property="IsEnabled" Value="False">
+                                                                    <Setter Property="Cursor" Value="Arrow"/>
+                                                                    <Setter TargetName="Card" Property="Background" Value="{StaticResource SurfaceMuted}"/>
+                                                                    <Setter TargetName="Card" Property="Opacity" Value="0.75"/>
+                                                                    <Setter TargetName="Ring" Property="Visibility" Value="Hidden"/>
+                                                                </Trigger>
+                                                            </ControlTemplate.Triggers>
+                                                        </ControlTemplate>
+                                                    </Setter.Value>
+                                                </Setter>
+                                            </Style>
+                                        </Border.Resources>
                                         <StackPanel>
-                                            <TextBlock Text="换到哪件护甲" FontWeight="SemiBold"/>
-                                            <TextBlock Text="只换身体，头盔保持原样。" Style="{StaticResource AppSupportingText}"/>
-                                            <TextBlock Text="搜索护甲名字或编号" Style="{StaticResource AppSupportingText}" Margin="0,8,0,2"/>
-                                            <TextBox Margin="0,0,0,4" Padding="6,3" Text="{Binding ArmorPanel.Query, UpdateSourceTrigger=PropertyChanged}"
+                                            <TextBlock Text="换到哪件护甲" FontSize="15" FontWeight="SemiBold"/>
+                                            <TextBlock Text="只换身体，头盔保持原样。可按名字或编号搜索。" Style="{StaticResource AppSupportingText}" Margin="0,2,0,0"/>
+
+                                            <Grid Margin="0,12,0,0">
+                                            <TextBox x:Name="ArmorSearchBox" Style="{StaticResource AppSearchBox}" Padding="10,0"
+                                                     Text="{Binding ArmorPanel.Query, UpdateSourceTrigger=PropertyChanged}"
                                                      AutomationProperties.Name="搜索护甲名字或编号"/>
-                                            <TextBlock Text="{Binding ArmorPanel.Message}" Foreground="{StaticResource StatusWarning}" TextWrapping="Wrap"/>
-                                            <ScrollViewer MaxHeight="300" VerticalScrollBarVisibility="Auto">
-                                                <ItemsControl ItemsSource="{Binding ArmorPanel.Groups}" Margin="0,2,8,0">
+                                            <TextBlock Text="搜索护甲名字或编号" VerticalAlignment="Center"
+                                                       IsHitTestVisible="False" Margin="11,0,0,0">
+                                                <TextBlock.Style>
+                                                    <Style TargetType="TextBlock" BasedOn="{StaticResource AppSupportingText}">
+                                                        <Setter Property="Visibility" Value="Collapsed"/>
+                                                        <Style.Triggers>
+                                                            <MultiDataTrigger>
+                                                                <MultiDataTrigger.Conditions>
+                                                                    <Condition Binding="{Binding ArmorPanel.Query}" Value=""/>
+                                                                    <Condition Binding="{Binding IsKeyboardFocused, ElementName=ArmorSearchBox}" Value="False"/>
+                                                                </MultiDataTrigger.Conditions>
+                                                                <Setter Property="Visibility" Value="Visible"/>
+                                                            </MultiDataTrigger>
+                                                        </Style.Triggers>
+                                                    </Style>
+                                                </TextBlock.Style>
+                                            </TextBlock>
+                                            </Grid>
+
+                                            <Border Margin="0,10,0,0" Padding="10,7" CornerRadius="6" Background="{StaticResource SurfaceMuted}"
+                                                    BorderBrush="{StaticResource StatusWarning}" BorderThickness="3,0,0,0">
+                                                <Border.Style>
+                                                    <Style TargetType="Border">
+                                                        <Setter Property="Visibility" Value="Visible"/>
+                                                        <Style.Triggers>
+                                                            <DataTrigger Binding="{Binding ArmorPanel.Message}" Value="{x:Null}">
+                                                                <Setter Property="Visibility" Value="Collapsed"/>
+                                                            </DataTrigger>
+                                                            <DataTrigger Binding="{Binding ArmorPanel.Message}" Value="">
+                                                                <Setter Property="Visibility" Value="Collapsed"/>
+                                                            </DataTrigger>
+                                                        </Style.Triggers>
+                                                    </Style>
+                                                </Border.Style>
+                                                <TextBlock Text="{Binding ArmorPanel.Message}" Foreground="{StaticResource StatusWarning}" TextWrapping="Wrap"/>
+                                            </Border>
+
+                                            <ScrollViewer MaxHeight="320" VerticalScrollBarVisibility="Auto" Margin="0,8,0,0" scroll:SmoothScrollBehavior.IsEnabled="True">
+                                                <ItemsControl ItemsSource="{Binding ArmorPanel.Groups}">
                                                     <ItemsControl.ItemTemplate>
                                                         <DataTemplate>
-                                                            <StackPanel Margin="0,2,0,4">
-                                                                <TextBlock Text="{Binding Header}" Style="{StaticResource AppSupportingText}" FontWeight="SemiBold"/>
-                                                                <ItemsControl ItemsSource="{Binding Options}">
+                                                            <StackPanel Margin="0,6,0,0">
+                                                                <StackPanel.Style>
+                                                                    <Style TargetType="StackPanel">
+                                                                        <Style.Triggers>
+                                                                            <DataTrigger Binding="{Binding Options.Count}" Value="0">
+                                                                                <Setter Property="Visibility" Value="Collapsed"/>
+                                                                            </DataTrigger>
+                                                                        </Style.Triggers>
+                                                                    </Style>
+                                                                </StackPanel.Style>
+                                                                <Expander Header="{Binding Header}">
+                                                                    <Expander.Style>
+                                                                        <Style TargetType="Expander" BasedOn="{StaticResource IasGroupExpander}">
+                                                                            <Setter Property="IsExpanded" Value="True"/>
+                                                                            <Style.Triggers>
+                                                                                <DataTrigger Binding="{Binding Name}" Value="换不了">
+                                                                                    <Setter Property="IsExpanded" Value="False"/>
+                                                                                </DataTrigger>
+                                                                            </Style.Triggers>
+                                                                        </Style>
+                                                                    </Expander.Style>
+                                                                    <ItemsControl ItemsSource="{Binding Options}">
+                                                                    <ItemsControl.ItemsPanel>
+                                                                        <ItemsPanelTemplate>
+                                                                            <UniformGrid Columns="4"/>
+                                                                        </ItemsPanelTemplate>
+                                                                    </ItemsControl.ItemsPanel>
                                                                     <ItemsControl.ItemTemplate>
                                                                         <DataTemplate>
-                                                                            <RadioButton GroupName="IasBodyRetarget" Margin="0,4,0,3"
+                                                                            <RadioButton GroupName="IasBodyRetarget" Style="{StaticResource IasArmorChoiceCard}"
                                                                                          IsEnabled="{Binding CanSelect}" Command="{Binding SelectCommand}">
                                                                                 <StackPanel>
-                                                                                    <StackPanel.Style>
-                                                                                        <Style TargetType="StackPanel">
-                                                                                            <Style.Triggers>
-                                                                                                <DataTrigger Binding="{Binding CanSelect}" Value="False">
-                                                                                                    <Setter Property="Opacity" Value="0.6"/>
-                                                                                                </DataTrigger>
-                                                                                            </Style.Triggers>
-                                                                                        </Style>
-                                                                                    </StackPanel.Style>
-                                                                                    <WrapPanel>
-                                                                                        <TextBlock Text="{Binding Name}"/>
-                                                                                        <TextBlock Text="原护甲" Margin="8,0,0,0" FontWeight="SemiBold"
-                                                                                                   Visibility="{Binding IsOriginal, Converter={StaticResource BoolToVis}}"/>
-                                                                                    </WrapPanel>
-                                                                                    <TextBlock Text="{Binding Detail}" Style="{StaticResource AppSupportingText}" TextWrapping="Wrap"/>
+                                                                                    <DockPanel LastChildFill="True">
+                                                                                        <Border DockPanel.Dock="Right" Style="{StaticResource AppBadge}" Padding="6,1" Margin="8,0,0,0"
+                                                                                                Visibility="{Binding IsOriginal, Converter={StaticResource BoolToVis}}">
+                                                                                            <TextBlock Text="原护甲" FontSize="11" Foreground="{StaticResource Accent}"/>
+                                                                                        </Border>
+                                                                                        <TextBlock Text="{Binding Name}" FontWeight="SemiBold" TextTrimming="CharacterEllipsis" ToolTip="{Binding Name}"/>
+                                                                                    </DockPanel>
+                                                                                    <TextBlock Text="{Binding Detail}" TextWrapping="Wrap" Margin="0,3,0,0" FontSize="12">
+                                                                                        <TextBlock.Style>
+                                                                                            <Style TargetType="TextBlock" BasedOn="{StaticResource AppSupportingText}">
+                                                                                                <Style.Triggers>
+                                                                                                    <DataTrigger Binding="{Binding Occupied}" Value="True">
+                                                                                                        <Setter Property="Foreground" Value="{StaticResource StatusWarning}"/>
+                                                                                                    </DataTrigger>
+                                                                                                </Style.Triggers>
+                                                                                            </Style>
+                                                                                        </TextBlock.Style>
+                                                                                    </TextBlock>
                                                                                 </StackPanel>
                                                                             </RadioButton>
                                                                         </DataTemplate>
                                                                     </ItemsControl.ItemTemplate>
                                                                 </ItemsControl>
+                                                                </Expander>
                                                             </StackPanel>
                                                         </DataTemplate>
                                                     </ItemsControl.ItemTemplate>
                                                 </ItemsControl>
                                             </ScrollViewer>
-                                            <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,6,0,0">
-                                                <Button Content="收起" Style="{StaticResource AppSecondaryButton}"
-                                                        Command="{Binding DataContext.CloseArmorCommand, RelativeSource={RelativeSource AncestorType=local:IasPageView}}"/>
-                                                <Button Content="换过去" Style="{StaticResource AppPrimaryButton}" Margin="8,0,0,0"
-                                                        IsEnabled="{Binding ArmorPanel.HasSelection}"
-                                                        Command="{Binding DataContext.ApplyArmorCommand, RelativeSource={RelativeSource AncestorType=local:IasPageView}}"
-                                                        CommandParameter="{Binding}"/>
-                                            </StackPanel>
+
+                                            <Border Margin="0,6,0,0" Padding="0,12,0,0" BorderBrush="{StaticResource StrokeSubtle}" BorderThickness="0,1,0,0">
+                                                <DockPanel>
+                                                    <StackPanel DockPanel.Dock="Right" Orientation="Horizontal">
+                                                        <Button Content="收起" Style="{StaticResource AppSecondaryButton}"
+                                                                Command="{Binding DataContext.CloseArmorCommand, RelativeSource={RelativeSource AncestorType=local:IasPageView}}"/>
+                                                        <Button Content="换过去" Style="{StaticResource AppPrimaryButton}" Margin="8,0,0,0" MinWidth="88"
+                                                                IsEnabled="{Binding ArmorPanel.HasSelection}"
+                                                                Command="{Binding DataContext.ApplyArmorCommand, RelativeSource={RelativeSource AncestorType=local:IasPageView}}"
+                                                                CommandParameter="{Binding}"/>
+                                                    </StackPanel>
+                                                    <TextBlock VerticalAlignment="Center" TextTrimming="CharacterEllipsis" Style="{StaticResource AppSupportingText}">
+                                                        <Run Text="已选："/><Run Text="{Binding ArmorPanel.Selected.Name, Mode=OneWay, FallbackValue=还没选}" FontWeight="SemiBold" Foreground="{StaticResource TextPrimary}"/>
+                                                    </TextBlock>
+                                                </DockPanel>
+                                            </Border>
                                         </StackPanel>
                                     </Border>
                                     <Border Margin="0,6,0,0" Padding="12" CornerRadius="6"

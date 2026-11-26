@@ -20,7 +20,7 @@ public sealed class IasStandardConverter(Func<string, uint> boneHash, IasTargetR
 	private readonly PatchEntryPayloadReader payloadReader = new();
 
 	public async Task<IasStandardResult> ConvertAsync(string sampleDirectory, string gameData, string outputDirectory,
-		CancellationToken cancellationToken = default, bool mergeHelmet = false)
+		CancellationToken cancellationToken = default, bool mergeHelmet = false, string? displayName = null)
 	{
 		var sample = Path.GetFullPath(sampleDirectory);
 		var output = Path.GetFullPath(outputDirectory);
@@ -153,11 +153,21 @@ public sealed class IasStandardConverter(Func<string, uint> boneHash, IasTargetR
 				await WritePatchAsync(sourcePath, $"{group.Key}.patch_{number}", template, package, group.ToArray(), cancellationToken)
 					.ConfigureAwait(false);
 			}
-			var name = await ReadPackageNameAsync(main, cancellationToken).ConfigureAwait(false);
+			var metadata = await ReadPackageMetadataAsync(sample, main, displayName, cancellationToken).ConfigureAwait(false);
 			var targets = string.Join(" / ", resolved.Where(item => merge is null || !item.Target.Helmet).Select(item => item.Target.Name).Distinct(StringComparer.Ordinal));
+			var manifestName = string.IsNullOrWhiteSpace(targets)
+				? $"{metadata.Name}（由 IAS 转换）"
+				: $"{metadata.Name} · {targets}（由 IAS 转换）";
 			Directory.CreateDirectory(package);
-			await File.WriteAllTextAsync(Path.Combine(package, "manifest.json"), SerializeManifest($"{name} · {targets}",
-				manifestGroups), cancellationToken).ConfigureAwait(false);
+			string? iconPath = null;
+			if (metadata.IconSourcePath is { } iconSource)
+			{
+				var iconFileName = "icon" + Path.GetExtension(iconSource).ToLowerInvariant();
+				File.Copy(iconSource, Path.Combine(package, iconFileName), overwrite: true);
+				iconPath = iconFileName;
+			}
+			await File.WriteAllTextAsync(Path.Combine(package, "manifest.json"), SerializeManifest(manifestName,
+				manifestGroups, metadata.Description, iconPath), cancellationToken).ConfigureAwait(false);
 			await File.WriteAllTextAsync(Path.Combine(output, "dependencies.json"), JsonSerializer.Serialize(new
 			{
 				Materials = usedMaterials.Order().Select(id => id.ToString("x16")),
@@ -446,11 +456,19 @@ public sealed class IasStandardConverter(Func<string, uint> boneHash, IasTargetR
 			throw new InvalidDataException($"Could not verify the physbone container in {gpuPath}.");
 	}
 
-	internal static string SerializeManifest(string name, IEnumerable<IasOptionGroup> groups) => JsonSerializer.Serialize(new
+	internal static string SerializeManifest(string name, IEnumerable<IasOptionGroup> groups,
+		string? description = null, string? iconPath = null)
 	{
-		name,
-		sectionalPatchNumbering = "ias-per-archive-v1",
-		options = groups.Select(group =>
+		var manifest = new Dictionary<string, object?>
+		{
+			["name"] = name,
+			["sectionalPatchNumbering"] = "ias-per-archive-v1",
+		};
+		if (!string.IsNullOrWhiteSpace(description))
+			manifest["description"] = description;
+		if (!string.IsNullOrWhiteSpace(iconPath))
+			manifest["iconPath"] = iconPath;
+		manifest["options"] = groups.Select(group =>
 		{
 			var primary = group.Options[0];
 			var subs = new List<object> { new { name = primary.Name } };
@@ -462,8 +480,9 @@ public sealed class IasStandardConverter(Func<string, uint> boneHash, IasTargetR
 				include = new[] { primary.Folder },
 				subOptions = subs,
 			};
-		}),
-	}, JsonOptions);
+		});
+		return JsonSerializer.Serialize(manifest, JsonOptions);
+	}
 
 	private async Task<(IReadOnlyList<PatchArchiveAdditionalEntry>, IReadOnlyList<IasDependency>, IReadOnlyList<IasDependency>)> ResolveMaterialsAsync(
 		IReadOnlyDictionary<AssetKey, PatchTocEntry> resources, IReadOnlySet<ulong> usedMaterials,
@@ -498,6 +517,24 @@ public sealed class IasStandardConverter(Func<string, uint> boneHash, IasTargetR
 			{
 				var payload = await payloadReader.ReadPayloadAsync(source, cancellationToken).ConfigureAwait(false);
 				material = defaults.Migrate(payload.TocData);
+				var missingIds = new HashSet<ulong>();
+				foreach (var texId in references.ReadTextureIds(material))
+				{
+					if (texId == 0)
+						continue;
+					var texKey = new AssetKey(MaterialDependencyResolver.TextureTypeId, texId);
+					if (!resources.ContainsKey(texKey) && await FindGameEntryAsync(texKey).ConfigureAwait(false) is null)
+						missingIds.Add(texId);
+				}
+				if (missingIds.Count > 0)
+				{
+					var sourceParent = IasMaterialDefaults.ReadParent(material);
+					var parentMaterial = sourceParent != 0
+						? await ReadGameMaterialAsync(new AssetKey(MaterialDependencyResolver.MaterialTypeId, sourceParent)).ConfigureAwait(false)
+						: null;
+					var parentSlots = parentMaterial is not null ? IasMaterialDefaults.ReadSlots(parentMaterial) : null;
+					material = defaults.MigrateMissing(material, missingIds.Contains, parentSlots);
+				}
 				entries.Add(ToAddition(payload with { TocData = material }));
 			}
 			else
@@ -590,19 +627,97 @@ public sealed class IasStandardConverter(Func<string, uint> boneHash, IasTargetR
 
 	private static string ArchiveName(PatchTocEntry entry) => Path.GetFileNameWithoutExtension(entry.SourceFilePath).ToLowerInvariant();
 
-	private static async Task<string> ReadPackageNameAsync(string main, CancellationToken token)
+	internal sealed record PackageMetadata(string Name, string? Description, string? IconSourcePath);
+
+	internal static async Task<PackageMetadata> ReadPackageMetadataAsync(string sample, string main,
+		string? preferredName, CancellationToken token)
 	{
-		var path = Path.Combine(main, "manifest.json");
-		if (File.Exists(path))
+		var companion = Path.Combine(sample, "companion");
+		var (companionName, companionDescription) = await ReadJsonSummaryAsync(Path.Combine(companion, "mod_group.json"), token).ConfigureAwait(false);
+		var (mainName, mainDescription, mainIcon) = await ReadMainManifestAsync(main, token).ConfigureAwait(false);
+		var name = FirstNonBlank(preferredName, companionName, mainName) ?? "IAS 角色";
+		var description = FirstNonBlank(mainDescription, await ReadDescriptionFileAsync(main, token).ConfigureAwait(false), companionDescription);
+		var iconSource = ResolveIconSource(main, companion, mainIcon);
+		return new(name, description, iconSource);
+	}
+
+	private static async Task<(string? Name, string? Description)> ReadJsonSummaryAsync(string path, CancellationToken token)
+	{
+		if (!File.Exists(path)) return (null, null);
+		try
 		{
 			using var document = JsonDocument.Parse(await File.ReadAllTextAsync(path, token).ConfigureAwait(false));
-			foreach (var property in document.RootElement.EnumerateObject())
-				if (property.Name.Equals("name", StringComparison.OrdinalIgnoreCase) &&
-					property.Value.ValueKind == JsonValueKind.String && property.Value.GetString() is { Length: > 0 } name)
-					return name;
+			if (document.RootElement.ValueKind != JsonValueKind.Object) return (null, null);
+			return (TryGetStringProperty(document.RootElement, "name"), TryGetStringProperty(document.RootElement, "description"));
 		}
-		return "IAS 角色";
+		catch (JsonException) { return (null, null); }
 	}
+
+	private static async Task<(string? Name, string? Description, string? IconPath)> ReadMainManifestAsync(string main, CancellationToken token)
+	{
+		var path = Path.Combine(main, "manifest.json");
+		if (!File.Exists(path)) return (null, null, null);
+		try
+		{
+			using var document = JsonDocument.Parse(await File.ReadAllTextAsync(path, token).ConfigureAwait(false));
+			if (document.RootElement.ValueKind != JsonValueKind.Object) return (null, null, null);
+			var root = document.RootElement;
+			return (
+				TryGetStringProperty(root, "name"),
+				TryGetStringProperty(root, "description"),
+				FirstNonBlank(TryGetStringProperty(root, "iconPath"), TryGetStringProperty(root, "icon_path")));
+		}
+		catch (JsonException) { return (null, null, null); }
+	}
+
+	private static async Task<string?> ReadDescriptionFileAsync(string main, CancellationToken token)
+	{
+		var path = Path.Combine(main, "Description.txt");
+		if (!File.Exists(path)) return null;
+		var text = (await File.ReadAllTextAsync(path, token).ConfigureAwait(false)).Trim();
+		return text.Length > 0 ? text : null;
+	}
+
+	private static string? ResolveIconSource(string main, string companion, string? manifestIconPath)
+	{
+		if (!string.IsNullOrWhiteSpace(manifestIconPath))
+		{
+			var candidate = Path.GetFullPath(Path.Combine(main, manifestIconPath.Replace('/', Path.DirectorySeparatorChar)));
+			if (IsWithin(candidate, main) && File.Exists(candidate) && IsSupportedIconExtension(candidate))
+				return candidate;
+		}
+		return FindStandardIconFile(companion) ?? FindStandardIconFile(main);
+	}
+
+	private static string? FindStandardIconFile(string directory)
+	{
+		if (!Directory.Exists(directory)) return null;
+		foreach (var ext in SupportedIconExtensions)
+		{
+			var path = Path.Combine(directory, "icon" + ext);
+			if (File.Exists(path)) return path;
+		}
+		return null;
+	}
+
+	private static readonly string[] SupportedIconExtensions = [".png", ".jpg", ".jpeg", ".bmp", ".webp"];
+
+	private static bool IsSupportedIconExtension(string path) =>
+		SupportedIconExtensions.Contains(Path.GetExtension(path), StringComparer.OrdinalIgnoreCase);
+
+	private static string? TryGetStringProperty(JsonElement element, string name)
+	{
+		foreach (var property in element.EnumerateObject())
+			if (property.Name.Equals(name, StringComparison.OrdinalIgnoreCase) &&
+				property.Value.ValueKind == JsonValueKind.String &&
+				property.Value.GetString() is { } value &&
+				!string.IsNullOrWhiteSpace(value))
+				return value.Trim();
+		return null;
+	}
+
+	private static string? FirstNonBlank(params string?[] values) =>
+		values.FirstOrDefault(value => !string.IsNullOrWhiteSpace(value))?.Trim();
 
 	private static PatchArchiveAdditionalEntry ToAddition(PatchEntryPayload payload) =>
 		new(payload.Entry.AssetKey, payload.TocData, payload.StreamData, payload.GpuResourceData,

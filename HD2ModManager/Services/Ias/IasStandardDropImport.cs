@@ -21,9 +21,13 @@ public static class IasStandardDropImport
                 IasComponentStore.GetInstalled(paths), ct).ConfigureAwait(false);
             var manifestPath = Path.Combine(folder, "manifest.json");
             var manifest = JsonNode.Parse(await File.ReadAllTextAsync(manifestPath, ct).ConfigureAwait(false))!.AsObject();
-            manifest["name"] = manifest["name"]!.GetValue<string>() + "（由 IAS 转换）";
-            await File.WriteAllTextAsync(manifestPath, manifest.ToJsonString(new JsonSerializerOptions { WriteIndented = true }), ct)
-                .ConfigureAwait(false);
+            var name = manifest["name"]!.GetValue<string>();
+            if (!name.EndsWith("（由 IAS 转换）", StringComparison.Ordinal))
+            {
+                manifest["name"] = name + "（由 IAS 转换）";
+                await File.WriteAllTextAsync(manifestPath, manifest.ToJsonString(new JsonSerializerOptions { WriteIndented = true }), ct)
+                    .ConfigureAwait(false);
+            }
 
             var plan = await CoreServices.CreateModImportPlanner().PlanFolderAsync(folder, ct).ConfigureAwait(false);
             var errors = plan.Diagnostics.Where(diagnostic => diagnostic.IsBlocking).Select(diagnostic => diagnostic.Message).ToArray();
