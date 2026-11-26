@@ -8,7 +8,7 @@ namespace HD2SourceMigration.IasConversion;
 
 internal static class IasNativeMesh
 {
-	internal static UnitMeshModel UseFourWeightStreams(UnitMeshModel donor)
+	internal static UnitMeshModel UseFourWeightStreams(UnitMeshModel donor, bool onlyPacked = false)
 	{
 		var format = UnitStreamAbiProfiles.GetCanonicalWriterProfile(donor) == UnitStreamAbiProfileKind.LegacyPre10800438
 			? 31u : 35u;
@@ -18,6 +18,10 @@ internal static class IasNativeMesh
 			Streams = donor.Streams.Select(stream =>
 			{
 				if (!visualStreams.Contains(stream.Index))
+					return stream;
+				// VPK 写入已有标量权重的外壳时，Canonical 会用完整的 SDK 流布局重建。
+				// 只接管会被原样保留的 10:10:10:2 权重，避免改变那些流的 UV 格式。
+				if (onlyPacked && !stream.Components.Any(component => component.Type == 7 && component.FormatName == "vec4_1010102"))
 					return stream;
 				var components = stream.Components.Select(component => component.Type == 7
 					? component with { Format = format, FormatName = "vec4_half", Size = 8 }

@@ -6,6 +6,7 @@ using HD2ModAdaptation.PatchReconstruction;
 using HD2ModAdaptation.PatchReconstruction.UnitMesh;
 using HD2ModAdaptation.PatchReconstruction.UnitMesh.Canonical;
 using HD2SourceMigration;
+using HD2SourceMigration.IasConversion;
 using HD2SourceMigration.Retarget;
 using HD2SourceMigration.Segmentation;
 using HD2SourceMigration.VpkConversion;
@@ -545,8 +546,11 @@ internal static class VpkExtractor
 
 				var customization = donorRead.Model.CustomizationInfo;
 				var author = new UnitAuthor();
+				// 同一接缝可能跨多个 Unit。统一用半精度四槽，避免某个外壳
+				// 沿用 10:10:10:2 权重并在编码时丢掉第四根骨的影响。
+				var donor = IasNativeMesh.UseFourWeightStreams(donorRead.Model, onlyPacked: true);
 				var authored = author.Author(new UnitAuthorRequest(
-					donorRead.Model,
+					donor,
 					donorRead.Payload.TocData,
 					unitTransformInfo,
 					builtMesh,
