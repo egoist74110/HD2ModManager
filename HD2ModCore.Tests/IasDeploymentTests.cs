@@ -186,6 +186,33 @@ public sealed class IasDeploymentTests
 	}
 
 	[Fact]
+	public async Task DisabledRoleManualRetargetToOccupiedArmorKeepsOccupantEnabledAndStaysDisabled()
+	{
+		var engine = new FakeRetargeter();
+		using var fixture = await Fixture.CreateAsync(retargeter: engine);
+		fixture.UseManifestMain();
+		fixture.SetArchiveOwner("sdkgroup.blocker", true, RetargetOriginal);
+		var added = await fixture.AddDirectAsync();
+		await fixture.Service.SetCharacterEnabledAsync(added.Role.Id, false, default);
+		fixture.SetArchiveOwner("sdkgroup.blocker", true, RetargetOriginal, Dp8Helmet);
+		fixture.Worker.Requests.Clear();
+
+		var choices = await fixture.Service.GetRetargetChoicesAsync(added.Role.Id, default);
+		var target = choices.Choices.Single(choice => choice.Original);
+		Assert.Null(target.Reason);
+		Assert.Equal(new[] { "sdkgroup.blocker" }, target.Occupants);
+
+		var moved = await fixture.Service.RetargetAsync(added.Role.Id, RetargetOriginal, default, target.OccupantIds);
+
+		Assert.True(moved.Retarget!.ReturnedToOriginal);
+		Assert.Empty(moved.Retarget.Occupants);
+		Assert.Equal("sdkgroup.role", moved.Role.Id);
+		Assert.False(Assert.Single(await fixture.Service.GetRolesWithStateAsync(default)).Enabled);
+		Assert.True(bool.Parse(File.ReadAllText(Path.Combine(fixture.IasLibrary, "sdkgroup.blocker.json"))));
+		Assert.DoesNotContain(fixture.Worker.Requests, request => request.Command == "set-enabled");
+	}
+
+	[Fact]
 	public async Task DirectPairWithConflictInstallsDisabled()
 	{
 		using var fixture = await Fixture.CreateAsync();

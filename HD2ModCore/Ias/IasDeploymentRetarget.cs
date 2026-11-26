@@ -10,7 +10,7 @@ public sealed partial class IasDeploymentService
 
 	private sealed record RetargetPreparation(IasInstalled Installed, string? PreviousId, string? PreviousRevision,
 		IasCharacterPackage? Derived, IasRoleArmor? Armor, string[] Archives, IasRetargetChange? Change, string? Hint,
-		bool Manual, string[] ExpectedOwners);
+		bool Manual, string[] ExpectedOwners, bool ExpectedEnabled = true);
 
 	public async Task<IasRetargetAnalysis> GetRetargetChoicesAsync(string id, CancellationToken ct)
 	{
@@ -48,22 +48,23 @@ public sealed partial class IasDeploymentService
 			var originalArchives = await ReadArchiveDataAsync<string[]>(installed, work, "companion-archives", package.CompanionZip, ct, isolatedRead: true)
 				.ConfigureAwait(false);
 			var owners = await GetArchiveOccupancyAsync(ct).ConfigureAwait(false);
+			var roleEnabled = owners.Any(owner => owner.Enabled && owner.Id == id);
 			var choices = DescribeChoices(inspection, role, originalArchives, owners);
 			var choice = choices.Choices.SingleOrDefault(item => item.Archive == archive)
 				?? throw new InvalidDataException("目标护甲已失效或已是当前护甲。");
 			if (choice.Reason is not null) throw new InvalidDataException(choice.Reason);
-			if (displayedOccupants is not null && !displayedOccupants.ToHashSet(StringComparer.Ordinal).SetEquals(choice.OccupantIds ?? []))
+			if (roleEnabled && displayedOccupants is not null && !displayedOccupants.ToHashSet(StringComparer.Ordinal).SetEquals(choice.OccupantIds ?? []))
 				throw new InvalidOperationException("护甲占用已变更，请重新选择。");
 			var originalName = role.Armor?.OriginalName ?? NameOf(inspection, original);
 			var from = role.Armor?.CurrentName ?? originalName;
 			var configured = new IasRoleArmor(original, archive, originalName, choice.Name, inspection.Author ?? role.Armor?.Author);
 			var archives = originalArchives.Where(item => !SameArchive(item, original)).Append(archive).ToArray();
-			var conflicts = ConflictsFor(id, archives, owners);
+			var conflicts = roleEnabled ? ConflictsFor(id, archives, owners) : [];
 			var derived = choice.Original ? null : await BuildVerifiedRetargetAsync(installed, package, archive, archives,
 				Path.Combine(work, "build"), ct).ConfigureAwait(false);
 			var change = new IasRetargetChange(configured, from, choice.Original, conflicts.Select(owner => owner.Name).Distinct().ToArray());
 			var prepared = new RetargetPreparation(installed, id, role.LibraryRevision, derived, configured, archives, change, null,
-				true, conflicts.Select(owner => owner.Id).ToArray());
+				true, conflicts.Select(owner => owner.Id).ToArray(), roleEnabled);
 			return await CommitAddAsync(package, IasRoleSource.IasPackage, ct, (_, token) => stamp.VerifyAsync(token), retarget: prepared)
 				.ConfigureAwait(false);
 		}
@@ -135,8 +136,9 @@ public sealed partial class IasDeploymentService
 			var label = role.Armor?.OriginalName ?? original;
 			choices.Insert(0, new(original, label, label + " " + original));
 		}
+		var roleEnabled = owners.Any(owner => owner.Enabled && owner.Id == role.Id);
 		var helmets = archives.Where(archive => !SameArchive(archive, original)).ToArray();
-		var headOwners = ConflictsFor(role.Id, helmets, owners);
+		var headOwners = roleEnabled ? ConflictsFor(role.Id, helmets, owners) : [];
 		return analysis with
 		{
 			BodyArchive = original,

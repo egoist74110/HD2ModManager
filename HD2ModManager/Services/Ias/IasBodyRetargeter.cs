@@ -78,7 +78,7 @@ internal sealed class IasBodyRetargeter(StoragePaths storage, string game) : IIa
 
     private async Task<IasBodyRetargetService> OpenAsync(IasInstalled installed, string work, CancellationToken ct)
     {
-        var sdk = installed.Version == "1.6.4"
+        var sdk = IasBodyRetargetService.IsSupportedVersion(installed.Version)
             ? await IasAqSdk.GetAsync(storage, Path.Combine(work, "sdk"), ct).ConfigureAwait(false) : "";
         return new(installed.Version, Path.Combine(installed.ComponentsDirectory, "expanded", "Generator"),
             sdk, Metadata(installed), Path.Combine(game, "data"));

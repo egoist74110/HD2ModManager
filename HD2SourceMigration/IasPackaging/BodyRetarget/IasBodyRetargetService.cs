@@ -19,6 +19,8 @@ public sealed record IasBodyRetargetOutput(string MainZip, string CompanionZip, 
 
 public sealed class IasBodyRetargetService(string version, string generator, string sdk, string metadata, string gameData)
 {
+	public static bool IsSupportedVersion(string? version) => version is "1.6.4" or "1.6.5";
+
 	private const ulong Unit = PatchUnitMeshReader.UnitTypeId;
 
 	private sealed record Donor(string Unit, string Archive, string Sha, int Nodes, string? Point);
@@ -189,7 +191,7 @@ public sealed class IasBodyRetargetService(string version, string generator, str
 
 	private async Task<Plan> ReadPlanAsync(string source, IReadOnlyList<string> targets, string? build, string work, CancellationToken ct)
 	{
-		if (version != "1.6.4") return new(null, null, null, null, $"IAS {version} 的配套格式尚未验证。", null, null, null, null);
+		if (!IsSupportedVersion(version)) return new(null, null, null, null, $"IAS {version} 的配套格式尚未验证。", null, null, null, null);
 		var script = Path.Combine(AppContext.BaseDirectory, "data", "resources", "ias", "ias_retarget.py");
 		var python = Path.Combine(generator, "python", "python.exe");
 		if (!File.Exists(script) || !File.Exists(python))

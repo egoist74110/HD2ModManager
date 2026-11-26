@@ -450,11 +450,16 @@ public sealed partial class IasDeploymentService
 				var latest = ConflictsFor(previous?.Id ?? "", retarget.Archives, owners);
 				if (retarget.Manual)
 				{
-					var body = retarget.Armor!.CurrentArchive;
-					if (latest.Any(owner => !owner.Archives.Contains(body, StringComparer.OrdinalIgnoreCase)))
-						throw new InvalidOperationException("原头盔仍被占用，请先处理头盔冲突。");
-					if (!latest.Select(owner => owner.Id).ToHashSet(StringComparer.Ordinal).SetEquals(retarget.ExpectedOwners))
-						throw new InvalidOperationException("护甲占用已变更，请重新选择。");
+					if (retarget.ExpectedEnabled != enabled)
+						throw new InvalidOperationException("角色启用状态已变更，请重新选择。");
+					if (enabled)
+					{
+						var body = retarget.Armor!.CurrentArchive;
+						if (latest.Any(owner => !owner.Archives.Contains(body, StringComparer.OrdinalIgnoreCase)))
+							throw new InvalidOperationException("原头盔仍被占用，请先处理头盔冲突。");
+						if (!latest.Select(owner => owner.Id).ToHashSet(StringComparer.Ordinal).SetEquals(retarget.ExpectedOwners))
+							throw new InvalidOperationException("护甲占用已变更，请重新选择。");
+					}
 				}
 				else if (latest.Length != 0 && (previous is null || enabled))
 				{
@@ -480,7 +485,7 @@ public sealed partial class IasDeploymentService
 			else
 			{
 				var conflicts = selected?.Manual == true
-					? await SwapConflictsAsync(installed, tx, id, token, selected.ExpectedOwners).ConfigureAwait(false)
+					? enabled ? await SwapConflictsAsync(installed, tx, id, token, selected.ExpectedOwners).ConfigureAwait(false) : []
 					: await ReadConflictsAsync(installed, tx, id, token).ConfigureAwait(false);
 				conflict = await DescribeConflictsAsync(conflicts, token).ConfigureAwait(false);
 				if (previous is null && conflict is not null) enabled = false;

@@ -239,7 +239,7 @@ public sealed class IasPageViewModelTests
         panel.Show(ArmorChoices());
         Assert.Equal(new[] { "空闲，能换（1）", "被占用（1）", "换不了（1）" }, panel.Groups.Select(group => group.Header));
         Assert.True(panel.Groups[1].Options[0].IsOriginal);
-        Assert.Contains("煤渣砖重制", panel.Groups[1].Options[0].Detail);
+        Assert.Equal("『煤渣砖重制』占着，选了会停用它", panel.Groups[1].Options[0].Detail);
         Assert.False(panel.Groups[2].Options[0].CanSelect);
         panel.Groups[1].Options[0].SelectCommand.Execute(null);
         Assert.True(panel.HasSelection);
@@ -248,6 +248,10 @@ public sealed class IasPageViewModelTests
         Assert.Equal("AD-49 阿波罗神", Assert.Single(panel.Groups[0].Options).Name);
         Assert.Empty(panel.Groups[1].Options);
         Assert.Empty(panel.Groups[2].Options);
+
+        var disabledPanel = new IasArmorPanelViewModel(willSwapOccupants: false);
+        disabledPanel.Show(ArmorChoices());
+        Assert.Equal("『煤渣砖重制』占着，启用时会停用它", disabledPanel.Groups[1].Options[0].Detail);
     }
 
     private static IasRetargetAnalysis ArmorChoices() => new("sr64", "长啸云天",

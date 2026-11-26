@@ -525,7 +525,7 @@ public sealed class IasPageViewModel : FullWorkspacePageViewModel
         CloseConversion();
         if (wasOpen) return;
         _armorCharacter = character;
-        var panel = new IasArmorPanelViewModel();
+        var panel = new IasArmorPanelViewModel(character.Enabled == true);
         character.ArmorPanel = panel;
         using var cancellation = new CancellationTokenSource();
         _loadArmor = cancellation;
