@@ -75,6 +75,115 @@ public sealed class IasDeploymentTests
 
 	private const string ReShadeConflict = "游戏 bin/dxgi.dll 无法识别为 ReShade，可能属于其他 Mod。请先核对这个文件的来源；本次安装未覆盖任何文件。";
 	private const string Dp8Helmet = "59d238094a164c88";
+	private const string RetargetOriginal = "b186eae3f2b61509";
+	private const string RetargetBody = "e4e41c5f9c3848f0";
+	private const string RetargetOther = "74bc9cf98d65b1bf";
+	private const string RetargetRejected = "27d61c15acfeaa0e";
+
+	[Fact]
+	public async Task DroppedPairRetargetsBodyAndRedropUsesOriginalIdentityAndContent()
+	{
+		var engine = new FakeRetargeter();
+		using var fixture = await Fixture.CreateAsync(retargeter: engine);
+		fixture.UseManifestMain();
+		fixture.SetArchiveOwner("sdkgroup.blocker", true, RetargetOriginal);
+		var added = await fixture.AddDirectAsync();
+
+		Assert.Equal(IasAddDisposition.Installed, added.Disposition);
+		Assert.Equal(RetargetBody, added.Retarget!.Armor.CurrentArchive);
+		Assert.Equal(new[] { "sdkgroup.blocker" }, added.Retarget.Occupants);
+		Assert.Equal("sdkgroup.moved", added.Role.Id);
+		Assert.Equal("fixture-group", added.Role.PackageIdentity);
+		Assert.True(Assert.Single(await fixture.Service.GetRolesWithStateAsync(default)).Enabled);
+		Assert.True(File.Exists(Path.Combine(fixture.Service.Sources(added.Role.Id), "retarget-original", "main", "manifest.json")));
+		Assert.Empty((await fixture.Service.ScanRolesAsync(default)).Library);
+		Assert.Single(fixture.Worker.Requests, request => request.Command == "regenerate");
+
+		var same = await fixture.AddDirectAsync();
+		Assert.Equal(IasAddDisposition.Identical, same.Disposition);
+		Assert.Equal(1, engine.Builds);
+
+		fixture.ChangeCompanion("新版", "fixture-group");
+		var updated = await fixture.AddDirectAsync();
+		Assert.Equal(IasAddDisposition.Updated, updated.Disposition);
+		Assert.Equal(RetargetBody, updated.Role.Armor!.CurrentArchive);
+		Assert.Equal(added.Role.Name, updated.Role.Name);
+		Assert.Equal(added.Role.ModIds, updated.Role.ModIds);
+		Assert.Equal(2, engine.Builds);
+
+		engine.BlockAll = true;
+		fixture.ChangeCompanion("不能换的新版本", "fixture-group");
+		var fallback = await fixture.AddDirectAsync();
+		Assert.Equal(IasAddDisposition.Updated, fallback.Disposition);
+		Assert.Contains("已退回原护甲", fallback.RetargetHint);
+		Assert.Equal(RetargetOriginal, fallback.Role.Armor!.CurrentArchive);
+		Assert.Equal(added.Role.ModIds, fallback.Role.ModIds);
+		Assert.False(Assert.Single(await fixture.Service.GetRolesWithStateAsync(default)).Enabled);
+		Assert.False(File.Exists(Path.Combine(fixture.IasLibrary, "sdkgroup.moved.json")));
+	}
+
+	[Theory]
+	[InlineData(false, "没有能换的空闲护甲")]
+	[InlineData(true, "原头盔也被占用")]
+	public async Task DropFallsBackWithoutEnablingWhenNoBodyMoveCanResolveConflict(bool helmet, string hint)
+	{
+		var engine = new FakeRetargeter { BlockAll = !helmet };
+		using var fixture = await Fixture.CreateAsync(retargeter: engine);
+		fixture.SetArchiveOwner("sdkgroup.blocker", true, helmet ? [RetargetOriginal, Dp8Helmet] : [RetargetOriginal]);
+		var added = await fixture.AddDirectAsync();
+
+		Assert.Equal(IasAddDisposition.InstalledDisabled, added.Disposition);
+		Assert.Contains(hint, added.RetargetHint);
+		Assert.Equal(0, engine.Builds);
+		Assert.False(Assert.Single(await fixture.Service.GetRolesWithStateAsync(default)).Enabled);
+		Assert.True(bool.Parse(File.ReadAllText(Path.Combine(fixture.IasLibrary, "sdkgroup.blocker.json"))));
+	}
+
+	[Theory]
+	[InlineData(false)]
+	[InlineData(true)]
+	public async Task ReturningToOccupiedOriginalUsesOneRegenerateAndRollsBackAllStoresOnFailure(bool fail)
+	{
+		var engine = new FakeRetargeter();
+		using var fixture = await Fixture.CreateAsync(retargeter: engine);
+		fixture.UseManifestMain();
+		fixture.SetArchiveOwner("sdkgroup.blocker", true, RetargetOriginal);
+		var added = await fixture.AddDirectAsync();
+		var choices = await fixture.Service.GetRetargetChoicesAsync(added.Role.Id, default);
+		Assert.Equal(new[] { "sdkgroup.blocker" }, choices.Choices.Single(choice => choice.Original).Occupants);
+		Assert.Null(choices.Choices.Single(choice => choice.Archive == RetargetOther).Reason);
+		Assert.NotNull(choices.Choices.Single(choice => choice.Archive == RetargetRejected).Reason);
+		var rolesPath = Path.Combine(fixture.IasLibrary, "roles.json");
+		var beforeRoles = File.ReadAllText(rolesPath);
+		var beforeProfile = await ActiveEntriesAsync(fixture);
+		var beforeRuntime = Path.Combine(fixture.Runtime, "prior");
+		File.WriteAllText(beforeRuntime, "prior runtime");
+		fixture.Worker.FailRegenerate = fail;
+		fixture.Worker.BeforeRegenerateFailure = () => File.Delete(beforeRuntime);
+		fixture.Worker.Requests.Clear();
+		if (fail)
+		{
+			await Assert.ThrowsAsync<InvalidOperationException>(() => fixture.Service.RetargetAsync(added.Role.Id, RetargetOriginal, default));
+			Assert.Equal(beforeRoles, File.ReadAllText(rolesPath));
+			Assert.Equal(beforeProfile, await ActiveEntriesAsync(fixture));
+			Assert.True(File.Exists(Path.Combine(fixture.IasLibrary, "sdkgroup.moved.json")));
+			Assert.False(File.Exists(Path.Combine(fixture.IasLibrary, "sdkgroup.role.json")));
+			Assert.Equal("prior runtime", File.ReadAllText(beforeRuntime));
+			Assert.True(bool.Parse(File.ReadAllText(Path.Combine(fixture.IasLibrary, "sdkgroup.blocker.json"))));
+		}
+		else
+		{
+			var returned = await fixture.Service.RetargetAsync(added.Role.Id, RetargetOriginal, default);
+			Assert.True(returned.Retarget!.ReturnedToOriginal);
+			Assert.Equal(added.Role.ModIds, returned.Role.ModIds);
+			Assert.Equal("sdkgroup.role", returned.Role.Id);
+			Assert.False(File.Exists(Path.Combine(fixture.IasLibrary, "sdkgroup.moved.json")));
+			Assert.False(bool.Parse(File.ReadAllText(Path.Combine(fixture.IasLibrary, "sdkgroup.blocker.json"))));
+			Assert.True(Assert.Single(await fixture.Service.GetRolesWithStateAsync(default)).Enabled);
+		}
+		Assert.Single(fixture.Worker.Requests, request => request.Command == "regenerate");
+		Assert.Equal(1, engine.Builds);
+	}
 
 	[Fact]
 	public async Task DirectPairWithConflictInstallsDisabled()
@@ -1028,7 +1137,7 @@ public sealed class IasDeploymentTests
 			File.WriteAllText(Path.Combine(IasLibrary, id + ".json"), enabled ? "true" : "false");
 		}
 
-		internal static async Task<Fixture> CreateAsync(bool shareOptionActivations = false)
+		internal static async Task<Fixture> CreateAsync(bool shareOptionActivations = false, FakeRetargeter? retargeter = null)
 		{
 			var fixture = new Fixture();
 			try
@@ -1039,7 +1148,14 @@ public sealed class IasDeploymentTests
 				{
 					fixture.DeployCalls++;
 					return fixture.FailProfileDeploy ? Task.FromException(new InvalidOperationException("模拟部署失败。")) : Task.CompletedTask;
-				}, fixture.SharedOptions);
+				}, fixture.SharedOptions, retargeter);
+				if (retargeter is not null)
+				{
+					fixture.Worker.ReadRetargetArchives = true;
+					fixture.Worker.CandidateArchives = [RetargetOriginal, Dp8Helmet];
+					fixture.Worker.RoleArchives["sdkgroup.role"] = [RetargetOriginal, Dp8Helmet];
+					fixture.Worker.RoleArchives["sdkgroup.moved"] = [RetargetBody, Dp8Helmet];
+				}
 				foreach (var path in new[] { fixture.Runtime, fixture.IasLibrary, Path.Combine(fixture.Paths.ModsDirectory, fixture.ManagedRelativePath) })
 					Directory.CreateDirectory(path);
 				File.WriteAllText(Path.Combine(fixture.Runtime, "permanent"), "恢复永久删除内容");
@@ -1090,6 +1206,35 @@ public sealed class IasDeploymentTests
 		}
 	}
 
+	private sealed class FakeRetargeter : IIasBodyRetargeter
+	{
+		internal int Builds { get; private set; }
+		internal bool BlockAll { get; set; }
+		public Task<IasRetargetAnalysis> AnalyzeAsync(IasInstalled installed, string source, string work, CancellationToken ct) =>
+			Task.FromResult(new IasRetargetAnalysis(RetargetOriginal, "原作者",
+			[
+				new(RetargetOriginal, "SR-64 煤渣砖", "SR-64"),
+				new(RetargetBody, "BP-20 思想矫正官", "BP-20", BlockAll ? "缺槽" : null),
+				new(RetargetOther, "AD-49 阿波罗神", "AD-49", BlockAll ? "缺槽" : null),
+				new(RetargetRejected, "RS-40 掠食凶兽", "RS-40", "缺可见槽")
+			]));
+
+		public Task<IasRetargetPair> RetargetAsync(IasInstalled installed, string source, string archive, string work, CancellationToken ct)
+		{
+			Builds++;
+			Directory.CreateDirectory(work);
+			var patch = Path.Combine(work, archive + ".patch_0");
+			File.WriteAllText(patch, "derived");
+			var main = Path.Combine(work, "IAS_MainMod.zip");
+			using (var zip = ZipFile.Open(main, ZipArchiveMode.Create))
+				zip.CreateEntryFromFile(patch, Path.GetFileName(patch));
+			var companion = Path.Combine(work, "IAS_Companion.hd2irpack.zip");
+			using (var zip = ZipFile.Open(companion, ZipArchiveMode.Create))
+				Write(zip, "mod_group.json", JsonSerializer.Serialize(new { name = "Retargeted", id = "derived-group" }));
+			return Task.FromResult(new IasRetargetPair(main, companion, [archive, Dp8Helmet], "原作者", patch, ["key"]));
+		}
+	}
+
 	private sealed class FakeWorker(string runtime) : IIasWorker
 	{
 		internal List<IasWorkerRequest> Requests { get; } = [];
@@ -1098,6 +1243,7 @@ public sealed class IasDeploymentTests
 		internal bool UseEmptyDataPatch { get; set; }
 		internal string? GraphicsError { get; set; }
 		internal string[] CandidateArchives { get; set; } = [];
+		internal bool ReadRetargetArchives { get; set; }
 		internal Dictionary<string, string[]> RoleArchives { get; } = new(StringComparer.Ordinal);
 		internal string? RegenerateError { get; set; }
 		private string GraphicsPath => Path.Combine(runtime, "graphics.json");
@@ -1113,7 +1259,12 @@ public sealed class IasDeploymentTests
 			{
 				case "companion-archives":
 					Assert.True(File.Exists(request.Argument));
+					if (ReadRetargetArchives && request.Argument!.EndsWith("IAS_Companion.hd2irpack.zip", StringComparison.Ordinal))
+						return Task.FromResult(new IasWorkerResponse(true, JsonSerializer.Serialize(RoleArchives["sdkgroup.moved"])));
 					return Task.FromResult(new IasWorkerResponse(true, JsonSerializer.Serialize(CandidateArchives)));
+				case "retarget-patch-keys":
+					Assert.True(File.Exists(request.Argument));
+					return Task.FromResult(new IasWorkerResponse(true, "[\"key\"]"));
 				case "archive-occupancy":
 					var owners = Directory.GetFiles(request.Library, "sdkgroup.*.json").Select(file =>
 					{
@@ -1148,7 +1299,12 @@ public sealed class IasDeploymentTests
 					using (var entry = zip.GetEntry("mod_group.json")!.Open())
 					using (var group = JsonDocument.Parse(entry))
 					{
-						var id = group.RootElement.GetProperty("name").GetString() == "Second" ? "sdkgroup.second" : "sdkgroup.role";
+						var id = group.RootElement.GetProperty("name").GetString() switch
+						{
+							"Second" => "sdkgroup.second",
+							"Retargeted" => "sdkgroup.moved",
+							_ => "sdkgroup.role"
+						};
 						File.WriteAllText(Path.Combine(request.Library, id + ".json"), request.Enabled ? "true" : "false");
 						return Task.FromResult(new IasWorkerResponse(true, id));
 					}

@@ -35,6 +35,8 @@ public sealed class IasPageViewModel : FullWorkspacePageViewModel
     private IasVpkTargets _currentVpkTargets = new(null, null);
     private IasCharacterRow? _expandedCharacter;
     private CancellationTokenSource? _loadTargets;
+    private IasCharacterRow? _armorCharacter;
+    private CancellationTokenSource? _loadArmor;
     private CancellationTokenSource? _loadVpkTargets;
     private bool _vpkTargetsResolved;
     private Task _vpkCatalogTask = Task.CompletedTask;
@@ -97,6 +99,11 @@ public sealed class IasPageViewModel : FullWorkspacePageViewModel
         ConvertCharacterCommand = new(character => ConvertAsync(character as IasCharacterRow), CanQueueConversion);
         CloseConversionCommand = new(_ => CloseConversion());
         StartConversionCommand = new(character => StartConversionAsync(character as IasCharacterRow), CanQueueConversion);
+        RetargetCharacterCommand = new(value => ToggleArmorAsync(value as IasCharacterRow ??
+            Characters.FirstOrDefault(row => row.Id == _result?.RetargetRoleId)), value =>
+            value is IasCharacterRow row ? CanQueueConversion(row) && row.CanRetarget : CanRetargetResult);
+        CloseArmorCommand = new(_ => CloseArmor());
+        ApplyArmorCommand = new(value => ApplyArmorAsync(value as IasCharacterRow), CanQueueConversion);
         RemoveCharacterCommand = new(character => RemoveAsync(character as IasCharacterRow), CanQueueConversion);
         CancelCommand = new(_ => CancelOperation(), _ => CanCancel);
         CancelWaitingCommand = new(value =>
@@ -129,6 +136,9 @@ public sealed class IasPageViewModel : FullWorkspacePageViewModel
     public AsyncRelayCommand ConvertCharacterCommand { get; }
     public RelayCommand CloseConversionCommand { get; }
     public AsyncRelayCommand StartConversionCommand { get; }
+    public AsyncRelayCommand RetargetCharacterCommand { get; }
+    public RelayCommand CloseArmorCommand { get; }
+    public AsyncRelayCommand ApplyArmorCommand { get; }
     public IasTargetPickerViewModel VpkArmor { get; }
     public IasTargetPickerViewModel VpkHelmet { get; }
     public string? VpkTargetWarning => _loadVpkTargets is not null && !_vpkTargetsResolved ? "正在读取 IAS 底子装备…"
@@ -226,6 +236,9 @@ public sealed class IasPageViewModel : FullWorkspacePageViewModel
     public bool ResultSuccess => _result?.Success == true;
     public bool ResultWarning => _result?.Warning == true;
     public bool CanSwapResult => _result?.SwapRoleId is { } id && Characters.Any(row => row.Id == id && row.Enabled == false);
+    public bool CanRetargetResult => _result?.RetargetRoleId is { } id &&
+        Characters.Any(row => row.Id == id && row.CanRetarget && CanQueueConversion(row));
+    public bool ResultRetargeted => _result is { Success: true, RetargetRoleId: not null };
     public IReadOnlyList<string> ResultWarnings => _result?.Warnings ?? [];
     public bool HasResultWarnings => ResultWarnings.Count > 0;
     public bool AreWarningsExpanded { get => _areWarningsExpanded; set => SetField(ref _areWarningsExpanded, value); }
@@ -311,6 +324,7 @@ public sealed class IasPageViewModel : FullWorkspacePageViewModel
         _chooseLibrary?.Cancel();
         _loadVpkTargets?.Cancel();
         CloseConversion();
+        CloseArmor();
         NotifyState();
     }
 
@@ -474,6 +488,7 @@ public sealed class IasPageViewModel : FullWorkspacePageViewModel
     private async Task ConvertAsync(IasCharacterRow? character)
     {
         if (character is null || !CanQueueConversion(character)) return;
+        CloseArmor();
         var wasOpen = ReferenceEquals(character, _expandedCharacter);
         CloseConversion();
         if (wasOpen) return;
@@ -500,6 +515,50 @@ public sealed class IasPageViewModel : FullWorkspacePageViewModel
         _loadTargets?.Cancel();
         if (_expandedCharacter is not null) _expandedCharacter.Conversion = null;
         _expandedCharacter = null;
+    }
+
+    private async Task ToggleArmorAsync(IasCharacterRow? character)
+    {
+        if (character is null || !character.CanRetarget || !CanQueueConversion(character)) return;
+        var wasOpen = ReferenceEquals(character, _armorCharacter);
+        CloseArmor();
+        CloseConversion();
+        if (wasOpen) return;
+        _armorCharacter = character;
+        var panel = new IasArmorPanelViewModel();
+        character.ArmorPanel = panel;
+        using var cancellation = new CancellationTokenSource();
+        _loadArmor = cancellation;
+        try
+        {
+            var choices = await _service.GetRetargetChoicesAsync(character.Id, cancellation.Token);
+            if (!cancellation.IsCancellationRequested) panel.Show(choices);
+        }
+        catch (OperationCanceledException) when (cancellation.IsCancellationRequested) { }
+        catch (Exception error) { panel.Message = $"无法读取护甲选项：{error.Message}"; }
+        finally { if (ReferenceEquals(_loadArmor, cancellation)) _loadArmor = null; }
+    }
+
+    private void CloseArmor()
+    {
+        _loadArmor?.Cancel();
+        if (_armorCharacter is not null) _armorCharacter.ArmorPanel = null;
+        _armorCharacter = null;
+    }
+
+    private Task ApplyArmorAsync(IasCharacterRow? character)
+    {
+        if (character?.ArmorPanel is not { Selected: { } option } panel || !CanQueueConversion(character))
+            return Task.CompletedTask;
+        string[] keys = ["role:" + character.Id];
+        if (_queue.Contains(keys))
+        {
+            panel.Message = "这个角色已在队列中。";
+            return Task.CompletedTask;
+        }
+        CloseArmor();
+        return _queue.Enqueue("换护甲", character.Name, keys,
+            (progress, ct) => _service.RetargetAsync(character.Id, option.Choice, progress, ct));
     }
 
     private Task StartConversionAsync(IasCharacterRow? character)
@@ -926,6 +985,7 @@ public sealed class IasPageViewModel : FullWorkspacePageViewModel
             _flashRoleId = null;
             _characterGroups = IasCharacterGroup.Create(_characters);
             if (_expandedCharacter is not null && !_characters.Contains(_expandedCharacter)) CloseConversion();
+            if (_armorCharacter is not null && !_characters.Contains(_armorCharacter)) CloseArmor();
             _lastRoleScan = DateTimeOffset.Now;
             if (reportScan || (diff.HasChanges && (requestedScan || _result is null)))
                 PublishResult(new(true, diff.Message, []), notify: diff.HasChanges);
@@ -1012,6 +1072,8 @@ public sealed class IasPageViewModel : FullWorkspacePageViewModel
         TurnOffLuaCommand.RaiseCanExecuteChanged();
         ChooseLibraryModCommand.RaiseCanExecuteChanged();
         ConvertCharacterCommand.RaiseCanExecuteChanged();
+        RetargetCharacterCommand.RaiseCanExecuteChanged();
+        ApplyArmorCommand.RaiseCanExecuteChanged();
         StartConversionCommand.RaiseCanExecuteChanged();
         RemoveCharacterCommand.RaiseCanExecuteChanged();
         CancelCommand.RaiseCanExecuteChanged();
@@ -1090,6 +1152,7 @@ public sealed class IasCharacterRow(IasCharacterInfo character, Func<IasCharacte
 {
     private bool? _pendingEnabled;
     private IasConversionPanelViewModel? _conversion;
+    private IasArmorPanelViewModel? _armorPanel;
     internal IasCharacterInfo Info => character;
     public IasConversionPanelViewModel? Conversion
     {
@@ -1102,6 +1165,18 @@ public sealed class IasCharacterRow(IasCharacterInfo character, Func<IasCharacte
         }
     }
     public bool IsConversionOpen => Conversion is not null;
+    public IasArmorPanelViewModel? ArmorPanel
+    {
+        get => _armorPanel;
+        set
+        {
+            _armorPanel = value;
+            PropertyChanged?.Invoke(this, new(nameof(ArmorPanel)));
+            PropertyChanged?.Invoke(this, new(nameof(IsArmorOpen)));
+        }
+    }
+    public bool IsArmorOpen => ArmorPanel is not null;
+    public bool CanRetarget => IsRegistered && character.Source == IasCharacterSource.IasPackage;
 
     public event PropertyChangedEventHandler? PropertyChanged;
     public string Id => character.Id;
@@ -1118,8 +1193,11 @@ public sealed class IasCharacterRow(IasCharacterInfo character, Func<IasCharacte
     public bool IsFlashing { get; private set; }
     public bool HasConflict => character.Conflict is not null;
     public string? Conflict => character.Conflict;
-    public string? MetaText => string.Join(" · ", new[] { character.LibraryOrigin,
-        character.Equipment is { } equipment ? $"套在 {equipment}" : null }.OfType<string>());
+    public string? MetaText => string.Join(" · ", new[] { character.LibraryOrigin, ArmorText,
+        character.Armor?.Author is { Length: > 0 } author ? $"原作者 {author}" : null }.OfType<string>());
+    private string? ArmorText => character.Armor is { } armor
+        ? armor.CurrentArchive == armor.OriginalArchive ? $"套在 {armor.CurrentName}" : $"套在 {armor.CurrentName}（原本 {armor.OriginalName}）"
+        : character.Equipment is { } equipment ? $"套在 {equipment}" : null;
     public bool IsChecked
     {
         get => IsLibraryOnly ? false : _pendingEnabled ?? Enabled ?? false;

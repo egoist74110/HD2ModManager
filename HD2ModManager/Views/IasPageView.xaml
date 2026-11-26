@@ -196,6 +196,11 @@
                             <Style TargetType="Border">
                                 <Setter Property="Background" Value="{StaticResource AppSurfaceBrush}"/>
                                 <Style.Triggers>
+                                    <DataTrigger Binding="{Binding ResultRetargeted}" Value="True">
+                                        <Setter Property="Background" Value="#EEF8F0"/>
+                                        <Setter Property="BorderBrush" Value="#B2D8BA"/>
+                                        <Setter Property="BorderThickness" Value="1"/>
+                                    </DataTrigger>
                                     <DataTrigger Binding="{Binding ResultWarning}" Value="True">
                                         <Setter Property="Background" Value="#FFF6DE"/>
                                         <Setter Property="BorderBrush" Value="#E6C77B"/>
@@ -237,6 +242,9 @@
                             <StackPanel Grid.Column="1" Orientation="Horizontal">
                                 <Button Content="换成这个" Style="{StaticResource AppQuietButton}"
                                         Visibility="{Binding CanSwapResult, Converter={StaticResource BoolToVis}}" Command="{Binding SwapCharacterCommand}"/>
+                                <Button Content="换护甲 ▾" Style="{StaticResource AppQuietButton}"
+                                        Visibility="{Binding CanRetargetResult, Converter={StaticResource BoolToVis}}"
+                                        Command="{Binding RetargetCharacterCommand}"/>
                                 <Button Content="去看看" Style="{StaticResource AppQuietButton}"
                                         Visibility="{Binding CanOpenCreatedMod, Converter={StaticResource BoolToVis}}" Command="{Binding OpenCreatedModCommand}"/>
                             </StackPanel>
@@ -432,13 +440,76 @@
                                         <Button Grid.Column="4" Content="在库里查看" Style="{StaticResource AppQuietButton}" VerticalAlignment="Center"
                                                 Visibility="{Binding IsLibraryOnly, Converter={StaticResource BoolToVis}}"
                                                 Command="{Binding DataContext.OpenLibraryCharacterCommand, RelativeSource={RelativeSource AncestorType=local:IasPageView}}" CommandParameter="{Binding}"/>
-                                        <Button Grid.Column="4" Content="转为普通 Mod ▾" Style="{StaticResource AppSecondaryButton}" VerticalAlignment="Center"
-                                                Visibility="{Binding IsRegistered, Converter={StaticResource BoolToVis}}"
-                                                Command="{Binding DataContext.ConvertCharacterCommand, RelativeSource={RelativeSource AncestorType=local:IasPageView}}" CommandParameter="{Binding}"/>
+                                        <StackPanel Grid.Column="4" Orientation="Horizontal" VerticalAlignment="Center"
+                                                    Visibility="{Binding IsRegistered, Converter={StaticResource BoolToVis}}">
+                                            <Button Content="换护甲 ▾" Style="{StaticResource AppQuietButton}" Margin="0,0,8,0"
+                                                    Visibility="{Binding CanRetarget, Converter={StaticResource BoolToVis}}"
+                                                    Command="{Binding DataContext.RetargetCharacterCommand, RelativeSource={RelativeSource AncestorType=local:IasPageView}}"
+                                                    CommandParameter="{Binding}"/>
+                                            <Button Content="转为普通 Mod ▾" Style="{StaticResource AppSecondaryButton}"
+                                                    Command="{Binding DataContext.ConvertCharacterCommand, RelativeSource={RelativeSource AncestorType=local:IasPageView}}"
+                                                    CommandParameter="{Binding}"/>
+                                        </StackPanel>
                                         <Button Grid.Column="5" Content="卸载" Style="{StaticResource AppSecondaryButton}" VerticalAlignment="Center" Margin="8,0,0,0"
                                                 Visibility="{Binding IsRegistered, Converter={StaticResource BoolToVis}}"
                                                 Command="{Binding DataContext.RemoveCharacterCommand, RelativeSource={RelativeSource AncestorType=local:IasPageView}}" CommandParameter="{Binding}"/>
                                     </Grid>
+                                    <Border Margin="0,6,0,0" Padding="12" CornerRadius="6" Background="{StaticResource AppSurfaceBrush}"
+                                            Visibility="{Binding IsArmorOpen, Converter={StaticResource BoolToVis}}">
+                                        <StackPanel>
+                                            <TextBlock Text="换到哪件护甲" FontWeight="SemiBold"/>
+                                            <TextBlock Text="只换身体，头盔保持原样。" Style="{StaticResource AppSupportingText}"/>
+                                            <TextBlock Text="搜索护甲名字或编号" Style="{StaticResource AppSupportingText}" Margin="0,8,0,2"/>
+                                            <TextBox Margin="0,0,0,4" Padding="6,3" Text="{Binding ArmorPanel.Query, UpdateSourceTrigger=PropertyChanged}"
+                                                     AutomationProperties.Name="搜索护甲名字或编号"/>
+                                            <TextBlock Text="{Binding ArmorPanel.Message}" Foreground="{StaticResource StatusWarning}" TextWrapping="Wrap"/>
+                                            <ScrollViewer MaxHeight="300" VerticalScrollBarVisibility="Auto">
+                                                <ItemsControl ItemsSource="{Binding ArmorPanel.Groups}" Margin="0,2,8,0">
+                                                    <ItemsControl.ItemTemplate>
+                                                        <DataTemplate>
+                                                            <StackPanel Margin="0,2,0,4">
+                                                                <TextBlock Text="{Binding Header}" Style="{StaticResource AppSupportingText}" FontWeight="SemiBold"/>
+                                                                <ItemsControl ItemsSource="{Binding Options}">
+                                                                    <ItemsControl.ItemTemplate>
+                                                                        <DataTemplate>
+                                                                            <RadioButton GroupName="IasBodyRetarget" Margin="0,4,0,3"
+                                                                                         IsEnabled="{Binding CanSelect}" Command="{Binding SelectCommand}">
+                                                                                <StackPanel>
+                                                                                    <StackPanel.Style>
+                                                                                        <Style TargetType="StackPanel">
+                                                                                            <Style.Triggers>
+                                                                                                <DataTrigger Binding="{Binding CanSelect}" Value="False">
+                                                                                                    <Setter Property="Opacity" Value="0.6"/>
+                                                                                                </DataTrigger>
+                                                                                            </Style.Triggers>
+                                                                                        </Style>
+                                                                                    </StackPanel.Style>
+                                                                                    <WrapPanel>
+                                                                                        <TextBlock Text="{Binding Name}"/>
+                                                                                        <TextBlock Text="原护甲" Margin="8,0,0,0" FontWeight="SemiBold"
+                                                                                                   Visibility="{Binding IsOriginal, Converter={StaticResource BoolToVis}}"/>
+                                                                                    </WrapPanel>
+                                                                                    <TextBlock Text="{Binding Detail}" Style="{StaticResource AppSupportingText}" TextWrapping="Wrap"/>
+                                                                                </StackPanel>
+                                                                            </RadioButton>
+                                                                        </DataTemplate>
+                                                                    </ItemsControl.ItemTemplate>
+                                                                </ItemsControl>
+                                                            </StackPanel>
+                                                        </DataTemplate>
+                                                    </ItemsControl.ItemTemplate>
+                                                </ItemsControl>
+                                            </ScrollViewer>
+                                            <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,6,0,0">
+                                                <Button Content="收起" Style="{StaticResource AppSecondaryButton}"
+                                                        Command="{Binding DataContext.CloseArmorCommand, RelativeSource={RelativeSource AncestorType=local:IasPageView}}"/>
+                                                <Button Content="换过去" Style="{StaticResource AppPrimaryButton}" Margin="8,0,0,0"
+                                                        IsEnabled="{Binding ArmorPanel.HasSelection}"
+                                                        Command="{Binding DataContext.ApplyArmorCommand, RelativeSource={RelativeSource AncestorType=local:IasPageView}}"
+                                                        CommandParameter="{Binding}"/>
+                                            </StackPanel>
+                                        </StackPanel>
+                                    </Border>
                                     <Border Margin="0,6,0,0" Padding="12" CornerRadius="6"
                                             Background="{StaticResource AppSurfaceBrush}"
                                             Visibility="{Binding IsConversionOpen, Converter={StaticResource BoolToVis}}">

@@ -25,12 +25,14 @@ public sealed class IasLibraryPickerRenderTests
     [Fact]
     public void RendersPickerStatesToPng()
     {
-        var output = Path.Combine(Repo(), "tmp", "w30", "screens");
+        var isolated = Environment.GetEnvironmentVariable("HD2_IAS_SNAPSHOT_DIR");
+        var root = isolated ?? Path.Combine(Repo(), "tmp");
+        var output = Path.Combine(root, "w30", "screens");
         Directory.CreateDirectory(output);
         Exception? failure = null;
         var thread = new Thread(() =>
         {
-            try { Render(output); }
+            try { Render(output, root, isolated is null ? Path.Combine(root, "w53", "screens") : Path.Combine(root, "screens")); }
             catch (Exception error) { failure = error; }
         });
         thread.SetApartmentState(ApartmentState.STA);
@@ -42,7 +44,7 @@ public sealed class IasLibraryPickerRenderTests
             Assert.True(new FileInfo(Path.Combine(output, name)).Length > 5000, name);
     }
 
-    private static void Render(string output)
+    private static void Render(string output, string root, string retargetOutput)
     {
         var app = new System.Windows.Application { ShutdownMode = ShutdownMode.OnExplicitShutdown };
         foreach (var file in new[] { "Controls.xaml", "DataTables.xaml", "CardTemplates.xaml" })
@@ -73,7 +75,7 @@ public sealed class IasLibraryPickerRenderTests
         try
         {
             // WPF 每个 AppDomain 只允许一个 Application；两页共用同一次离屏宿主。
-            IasPageViewModelTests.RenderRoleStates(app, Path.Combine(Repo(), "tmp", "w52", "screens"));
+            IasPageViewModelTests.RenderRoleStates(app, Path.Combine(root, "w52", "screens"), retargetOutput);
         }
         finally
         {

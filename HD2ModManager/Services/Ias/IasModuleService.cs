@@ -54,7 +54,12 @@ public sealed class IasModuleService(
         }
         var worker = new IasProcessWorker(IasProcessWorker.Locate(AppContext.BaseDirectory),
             Path.Combine(paths.AppRootDirectory, "ias", "worker"), http);
+#if WINDOWS
+        return new(paths, game, http, worker, IsGameRunning, optionActivations: optionActivations,
+            retargeter: new IasBodyRetargeter(paths, game));
+#else
         return new(paths, game, http, worker, IsGameRunning, optionActivations: optionActivations);
+#endif
     }
 
     public async Task<IasPageStatus> GetStatusAsync(CancellationToken ct)
@@ -229,7 +234,8 @@ public sealed class IasModuleService(
                     Equipment = Equipment(item.Archives),
                     Conflict = item.Enabled == false ? Conflict(role.Id, item.Archives) : null,
                     Revision = item.Revision,
-                    RegisteredRevision = role.LibraryRevision
+                    RegisteredRevision = role.LibraryRevision,
+                    Armor = role.Armor
                 };
             });
             var candidates = scan.Library.Select(item =>
@@ -625,23 +631,49 @@ public sealed class IasModuleService(
     private static IasOperationResult FormatDirectAdd(IasAddResult added)
     {
         var (role, disposition, conflict) = added;
+        if (added.Retarget is { } change)
+        {
+            var message = disposition == IasAddDisposition.Installed
+                ? $"『{role.Name}』的原护甲 {change.Armor.OriginalName} 被{Names(change.Occupants)}占用，已换到 {change.Armor.CurrentName} 并启用。"
+                : $"已把『{role.Name}』从 {change.From} 换到 {change.Armor.CurrentName}" +
+                    (change.ReturnedToOriginal ? "（换回了原护甲）" : "") +
+                    (change.Occupants.Length == 0 ? "。" : $"，并停用了{Names(change.Occupants)}。");
+            return new(true, message, []) { RetargetRoleId = role.Id, FlashRoleId = role.Id };
+        }
         return disposition switch
         {
             IasAddDisposition.Identical => new(true, $"『{role.Name}』已经装过了，内容一样，没有再装。", [])
             {
                 Warning = true, FlashRoleId = role.Id, SkipLibraryReload = true
             },
+            IasAddDisposition.Updated when added.RetargetHint is { } hint =>
+                new(true, $"已更新『{role.Name}』。{hint}。{(conflict is null ? "" : $"已装好，但没启用：{conflict.Hint}。")}", [])
+                {
+                    Warning = true, UpdatedRoleId = role.Id, FlashRoleId = role.Id,
+                    SwapRoleId = conflict is null ? null : role.Id
+                },
             IasAddDisposition.Updated => new(true, $"已更新『{role.Name}』，启用状态和设置保持不变。", [])
             {
                 UpdatedRoleId = role.Id, FlashRoleId = role.Id
             },
-            IasAddDisposition.InstalledDisabled => new(true, $"已装好，但没启用：{conflict!.Hint}。", [])
+            IasAddDisposition.InstalledDisabled => new(true, $"已装好，但没启用：{conflict!.Hint}" +
+                (added.RetargetHint is { } reason ? $"，{reason}。" : "。"), [])
             {
                 Warning = true, SwapRoleId = role.Id
             },
             _ => new(true, $"已添加『{role.Name}』。", [])
         };
+
+        static string Names(IEnumerable<string> names) => string.Join("、", names.Select(name => $"『{name}』"));
     }
+
+    public Task<IasRetargetAnalysis> GetRetargetChoicesAsync(string characterId, CancellationToken ct) =>
+        Task.Run(() => Open(getPaths()).GetRetargetChoicesAsync(characterId, ct), ct);
+
+    public Task<IasOperationResult> RetargetAsync(string characterId, IasRetargetChoice choice, IProgress<IasPageProgress> progress,
+        CancellationToken ct) =>
+        ExecuteAsync("正在换护甲…", progress, ct, async (service, _) =>
+            FormatDirectAdd(await service.RetargetAsync(characterId, choice.Archive, ct, choice.OccupantIds).ConfigureAwait(false)), keepErrorMessage: true);
 
     internal sealed record DropConversion(string Path, IasDropItemKind Kind, string? Name,
         IReadOnlyList<IasSourceStamp> Origins, IReadOnlyList<string> MaterialVpks);

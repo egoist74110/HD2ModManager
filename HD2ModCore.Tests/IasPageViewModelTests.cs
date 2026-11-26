@@ -108,7 +108,7 @@ public sealed class IasPageViewModelTests
             { LibraryModId = "eku", LibraryOrigin = "上一份管理器转出来的角色", Equipment = "DP-8 民主执政官" }
     ];
 
-    internal static void RenderRoleStates(System.Windows.Application app, string output)
+    internal static void RenderRoleStates(System.Windows.Application app, string output, string retargetOutput)
     {
         Directory.CreateDirectory(output);
         app.Resources["BoolToVis"] = new BooleanToVisibilityConverter();
@@ -130,7 +130,8 @@ public sealed class IasPageViewModelTests
         var service = new ServiceStub(IasStatusKind.Installed, "1.6.4")
         {
             ReadCharacters = _ => scan,
-            Add = (_, _, _) => Task.FromResult(duplicate)
+            Add = (_, _, _) => Task.FromResult(duplicate),
+            ArmorChoices = ArmorChoices()
         };
         using var page = CreatePage(service);
         page.EnterAsync().GetAwaiter().GetResult();
@@ -151,25 +152,73 @@ public sealed class IasPageViewModelTests
         page.OnLibrarySnapshotChanged();
         Save("library-roles", "库里有，未启用");
 
-        void Save(string name, string expectedText)
+        var w53 = retargetOutput;
+        Directory.CreateDirectory(w53);
+        var moved = roles[0] with
         {
-            var view = new HD2ModManager.Views.IasPageView { DataContext = page };
+            Armor = new("sr64", "bp20", "SR-64 煤渣砖", "BP-20 思想矫正官", "长啸云天")
+        };
+        var auto = new IasOperationResult(true,
+            "『Milfy SR-64』的原护甲 SR-64 煤渣砖 被『煤渣砖重制』占用，已换到 BP-20 思想矫正官 并启用。", [])
+            { RetargetRoleId = moved.Id };
+        var blocked = new IasOperationResult(true,
+            "已装好，但没启用：和『煤渣砖重制』占同一件护甲（SR-64 煤渣砖头盔），原头盔也被占用，只换身体无法解决。", [])
+            { Warning = true, SwapRoleId = moved.Id };
+        var occupant = roles[1] with { Name = "煤渣砖重制", Enabled = true, Conflict = null };
+        var original = moved with { Armor = moved.Armor! with { CurrentArchive = "sr64", CurrentName = "SR-64 煤渣砖" } };
+        var returned = new IasOperationResult(true, "已把『Milfy SR-64』从 BP-20 思想矫正官 换到 SR-64 煤渣砖（换回了原护甲）。", [])
+            { RetargetRoleId = moved.Id };
+        var next = auto;
+        IReadOnlyList<IasCharacterInfo> retargetRows = [moved, occupant];
+        var retargetService = new ServiceStub(IasStatusKind.Installed, "1.6.4")
+        {
+            ReadCharacters = _ => Task.FromResult(retargetRows),
+            Add = (_, _, _) => Task.FromResult(next),
+            ArmorChoices = ArmorChoices(),
+            Retarget = (_, archive) =>
+            {
+                Assert.Equal("sr64", archive);
+                retargetRows = [original, occupant with { Enabled = false, Conflict = "和『Milfy SR-64』占同一件护甲（SR-64 煤渣砖）" }];
+                return returned;
+            }
+        };
+        using var retargetPage = CreatePage(retargetService);
+        retargetPage.EnterAsync().GetAwaiter().GetResult();
+        retargetPage.HandleWindowDropAsync([AppContext.BaseDirectory]).GetAwaiter().GetResult();
+        Save("automatic-retarget", auto.Message, retargetPage, w53, "套在 BP-20 思想矫正官（原本 SR-64 煤渣砖） · 原作者 长啸云天");
+        retargetPage.RetargetCharacterCommand.Execute(null);
+        Save("retarget-panel", "被占用（1）", retargetPage, w53, "原护甲", "换不了（1）", "空闲，能换（1）", "换过去");
+        var row = retargetPage.Characters.Single(item => item.Id == moved.Id);
+        row.ArmorPanel!.Groups.SelectMany(group => group.Options).Single(option => option.IsOriginal).SelectCommand.Execute(null);
+        retargetPage.ApplyArmorCommand.Execute(row);
+        Save("returned-to-original", returned.Message, retargetPage, w53);
+        next = blocked;
+        retargetRows = [original with { Enabled = false, Conflict = "和『煤渣砖重制』占同一件护甲（SR-64 煤渣砖头盔）" }, occupant];
+        retargetPage.HandleWindowDropAsync([AppContext.BaseDirectory]).GetAwaiter().GetResult();
+        Save("helmet-conflict", blocked.Message, retargetPage, w53, "换成这个");
+
+        void Save(string name, string expectedText, IasPageViewModel? model = null, string? destination = null,
+            params string[] additional)
+        {
+            var view = new HD2ModManager.Views.IasPageView { DataContext = model ?? page };
             var canvas = new Border
             {
                 Background = (Brush)app.Resources["SurfaceCanvas"],
                 Padding = new Thickness(16),
                 Child = view
             };
-            var size = new Size(1000, 960);
+            var size = new Size(1000, name == "retarget-panel" ? 1140 : 960);
             canvas.Measure(size);
             canvas.Arrange(new Rect(size));
             canvas.UpdateLayout();
-            Assert.Contains(VisibleText(canvas), text => text == expectedText);
+            var texts = VisibleText(canvas).ToArray();
+            foreach (var text in additional.Prepend(expectedText))
+                Assert.Contains(text, texts);
             var bitmap = new RenderTargetBitmap((int)size.Width, (int)size.Height, 96, 96, PixelFormats.Pbgra32);
             bitmap.Render(canvas);
             var encoder = new PngBitmapEncoder();
             encoder.Frames.Add(BitmapFrame.Create(bitmap));
-            var path = Path.Combine(output, name + ".png");
+            var path = Path.Combine(destination ?? output, name + ".png");
             using (var file = File.Create(path)) encoder.Save(file);
             Assert.True(new FileInfo(path).Length > 5000, name);
         }
@@ -177,10 +226,36 @@ public sealed class IasPageViewModelTests
         {
             if (node is UIElement { Visibility: not Visibility.Visible }) yield break;
             if (node is TextBlock block) yield return block.Text;
+            if (node is Button { Content: string label }) yield return label;
             for (var i = 0; i < VisualTreeHelper.GetChildrenCount(node); i++)
                 foreach (var text in VisibleText(VisualTreeHelper.GetChild(node, i))) yield return text;
         }
     }
+
+    [Fact]
+    public void RetargetPanelGroupsAndSearchExcludeDisabledChoicesFromSelection()
+    {
+        var panel = new IasArmorPanelViewModel();
+        panel.Show(ArmorChoices());
+        Assert.Equal(new[] { "空闲，能换（1）", "被占用（1）", "换不了（1）" }, panel.Groups.Select(group => group.Header));
+        Assert.True(panel.Groups[1].Options[0].IsOriginal);
+        Assert.Contains("煤渣砖重制", panel.Groups[1].Options[0].Detail);
+        Assert.False(panel.Groups[2].Options[0].CanSelect);
+        panel.Groups[1].Options[0].SelectCommand.Execute(null);
+        Assert.True(panel.HasSelection);
+        panel.Query = "ad-49";
+        Assert.False(panel.HasSelection);
+        Assert.Equal("AD-49 阿波罗神", Assert.Single(panel.Groups[0].Options).Name);
+        Assert.Empty(panel.Groups[1].Options);
+        Assert.Empty(panel.Groups[2].Options);
+    }
+
+    private static IasRetargetAnalysis ArmorChoices() => new("sr64", "长啸云天",
+    [
+        new("ad49", "AD-49 阿波罗神", "AD-49"),
+        new("sr64", "SR-64 煤渣砖", "SR-64", Occupants: ["煤渣砖重制"], Original: true),
+        new("rs40", "RS-40 掠食凶兽", "RS-40", "缺少作者可见部件或差分槽")
+    ]);
 
     [Fact]
     public async Task RunningGameDisablesWritesAndRecoveryRunsOnReentryAfterExit()
@@ -1637,6 +1712,12 @@ public sealed class IasPageViewModelTests
 
     private sealed class ServiceStub(IasStatusKind kind, string? version = null) : IIasModuleService
     {
+        public IasRetargetAnalysis? ArmorChoices { get; init; }
+        public Func<string, string, IasOperationResult>? Retarget { get; init; }
+        public Task<IasRetargetAnalysis> GetRetargetChoicesAsync(string id, CancellationToken ct) =>
+            Task.FromResult(ArmorChoices ?? new IasRetargetAnalysis(null, null, []));
+        public Task<IasOperationResult> RetargetAsync(string id, IasRetargetChoice choice, IProgress<IasPageProgress> progress, CancellationToken ct) =>
+            Task.FromResult(Retarget?.Invoke(id, choice.Archive) ?? new IasOperationResult(false, "无法换护甲。", []));
         public Func<string, Task<IasOperationResult>>? Adopt { get; init; }
         public List<string> AdoptCalls { get; } = [];
         public Task<IasOperationResult> AdoptLibraryRoleAsync(string modId, IProgress<IasPageProgress> progress, CancellationToken ct)

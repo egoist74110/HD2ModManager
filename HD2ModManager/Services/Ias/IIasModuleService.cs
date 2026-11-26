@@ -11,6 +11,10 @@ public interface IIasModuleService
     Task<IReadOnlyList<IasLibraryCandidate>> GetConvertibleLibraryModsAsync(CancellationToken ct);
     Task<IasVpkTargetCatalog> GetVpkTargetCatalogAsync(CancellationToken ct);
     Task<IasStandardTargetCatalog> GetStandardTargetCatalogAsync(string characterId, CancellationToken ct);
+    Task<IasRetargetAnalysis> GetRetargetChoicesAsync(string characterId, CancellationToken ct) =>
+        Task.FromResult(new IasRetargetAnalysis(null, null, [], "当前没有可读取的护甲选项。"));
+    Task<IasOperationResult> RetargetAsync(string characterId, IasRetargetChoice choice, IProgress<IasPageProgress> progress, CancellationToken ct) =>
+        Task.FromResult(new IasOperationResult(false, "当前无法换护甲。", []));
     IasDropClassification Classify(IReadOnlyList<string> paths);
 
     Task<IasOperationResult> InstallOrUpdateAsync(IProgress<IasPageProgress> progress, CancellationToken ct);
@@ -64,6 +68,7 @@ public sealed record IasCharacterInfo(string Id, string Name, string? IconPath, 
     public string? Conflict { get; init; }
     public string Revision { get; init; } = "";
     public string? RegisteredRevision { get; init; }
+    public IasRoleArmor? Armor { get; init; }
 }
 
 /// <summary>库里 Mod 的来源：决定转换走哪条路。</summary>
@@ -128,6 +133,7 @@ public sealed record IasOperationResult(bool Success, string Message, IReadOnlyL
     public bool DownloadFailed { get; init; }
     public bool Warning { get; init; }
     public string? SwapRoleId { get; init; }
+    public string? RetargetRoleId { get; init; }
     public string? FlashRoleId { get; init; }
     public string? UpdatedRoleId { get; init; }
     public bool SkipLibraryReload { get; init; }

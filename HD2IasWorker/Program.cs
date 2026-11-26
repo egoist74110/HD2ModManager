@@ -148,7 +148,15 @@ sealed class OfficialIas
 			}
 		}
 
-		if (request.Command is "check-interface" or "archive-occupancy" or "companion-archives")
+		if (request.Command == "retarget-patch-keys")
+		{
+			var archive = TypeOf("Archive");
+			_methods.Add("InspectRetargetArchive", RequireMethod(archive, "Inspect", archive, true, str, str, str));
+			Bind(archive, "ResourceKeys", typeof(string[]), true, str);
+			RequireField(archive, "Duplicate", typeof(bool));
+		}
+
+		if (request.Command is "check-interface" or "archive-occupancy" or "companion-archives" or "retarget-patch-keys")
 		{
 			_runtime = string.Empty;
 			return;
@@ -226,6 +234,11 @@ sealed class OfficialIas
 					new JsonSerializerOptions { IncludeFields = true });
 			case "archive-occupancy":
 				return JsonSerializer.Serialize(ReadArchiveOwners(argument));
+			case "retarget-patch-keys":
+				var patch = Required(argument);
+				if (Field(Call("InspectRetargetArchive", null, patch, null, null)!, "Duplicate") is true)
+					throw new InvalidDataException("换绑 patch 含重复资源键。");
+				return JsonSerializer.Serialize((string[])Call("ResourceKeys", null, patch)!);
 			case "companion-archives":
 				// 官方解析器会写 CAS。只在 worker 的一次性临时源库中执行。
 				var scratch = Directory.CreateTempSubdirectory("ias-companion-").FullName;

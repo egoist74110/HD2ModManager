@@ -2,7 +2,10 @@ namespace HD2ModCore.Ias;
 
 public sealed record IasWorkerRequest(
 	string Command, string GameRoot, string Components, string Library, string Backup,
-	string Export, string Icon, string Version, string? Argument = null, bool Enabled = false);
+	string Export, string Icon, string Version, string? Argument = null, bool Enabled = false)
+{
+	public bool IsolatedRead { get; init; }
+}
 
 public enum IasWorkerErrorKind { ReShadeConflict }
 

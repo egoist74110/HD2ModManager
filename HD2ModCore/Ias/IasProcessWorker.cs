@@ -52,7 +52,8 @@ public sealed class IasProcessWorker(string sourceDirectory, string workerDirect
 		var sourceExe = Path.Combine(sourceDirectory, "HD2IasWorker.exe");
 		if (!File.Exists(sourceExe)) throw new FileNotFoundException("未找到 IAS 部署 worker。", sourceExe);
 		var copy = Stopwatch.StartNew();
-		var readOnly = request.Command == "archive-occupancy" && request.Argument == "*";
+		var readOnly = request.Command == "archive-occupancy" && request.Argument == "*" ||
+			request.IsolatedRead && request.Command is "companion-archives" or "retarget-patch-keys";
 		var destination = readOnly ? start.Environment["TEMP"]! : workerDirectory;
 		Directory.CreateDirectory(destination);
 		if (readOnly)
