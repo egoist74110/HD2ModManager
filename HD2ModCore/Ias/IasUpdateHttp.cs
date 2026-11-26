@@ -23,6 +23,22 @@ public static class IasUpdateHttp
 		catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or InvalidOperationException) { return false; }
 	}
 
+	/// <summary>
+	/// 镜像只代理 github.com 地址。非直连模式下，把官方清单和 LFS 整包（media.githubusercontent.com）
+	/// 换成 github.com 上的同一文件；GitHub 会 302 回原地址，内容与签名清单一致。其余地址原样返回。
+	/// </summary>
+	internal static string MirrorableUrl(Uri uri, DownloadSourceMode mode)
+	{
+		if (mode == DownloadSourceMode.Ask) return uri.AbsoluteUri;
+		if (uri == IasFeedClient.FeedUri)
+			return "https://github.com/Estecsky/HD2-Integrated-Armor-System/raw/refs/heads/main/feed.json";
+		const string media = "/media/Estecsky/HD2-Integrated-Armor-System/";
+		if (string.Equals(uri.Host, "media.githubusercontent.com", StringComparison.OrdinalIgnoreCase) &&
+			IasFeedClient.IsOfficialUrl(uri) && uri.AbsolutePath.StartsWith(media, StringComparison.OrdinalIgnoreCase))
+			return "https://github.com/Estecsky/HD2-Integrated-Armor-System/raw/" + uri.AbsolutePath[media.Length..] + uri.Query;
+		return uri.AbsoluteUri;
+	}
+
 	public static UpdateNetworkSettings ReadSettings(string managerRoot)
 	{
 		var path = Path.Combine(managerRoot, "config", "app-update.json");
@@ -66,8 +82,7 @@ public static class IasUpdateHttp
 				return await SendRawAsync(uri.AbsoluteUri, null, cancellationToken).ConfigureAwait(false);
 			var source = _network.Source();
 			// 更新器的镜像支持 GitHub 仓库地址。该路径和 raw URL 对应同一个签名清单。
-			var url = uri == IasFeedClient.FeedUri && _network.Settings.Mode != DownloadSourceMode.Ask
-				? "https://github.com/Estecsky/HD2-Integrated-Armor-System/raw/refs/heads/main/feed.json" : uri.AbsoluteUri;
+			var url = MirrorableUrl(uri, _network.Settings.Mode);
 			var headers = request.Headers.ToDictionary(pair => pair.Key, pair => string.Join(", ", pair.Value));
 			var response = await (uri == IasFeedClient.FeedUri && _network.Settings.Mode == DownloadSourceMode.Ask
 				? source.Direct(url, headers, cancellationToken) : source.Fetch(url, headers, cancellationToken)).ConfigureAwait(false);
