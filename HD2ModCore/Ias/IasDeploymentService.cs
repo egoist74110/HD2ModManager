@@ -9,7 +9,19 @@ namespace HD2ModCore.Ias;
 public enum IasRoleSource { IasPackage, PatchMod, L4d2Vpk }
 
 public sealed record IasRole(string Id, string Name, IasRoleSource Source, DateTimeOffset AddedAt, Guid[] ModIds,
-	Guid[]? OwnedModIds = null);
+	Guid[]? OwnedModIds = null, string? PackageIdentity = null, string? LibraryRevision = null);
+
+public enum IasAddDisposition { Installed, InstalledDisabled, Identical, Updated }
+
+public sealed record IasAddResult(IasRole Role, IasAddDisposition Disposition, IasRoleConflict? Conflict = null);
+
+public sealed record IasRoleConflict(string[] Names, string[] Equipment)
+{
+	public string Occupants => string.Join("、", Names.Select(name => $"『{name}』"));
+	public string EquipmentText => string.Join("、", Equipment);
+	public string Hint => $"和{Occupants}占同一件护甲（{EquipmentText}）";
+	public string SwapMessage(string role) => $"已启用『{role}』，并停用了{Occupants}（它们占同一件护甲：{EquipmentText}）。";
+}
 
 public sealed class IasDeploymentService
 {
@@ -26,7 +38,7 @@ public sealed class IasDeploymentService
 	private readonly Func<Profile, LibrarySnapshot, CancellationToken, Task>? _deploy;
 	private readonly Func<bool> _isGameRunning;
 	private const string SystemLabel = "IAS 系统";
-	private const string RoleLabel = "IAS 角色";
+	private const string RoleLabel = IasLibraryScan.RoleLabel;
 
 	public IasDeploymentService(StoragePaths paths, string gameRoot, HttpClient http, IIasWorker worker, Func<bool> isGameRunning,
 		Func<Profile, LibrarySnapshot, CancellationToken, Task>? deploy = null, OptionActivationStore? optionActivations = null)
@@ -193,23 +205,36 @@ public sealed class IasDeploymentService
 		return (SyncProfile(snapshot, profile, id, roles, activeRoles), true);
 	}, token, captureRuntime: false);
 
-	public Task SetCharacterEnabledAsync(string id, bool enabled, CancellationToken token) => ChangeAsync(async (tx, snapshot) =>
+	public Task<string> SetCharacterEnabledAsync(string id, bool enabled, CancellationToken token) => ChangeAsync(async (tx, snapshot) =>
 	{
 		var installed = await RequireCompatibleAsync(token).ConfigureAwait(false);
-		var role = GetRoles().SingleOrDefault(role => role.Id == id)
+		var roles = GetRoles();
+		var role = roles.SingleOrDefault(role => role.Id == id)
 			?? throw new InvalidOperationException("找不到要切换的 IAS 角色。");
 		var profile = Active(snapshot);
 		var inProfile = HasManagedMod(profile);
+		IasArchiveOwner[] displaced = [];
 		if (enabled)
-			await RequireRegisteredArchivesFreeAsync(installed, tx, role.Id, token).ConfigureAwait(false);
+		{
+			if (IsMissing(snapshot, role)) throw new InvalidOperationException($"『{role.Name}』的 Mod 库文件已删除。");
+			displaced = await SwapConflictsAsync(installed, tx, role.Id, token).ConfigureAwait(false);
+		}
 		await RunAsync(installed, tx, "set-enabled", role.Id, false, token, enabled).ConfigureAwait(false);
-		var states = await ReadRoleStatesAsync(installed, tx.Backup, [role], token).ConfigureAwait(false);
-		if (states[role.Id] != enabled) throw new InvalidOperationException("IAS 角色的启用状态未更新。");
+		var states = await ReadRoleStatesAsync(installed, tx.Backup, roles, token).ConfigureAwait(false);
+		if (states[role.Id] != enabled || displaced.Any(owner => !states.TryGetValue(owner.Id, out var active) || active))
+			throw new InvalidOperationException("IAS 角色的启用状态未更新。");
 		var next = await RegenerateAsync(installed, tx, snapshot, token, addToProfile: false).ConfigureAwait(false);
-		if (!inProfile) return (next, false);
-		var roleMods = role.ModIds.Select(key => new ModNodeId(key)).ToHashSet();
-		var entries = profile!.Entries.Select(entry => entry.NodeId);
-		return (SetEntries(next, profile, enabled ? entries.Concat(roleMods) : entries.Where(id => !roleMods.Contains(id))), true);
+		if (inProfile)
+		{
+			var stopped = displaced.Select(owner => owner.Id).ToHashSet(StringComparer.Ordinal);
+			if (!enabled) stopped.Add(role.Id);
+			var removed = roles.Where(item => stopped.Contains(item.Id)).SelectMany(item => item.ModIds).ToHashSet();
+			var retained = profile!.Entries.Select(entry => entry.NodeId).Where(key => !removed.Contains(key.Value));
+			next = SetEntries(next, profile, enabled ? retained.Concat(role.ModIds.Select(key => new ModNodeId(key))) : retained);
+		}
+		var conflict = await DescribeConflictsAsync(displaced, token).ConfigureAwait(false);
+		var message = conflict?.SwapMessage(role.Name) ?? (enabled ? $"已启用『{role.Name}』。" : $"已停用『{role.Name}』。");
+		return (next, inProfile, message);
 	}, token);
 
 	public async Task<IReadOnlyList<(IasRole Role, bool? Enabled)>> GetRolesWithStateAsync(CancellationToken token)
@@ -229,16 +254,133 @@ public sealed class IasDeploymentService
 		finally { IasFileTree.Delete(work); }
 	}
 
-	public Task<IasRole> AddAsync(IReadOnlyList<string> paths, IasRoleSource source, CancellationToken token,
-		Func<LibrarySnapshot, CancellationToken, Task>? verifyOrigin = null) =>
-		AddAsync(paths, source, work => IasCharacterPackage.Read(paths, work, token), token, verifyOrigin);
+	public async Task<IasRoleScan> ScanRolesAsync(CancellationToken token)
+	{
+		using var lease = Directory.Exists(_root) ? AcquireIasLease() : null;
+		var snapshot = await LoadModsAsync(token).ConfigureAwait(false);
+		var roles = GetRoles();
+		var known = roles.SelectMany(role => role.OwnedModIds ?? role.ModIds).ToHashSet();
+		if (ManagedModId is { } managed) known.Add(managed);
+		var candidates = snapshot.Nodes.Values.Where(node => !known.Contains(node.Id.Value))
+			.Select(node => ReadLibraryRole(node, token)).OfType<IasLibraryRole>().ToArray();
+		var owners = Array.Empty<IasArchiveOwner>();
+		Dictionary<string, bool>? states = null;
+		if ((roles.Count > 0 || candidates.Length > 0) && GetInstalled() is { } installed &&
+			Directory.Exists(_game) && Directory.Exists(At("library")))
+		{
+			// 占用查询只读官方登记与配套索引，不解析新包。
+			owners = await ReadArchiveOwnersAsync(installed, At("library"), "*", token).ConfigureAwait(false);
+			states = owners.ToDictionary(owner => owner.Id, owner => owner.Enabled, StringComparer.Ordinal);
+		}
+		var registered = roles.Select(role =>
+		{
+			var revisions = new List<string>();
+			var missing = false;
+			foreach (var id in role.OwnedModIds ?? role.ModIds)
+			{
+				if (ModDirectory(snapshot, id) is not { } directory || !Directory.Exists(directory))
+				{
+					missing = true;
+					continue;
+				}
+				var files = IasLibraryScan.ReadFiles(directory, token);
+				missing |= ArePatchFilesMissing(snapshot.Nodes[new(id)], files);
+				revisions.Add(IasLibraryScan.Revision(directory, files, token));
+			}
+			var archives = owners.FirstOrDefault(owner => owner.Id == role.Id)?.Archives ??
+				IasLibraryScan.ReadCompanionDirectory(Path.Combine(Sources(role.Id), "companion"))?.Archives ?? [];
+			bool? enabled = states is not null && states.TryGetValue(role.Id, out var value) ? value : null;
+			return new IasScannedRole(role, enabled, missing, archives, string.Join("/", revisions));
+		}).ToArray();
+		return new(registered, candidates, owners.Where(owner => owner.Enabled).ToArray());
+	}
 
-	public Task<IasRole> AddPreparedAsync(IReadOnlyList<IasInputContents> inputs, CancellationToken token,
+	public async Task<IasAddResult> AdoptLibraryRoleAsync(Guid modId, CancellationToken token)
+	{
+		EnsureGameStopped();
+		var snapshot = await LoadModsAsync(token).ConfigureAwait(false);
+		var candidate = ReadCandidate(snapshot);
+		if (candidate.CompanionPath is not { } companion)
+			throw new InvalidOperationException($"『{candidate.Name}』在库里没有配套包，请重新拖入主包和配套包。");
+		var work = At("temp/adopt-" + Guid.NewGuid().ToString("N"));
+		try
+		{
+			var stamp = await IasSourceStamp.CaptureAsync(candidate.Directory, $"库里的『{candidate.Name}』", token).ConfigureAwait(false);
+			var companionStamp = await IasSourceStamp.CaptureAsync(companion, $"『{candidate.Name}』的 IAS 配套", token).ConfigureAwait(false);
+			using var workspace = new IasDropWorkspace();
+			var input = await workspace.InspectAsync(companion, token).ConfigureAwait(false);
+			if (input.Companions.Count != 1)
+				throw new InvalidDataException($"『{candidate.Name}』的 IAS 配套包无法读取。");
+			var main = Path.Combine(work, "library-main");
+			var prefix = Path.TrimEndingDirectorySeparator(companion) + Path.DirectorySeparatorChar;
+			foreach (var file in IasLibraryScan.ReadFiles(candidate.Directory, token))
+			{
+				if (file.Equals(companion, StringComparison.OrdinalIgnoreCase) ||
+					file.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)) continue;
+				IasFileTree.Copy(file, IasFileTree.Under(main, Path.GetRelativePath(candidate.Directory, file)));
+			}
+			var package = IasCharacterPackage.ReadPrepared([input with { OriginalPath = candidate.Directory, Main = [main] }], work, token);
+			return await CommitAddAsync(package, IasRoleSource.IasPackage, token, async (current, ct) =>
+			{
+				var latest = ReadCandidate(current);
+				if (latest.Directory != candidate.Directory || latest.CompanionPath != companion)
+					throw new InvalidOperationException($"『{candidate.Name}』在登记期间已移动，请刷新后重试。");
+				await stamp.VerifyAsync(ct).ConfigureAwait(false);
+				await companionStamp.VerifyAsync(ct).ConfigureAwait(false);
+			}, candidate).ConfigureAwait(false);
+		}
+		finally { IasFileTree.Delete(work); }
+
+		IasLibraryRole ReadCandidate(LibrarySnapshot current) =>
+			current.Nodes.TryGetValue(new(modId), out var node) && ReadLibraryRole(node, token) is { } item
+				? item : throw new InvalidOperationException("这个 IAS Mod 已从库里移除或更改，请刷新列表。");
+	}
+
+	private IasLibraryRole? ReadLibraryRole(ModNode node, CancellationToken token)
+	{
+		var candidate = IasLibraryScan.ReadCandidate(_paths, node, token);
+		if (candidate is not { Legacy: true, CompanionPath: null }) return candidate;
+		var sources = At("library/sources");
+		if (!Directory.Exists(sources)) return candidate;
+		var matches = new List<(string Path, string[] Archives)>();
+		foreach (var directory in Directory.EnumerateDirectories(sources))
+		{
+			token.ThrowIfCancellationRequested();
+			var safe = IasFileTree.Under(sources, Path.GetFileName(directory));
+			var manifest = IasFileTree.Under(safe, "main/manifest.json");
+			if (!IasLibraryScan.HasMainIdentity(manifest, node.Id.Value)) continue;
+			var companion = IasFileTree.Under(safe, "companion");
+			if (IasLibraryScan.ReadCompanionDirectory(companion) is { } group)
+				matches.Add((companion, group.Archives));
+		}
+		return matches.Count == 1 ? candidate with { CompanionPath = matches[0].Path, Archives = matches[0].Archives } : candidate;
+	}
+
+	private string? ModDirectory(LibrarySnapshot snapshot, Guid id) =>
+		snapshot.Nodes.TryGetValue(new(id), out var node) ? IasFileTree.Under(_paths.ModsDirectory, node.RelativePath) : null;
+
+	private bool IsMissing(LibrarySnapshot snapshot, IasRole role) =>
+		(role.OwnedModIds ?? role.ModIds).Any(id => !Directory.Exists(ModDirectory(snapshot, id)));
+
+	private static bool ArePatchFilesMissing(ModNode node, string[] files)
+	{
+		if (node.PatchGroups.Count == 0) return false;
+		var names = files.Select(Path.GetFileName).ToHashSet(StringComparer.OrdinalIgnoreCase);
+		return node.PatchGroups.Any(group =>
+			!names.Contains($"{group.ArchiveHex16}.patch_{group.PatchIndex}"));
+	}
+
+	public async Task<IasRole> AddAsync(IReadOnlyList<string> paths, IasRoleSource source, CancellationToken token,
+		Func<LibrarySnapshot, CancellationToken, Task>? verifyOrigin = null) =>
+		(await AddAsync(paths, source, work => IasCharacterPackage.Read(paths, work, token), token, verifyOrigin)
+			.ConfigureAwait(false)).Role;
+
+	public Task<IasAddResult> AddPreparedAsync(IReadOnlyList<IasInputContents> inputs, CancellationToken token,
 		Func<LibrarySnapshot, CancellationToken, Task>? verifyOrigin = null) =>
 		AddAsync(inputs.Select(item => item.OriginalPath).ToArray(), IasRoleSource.IasPackage,
 			work => Task.FromResult(IasCharacterPackage.ReadPrepared(inputs, work, token)), token, verifyOrigin);
 
-	private async Task<IasRole> AddAsync(IReadOnlyList<string> paths, IasRoleSource source,
+	private async Task<IasAddResult> AddAsync(IReadOnlyList<string> paths, IasRoleSource source,
 		Func<string, Task<IasCharacterPackage>> readPackage, CancellationToken token,
 		Func<LibrarySnapshot, CancellationToken, Task>? verifyOrigin)
 	{
@@ -251,8 +393,9 @@ public sealed class IasDeploymentService
 				foreach (var path in paths)
 					stamps.Add(await IasSourceStamp.CaptureAsync(path, $"IAS 导入源「{Path.GetFileName(path)}」", token).ConfigureAwait(false));
 			var package = await IasTiming.MeasureAsync("锁外准备 IAS 主包与配套包", () => readPackage(work)).ConfigureAwait(false);
-			using (AcquireIasLease())
+			if (source != IasRoleSource.IasPackage)
 			{
+				using var lease = AcquireIasLease();
 				var installed = GetInstalled() ?? throw new InvalidOperationException("请先安装 IAS。");
 				var archives = await ReadArchiveDataAsync<string[]>(installed, work, "companion-archives",
 					package.CompanionZip, token).ConfigureAwait(false);
@@ -272,28 +415,92 @@ public sealed class IasDeploymentService
 		finally { IasFileTree.Delete(work); }
 	}
 
-	private Task<IasRole> CommitAddAsync(IasCharacterPackage package, IasRoleSource source, CancellationToken token,
-		Func<LibrarySnapshot, CancellationToken, Task> verifyOrigin) =>
-		ChangeAsync<IasRole>(async (tx, snapshot) =>
+	private Task<IasAddResult> CommitAddAsync(IasCharacterPackage package, IasRoleSource source, CancellationToken token,
+		Func<LibrarySnapshot, CancellationToken, Task> verifyOrigin, IasLibraryRole? adoption = null)
+	{
+		IasRole? previous = null;
+		var identity = source == IasRoleSource.IasPackage ? package.Identity : null;
+		return ChangeAsync<IasAddResult>(async (tx, snapshot) =>
 		{
 			var profile = RequireActive(snapshot);
 			var installed = await RequireCompatibleAsync(token).ConfigureAwait(false);
 			if (!HasManagedMod(profile)) throw new InvalidOperationException("请先打开 IAS。");
-			var id = await RunAsync(installed, tx, "import", package.CompanionZip, false, token).ConfigureAwait(false);
+			var roles = GetRoles();
+			var enabled = previous is null ||
+				(await ReadRoleStatesAsync(installed, tx.Backup, [previous], token).ConfigureAwait(false))[previous.Id];
+			if (previous is not null)
+				await RunAsync(installed, tx, "remove", previous.Id, false, token).ConfigureAwait(false);
+			var id = await RunAsync(installed, tx, "import", package.CompanionZip, false, token,
+				enabled: source != IasRoleSource.IasPackage).ConfigureAwait(false);
 			if (string.IsNullOrWhiteSpace(id))
 				throw new InvalidDataException("IAS worker 未返回角色标识。");
-			var roles = GetRoles();
-			if (roles.Any(role => role.Id == id)) throw new InvalidOperationException("这个 IAS 角色已安装。");
-			await RequireRegisteredArchivesFreeAsync(installed, tx, id, token).ConfigureAwait(false);
+			if (roles.Any(role => role.Id == id && role.Id != previous?.Id)) throw new InvalidOperationException("这个 IAS 角色已安装。");
+			IasRoleConflict? conflict = null;
+			if (source != IasRoleSource.IasPackage)
+				await RequireRegisteredArchivesFreeAsync(installed, tx, id, token).ConfigureAwait(false);
+			else if (adoption is not null)
+				conflict = await DescribeConflictsAsync(await SwapConflictsAsync(installed, tx, id, token)
+					.ConfigureAwait(false), token).ConfigureAwait(false);
+			else
+			{
+				var conflicts = await ReadConflictsAsync(installed, tx, id, token).ConfigureAwait(false);
+				conflict = await DescribeConflictsAsync(conflicts, token).ConfigureAwait(false);
+				if (previous is null && conflict is not null) enabled = false;
+			}
+			if (enabled && source == IasRoleSource.IasPackage)
+				await RunAsync(installed, tx, "set-enabled", id, false, token, true).ConfigureAwait(false);
+			if (previous is not null) IasFileTree.Delete(Sources(previous.Id));
 			var roleSources = Sources(id);
-			IasFileTree.Copy(Path.GetDirectoryName(package.Main)!, roleSources);
-			var imported = await IasTiming.MeasureAsync("导入模组库", () => tx.ImportAsync(snapshot, package.Main, package.Name, RoleLabel, null, token)).ConfigureAwait(false);
-			var role = new IasRole(id, package.Name, source, DateTimeOffset.UtcNow, imported.Roots.Select(i => i.Value).ToArray(),
-				imported.All.Select(i => i.Value).ToArray());
-			Write(At("library/roles.json"), roles.Append(role).ToArray());
-			var next = SetEntries(imported.Snapshot, profile, profile.Entries.Select(e => e.NodeId).Concat(imported.Roots));
-			return (await RegenerateAsync(installed, tx, next, token).ConfigureAwait(false), true, role);
-		}, token, validate: verifyOrigin);
+			IasFileTree.Copy(package.Source, roleSources);
+			var name = previous?.Name ?? adoption?.Name ?? package.Name;
+			IasRole role;
+			var next = snapshot;
+			if (adoption is not null)
+			{
+				var root = snapshot.Nodes[new(adoption.ModId)];
+				var owned = IasLibraryScan.PackagedOptions(snapshot, root).Prepend(root.Id).Select(key => key.Value).ToArray();
+				var revisions = owned.Select(key =>
+				{
+					var directory = ModDirectory(snapshot, key)!;
+					return IasLibraryScan.Revision(directory, IasLibraryScan.ReadFiles(directory, token), token);
+				});
+				role = new(id, name, source, adoption.AddedAt, [adoption.ModId], owned, identity, string.Join("/", revisions));
+			}
+			else
+			{
+				var registeredIds = roles.SelectMany(item => item.OwnedModIds ?? item.ModIds).ToHashSet();
+				var imported = await IasTiming.MeasureAsync("导入模组库", () => tx.ImportAsync(snapshot, package.Main,
+					name, RoleLabel, null, token, previous, package.CompanionZip, registeredIds)).ConfigureAwait(false);
+				if (previous is null && imported.Roots.Length == 1)
+					name = imported.Snapshot.Nodes[imported.Roots[0]].Metadata.Name;
+				role = new(id, name, previous?.Source ?? source, previous?.AddedAt ?? DateTimeOffset.UtcNow,
+					imported.Roots.Select(i => i.Value).ToArray(), imported.All.Select(i => i.Value).ToArray(), identity,
+					tx.Revision(imported.Snapshot, imported.All, token));
+				next = imported.Snapshot;
+			}
+			Write(At("library/roles.json"), roles.Where(item => item.Id != previous?.Id).Append(role).ToArray());
+			var disposition = previous is not null ? IasAddDisposition.Updated :
+				enabled ? IasAddDisposition.Installed : IasAddDisposition.InstalledDisabled;
+			next = await RegenerateAsync(installed, tx, next, token).ConfigureAwait(false);
+			return (next, true, new(role, disposition, conflict));
+		}, token, validate: verifyOrigin, readOnly: async ct =>
+		{
+			if (source != IasRoleSource.IasPackage) return (false, default!);
+			var roles = GetRoles();
+			previous = identity is null ? null : roles.SingleOrDefault(role => string.Equals(identity, role.PackageIdentity ??
+				IasLibraryScan.ReadCompanionDirectory(Path.Combine(Sources(role.Id), "companion"))?.Identity,
+				StringComparison.OrdinalIgnoreCase));
+			if (adoption is not null)
+			{
+				if (previous is not null || roles.Any(role => (role.OwnedModIds ?? role.ModIds).Contains(adoption.ModId)))
+					throw new InvalidOperationException("这个 IAS 角色已登记，请刷新列表。");
+				return (false, default!);
+			}
+			if (previous is not null && await package.HasSameContentAsync(Sources(previous.Id), ct).ConfigureAwait(false))
+				return (true, new(previous, IasAddDisposition.Identical));
+			return (false, default!);
+		});
+	}
 
 	public Task RemoveAsync(string id, CancellationToken token) => ChangeAsync(async (tx, snapshot) =>
 	{
@@ -421,6 +628,46 @@ public sealed class IasDeploymentService
 		await RequireArchivesFreeAsync(candidate.Archives, owners, id, token).ConfigureAwait(false);
 	}
 
+	private async Task<IasArchiveOwner[]> SwapConflictsAsync(IasInstalled installed, IasModTransaction tx, string id, CancellationToken token)
+	{
+		var conflicts = await ReadConflictsAsync(installed, tx, id, token).ConfigureAwait(false);
+		foreach (var owner in conflicts)
+			await RunAsync(installed, tx, "set-enabled", owner.Id, false, token, false).ConfigureAwait(false);
+		return conflicts;
+	}
+
+	private async Task<IasArchiveOwner[]> ReadConflictsAsync(IasInstalled installed, IasModTransaction tx, string id, CancellationToken token)
+	{
+		var owners = await ReadArchiveOwnersAsync(installed, tx.Backup, id, token).ConfigureAwait(false);
+		var candidate = owners.SingleOrDefault(owner => owner.Id == id)
+			?? throw new InvalidDataException($"官方 IAS 角色库中找不到 {id}。");
+		return ConflictsFor(id, candidate.Archives, owners);
+	}
+
+	public static IasArchiveOwner[] ConflictsFor(string id, string[] archives, IEnumerable<IasArchiveOwner> owners) =>
+		owners.Where(owner => owner.Enabled && owner.Id != id)
+			.Select(owner => owner with { Archives = owner.Archives.Intersect(archives, StringComparer.OrdinalIgnoreCase).ToArray() })
+			.Where(owner => owner.Archives.Length > 0).ToArray();
+
+	public static IasRoleConflict? DescribeConflicts(IReadOnlyList<IasArchiveOwner> owners, IReadOnlyDictionary<string, string> equipment) =>
+		owners.Count == 0 ? null : new(owners.Select(owner => owner.Name).Distinct().ToArray(),
+			owners.SelectMany(owner => owner.Archives).Distinct(StringComparer.OrdinalIgnoreCase)
+				.Select(archive => equipment.GetValueOrDefault(archive, archive)).Distinct().ToArray());
+
+	private async Task<IasRoleConflict?> DescribeConflictsAsync(IReadOnlyList<IasArchiveOwner> owners, CancellationToken token) =>
+		owners.Count == 0 ? null : DescribeConflicts(owners, await ReadEquipmentNamesAsync(token).ConfigureAwait(false));
+
+	public async Task<IReadOnlyDictionary<string, string>> ReadEquipmentNamesAsync(CancellationToken token)
+	{
+		try
+		{
+			var catalog = await CoreServices.CreateRuntimeArmorRegistryService(_paths).ReadArmorCatalogAsync(token).ConfigureAwait(false);
+			return catalog.GroupBy(entry => entry.ArchiveId, StringComparer.OrdinalIgnoreCase)
+				.ToDictionary(group => group.Key, group => group.First().DisplayName, StringComparer.OrdinalIgnoreCase);
+		}
+		catch (Microsoft.Data.Sqlite.SqliteException) { return new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase); }
+	}
+
 	private async Task RequireArchivesFreeAsync(IReadOnlyList<string> archives, IReadOnlyList<IasArchiveOwner> owners,
 		string? excluding, CancellationToken token)
 	{
@@ -474,7 +721,7 @@ public sealed class IasDeploymentService
 	{
 		var request = new IasWorkerRequest(command, _game, installed.ComponentsDirectory, At("library"), backup,
 			string.Empty, string.Empty, installed.Version, argument);
-		var value = await RunWorkerAsync(request, token).ConfigureAwait(false);
+		var value = await RunWorkerAsync(request, token, measure: command != "archive-occupancy" || argument != "*").ConfigureAwait(false);
 		return JsonSerializer.Deserialize<T>(value ?? "null")
 			?? throw new InvalidDataException("IAS worker 未返回装备 Archive 信息。");
 	}
@@ -484,7 +731,7 @@ public sealed class IasDeploymentService
 	{
 		var managed = roles.SelectMany(role => role.ModIds).Append(dataId).Select(id => new ModNodeId(id)).ToHashSet();
 		var enabled = states is null ? [] : roles.Where(role => states[role.Id]).SelectMany(role => role.ModIds)
-			.Prepend(dataId).Select(id => new ModNodeId(id)).ToArray();
+			.Prepend(dataId).Select(id => new ModNodeId(id)).Where(snapshot.Nodes.ContainsKey).ToArray();
 		var retained = profile.Entries.Select(entry => entry.NodeId).Where(id => !managed.Contains(id) || enabled.Contains(id));
 		return SetEntries(snapshot, profile, retained.Concat(enabled));
 	}
@@ -531,10 +778,11 @@ public sealed class IasDeploymentService
 		return await RunWorkerAsync(request, token).ConfigureAwait(false);
 	}
 
-	private async Task<string?> RunWorkerAsync(IasWorkerRequest request, CancellationToken token)
+	private async Task<string?> RunWorkerAsync(IasWorkerRequest request, CancellationToken token, bool measure = true)
 	{
-		var result = await IasTiming.MeasureAsync("官方 IAS：" + request.Command,
-			() => _worker.RunAsync(request, token)).ConfigureAwait(false);
+		var result = measure
+			? await IasTiming.MeasureAsync("官方 IAS：" + request.Command, () => _worker.RunAsync(request, token)).ConfigureAwait(false)
+			: await _worker.RunAsync(request, token).ConfigureAwait(false);
 		if (!result.Success) throw new InvalidOperationException(result.Error ?? $"IAS worker {request.Command} 失败。");
 		return result.Value;
 	}
@@ -565,7 +813,8 @@ public sealed class IasDeploymentService
 
 	private async Task<T> ChangeAsync<T>(Func<IasModTransaction, LibrarySnapshot, Task<(LibrarySnapshot Mods, bool Deploy, T Value)>> operation,
 		CancellationToken token, Func<Task>? afterDeploy = null, bool captureRuntime = true, bool captureComponents = false,
-		Func<LibrarySnapshot, CancellationToken, Task>? validate = null)
+		Func<LibrarySnapshot, CancellationToken, Task>? validate = null,
+		Func<CancellationToken, Task<(bool Handled, T Value)>>? readOnly = null)
 	{
 		EnsureGameStopped();
 		Directory.CreateDirectory(_root);
@@ -579,6 +828,11 @@ public sealed class IasDeploymentService
 			await IasTiming.MeasureAsync("锁内复核转换源", () => validate(snapshot, token)).ConfigureAwait(false);
 		token.ThrowIfCancellationRequested();
 		EnsureGameStopped();
+		if (readOnly is not null)
+		{
+			var result = await readOnly(token).ConfigureAwait(false);
+			if (result.Handled) return result.Value;
+		}
 		using var tx = IasTiming.Measure("拍快照", () => new IasModTransaction(_paths, _root, _game, captureRuntime, captureComponents, _optionActivations));
 		IGameDataDeploymentLease? deploymentLease = null;
 		ActivationState? previousDeployment = null;

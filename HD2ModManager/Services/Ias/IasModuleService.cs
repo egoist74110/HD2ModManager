@@ -214,13 +214,45 @@ public sealed class IasModuleService(
         Task.Run<IReadOnlyList<IasCharacterInfo>>(async () =>
         {
             var service = Open(getPaths(), requireGame: false);
-            var roles = await service.GetRolesWithStateAsync(ct).ConfigureAwait(false);
-            return roles.Select(item =>
+            var scan = await service.ScanRolesAsync(ct).ConfigureAwait(false);
+            var equipment = scan.Registered.Count + scan.Library.Count == 0
+                ? new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+                : await service.ReadEquipmentNamesAsync(ct).ConfigureAwait(false);
+            var registered = scan.Registered.Select(item =>
             {
-                var (role, enabled) = item;
+                var role = item.Role;
                 var icon = Path.Combine(service.Sources(role.Id), "companion", "icon.png");
-                return new IasCharacterInfo(role.Id, role.Name, File.Exists(icon) ? icon : null, (IasCharacterSource)role.Source, role.AddedAt, enabled);
-            }).ToArray();
+                return new IasCharacterInfo(role.Id, role.Name, File.Exists(icon) ? icon : null, (IasCharacterSource)role.Source, role.AddedAt, item.Enabled)
+                {
+                    MissingFromLibrary = item.MissingFromLibrary,
+                    RegisteredModId = role.ModIds.Length == 1 ? role.ModIds[0].ToString("N") : null,
+                    Equipment = Equipment(item.Archives),
+                    Conflict = item.Enabled == false ? Conflict(role.Id, item.Archives) : null,
+                    Revision = item.Revision,
+                    RegisteredRevision = role.LibraryRevision
+                };
+            });
+            var candidates = scan.Library.Select(item =>
+            {
+                var id = item.ModId.ToString("N");
+                return new IasCharacterInfo("library:" + id, item.Name, null,
+                    item.Legacy ? IasCharacterSource.PatchMod : IasCharacterSource.IasPackage, item.AddedAt, false)
+                {
+                    LibraryModId = id,
+                    LibraryOrigin = item.Legacy
+                        ? item.CompanionPath is null ? "上一份管理器转出来的角色 · 缺少配套包" : "上一份管理器转出来的角色"
+                        : "以前当普通 Mod 导入进库的 IAS 包",
+                    Equipment = Equipment(item.Archives),
+                    Conflict = Conflict("", item.Archives),
+                    Revision = item.Revision
+                };
+            });
+            return [.. registered, .. candidates];
+
+            string? Equipment(string[] archives) => archives.Length == 0 ? null :
+                string.Join("、", archives.Select(archive => equipment.GetValueOrDefault(archive, archive)).Distinct());
+            string? Conflict(string id, string[] archives) =>
+                IasDeploymentService.DescribeConflicts(IasDeploymentService.ConflictsFor(id, archives, scan.Occupants), equipment)?.Hint;
         }, ct);
 
     public async Task<IReadOnlyList<IasLibraryCandidate>> GetConvertibleLibraryModsAsync(CancellationToken ct)
@@ -378,8 +410,16 @@ public sealed class IasModuleService(
     public Task<IasOperationResult> SetCharacterEnabledAsync(string characterId, bool enabled, IProgress<IasPageProgress> progress, CancellationToken ct) =>
         ExecuteAsync(enabled ? "启用 IAS 角色" : "停用 IAS 角色", progress, ct, async (service, _) =>
         {
-            await service.SetCharacterEnabledAsync(characterId, enabled, ct).ConfigureAwait(false);
-            return new(true, enabled ? "IAS 角色已启用。" : "IAS 角色已停用。", []);
+            var message = await service.SetCharacterEnabledAsync(characterId, enabled, ct).ConfigureAwait(false);
+            return new(true, message, []) { FlashRoleId = enabled ? characterId : null };
+        });
+
+    public Task<IasOperationResult> AdoptLibraryRoleAsync(string modId, IProgress<IasPageProgress> progress, CancellationToken ct) =>
+        ExecuteAsync("登记 IAS 角色", progress, ct, async (service, _) =>
+        {
+            var added = await service.AdoptLibraryRoleAsync(Guid.Parse(modId), ct).ConfigureAwait(false);
+            return new(true, added.Conflict?.SwapMessage(added.Role.Name) ??
+                $"已把『{added.Role.Name}』登记进 IAS 并启用。", []) { FlashRoleId = added.Role.Id };
         });
 
     public Task<IasOperationResult> SetReShadeAsync(bool enabled, bool acknowledgeRisk, IProgress<IasPageProgress> progress, CancellationToken ct) =>
@@ -527,17 +567,19 @@ public sealed class IasModuleService(
 
         ct.ThrowIfCancellationRequested();
         var count = 0;
+        IasOperationResult? directResult = null;
         if (direct.Count != 0 && halfDropHint is null)
         {
             progress.Report(new("正在添加 IAS 主包与配套包…", null, null, true));
             try
             {
-                await service.AddPreparedAsync(direct, ct, async (_, token) =>
+                var added = await service.AddPreparedAsync(direct, ct, async (_, token) =>
                 {
                     foreach (var item in direct)
                         await origins[item.OriginalPath].VerifyAsync(token).ConfigureAwait(false);
                 }).ConfigureAwait(false);
-                count++;
+                directResult = FormatDirectAdd(added);
+                if (added.Disposition != IasAddDisposition.Identical) count++;
             }
             catch (Exception error) when (conversions.Count != 0 && error is not OperationCanceledException)
             {
@@ -563,12 +605,41 @@ public sealed class IasModuleService(
                         await origin.VerifyAsync(commitToken).ConfigureAwait(false);
                 }, conversion.MaterialVpks);
         }, ct).ConfigureAwait(false);
+        if (directResult is not null)
+            result = directResult with
+            {
+                Warnings = result.Warnings,
+                SkipLibraryReload = directResult.SkipLibraryReload && count == 0 && !result.Success,
+                Message = result.Success && conversions.Count > 0
+                    ? $"{directResult.Message} {result.Message}" : directResult.Message
+            };
         if (halfDropHint is null) return result;
         if (result.Success) return result with { Warnings = [halfDropHint, .. result.Warnings] };
         return result with
         {
             Message = halfDropHint,
             Warnings = result.Warnings.Contains(result.Message) ? result.Warnings : [result.Message, .. result.Warnings]
+        };
+    }
+
+    private static IasOperationResult FormatDirectAdd(IasAddResult added)
+    {
+        var (role, disposition, conflict) = added;
+        return disposition switch
+        {
+            IasAddDisposition.Identical => new(true, $"『{role.Name}』已经装过了，内容一样，没有再装。", [])
+            {
+                Warning = true, FlashRoleId = role.Id, SkipLibraryReload = true
+            },
+            IasAddDisposition.Updated => new(true, $"已更新『{role.Name}』，启用状态和设置保持不变。", [])
+            {
+                UpdatedRoleId = role.Id, FlashRoleId = role.Id
+            },
+            IasAddDisposition.InstalledDisabled => new(true, $"已装好，但没启用：{conflict!.Hint}。", [])
+            {
+                Warning = true, SwapRoleId = role.Id
+            },
+            _ => new(true, $"已添加『{role.Name}』。", [])
         };
     }
 
@@ -846,7 +917,7 @@ public sealed class IasModuleService(
                 DownloadFailed = IasDownloadFailure.Is(error)
             };
         }
-        if (result.Success && refreshLibrary is not null)
+        if (result.Success && !result.SkipLibraryReload && refreshLibrary is not null)
         {
             try { await IasTiming.MeasureAsync("刷新管理器模组库", refreshLibrary).ConfigureAwait(false); }
             catch (Exception error) { return result with { Warnings = [.. result.Warnings, $"刷新 Mod 库失败：{error.Message}"] }; }

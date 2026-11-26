@@ -70,11 +70,19 @@ public sealed class IasLibraryPickerRenderTests
         var loading = new IasLibraryPickerDialog(null, CancellationToken.None);
         Save(loading, Path.Combine(output, "picker-loading.png"));
 
-        app.Shutdown();
-        Dispatcher.CurrentDispatcher.InvokeShutdown();
-        // 没有 Run 过的 Application 不会自己把静态引用清掉；不清的话别的测试会拿到一个已死的 Dispatcher。
-        typeof(System.Windows.Application).GetField("_appInstance",
-            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static)?.SetValue(null, null);
+        try
+        {
+            // WPF 每个 AppDomain 只允许一个 Application；两页共用同一次离屏宿主。
+            IasPageViewModelTests.RenderRoleStates(app, Path.Combine(Repo(), "tmp", "w52", "screens"));
+        }
+        finally
+        {
+            app.Shutdown();
+            Dispatcher.CurrentDispatcher.InvokeShutdown();
+            // 没有 Run 过的 Application 不会自己清掉静态引用。
+            typeof(System.Windows.Application).GetField("_appInstance",
+                System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static)?.SetValue(null, null);
+        }
     }
 
     private static void Save(Window window, string path)

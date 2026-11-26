@@ -1,10 +1,44 @@
 using System.IO.Compression;
+using System.Security.Cryptography;
 using System.Text.Json;
 
 namespace HD2ModCore.Ias;
 
 internal sealed record IasCharacterPackage(string Name, string Main, string CompanionZip)
 {
+	internal string Source => Path.GetDirectoryName(Main)!;
+	internal string? Identity => IasLibraryScan.ReadCompanionDirectory(Path.Combine(Source, "companion"))?.Identity;
+
+	internal async Task<bool> HasSameContentAsync(string directory, CancellationToken token)
+	{
+		foreach (var part in new[] { "main", "companion" })
+		{
+			var before = Path.Combine(directory, part);
+			var after = Path.Combine(Source, part);
+			if (!Directory.Exists(before)) return false;
+			var oldFiles = Files(before);
+			var newFiles = Files(after);
+			if (!oldFiles.SequenceEqual(newFiles, StringComparer.Ordinal)) return false;
+			foreach (var file in newFiles)
+			{
+				token.ThrowIfCancellationRequested();
+				var oldPath = IasFileTree.Under(before, file);
+				var newPath = IasFileTree.Under(after, file);
+				if (new FileInfo(oldPath).Length != new FileInfo(newPath).Length) return false;
+				await using var oldStream = File.OpenRead(oldPath);
+				await using var newStream = File.OpenRead(newPath);
+				var hash = await SHA256.HashDataAsync(oldStream, token).ConfigureAwait(false);
+				if (!hash.SequenceEqual(await SHA256.HashDataAsync(newStream, token).ConfigureAwait(false))) return false;
+			}
+		}
+		return true;
+
+		static string[] Files(string root) => Directory.EnumerateFiles(root, "*", IasPackageDetector.SafeEnumeration)
+			.Select(file => Path.GetRelativePath(root, file))
+			.Where(relative => !relative.Equals(Infrastructure.ModSettingsFile.FileName, StringComparison.OrdinalIgnoreCase))
+			.Order(StringComparer.Ordinal).ToArray();
+	}
+
 	internal static async Task<IasCharacterPackage> Read(IReadOnlyList<string> input, string work, CancellationToken token)
 	{
 		if (input.Count == 0) throw new InvalidDataException("请提供 IAS 主包与配套包。");

@@ -59,7 +59,8 @@ internal sealed class IasModTransaction : IDisposable
 
 	internal async Task<(LibrarySnapshot Snapshot, ModNodeId[] Roots, ModNodeId[] All)> ImportAsync(
 		LibrarySnapshot snapshot, string input, string? name, string? label, Guid? replacement,
-		CancellationToken token)
+		CancellationToken token, IasRole? roleReplacement = null, string? companion = null,
+		IReadOnlySet<Guid>? registeredIds = null)
 	{
 		if (File.Exists(input))
 		{
@@ -99,33 +100,92 @@ internal sealed class IasModTransaction : IDisposable
 			return (snapshot with { Nodes = nodes }, [previous.Id], [previous.Id]);
 		}
 
+		var previousRoots = roleReplacement?.ModIds.Select(id => new ModNodeId(id)).ToArray();
+		var owned = (roleReplacement?.OwnedModIds ?? roleReplacement?.ModIds ?? []).Select(id => new ModNodeId(id)).ToHashSet();
+		var reclaimable = new HashSet<ModNodeId>();
+		if (roleReplacement is null && companion is not null)
+			foreach (var id in roots)
+			{
+				if (registeredIds?.Contains(id.Value) == true || !nodes.TryGetValue(id, out var node) ||
+					(!IasLibraryScan.IsMarked(node) && IasLibraryScan.ReadCandidate(_paths, node, token) is null)) continue;
+				reclaimable.Add(id);
+				reclaimable.UnionWith(IasLibraryScan.PackagedOptions(snapshot, node).Where(option =>
+					registeredIds?.Contains(option.Value) != true));
+			}
+		var mapping = staged.Keys.ToDictionary(id => id);
+		if (previousRoots is { Length: 1 } && roots.Length == 1)
+			mapping[roots[0]] = previousRoots[0];
+		else if (previousRoots is not null && !previousRoots.ToHashSet().SetEquals(roots))
+			throw new InvalidDataException("新版 IAS 主包的主体结构发生变化，无法保留原角色的设置。");
+		if (roleReplacement is not null)
+		{
+			var previousOptions = owned.Where(snapshot.Nodes.ContainsKey).Select(id => snapshot.Nodes[id])
+				.Where(node => node.Metadata.Kind == ModNodeKind.Option && node.Metadata.SourcePackagePath is not null)
+				.ToLookup(node => node.Metadata.SourcePackagePath!, StringComparer.OrdinalIgnoreCase);
+			foreach (var node in staged.Values.Where(node => node.Metadata.Kind == ModNodeKind.Option && !owned.Contains(node.Id)))
+			{
+				if (node.Metadata.SourcePackagePath is not { } path) continue;
+				var candidates = previousOptions[path].ToArray();
+				if (candidates.Length == 1 && !staged.ContainsKey(candidates[0].Id)) mapping[node.Id] = candidates[0].Id;
+			}
+		}
+		if (mapping.Values.Distinct().Count() != mapping.Count)
+			throw new InvalidDataException("新版 IAS 主包的主体身份和已有选项重叠。");
+
 		foreach (var (id, node) in staged)
 		{
-			if (nodes.ContainsKey(id)) throw new InvalidOperationException($"Mod 库中已存在同一身份：{node.Metadata.Name}");
 			var isRoot = roots.Contains(id);
+			var targetId = mapping[id];
+			nodes.TryGetValue(targetId, out var existingNode);
+			if (existingNode is not null && !owned.Contains(targetId) && !reclaimable.Contains(targetId))
+				throw new InvalidOperationException($"IAS 主包和库里的「{existingNode.Metadata.Name}」使用了同一个 Mod 编号，无法安全覆盖。");
+			var existingPath = existingNode is null ? null : ModPath(existingNode.RelativePath);
 			var installed = node with
 			{
+				Id = targetId,
+				RelativePath = existingNode?.RelativePath ?? node.RelativePath,
+				Children = node.Children.Select(child => mapping.GetValueOrDefault(child, child))
+					.Concat(existingNode?.Children.Where(child => !owned.Contains(child)) ?? []).Distinct().ToArray(),
 				Metadata = node.Metadata with
 				{
-					Name = isRoot && roots.Length == 1 && name is not null ? name : node.Metadata.Name,
-					Notes = isRoot ? Label(node.Metadata.Notes, label) : node.Metadata.Notes
+					Name = existingNode?.Metadata.Name ?? (isRoot && roots.Length == 1 && name is not null ? name : node.Metadata.Name),
+					Notes = isRoot ? EnsureLabel(existingNode?.Metadata.Notes ?? node.Metadata.Notes, label) :
+						existingNode?.Metadata.Notes ?? node.Metadata.Notes,
+					CreatedUtc = existingNode?.Metadata.CreatedUtc ?? node.Metadata.CreatedUtc,
+					HostModGuids = node.Metadata.HostModGuids?.Select(MapId).ToArray(),
+					SuppressDefaultDirectOptionActivation = existingNode?.Metadata.SuppressDefaultDirectOptionActivation ??
+						node.Metadata.SuppressDefaultDirectOptionActivation
 				}
 			};
-			while (Path.Exists(ModPath(installed.RelativePath)) || _writes.ContainsKey(ModPath(installed.RelativePath)))
+			while (existingPath is null && (Path.Exists(ModPath(installed.RelativePath)) || _writes.ContainsKey(ModPath(installed.RelativePath))))
 				installed = installed with { RelativePath = $"ias-{Guid.NewGuid():N}" };
 			var source = IasFileTree.Under(stagePaths.ModsDirectory, node.RelativePath);
-			WriteMetadata(source, installed);
+			WriteMetadata(source, installed, existingPath);
+			if (isRoot && companion is not null)
+				File.Copy(companion, Path.Combine(source, IasLibraryScan.CompanionFile), overwrite: true);
 			_writes[ModPath(installed.RelativePath)] = source;
-			nodes.Add(id, installed);
+			nodes[targetId] = installed;
 		}
 		var options = CoreServices.CreateOptionActivationStore(stagePaths).CreateSnapshot();
-		foreach (var (key, value) in options.Options) _optionChanges.Add(key, value);
-		return (snapshot with { Nodes = nodes }, roots, staged.Keys.ToArray());
+		foreach (var (key, value) in options.Options)
+		{
+			if (Guid.TryParse(key, out var guid) && mapping.TryGetValue(new(guid), out var target) && nodes.ContainsKey(target) &&
+				!snapshot.Nodes.ContainsKey(target))
+				_optionChanges.Add(target.Value.ToString("N"), value.ToDictionary(pair => MapId(pair.Key), pair => pair.Value,
+					StringComparer.OrdinalIgnoreCase));
+		}
+		var nextSnapshot = RemoveMods(snapshot with { Nodes = nodes },
+			owned.Except(mapping.Values).Select(id => id.Value));
+		return (nextSnapshot, roots.Select(id => mapping[id]).ToArray(), mapping.Values.ToArray());
+
+		string MapId(string id) => Guid.TryParse(id, out var guid) && mapping.TryGetValue(new(guid), out var mapped)
+			? mapped.Value.ToString("N") : id;
 	}
 
 	internal LibrarySnapshot RemoveMods(LibrarySnapshot snapshot, IEnumerable<Guid> ids)
 	{
 		var removed = ids.Select(id => new ModNodeId(id)).ToHashSet();
+		if (removed.Count == 0) return snapshot;
 		var nodes = snapshot.Nodes.Where(pair => !removed.Contains(pair.Key)).ToDictionary(pair => pair.Key, pair => pair.Value);
 		var options = OptionRelationshipGraph.Create(snapshot);
 		foreach (var reference in nodes.Values)
@@ -148,8 +208,16 @@ internal sealed class IasModTransaction : IDisposable
 			if (!result.Succeeded) throw new InvalidOperationException($"无法从配置移除 IAS：{result.Message}");
 			current = result.Snapshot;
 		}
-		return removed.Count == 0 ? current : current with { Nodes = nodes };
+		return current with { Nodes = nodes };
 	}
+
+	internal string Revision(LibrarySnapshot snapshot, IEnumerable<ModNodeId> ids, CancellationToken token) =>
+		string.Join("/", ids.Select(id =>
+		{
+			var target = ModPath(snapshot.Nodes[id].RelativePath);
+			var directory = _writes[target]!;
+			return IasLibraryScan.Revision(directory, IasLibraryScan.ReadFiles(directory, token), token);
+		}));
 
 	internal async Task PublishAsync(LibrarySnapshot next, JsonModLibraryStore store, CancellationToken token)
 	{
@@ -239,14 +307,16 @@ internal sealed class IasModTransaction : IDisposable
 	}
 
 	private string ModPath(string relative) => IasFileTree.Under(_paths.ModsDirectory, relative);
-	private static void WriteMetadata(string directory, ModNode node)
+	private static void WriteMetadata(string directory, ModNode node, string? previousDirectory = null)
 	{
-		var previous = ModSettingsFile.TryRead(directory);
+		var previous = ModSettingsFile.TryRead(previousDirectory ?? directory);
 		var error = ModSettingsFile.TryWrite(directory, new(ModSettingsFile.CurrentSchema, previous?.EnabledMaterialPatches,
 			node.Id.Value.ToString("N"), node.Metadata.Name, node.Metadata.Notes));
 		if (error is not null) throw new IOException($"无法写入 IAS Mod 标识：{error}");
 	}
 	private static string? Label(string? notes, string? label) =>
 		label is null ? notes : string.IsNullOrEmpty(notes) ? $"[{label}]" : $"[{label}] {notes}";
+	private static string? EnsureLabel(string? notes, string? label) =>
+		label is not null && notes?.StartsWith($"[{label}]", StringComparison.Ordinal) == true ? notes : Label(notes, label);
 }
 

@@ -8,6 +8,8 @@ internal sealed class FakeIasModuleService : IIasModuleService
 {
     public bool IsGameRunning() => false;
     public Task<bool> RecoverPendingAsync(CancellationToken ct) => Task.FromResult(false);
+    public Task<IasOperationResult> AdoptLibraryRoleAsync(string modId, IProgress<IasPageProgress> progress, CancellationToken ct) =>
+        Task.FromResult(new IasOperationResult(false, "演示库中没有这个 IAS Mod。", []));
 
     private const string CurrentVersion = "1.6.4";
     private const string UpdateVersion = "1.6.5";

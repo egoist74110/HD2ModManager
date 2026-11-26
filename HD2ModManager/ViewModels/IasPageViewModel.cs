@@ -64,10 +64,17 @@ public sealed class IasPageViewModel : FullWorkspacePageViewModel
     private IasOperationResult? _result;
     private bool _areWarningsExpanded;
     private IReadOnlyList<IasCharacterRow> _characters = [];
+    private IReadOnlyList<IasCharacterGroup> _characterGroups = IasCharacterGroup.Create([]);
+    private bool _roleScanPending;
+    private bool _manualRoleScan;
+    private DateTimeOffset? _lastRoleScan;
+    private string? _flashRoleId;
+    private readonly HashSet<string> _updatedRoles = new(StringComparer.Ordinal);
 
     public IasPageViewModel(IIasModuleService service, IIasPageDialogs dialogs, NotificationService notifications,
         Func<string, string?> findModName, Action<string> openMod, IasOperationQueue queue,
-        IasVpkTargets? savedVpkTargets = null, Action<IasVpkTargets>? saveVpkTargets = null, Action? openSettings = null)
+        IasVpkTargets? savedVpkTargets = null, Action<IasVpkTargets>? saveVpkTargets = null, Action? openSettings = null,
+        Action<string>? openLibraryMod = null)
     {
         _openSettings = openSettings;
         _service = service;
@@ -98,6 +105,16 @@ public sealed class IasPageViewModel : FullWorkspacePageViewModel
         });
         OpenOfficialPageCommand = new(_ => OpenOfficialPage(), _ => CanAct);
         OpenCreatedModCommand = new(_ => OpenCreatedMod(), _ => CanAct && CanOpenCreatedMod);
+        RefreshRolesCommand = new(_ => RequestRoleScan(manual: true), _ => _active && !IsScanningRoles && !_roleScanPending);
+        SwapCharacterCommand = new(value =>
+        {
+            var row = value as IasCharacterRow ?? Characters.FirstOrDefault(item => item.Id == _result?.SwapRoleId);
+            return row is null ? Task.CompletedTask : SetCharacterEnabledAsync(row, true);
+        }, value => CanToggleCharacter && (value is IasCharacterRow { IsToggling: false } || CanSwapResult));
+        OpenLibraryCharacterCommand = new(value =>
+        {
+            if (value is IasCharacterRow { LibraryModId: { } id }) (openLibraryMod ?? _openMod)(id);
+        });
         ToggleReShadeCommand = new(_ => SetReShadeAsync(!ReShadeEnabled), _ => CanToggleReShade);
         SelectDlssCommand = new(value => SetDlssAsync((IasDlssMode)value!),
             value => value is IasDlssMode mode && CanSelectDlss(mode));
@@ -126,6 +143,9 @@ public sealed class IasPageViewModel : FullWorkspacePageViewModel
     public AsyncRelayCommand ToggleReShadeCommand { get; }
     public AsyncRelayCommand SelectDlssCommand { get; }
     public AsyncRelayCommand RepairGraphicsCommand { get; }
+    public AsyncRelayCommand RefreshRolesCommand { get; }
+    public AsyncRelayCommand SwapCharacterCommand { get; }
+    public RelayCommand OpenLibraryCharacterCommand { get; }
 
     public IasQueuedOperation? CurrentQueueItem => _queue.Current;
     public IReadOnlyList<IasQueuedOperation> WaitingQueue => _queue.Waiting;
@@ -173,7 +193,11 @@ public sealed class IasPageViewModel : FullWorkspacePageViewModel
     public bool ShowTurnOffLua => ShowConflictWarning && _status.BuiltInLuaOn;
     public bool ShowMappingWarning => ShowConflictWarning && _status.MappingInUse;
     public IReadOnlyList<IasCharacterRow> Characters => _characters;
-    public string CharacterTitle => $"角色（{Characters.Count}）";
+    public IReadOnlyList<IasCharacterGroup> CharacterGroups => _characterGroups;
+    public string CharacterTitle => $"IAS 角色（{Characters.Count}）";
+    public bool IsScanningRoles { get; private set; }
+    public string RoleScanText => IsScanningRoles ? "正在扫描 Mod 库…" :
+        _lastRoleScan is { } timestamp ? $"已同步 · {timestamp:HH:mm:ss}" : "等待同步";
     public double DropHeight => Characters.Count == 0 ? 180 : 72;
     public bool IsWindowDropHighlighted => _windowDropHint is not null;
     public string DropText => _windowDropHint ?? DropStatusText;
@@ -200,6 +224,8 @@ public sealed class IasPageViewModel : FullWorkspacePageViewModel
     public string? ProgressDetail => CurrentQueueItem?.Task.Stage ?? _progress?.Detail;
     public bool HasResult => _result is not null && !ShowProgress;
     public bool ResultSuccess => _result?.Success == true;
+    public bool ResultWarning => _result?.Warning == true;
+    public bool CanSwapResult => _result?.SwapRoleId is { } id && Characters.Any(row => row.Id == id && row.Enabled == false);
     public IReadOnlyList<string> ResultWarnings => _result?.Warnings ?? [];
     public bool HasResultWarnings => ResultWarnings.Count > 0;
     public bool AreWarningsExpanded { get => _areWarningsExpanded; set => SetField(ref _areWarningsExpanded, value); }
@@ -277,6 +303,10 @@ public sealed class IasPageViewModel : FullWorkspacePageViewModel
         _gameProcessTimer = null;
         ClearWindowDrop();
         _refreshPending = false;
+        _roleScanPending = false;
+        _manualRoleScan = false;
+        _flashRoleId = null;
+        _updatedRoles.Clear();
         _refresh?.Cancel();
         _chooseLibrary?.Cancel();
         _loadVpkTargets?.Cancel();
@@ -387,28 +417,23 @@ public sealed class IasPageViewModel : FullWorkspacePageViewModel
 
     public async Task SetCharacterEnabledAsync(IasCharacterRow character, bool enabled)
     {
-        if (!CanToggleCharacter || !Characters.Contains(character) || character.Enabled is null || character.Enabled == enabled) return;
+        if (!CanToggleCharacter || !Characters.Contains(character) || character.IsToggling ||
+            character.Enabled is null || character.Enabled == enabled) return;
         var id = character.Id;
         var service = _service;
-        var succeeded = false;
         // 排队期间开关先显示目标位置；成功后保持到列表刷新换上新行，失败/取消/没排上才弹回。
         character.ShowPendingEnabled(enabled);
         try
         {
-            await QueueAsync(enabled ? "启用 IAS 角色" : "停用 IAS 角色", character.Name, ["role:" + id], null,
-                async (progress, ct) =>
-                {
-                    var result = await service.SetCharacterEnabledAsync(id, enabled, progress, ct);
-                    succeeded = result.Success;
-                    return result;
-                });
+            await QueueAsync(character.IsLibraryOnly ? "登记 IAS 角色" : enabled ? "启用 IAS 角色" : "停用 IAS 角色",
+                character.Name, ["role:" + id], null, (progress, ct) => character.LibraryModId is { } modId
+                    ? service.AdoptLibraryRoleAsync(modId, progress, ct)
+                    : service.SetCharacterEnabledAsync(id, enabled, progress, ct));
         }
         finally
         {
-            if (succeeded) _refreshPending = _active;
-            else character.ShowPendingEnabled(null);
+            character.ShowPendingEnabled(null);
             NotifyState();
-            _ = RefreshPendingAsync();
         }
     }
 
@@ -574,7 +599,7 @@ public sealed class IasPageViewModel : FullWorkspacePageViewModel
     }
 
     private bool CanQueueConversion(object? character) => CanQueue && ShowIasToggle &&
-        character is IasCharacterRow row && Characters.Contains(row);
+        character is IasCharacterRow { IsLibraryOnly: false } row && Characters.Contains(row);
 
     private Task ConfirmAndRunAsync(IasConfirmation confirmation,
         Func<bool, IProgress<IasPageProgress>, CancellationToken, Task<IasOperationResult>> execute)
@@ -702,7 +727,12 @@ public sealed class IasPageViewModel : FullWorkspacePageViewModel
         if (e.PropertyName == nameof(BackgroundTaskItem.CanCancel)) NotifyCancel();
     }
 
-    private void OnQueueResult(IasOperationResult result) => PublishResult(result, notify: false);
+    private void OnQueueResult(IasOperationResult result)
+    {
+        _flashRoleId = result.FlashRoleId;
+        if (result.UpdatedRoleId is { } id) _updatedRoles.Add(id);
+        PublishResult(result, notify: false);
+    }
 
     private Task RunOperationAsync(Func<IProgress<IasPageProgress>, CancellationToken, Task<IasOperationResult>> execute,
         bool offerConflicts = false)
@@ -793,47 +823,69 @@ public sealed class IasPageViewModel : FullWorkspacePageViewModel
         return RefreshPendingAsync();
     }
 
+    public void OnLibrarySnapshotChanged()
+    {
+        if (_active && !_queue.HasWork) _ = RequestRoleScan(manual: false);
+    }
+
+    private Task RequestRoleScan(bool manual)
+    {
+        _roleScanPending = true;
+        _manualRoleScan |= manual;
+        return RefreshPendingAsync();
+    }
+
     private async Task RefreshPendingAsync(bool allowPaused = false)
     {
-        if (!_active || _isBusy || !_refreshPending || HasCurrentQueueItem || _queue.IsStopping ||
+        if (!_active || _isBusy || (!_refreshPending && !_roleScanPending) || HasCurrentQueueItem || _queue.IsStopping ||
             (_queue.IsPaused && !allowPaused)) return;
         _queue.Pause();
         _isBusy = true;
         try
         {
             // 快速离开再返回时，等上一轮刷新退出后再开始下一轮。
-            while (_active && _refreshPending)
+            while (_active && (_refreshPending || _roleScanPending))
             {
+                var readStatus = _refreshPending;
+                var reportScan = _manualRoleScan;
+                var requestedScan = _roleScanPending;
                 _refreshPending = false;
+                _roleScanPending = false;
+                _manualRoleScan = false;
                 using var cancellation = new CancellationTokenSource();
                 _refresh = cancellation;
                 NotifyState();
                 try
                 {
-                    if (_recoveryPending && !GameRunning)
+                    if (readStatus && _recoveryPending && !GameRunning)
                     {
                         await _service.RecoverPendingAsync(cancellation.Token);
                         cancellation.Token.ThrowIfCancellationRequested();
                         _recoveryPending = false;
                     }
-                    var status = await _service.GetStatusAsync(cancellation.Token);
-                    cancellation.Token.ThrowIfCancellationRequested();
-                    var characters = await _service.GetCharactersAsync(cancellation.Token);
-                    cancellation.Token.ThrowIfCancellationRequested();
-                    _status = status;
-                    var oldRows = _characters.ToDictionary(row => row.Info);
-                    _characters = characters.Select(item => oldRows.GetValueOrDefault(item) ??
-                        new IasCharacterRow(item, SetCharacterEnabledAsync)).ToArray();
-                    if (_expandedCharacter is not null && !_characters.Contains(_expandedCharacter)) CloseConversion();
-                    var previousCatalog = _vpkCatalogTask;
-                    var currentCatalog = RefreshVpkTargetsAsync();
-                    _vpkCatalogTask = previousCatalog.IsCompletedSuccessfully ? currentCatalog : Task.WhenAll(previousCatalog, currentCatalog);
+                    if (readStatus)
+                    {
+                        var status = await _service.GetStatusAsync(cancellation.Token);
+                        cancellation.Token.ThrowIfCancellationRequested();
+                        _status = status;
+                    }
+                    await ScanCharactersAsync(reportScan, requestedScan, cancellation.Token);
+                    if (readStatus)
+                    {
+                        var previousCatalog = _vpkCatalogTask;
+                        var currentCatalog = RefreshVpkTargetsAsync();
+                        _vpkCatalogTask = previousCatalog.IsCompletedSuccessfully ? currentCatalog : Task.WhenAll(previousCatalog, currentCatalog);
+                    }
                 }
                 catch (OperationCanceledException) when (cancellation.IsCancellationRequested) { continue; }
                 catch (Exception exception)
                 {
                     if (!cancellation.IsCancellationRequested)
-                        _status = _status with { Kind = IasStatusKind.Error, Message = exception.Message };
+                    {
+                        if (readStatus && _status.Kind == IasStatusKind.Checking)
+                            _status = _status with { Kind = IasStatusKind.Error, Message = exception.Message };
+                        PublishResult(new(false, $"刷新 IAS 角色失败：{exception.Message}", []));
+                    }
                     continue;
                 }
                 finally { _refresh = null; }
@@ -854,12 +906,44 @@ public sealed class IasPageViewModel : FullWorkspacePageViewModel
         }
     }
 
+    private async Task ScanCharactersAsync(bool reportScan, bool requestedScan, CancellationToken token)
+    {
+        IsScanningRoles = true;
+        NotifyState();
+        try
+        {
+            var characters = await _service.GetCharactersAsync(token);
+            token.ThrowIfCancellationRequested();
+            var diff = IasCharacterScanDiff.Compare(_characters.Select(row => row.Info), characters);
+            var oldRows = _characters.ToDictionary(row => row.Info);
+            _characters = characters.Select(item => oldRows.GetValueOrDefault(item) ??
+                new IasCharacterRow(item, SetCharacterEnabledAsync)).ToArray();
+            foreach (var row in _characters)
+            {
+                row.ShowUpdated(_updatedRoles.Contains(row.Id));
+                row.ShowFlash(row.Id == _flashRoleId);
+            }
+            _flashRoleId = null;
+            _characterGroups = IasCharacterGroup.Create(_characters);
+            if (_expandedCharacter is not null && !_characters.Contains(_expandedCharacter)) CloseConversion();
+            _lastRoleScan = DateTimeOffset.Now;
+            if (reportScan || (diff.HasChanges && (requestedScan || _result is null)))
+                PublishResult(new(true, diff.Message, []), notify: diff.HasChanges);
+        }
+        finally
+        {
+            IsScanningRoles = false;
+            NotifyState();
+        }
+    }
+
     private void PublishResult(IasOperationResult result, bool notify = true)
     {
         if (result is { Success: true, CreatedModId: { } id } && _findModName(id) is { } name)
             result = result with { Message = $"已放进 Mod 库：{name}" };
         if (notify)
-            _notifications.Show(result.Message, result.Success ? NotificationLevel.Info : NotificationLevel.Error,
+            _notifications.Show(result.Message, result.Warning ? NotificationLevel.Warning :
+                result.Success ? NotificationLevel.Info : NotificationLevel.Error,
                 TimeSpan.FromSeconds(6), "IAS");
         if (_disposed) return;
         ClearResult();
@@ -936,10 +1020,70 @@ public sealed class IasPageViewModel : FullWorkspacePageViewModel
         ToggleReShadeCommand.RaiseCanExecuteChanged();
         SelectDlssCommand.RaiseCanExecuteChanged();
         RepairGraphicsCommand.RaiseCanExecuteChanged();
+        RefreshRolesCommand.RaiseCanExecuteChanged();
+        SwapCharacterCommand.RaiseCanExecuteChanged();
     }
 
     private static string FormatSize(long? bytes) => bytes is { } value ? $"{value / (1024d * 1024):0.##} MB" : "未知大小";
 
+}
+
+public sealed record IasCharacterGroup(string Title, string Description, string EmptyText, IReadOnlyList<IasCharacterRow> Rows)
+{
+    public bool IsEmpty => Rows.Count == 0;
+
+    internal static IasCharacterGroup[] Create(IReadOnlyList<IasCharacterRow> rows)
+    {
+        var enabled = rows.Where(row => row.Enabled == true).ToArray();
+        var disabled = rows.Where(row => row.Enabled != true).OrderBy(row => row.IsLibraryOnly).ToArray();
+        return
+        [
+            new($"已启用（{enabled.Length}）", "进游戏按 F4 在 IAS 面板里选", "还没有启用的角色", enabled),
+            new($"未启用（{disabled.Length}）", "打开开关就启用；和已启用的抢同一件护甲时，自动停用那个", "没有未启用的角色", disabled)
+        ];
+    }
+}
+
+internal sealed record IasCharacterScanDiff(int Discovered, int Changed, int Missing, int Restored, int Removed)
+{
+    internal bool HasChanges => Discovered + Changed + Missing + Restored + Removed > 0;
+    internal string Message
+    {
+        get
+        {
+            if (!HasChanges) return "刷新完成：Mod 库和 IAS 一致，没有变化。";
+            var details = new List<string>();
+            if (Discovered > 0) details.Add($"发现 {Discovered} 个库里的 IAS Mod");
+            if (Changed > 0) details.Add($"发现 {Changed} 个角色的库内文件有变化");
+            if (Missing > 0) details.Add($"{Missing} 个角色的库内文件已删除");
+            if (Restored > 0) details.Add($"{Restored} 个角色的库内文件已恢复");
+            if (Removed > 0) details.Add($"库里移除了 {Removed} 个未登记的 IAS Mod");
+            return $"刷新完成：{string.Join("，", details)}。";
+        }
+    }
+
+    internal static IasCharacterScanDiff Compare(IEnumerable<IasCharacterInfo> before, IReadOnlyList<IasCharacterInfo> after)
+    {
+        var old = before.ToDictionary(item => item.Id, StringComparer.Ordinal);
+        var discovered = 0;
+        var changed = 0;
+        var missing = 0;
+        var restored = 0;
+        foreach (var item in after)
+        {
+            var previous = old.GetValueOrDefault(item.Id);
+            if (item.LibraryModId is not null && previous is null) discovered++;
+            if (item.MissingFromLibrary && previous?.MissingFromLibrary != true) missing++;
+            if (previous?.MissingFromLibrary == true && !item.MissingFromLibrary) restored++;
+            var previousRevision = previous?.Revision ?? item.RegisteredRevision;
+            if (previous?.MissingFromLibrary != true && !item.MissingFromLibrary && previousRevision is not null &&
+                item.Revision != previousRevision) changed++;
+        }
+        var ids = after.Select(item => item.Id).ToHashSet(StringComparer.Ordinal);
+        var registeredMods = after.Select(item => item.RegisteredModId).OfType<string>().ToHashSet(StringComparer.OrdinalIgnoreCase);
+        return new(discovered, changed, missing, restored,
+            old.Values.Count(item => item.LibraryModId is { } mod && !registeredMods.Contains(mod) && !ids.Contains(item.Id)));
+    }
 }
 
 public sealed class IasCharacterRow(IasCharacterInfo character, Func<IasCharacterRow, bool, Task> setEnabled) : INotifyPropertyChanged
@@ -964,13 +1108,46 @@ public sealed class IasCharacterRow(IasCharacterInfo character, Func<IasCharacte
     public string Name => character.Name;
     public string? IconPath => character.IconPath;
     public bool? Enabled => character.Enabled;
-    public bool IsDisabled => Enabled == false;
+    public string? LibraryModId => character.LibraryModId;
+    public bool IsLibraryOnly => LibraryModId is not null;
+    public bool IsRegistered => !IsLibraryOnly;
+    public bool IsDisabled => Enabled == false && IsRegistered;
+    public bool IsToggling => _pendingEnabled is not null;
+    public bool MissingFromLibrary => character.MissingFromLibrary;
+    public bool IsUpdated { get; private set; }
+    public bool IsFlashing { get; private set; }
+    public bool HasConflict => character.Conflict is not null;
+    public string? Conflict => character.Conflict;
+    public string? MetaText => string.Join(" · ", new[] { character.LibraryOrigin,
+        character.Equipment is { } equipment ? $"套在 {equipment}" : null }.OfType<string>());
     public bool IsChecked
     {
-        get => _pendingEnabled ?? Enabled ?? false;
+        get => IsLibraryOnly ? false : _pendingEnabled ?? Enabled ?? false;
         set => _ = setEnabled(this, value);
     }
-    public string ToggleHint => IsChecked ? "停用这个角色" : "启用这个角色";
+    public string ToggleHint => IsToggling ? IsLibraryOnly ? "正在登记…" : "正在切换…" :
+        IsLibraryOnly ? "登记进 IAS 并启用" : IsChecked ? "停用这个角色" : "启用这个角色";
+
+    internal void ShowUpdated(bool updated)
+    {
+        if (IsUpdated == updated) return;
+        IsUpdated = updated;
+        PropertyChanged?.Invoke(this, new(nameof(IsUpdated)));
+    }
+
+    internal void ShowFlash(bool flash)
+    {
+        if (IsFlashing)
+        {
+            IsFlashing = false;
+            PropertyChanged?.Invoke(this, new(nameof(IsFlashing)));
+        }
+        if (flash)
+        {
+            IsFlashing = true;
+            PropertyChanged?.Invoke(this, new(nameof(IsFlashing)));
+        }
+    }
 
     internal void ShowPendingEnabled(bool? enabled)
     {

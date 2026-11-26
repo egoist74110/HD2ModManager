@@ -17,6 +17,7 @@ public interface IIasModuleService
     Task<IasOperationResult> UninstallAsync(bool removeCharacters, IProgress<IasPageProgress> progress, CancellationToken ct);
     Task<IasOperationResult> SetEnabledInActiveProfileAsync(bool enabled, IProgress<IasPageProgress> progress, CancellationToken ct);
     Task<IasOperationResult> SetCharacterEnabledAsync(string characterId, bool enabled, IProgress<IasPageProgress> progress, CancellationToken ct);
+    Task<IasOperationResult> AdoptLibraryRoleAsync(string modId, IProgress<IasPageProgress> progress, CancellationToken ct);
     Task<IasOperationResult> SetReShadeAsync(bool enabled, bool acknowledgeRisk, IProgress<IasPageProgress> progress, CancellationToken ct);
     Task<IasOperationResult> SetDlssAsync(IasDlssMode mode, IProgress<IasPageProgress> progress, CancellationToken ct);
     Task<IasOperationResult> TurnOffManagerFeaturesAsync(bool physics, bool builtInLua, CancellationToken ct);
@@ -53,7 +54,17 @@ public sealed record IasPageStatus(
 
 public enum IasCharacterSource { IasPackage, PatchMod, L4d2Vpk }
 
-public sealed record IasCharacterInfo(string Id, string Name, string? IconPath, IasCharacterSource Source, DateTimeOffset AddedAt, bool? Enabled);
+public sealed record IasCharacterInfo(string Id, string Name, string? IconPath, IasCharacterSource Source, DateTimeOffset AddedAt, bool? Enabled)
+{
+    public string? LibraryModId { get; init; }
+    public string? RegisteredModId { get; init; }
+    public string? LibraryOrigin { get; init; }
+    public bool MissingFromLibrary { get; init; }
+    public string? Equipment { get; init; }
+    public string? Conflict { get; init; }
+    public string Revision { get; init; } = "";
+    public string? RegisteredRevision { get; init; }
+}
 
 /// <summary>库里 Mod 的来源：决定转换走哪条路。</summary>
 public enum IasLibrarySource { Standard, L4d2Vpk, CustomModel }
@@ -115,4 +126,9 @@ public sealed record IasOperationResult(bool Success, string Message, IReadOnlyL
 {
     /// <summary>失败原因是下载连不上（换下载来源可能解决）。</summary>
     public bool DownloadFailed { get; init; }
+    public bool Warning { get; init; }
+    public string? SwapRoleId { get; init; }
+    public string? FlashRoleId { get; init; }
+    public string? UpdatedRoleId { get; init; }
+    public bool SkipLibraryReload { get; init; }
 }

@@ -1743,6 +1743,7 @@ namespace HD2ModManager.ViewModels
                     if (Volatile.Read(ref _disposed) != 0) return;
                     CloseDeletedModDetails();
                     RefreshNonListPagesAfterLibrarySnapshot();
+                    _iasWorkspacePage?.OnLibrarySnapshotChanged();
                 });
             }
             catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { }
@@ -2534,7 +2535,7 @@ namespace HD2ModManager.ViewModels
             return _iasWorkspacePage ??= new IasPageViewModel(_iasService,
                 new Views.IasPageDialogs(), _notificationService, FindIasCreatedModName, OpenIasCreatedMod, _iasQueue,
                 SettingsService.GetIasVpkTargets(), SettingsService.SetIasVpkTargets,
-                () => Navigate(WorkspaceMode.Settings));
+                () => Navigate(WorkspaceMode.Settings), OpenIasLibraryMod);
         }
 
         private IIasModuleService CreateIasService()
@@ -2587,6 +2588,18 @@ namespace HD2ModManager.ViewModels
             ClearTransientSelection();
             SelectedModId = id;
             OpenSinglePage(WorkspacePageType.ModDetails);
+        }
+
+        private void OpenIasLibraryMod(string id)
+        {
+            if (_libraryService.Get(id) is not { } mod) return;
+            OpenSinglePage(WorkspacePageType.Library);
+            if (LeftPage is LibraryPageViewModel library)
+            {
+                library.ClearSearchCommand.Execute(null);
+                library.Query = mod.Name;
+                library.ApplySelection([mod.Guid]);
+            }
         }
 
         private ArmorRegistryPageViewModel CreateArmorRegistryPage()

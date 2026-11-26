@@ -1,5 +1,9 @@
 using System.IO;
 using System.IO.Compression;
+using System.Windows;
+using System.Windows.Controls;
+using System.Windows.Media;
+using System.Windows.Media.Imaging;
 using HD2ModCore.Ias;
 using HD2ModCore.Domain;
 using HD2ModManager.Enums;
@@ -12,6 +16,172 @@ namespace HD2ModCore.Tests;
 [Collection("WpfApplication")]
 public sealed class IasPageViewModelTests
 {
+    [Fact]
+    public async Task GroupsKeepLibraryCandidatesBelowRegisteredRolesAndManualScanReportsDifferences()
+    {
+        var shots = RoleSamples();
+        var current = shots[..3];
+        var notifications = new NotificationService();
+        var service = new ServiceStub(IasStatusKind.Installed, "1.6.4")
+        {
+            ReadCharacters = _ => Task.FromResult<IReadOnlyList<IasCharacterInfo>>(current)
+        };
+        using var page = CreatePage(service, notifications: notifications);
+        await page.EnterAsync();
+        Assert.Equal(new[] { "已启用（1）", "未启用（2）" }, page.CharacterGroups.Select(group => group.Title));
+        Assert.Equal(new[] { "disabled", "library:brem" }, page.CharacterGroups[1].Rows.Select(row => row.Id));
+
+        current = [shots[0] with { Revision = "new" }, shots[1] with { MissingFromLibrary = true }, shots[3]];
+        page.RefreshRolesCommand.Execute(null);
+        Assert.Contains("发现 1 个库里的 IAS Mod", page.ResultText);
+        Assert.Contains("1 个角色的库内文件有变化", page.ResultText);
+        Assert.Contains("1 个角色的库内文件已删除", page.ResultText);
+        Assert.Contains("库里移除了 1 个未登记的 IAS Mod", page.ResultText);
+        Assert.True(page.CharacterGroups[1].Rows[0].MissingFromLibrary);
+        Assert.Equal(2, service.CharacterReads);
+        Assert.Equal(1, service.StatusReads);
+        Assert.Equal(page.ResultText, notifications.History.Last().Message);
+
+        page.RefreshRolesCommand.Execute(null);
+        Assert.Equal("刷新完成：Mod 库和 IAS 一致，没有变化。", page.ResultText);
+        Assert.Equal(2, notifications.History.Count);
+    }
+
+    [Fact]
+    public async Task IdenticalDropRefreshesOnceAndKeepsWarningAndFlash()
+    {
+        var duplicate = new IasOperationResult(true, "『Milfy SR-64』已经装过了，内容一样，没有再装。", [])
+            { Warning = true, FlashRoleId = "character", SkipLibraryReload = true };
+        var service = new ServiceStub(IasStatusKind.Installed, "1.6.4")
+            { Add = (_, _, _) => Task.FromResult(duplicate) };
+        var dialogs = new DialogStub(null);
+        using var page = CreatePage(service, dialogs);
+        await page.EnterAsync();
+
+        await page.HandleWindowDropAsync([AppContext.BaseDirectory]);
+
+        Assert.Equal(2, service.CharacterReads);
+        Assert.Equal(duplicate.Message, page.ResultText);
+        Assert.True(page.ResultWarning);
+        Assert.True(Assert.Single(page.Characters).IsFlashing);
+        Assert.StartsWith("已同步 · ", page.RoleScanText);
+        Assert.Equal(0, dialogs.Confirmations);
+    }
+
+    [Fact]
+    public async Task OpeningLibraryRowQueuesAdoptionAndShowsPendingSwitch()
+    {
+        var candidates = RoleSamples();
+        var current = candidates[..3];
+        var adopt = new TaskCompletionSource<IasOperationResult>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var service = new ServiceStub(IasStatusKind.Installed, "1.6.4")
+        {
+            ReadCharacters = _ => Task.FromResult<IReadOnlyList<IasCharacterInfo>>(current),
+            Adopt = _ => adopt.Task
+        };
+        var dialogs = new DialogStub(null);
+        using var page = CreatePage(service, dialogs);
+        await page.EnterAsync();
+        var row = Assert.Single(page.Characters, item => item.IsLibraryOnly);
+        var task = page.SetCharacterEnabledAsync(row, true);
+        Assert.True(row.IsToggling);
+        Assert.False(row.IsChecked);
+        Assert.Equal("正在登记…", row.ToggleHint);
+        current = [candidates[0], candidates[1], candidates[2] with { Id = "brem", LibraryModId = null, RegisteredModId = "brem", Enabled = true }];
+        adopt.SetResult(new(true, "已把『布莱默顿』登记进 IAS 并启用。", []));
+        await task;
+        Assert.Equal(new[] { "brem" }, service.AdoptCalls);
+        Assert.Equal(2, page.CharacterGroups[0].Rows.Count);
+        Assert.Empty(service.ToggleCalls);
+        Assert.Equal(0, dialogs.Confirmations);
+    }
+
+    private static IasCharacterInfo[] RoleSamples() =>
+    [
+        new("character", "Milfy SR-64", null, IasCharacterSource.IasPackage, DateTimeOffset.UnixEpoch, true)
+            { Equipment = "SR-64 煤渣砖", Revision = "original" },
+        new("disabled", "少前2 维多利亚", null, IasCharacterSource.IasPackage, DateTimeOffset.UnixEpoch, false)
+            { Equipment = "SR-64 煤渣砖", Conflict = "和『Milfy SR-64』占同一件护甲（SR-64 煤渣砖）" },
+        new("library:brem", "布莱默顿", null, IasCharacterSource.IasPackage, DateTimeOffset.UnixEpoch, false)
+            { LibraryModId = "brem", LibraryOrigin = "以前当普通 Mod 导入进库的 IAS 包", Equipment = "DP-8 民主执政官" },
+        new("library:eku", "Eku", null, IasCharacterSource.PatchMod, DateTimeOffset.UnixEpoch, false)
+            { LibraryModId = "eku", LibraryOrigin = "上一份管理器转出来的角色", Equipment = "DP-8 民主执政官" }
+    ];
+
+    internal static void RenderRoleStates(System.Windows.Application app, string output)
+    {
+        Directory.CreateDirectory(output);
+        app.Resources["BoolToVis"] = new BooleanToVisibilityConverter();
+        app.Resources["CardStackMargin"] = new Thickness(0, 0, 0, 12);
+        app.Resources["CardPadding"] = new Thickness(16);
+        app.Resources["CardCornerRadius"] = new CornerRadius(14);
+        app.Resources["LayoutGap"] = 12d;
+        app.Resources["CardContainer"] = new Style(typeof(Border), (Style)app.Resources["AppCard"])
+        {
+            Setters = { new Setter(Border.PaddingProperty, app.Resources["CardPadding"]),
+                new Setter(FrameworkElement.MarginProperty, new Thickness(0)) }
+        };
+
+        var roles = RoleSamples();
+        var current = roles[..2];
+        var scan = Task.FromResult<IReadOnlyList<IasCharacterInfo>>(current);
+        var duplicate = new IasOperationResult(true, "『Milfy SR-64』已经装过了，内容一样，没有再装。", [])
+            { Warning = true, FlashRoleId = roles[0].Id, SkipLibraryReload = true };
+        var service = new ServiceStub(IasStatusKind.Installed, "1.6.4")
+        {
+            ReadCharacters = _ => scan,
+            Add = (_, _, _) => Task.FromResult(duplicate)
+        };
+        using var page = CreatePage(service);
+        page.EnterAsync().GetAwaiter().GetResult();
+        Save("groups-and-conflict", "和『Milfy SR-64』占同一件护甲（SR-64 煤渣砖）");
+
+        page.HandleWindowDropAsync([AppContext.BaseDirectory]).GetAwaiter().GetResult();
+        Save("duplicate-drop", duplicate.Message);
+
+        var pending = new TaskCompletionSource<IReadOnlyList<IasCharacterInfo>>();
+        scan = pending.Task;
+        page.RefreshRolesCommand.Execute(null);
+        Assert.True(page.IsScanningRoles);
+        Save("refresh-scanning", "正在扫描 Mod 库…");
+        pending.SetResult(roles[..3]);
+        Assert.False(page.IsScanningRoles);
+        Save("refresh-complete", "刷新完成：发现 1 个库里的 IAS Mod。");
+        scan = Task.FromResult<IReadOnlyList<IasCharacterInfo>>(roles);
+        page.OnLibrarySnapshotChanged();
+        Save("library-roles", "库里有，未启用");
+
+        void Save(string name, string expectedText)
+        {
+            var view = new HD2ModManager.Views.IasPageView { DataContext = page };
+            var canvas = new Border
+            {
+                Background = (Brush)app.Resources["SurfaceCanvas"],
+                Padding = new Thickness(16),
+                Child = view
+            };
+            var size = new Size(1000, 960);
+            canvas.Measure(size);
+            canvas.Arrange(new Rect(size));
+            canvas.UpdateLayout();
+            Assert.Contains(VisibleText(canvas), text => text == expectedText);
+            var bitmap = new RenderTargetBitmap((int)size.Width, (int)size.Height, 96, 96, PixelFormats.Pbgra32);
+            bitmap.Render(canvas);
+            var encoder = new PngBitmapEncoder();
+            encoder.Frames.Add(BitmapFrame.Create(bitmap));
+            var path = Path.Combine(output, name + ".png");
+            using (var file = File.Create(path)) encoder.Save(file);
+            Assert.True(new FileInfo(path).Length > 5000, name);
+        }
+        static IEnumerable<string> VisibleText(DependencyObject node)
+        {
+            if (node is UIElement { Visibility: not Visibility.Visible }) yield break;
+            if (node is TextBlock block) yield return block.Text;
+            for (var i = 0; i < VisualTreeHelper.GetChildrenCount(node); i++)
+                foreach (var text in VisibleText(VisualTreeHelper.GetChild(node, i))) yield return text;
+        }
+    }
+
     [Fact]
     public async Task RunningGameDisablesWritesAndRecoveryRunsOnReentryAfterExit()
     {
@@ -1467,6 +1637,14 @@ public sealed class IasPageViewModelTests
 
     private sealed class ServiceStub(IasStatusKind kind, string? version = null) : IIasModuleService
     {
+        public Func<string, Task<IasOperationResult>>? Adopt { get; init; }
+        public List<string> AdoptCalls { get; } = [];
+        public Task<IasOperationResult> AdoptLibraryRoleAsync(string modId, IProgress<IasPageProgress> progress, CancellationToken ct)
+        {
+            AdoptCalls.Add(modId);
+            return Adopt?.Invoke(modId) ?? Task.FromResult(new IasOperationResult(true, "已登记并启用。", []));
+        }
+        public Func<CancellationToken, Task<IReadOnlyList<IasCharacterInfo>>>? ReadCharacters { get; init; }
         public bool GameRunning { get; set; }
         public int RecoveryCalls { get; private set; }
         public bool IsGameRunning() => GameRunning;
@@ -1530,6 +1708,7 @@ public sealed class IasPageViewModelTests
         public Task<IReadOnlyList<IasCharacterInfo>> GetCharactersAsync(CancellationToken ct)
         {
             CharacterReads++;
+            if (ReadCharacters is not null) return ReadCharacters(ct);
             var characters = new List<IasCharacterInfo>();
             if (!_removedCharacters.Contains("character"))
                 characters.Add(new("character", "Milfy SR-64", null, IasCharacterSource.IasPackage, DateTimeOffset.UnixEpoch, CharacterEnabled));

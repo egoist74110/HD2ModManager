@@ -52,14 +52,29 @@ public sealed class IasProcessWorker(string sourceDirectory, string workerDirect
 		var sourceExe = Path.Combine(sourceDirectory, "HD2IasWorker.exe");
 		if (!File.Exists(sourceExe)) throw new FileNotFoundException("未找到 IAS 部署 worker。", sourceExe);
 		var copy = Stopwatch.StartNew();
-		Directory.CreateDirectory(workerDirectory);
+		var readOnly = request.Command == "archive-occupancy" && request.Argument == "*";
+		var destination = readOnly ? start.Environment["TEMP"]! : workerDirectory;
+		Directory.CreateDirectory(destination);
+		if (readOnly)
+		{
+			// 扫描沿用已安装的运行依赖，worker 本身和日志只写一次性目录。
+			if (Directory.Exists(workerDirectory))
+				foreach (var file in Directory.EnumerateFiles(workerDirectory))
+					IasFileTree.Copy(file, IasFileTree.Under(destination, Path.GetFileName(file)));
+			start.FileName = Path.Combine(destination, "HD2IasWorker.exe");
+			start.WorkingDirectory = destination;
+			request = request with { Backup = destination };
+		}
 		foreach (var source in Directory.EnumerateFiles(sourceDirectory))
 		{
-			var target = IasFileTree.Under(workerDirectory, Path.GetFileName(source));
+			var target = IasFileTree.Under(destination, Path.GetFileName(source));
 			File.Copy(source, target, overwrite: true);
 		}
-		IasTiming.Record($"官方 IAS：{request.Command}：复制 worker", copy.Elapsed);
-		await EnsureRuntimeAsync(null, cancellationToken).ConfigureAwait(false);
+		if (!readOnly)
+		{
+			IasTiming.Record($"官方 IAS：{request.Command}：复制 worker", copy.Elapsed);
+			await EnsureRuntimeAsync(null, cancellationToken).ConfigureAwait(false);
+		}
 
 		using var limit = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
 		limit.CancelAfter(TimeSpan.FromMinutes(15));
@@ -87,7 +102,7 @@ public sealed class IasProcessWorker(string sourceDirectory, string workerDirect
 		}
 		var output = await stdout.ConfigureAwait(false);
 		var diagnostics = (await stderr.ConfigureAwait(false)).Trim();
-		foreach (var line in diagnostics.Split('\n'))
+		foreach (var line in readOnly ? [] : diagnostics.Split('\n'))
 		{
 			// worker 用 "IAS计时\t阶段\t毫秒" 报告内部各步耗时。
 			var parts = line.Trim().Split('\t');
@@ -107,7 +122,8 @@ public sealed class IasProcessWorker(string sourceDirectory, string workerDirect
 		if (request.Command == "reshade-install" && process.ExitCode == 1 &&
 			result is { Success: false, ErrorKind: IasWorkerErrorKind.ReShadeConflict, Error.Length: > 0 })
 			return result;
-		return new(false, Error: $"IAS worker {request.Command} 失败（退出码 {process.ExitCode}）：{result?.Error ?? output}\n诊断日志：{request.Backup}");
+		var detail = readOnly ? "" : $"\n诊断日志：{request.Backup}";
+		return new(false, Error: $"IAS worker {request.Command} 失败（退出码 {process.ExitCode}）：{result?.Error ?? output}{detail}");
 	}
 
 	private ProcessStartInfo CreateStartInfo(string temp)

@@ -77,22 +77,26 @@ public sealed class IasDeploymentTests
 	private const string Dp8Helmet = "59d238094a164c88";
 
 	[Fact]
-	public async Task DirectPairChecksArchiveBeforeImport()
+	public async Task DirectPairWithConflictInstallsDisabled()
 	{
 		using var fixture = await Fixture.CreateAsync();
 		fixture.SetArchiveOwner("sdkgroup.existing", enabled: true, Dp8Helmet);
-		fixture.Worker.CandidateArchives = [Dp8Helmet];
+		fixture.Worker.RoleArchives["sdkgroup.role"] = [Dp8Helmet];
 
-		var error = await Assert.ThrowsAsync<InvalidOperationException>(() =>
-			fixture.Service.AddAsync(fixture.Pair, IasRoleSource.IasPackage, default));
+		var added = await fixture.AddDirectAsync();
 
-		Assert.Equal($"与已启用角色『sdkgroup.existing』占用同一装备（{Dp8Helmet}），请先停用其中一个。", error.Message);
-		Assert.Equal(new[] { "companion-archives", "archive-occupancy" }, fixture.Worker.Requests.Select(request => request.Command));
+		Assert.Equal(IasAddDisposition.InstalledDisabled, added.Disposition);
+		Assert.Equal($"和『sdkgroup.existing』占同一件护甲（{Dp8Helmet}）", added.Conflict!.Hint);
+		Assert.Equal(new[] { "import", "archive-occupancy", "regenerate", "status" }, fixture.Worker.Requests.Select(request => request.Command));
+		Assert.False(Assert.Single(await fixture.Service.GetRolesWithStateAsync(default)).Enabled);
+		Assert.DoesNotContain(Assert.Single(added.Role.ModIds), await ActiveEntriesAsync(fixture));
 		Assert.False(Directory.Exists(fixture.Snapshot));
 	}
 
-	[Fact]
-	public async Task DisabledOwnerAllowsAddButCannotBeEnabledOverNewOwner()
+	[Theory]
+	[InlineData(false)]
+	[InlineData(true)]
+	public async Task EnablingConflictingRoleSwapsOnceAndRollsBackOnFailure(bool fail)
 	{
 		using var fixture = await Fixture.CreateAsync();
 		fixture.Worker.RoleArchives["sdkgroup.role"] = [Dp8Helmet];
@@ -100,15 +104,30 @@ public sealed class IasDeploymentTests
 		await fixture.Service.SetCharacterEnabledAsync(role.Id, false, default);
 		Assert.Empty(await fixture.Service.GetArchiveOccupancyAsync(default));
 		await fixture.Service.PreflightArchivesAsync([Dp8Helmet], default);
-		fixture.SetArchiveOwner("sdkgroup.existing", enabled: true, Dp8Helmet);
+		fixture.ChangeCompanion("Second", "other");
+		fixture.Worker.RoleArchives["sdkgroup.second"] = [Dp8Helmet];
+		var other = await fixture.Service.AddAsync(fixture.Pair, IasRoleSource.IasPackage, default);
 		fixture.Worker.Requests.Clear();
 
-		var error = await Assert.ThrowsAsync<InvalidOperationException>(() =>
-			fixture.Service.SetCharacterEnabledAsync(role.Id, true, default));
-
-		Assert.Contains($"『sdkgroup.existing』占用同一装备（{Dp8Helmet}）", error.Message);
-		Assert.Equal("archive-occupancy", Assert.Single(fixture.Worker.Requests).Command);
-		Assert.False(Assert.Single(await fixture.Service.GetRolesWithStateAsync(default)).Enabled);
+		var before = Inventory(fixture.Runtime, fixture.IasLibrary, fixture.Paths.ModsDirectory);
+		fixture.Worker.FailRegenerate = fail;
+		if (fail)
+		{
+			await Assert.ThrowsAsync<InvalidOperationException>(() => fixture.Service.SetCharacterEnabledAsync(role.Id, true, default));
+			Assert.Equal(before, Inventory(fixture.Runtime, fixture.IasLibrary, fixture.Paths.ModsDirectory));
+		}
+		else
+		{
+			var message = await fixture.Service.SetCharacterEnabledAsync(role.Id, true, default);
+			Assert.Equal($"已启用『Sample』，并停用了『Second』（它们占同一件护甲：{Dp8Helmet}）。", message);
+		}
+		Assert.Single(fixture.Worker.Requests, request => request.Command == "regenerate");
+		Assert.Collection(fixture.Worker.Requests.Where(item => item.Command == "set-enabled"),
+			request => { Assert.Equal(other.Id, request.Argument); Assert.False(request.Enabled); },
+			request => { Assert.Equal(role.Id, request.Argument); Assert.True(request.Enabled); });
+		var enabled = Assert.Single(await fixture.Service.GetRolesWithStateAsync(default), item => item.Enabled == true);
+		Assert.Equal(fail ? other.Id : role.Id, enabled.Role.Id);
+		Assert.Equal(new[] { fixture.ManagedId, Assert.Single(enabled.Role.ModIds) }, await ActiveEntriesAsync(fixture));
 	}
 
 	[Fact]
@@ -299,7 +318,7 @@ public sealed class IasDeploymentTests
 		using var fixture = await Fixture.CreateAsync();
 		var role = await fixture.Service.AddAsync(fixture.Pair, IasRoleSource.IasPackage, default);
 		Assert.Equal("sdkgroup.role", role.Id);
-		Assert.Equal(new[] { "companion-archives", "archive-occupancy", "import", "archive-occupancy", "regenerate", "status" },
+		Assert.Equal(new[] { "import", "archive-occupancy", "set-enabled", "regenerate", "status" },
 			fixture.Worker.Requests.Select(request => request.Command));
 		var initial = await fixture.Service.LoadModsAsync(default);
 		Assert.Equal(2, initial.Nodes.Count);
@@ -314,7 +333,7 @@ public sealed class IasDeploymentTests
 
 		await fixture.Service.RemoveAsync(role.Id, default);
 
-		Assert.Equal(new[] { "remove", "regenerate" }, fixture.Worker.Requests.Skip(6).Select(request => request.Command));
+		Assert.Equal(new[] { "remove", "regenerate" }, fixture.Worker.Requests.Skip(5).Select(request => request.Command));
 		var after = await fixture.Service.LoadModsAsync(default);
 		Assert.Single(after.Nodes);
 		Assert.Equal(fixture.ManagedId, Assert.Single(IasDeploymentService.Active(after)!.Entries).NodeId.Value);
@@ -413,6 +432,121 @@ public sealed class IasDeploymentTests
 
 	private static async Task<Guid[]> ActiveEntriesAsync(Fixture fixture) =>
 		IasDeploymentService.Active(await fixture.Service.LoadModsAsync(default))!.Entries.Select(entry => entry.NodeId.Value).ToArray();
+
+	[Theory]
+	[InlineData(false)]
+	[InlineData(true)]
+	public async Task SameIdentitySkipsIdenticalAndUpdatesChangedPackageInPlace(bool enabled)
+	{
+		using var fixture = await Fixture.CreateAsync();
+		var installed = await fixture.AddDirectAsync();
+		if (!enabled) await fixture.Service.SetCharacterEnabledAsync(installed.Role.Id, false, default);
+		var modId = new ModNodeId(Assert.Single(installed.Role.ModIds));
+		var node = (await fixture.Service.LoadModsAsync(default)).Nodes[modId];
+		var directory = Path.Combine(fixture.Paths.ModsDirectory, node.RelativePath);
+		var settings = ModSettingsFile.TryRead(directory)! with { EnabledMaterialPatches = ["custom-material"] };
+		Assert.Null(ModSettingsFile.TryWrite(directory, settings));
+		var before = Inventory(fixture.Runtime, fixture.IasLibrary, fixture.Paths.ModsDirectory);
+		fixture.Worker.Requests.Clear();
+
+		var same = await fixture.AddDirectAsync();
+
+		Assert.Equal(IasAddDisposition.Identical, same.Disposition);
+		Assert.Empty(fixture.Worker.Requests);
+		Assert.Equal(before, Inventory(fixture.Runtime, fixture.IasLibrary, fixture.Paths.ModsDirectory));
+		Assert.False(Directory.Exists(fixture.Snapshot));
+
+		fixture.ChangeCompanion("Updated title", "fixture-group");
+		var updated = await fixture.AddDirectAsync();
+		Assert.Equal(IasAddDisposition.Updated, updated.Disposition);
+		Assert.Equal(installed.Role.Name, updated.Role.Name);
+		Assert.Equal(installed.Role.AddedAt, updated.Role.AddedAt);
+		Assert.Equal(modId.Value, Assert.Single(updated.Role.ModIds));
+		Assert.Equal(enabled, Assert.Single(await fixture.Service.GetRolesWithStateAsync(default)).Enabled);
+		Assert.Equal(new[] { "custom-material" }, ModSettingsFile.TryRead(directory)!.EnabledMaterialPatches);
+		Assert.Single(fixture.Worker.Requests, request => request.Command == "regenerate");
+		Assert.Equal(enabled, (await ActiveEntriesAsync(fixture)).Contains(modId.Value));
+	}
+
+	[Theory]
+	[InlineData(false)]
+	[InlineData(true)]
+	public async Task LibraryScanFindsAndAdoptsMarkedAndOrdinaryIasNodes(bool legacy)
+	{
+		using var fixture = await Fixture.CreateAsync();
+		var id = ModNodeId.New();
+		var directory = Path.Combine(fixture.Paths.ModsDirectory, "library-role");
+		Directory.CreateDirectory(directory);
+		File.WriteAllText(Path.Combine(directory, "a7c4c9d700000000.patch_0"), "main-patch");
+		File.Copy(fixture.Pair[1], Path.Combine(directory, "Sample.hd2irpack.zip"));
+		var snapshot = await fixture.Service.LoadModsAsync(default);
+		var node = new ModNode(id, "library-role", new("库里旧角色", legacy ? "[IAS 角色]" : "旧版普通导入",
+			DateTimeOffset.UnixEpoch, null), [new("a7c4c9d700000000", 0)], []);
+		var store = new JsonModLibraryStore(fixture.Paths, allowLegacyMigration: false);
+		await store.SaveAsync(snapshot with { Nodes = snapshot.Nodes.Append(KeyValuePair.Create(id, node)).ToDictionary() }, default);
+		fixture.SetArchiveOwner("sdkgroup.existing", enabled: true, Dp8Helmet);
+		fixture.Worker.RoleArchives["sdkgroup.role"] = [Dp8Helmet];
+
+		var scan = await fixture.Service.ScanRolesAsync(default);
+		var candidate = Assert.Single(scan.Library);
+		Assert.Equal(id.Value, candidate.ModId);
+		Assert.Equal(legacy, candidate.Legacy);
+		Assert.NotNull(candidate.CompanionPath);
+		Assert.Equal("archive-occupancy", Assert.Single(fixture.Worker.Requests).Command);
+		Assert.Equal("sdkgroup.existing", Assert.Single(scan.Occupants).Id);
+
+		var added = await fixture.Service.AdoptLibraryRoleAsync(candidate.ModId, default);
+		Assert.Equal(id.Value, Assert.Single(added.Role.ModIds));
+		Assert.Equal("库里旧角色", added.Role.Name);
+		Assert.NotNull(added.Conflict);
+		Assert.Single(fixture.Worker.Requests, request => request.Command == "regenerate");
+		Assert.Equal(new[] { "sdkgroup.existing", added.Role.Id },
+			fixture.Worker.Requests.Where(request => request.Command == "set-enabled").Select(request => request.Argument));
+		scan = await fixture.Service.ScanRolesAsync(default);
+		Assert.Empty(scan.Library);
+		var registered = Assert.Single(scan.Registered);
+		Assert.True(registered.Enabled);
+		Assert.False(registered.MissingFromLibrary);
+		Assert.Equal(registered.Role.LibraryRevision, registered.Revision);
+
+		var patch = Path.Combine(directory, "a7c4c9d700000000.patch_0");
+		File.AppendAllText(patch, "-modified");
+		var changed = Assert.Single((await fixture.Service.ScanRolesAsync(default)).Registered);
+		Assert.NotEqual(registered.Revision, changed.Revision);
+		File.Delete(patch);
+		var missing = Assert.Single((await fixture.Service.ScanRolesAsync(default)).Registered);
+		Assert.True(missing.MissingFromLibrary);
+		Assert.True(missing.Enabled);
+		Assert.Single(fixture.Worker.Requests, request => request.Command == "regenerate");
+	}
+
+	[Fact]
+	public async Task RedropRecoversLegacyMainAndItsOptionsWithoutADuplicate()
+	{
+		using var fixture = await Fixture.CreateAsync();
+		fixture.UseManifestMain();
+		var original = (await fixture.AddDirectAsync()).Role;
+		var root = new ModNodeId(Assert.Single(original.ModIds));
+		var before = await fixture.Service.LoadModsAsync(default);
+		Assert.True(original.OwnedModIds!.Length > 1);
+		var originalDirectory = Path.Combine(fixture.Paths.ModsDirectory, before.Nodes[root].RelativePath);
+		File.Delete(Path.Combine(originalDirectory, "IAS_Companion.hd2irpack.zip"));
+		File.Delete(Path.Combine(fixture.IasLibrary, "roles.json"));
+		File.Delete(Path.Combine(fixture.IasLibrary, original.Id + ".json"));
+		IasFileTree.Delete(fixture.Service.Sources(original.Id));
+
+		var legacy = Assert.Single((await fixture.Service.ScanRolesAsync(default)).Library);
+		Assert.True(legacy.Legacy);
+		Assert.Null(legacy.CompanionPath);
+		var recovered = await fixture.AddDirectAsync();
+
+		Assert.Equal(IasAddDisposition.Installed, recovered.Disposition);
+		Assert.Equal(original.ModIds, recovered.Role.ModIds);
+		Assert.Equal(original.OwnedModIds.Order(), recovered.Role.OwnedModIds!.Order());
+		Assert.Equal(before.Nodes.Keys.OrderBy(key => key.Value),
+			(await fixture.Service.LoadModsAsync(default)).Nodes.Keys.OrderBy(key => key.Value));
+		Assert.Empty((await fixture.Service.ScanRolesAsync(default)).Library);
+	}
 
 	[Theory]
 	[InlineData(true)]
@@ -861,6 +995,33 @@ public sealed class IasDeploymentTests
 		internal IasDeploymentService Service { get; private set; } = null!;
 		internal string[] Pair => [Path.Combine(Root, "Sample_IAS_MainMod.zip"), Path.Combine(Root, "Sample_IAS_Companion.hd2irpack.zip")];
 
+		internal async Task<IasAddResult> AddDirectAsync()
+		{
+			using var workspace = new IasDropWorkspace();
+			var main = await workspace.InspectAsync(Pair[0], default);
+			var companion = await workspace.InspectAsync(Pair[1], default);
+			return await Service.AddPreparedAsync([main, companion], default);
+		}
+
+		internal void ChangeCompanion(string name, string id)
+		{
+			using var zip = ZipFile.Open(Pair[1], ZipArchiveMode.Update);
+			zip.GetEntry("mod_group.json")!.Delete();
+			Write(zip, "mod_group.json", JsonSerializer.Serialize(new { name, id }));
+		}
+
+		internal void UseManifestMain()
+		{
+			using var zip = ZipFile.Open(Pair[0], ZipArchiveMode.Update);
+			zip.GetEntry("a7c4c9d700000000.patch_0")!.Delete();
+			Write(zip, "manifest.json", JsonSerializer.Serialize(new
+			{
+				Version = 1, Guid = Guid.NewGuid().ToString(), Name = "Fixture IAS Main",
+				Options = new[] { new { Name = "Body", Include = new[] { "Files" } } }
+			}));
+			Write(zip, "Files/a7c4c9d700000000.patch_0", "main-patch");
+		}
+
 		internal void SetArchiveOwner(string id, bool enabled, params string[] archives)
 		{
 			Worker.RoleArchives[id] = archives;
@@ -905,7 +1066,7 @@ public sealed class IasDeploymentTests
 				using (var zip = ZipFile.Open(fixture.Pair[0], ZipArchiveMode.Create))
 					Write(zip, "a7c4c9d700000000.patch_0", "main-patch");
 				using (var zip = ZipFile.Open(fixture.Pair[1], ZipArchiveMode.Create))
-					Write(zip, "mod_group.json", "{\"name\":\"Sample\"}");
+					Write(zip, "mod_group.json", "{\"name\":\"Sample\",\"id\":\"fixture-group\"}");
 				var id = new ModNodeId(fixture.ManagedId);
 				var profile = new Profile(ProfileId.New(), "Test", DateTimeOffset.UtcNow, null,
 					[new(id, 0, DateTimeOffset.UtcNow)]);
@@ -958,7 +1119,7 @@ public sealed class IasDeploymentTests
 					{
 						var id = Path.GetFileNameWithoutExtension(file);
 						return new IasArchiveOwner(id, id, bool.Parse(File.ReadAllText(file)), RoleArchives.GetValueOrDefault(id) ?? []);
-					}).Where(owner => owner.Enabled || owner.Id == request.Argument);
+					}).Where(owner => owner.Enabled || owner.Id == request.Argument || request.Argument == "*");
 					return Task.FromResult(new IasWorkerResponse(true, JsonSerializer.Serialize(owners)));
 				case "graphics-status":
 					return Task.FromResult(new IasWorkerResponse(true, JsonSerializer.Serialize(ReadGraphics())));
@@ -988,7 +1149,7 @@ public sealed class IasDeploymentTests
 					using (var group = JsonDocument.Parse(entry))
 					{
 						var id = group.RootElement.GetProperty("name").GetString() == "Second" ? "sdkgroup.second" : "sdkgroup.role";
-						File.WriteAllText(Path.Combine(request.Library, id + ".json"), "true");
+						File.WriteAllText(Path.Combine(request.Library, id + ".json"), request.Enabled ? "true" : "false");
 						return Task.FromResult(new IasWorkerResponse(true, id));
 					}
 				case "remove":

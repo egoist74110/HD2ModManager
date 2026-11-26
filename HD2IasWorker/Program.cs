@@ -1,9 +1,11 @@
 using System.Collections;
+using System.Buffers.Binary;
 using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Runtime.Loader;
 using System.Text;
 using System.Text.Json;
+using System.Text.RegularExpressions;
 using HD2ModCore.Ias;
 
 Console.InputEncoding = Encoding.UTF8;
@@ -132,6 +134,18 @@ sealed class OfficialIas
 			RequireField(libraryEntry, "bundle", bundle);
 			RequireField(bundle, "name", str);
 			Bind(store, "ImportSdkZip", bundle, false, str);
+			if (request.Argument == "*")
+			{
+				var blob = store.GetMethod("Blob", BindingFlags.NonPublic | BindingFlags.Instance, null, [str], null);
+				if (blob?.ReturnType != str) throw Missing("方法 String OwnedStore.Blob(String)");
+				_methods.Add("Blob", blob);
+				var ownedFile = TypeOf("OwnedFile");
+				RequireField(bundle, "id", str);
+				RequireField(bundle, "source_id", str);
+				RequireField(bundle, "files", ownedFile.MakeArrayType());
+				RequireField(ownedFile, "path", str);
+				RequireField(ownedFile, "sha256", str);
+			}
 		}
 
 		if (request.Command is "check-interface" or "archive-occupancy" or "companion-archives")
@@ -199,7 +213,7 @@ sealed class OfficialIas
 				if (Field(entry, "error") is string { Length: > 0 } error)
 					throw new InvalidDataException($"无法登记 IAS 配套包：{error}");
 				var id = Required(Field(entry, "id") as string);
-				Call("SetLibraryEnabled", store, id, true);
+				Call("SetLibraryEnabled", store, id, _request.Enabled);
 				return id;
 			case "remove":
 				Call("RemoveFromLibrary", Store(), Required(argument));
@@ -249,11 +263,39 @@ sealed class OfficialIas
 		{
 			var id = (string)Field(entry, "id")!;
 			var enabled = (bool)Field(entry, "enabled")!;
-			if (!enabled && id != includeRole) continue;
-			var bundle = Field(entry, "bundle")
-				?? throw new InvalidDataException($"IAS 配套无效：{id}");
-			yield return new(id, (string?)Field(bundle, "name") ?? id, enabled, BundleArchives(store, bundle));
+			if (!enabled && id != includeRole && includeRole != "*") continue;
+			var bundle = Field(entry, "bundle");
+			if (bundle is null && !enabled && includeRole == "*") continue;
+			if (bundle is null) throw new InvalidDataException($"IAS 配套无效：{id}");
+			var archives = includeRole == "*" ? ReadArchiveHeaders(store, bundle) : BundleArchives(store, bundle);
+			yield return new(id, (string?)Field(bundle, "name") ?? id, enabled, archives);
 		}
+	}
+
+	private string[] ReadArchiveHeaders(object store, object bundle)
+	{
+		// 列表刷新只读归属头。实际启用仍用官方 BundleArchives 校验配套和 CAS。
+		var archives = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+		foreach (var key in new[] { "id", "source_id" })
+		{
+			var match = Regex.Match((string?)Field(bundle, key) ?? "", @"^sdk\.[0-9a-f]{32}\.([0-9a-f]{16})$");
+			if (match.Success) archives.Add(match.Groups[1].Value);
+		}
+		Span<byte> header = stackalloc byte[104];
+		foreach (var file in ((IEnumerable)Field(bundle, "files")!).Cast<object>())
+		{
+			var path = (string)Field(file, "path")!;
+			var match = Regex.Match(path, @"^bin/HD2IndependentRig/[0-9a-fA-F]{32}\.([0-9a-fA-F]{16})\.rigbin$");
+			if (match.Success) archives.Add(match.Groups[1].Value);
+			if (!path.EndsWith(".hd2shared", StringComparison.Ordinal)) continue;
+			var blob = (string)Call("Blob", store, Field(file, "sha256"))!;
+			using var stream = File.OpenRead(blob);
+			if (stream.Length < 148 || stream.ReadAtLeast(header, header.Length, false) != header.Length ||
+				!header[..8].SequenceEqual("HD2SHR1\0"u8))
+				throw new InvalidDataException("IAS 共享配套归属清单损坏。");
+			archives.Add(BinaryPrimitives.ReadUInt64LittleEndian(header[96..]).ToString("x16"));
+		}
+		return archives.Order(StringComparer.OrdinalIgnoreCase).ToArray();
 	}
 
 	private string[] BundleArchives(object store, object bundle) =>
