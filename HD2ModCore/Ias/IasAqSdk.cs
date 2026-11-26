@@ -6,10 +6,11 @@ namespace HD2ModCore.Ias;
 public static class IasAqSdk
 {
 	private const string Revision = "86b7252";
-	private static readonly Uri ArchiveUri = new($"https://codeload.github.com/Estecsky/HD2SDK-AQ-Edition/zip/{Revision}");
+	internal static readonly Uri ArchiveUri = new($"https://codeload.github.com/Estecsky/HD2SDK-AQ-Edition/zip/{Revision}");
+	internal static readonly Uri MirrorArchiveUri = new($"https://github.com/Estecsky/HD2SDK-AQ-Edition/archive/{Revision}.zip");
 	private const long MaxDownload = 128 * 1024 * 1024;
 
-	public static async Task<string> GetAsync(StoragePaths paths, string work, CancellationToken token)
+	public static async Task<string> GetAsync(StoragePaths paths, string work, CancellationToken token, HttpClient? http = null)
 	{
 		var configured = Environment.GetEnvironmentVariable("HD2_AQSDK_DIR");
 		if (!string.IsNullOrWhiteSpace(configured)) return Path.GetFullPath(configured);
@@ -19,7 +20,10 @@ public static class IasAqSdk
 		if (Directory.Exists(cached)) return cached;
 		Directory.CreateDirectory(work);
 		var package = Path.Combine(work, "aqsdk.zip");
-		using var client = new HttpClient(new SocketsHttpHandler { AllowAutoRedirect = false, ConnectTimeout = TimeSpan.FromSeconds(15) });
+		using var fallback = http is null
+			? IasUpdateHttp.Create(() => IasUpdateHttp.ReadSettings(Path.GetFullPath(paths.AppRootDirectory)))
+			: null;
+		var client = http ?? fallback!;
 		using var timeout = CancellationTokenSource.CreateLinkedTokenSource(token);
 		timeout.CancelAfter(TimeSpan.FromMinutes(3));
 		try
@@ -53,7 +57,8 @@ public static class IasAqSdk
 		}
 		catch (Exception error) when (error is HttpRequestException || error is OperationCanceledException && !token.IsCancellationRequested)
 		{
-			throw new IOException($"无法从官方 GitHub 取得 AQ SDK 快照 {Revision}。可用 HD2_AQSDK_DIR 指定兼容的本地 HD2SDK-AQ-Edition 根目录。{error.Message}", error);
+			var cause = error is OperationCanceledException ? new TimeoutException($"下载 AQ SDK 快照 {Revision} 超时。", error) : error;
+			throw new IOException($"无法取得 AQ SDK 快照 {Revision}。可用 HD2_AQSDK_DIR 指定兼容的本地 HD2SDK-AQ-Edition 根目录。{error.Message}", cause);
 		}
 	}
 }

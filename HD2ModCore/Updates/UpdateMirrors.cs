@@ -60,7 +60,9 @@ public static class UpdateMirrors
 
 	private static bool RedirectOk(Uri u, Mirror mirror) =>
 		u.Scheme == "https" && string.IsNullOrEmpty(u.UserInfo)
-		&& (u.Host == new Uri(mirror.Base).Host || u.Host == "github.com" || u.Host.EndsWith(".githubusercontent.com", StringComparison.OrdinalIgnoreCase));
+		&& (u.Host == new Uri(mirror.Base).Host || u.Host == "github.com"
+			|| string.Equals(u.Host, "codeload.github.com", StringComparison.OrdinalIgnoreCase)
+			|| u.Host.EndsWith(".githubusercontent.com", StringComparison.OrdinalIgnoreCase));
 
 	/// <summary>
 	/// 把 GitHub URL 经镜像发出去；其他 URL 一律拒绝。重定向在这里手动跟随：镜像会返回路径绝对的

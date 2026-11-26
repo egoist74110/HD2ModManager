@@ -24,14 +24,16 @@ public static class IasUpdateHttp
 	}
 
 	/// <summary>
-	/// 镜像只代理 github.com 地址。非直连模式下，把官方清单和 LFS 整包（media.githubusercontent.com）
-	/// 换成 github.com 上的同一文件；GitHub 会 302 回原地址，内容与签名清单一致。其余地址原样返回。
+	/// 镜像只代理 github.com 地址。非直连模式下，把官方清单、LFS 整包（media.githubusercontent.com）
+	/// 和 AQ SDK 快照（codeload.github.com）换成 github.com 上的同一文件；GitHub 会 302 回原地址，内容一致。其余地址原样返回。
 	/// </summary>
 	internal static string MirrorableUrl(Uri uri, DownloadSourceMode mode)
 	{
 		if (mode == DownloadSourceMode.Ask) return uri.AbsoluteUri;
 		if (uri == IasFeedClient.FeedUri)
 			return "https://github.com/Estecsky/HD2-Integrated-Armor-System/raw/refs/heads/main/feed.json";
+		if (uri == IasAqSdk.ArchiveUri)
+			return IasAqSdk.MirrorArchiveUri.AbsoluteUri;
 		const string media = "/media/Estecsky/HD2-Integrated-Armor-System/";
 		if (string.Equals(uri.Host, "media.githubusercontent.com", StringComparison.OrdinalIgnoreCase) &&
 			IasFeedClient.IsOfficialUrl(uri) && uri.AbsolutePath.StartsWith(media, StringComparison.OrdinalIgnoreCase))

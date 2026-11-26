@@ -56,7 +56,7 @@ public sealed class IasModuleService(
             Path.Combine(paths.AppRootDirectory, "ias", "worker"), http);
 #if WINDOWS
         return new(paths, game, http, worker, IsGameRunning, optionActivations: optionActivations,
-            retargeter: new IasBodyRetargeter(paths, game));
+            retargeter: new IasBodyRetargeter(paths, game, http));
 #else
         return new(paths, game, http, worker, IsGameRunning, optionActivations: optionActivations);
 #endif
@@ -326,7 +326,7 @@ public sealed class IasModuleService(
         var stage = ConversionStage(storage);
         try
         {
-            var sdk = await IasAqSdk.GetAsync(storage, stage, ct).ConfigureAwait(false);
+            var sdk = await IasAqSdk.GetAsync(storage, stage, ct, http).ConfigureAwait(false);
             var targets = await IasPackagingService.GetVpkTargetsAsync(sdk, service.GameData, ct).ConfigureAwait(false);
             var catalog = await IasEquipmentCatalog.ReadAsync(storage, ct).ConfigureAwait(false);
             var armor = catalog.ByArchive(false, targets.BodyArchives);
@@ -544,7 +544,7 @@ public sealed class IasModuleService(
         }
 
         string? sdk = null;
-        string? vpkSetupError = null;
+        Exception? vpkSetupError = null;
         IasVpkTargetCatalog? vpkCatalog = null;
         if (conversions.Any(item => item.Kind == IasDropItemKind.L4d2Vpk))
         {
@@ -554,7 +554,7 @@ public sealed class IasModuleService(
                 if (vpkTargets?.Error is { } targetError) throw new InvalidDataException(targetError);
                 progress.Report(new("正在检查 IAS 底子装备…", null, null, true));
                 sdk = await IasTiming.MeasureAsync("获取 AQ SDK",
-                    () => IasAqSdk.GetAsync(storage, stage, ct)).ConfigureAwait(false);
+                    () => IasAqSdk.GetAsync(storage, stage, ct, http)).ConfigureAwait(false);
                 var targets = await IasTiming.MeasureAsync("查找可用 IAS 底子",
                     () => IasPackagingService.GetVpkTargetsAsync(sdk, service.GameData, ct)).ConfigureAwait(false);
                 var catalog = await IasEquipmentCatalog.ReadAsync(storage, ct).ConfigureAwait(false);
@@ -566,7 +566,7 @@ public sealed class IasModuleService(
             }
             catch (Exception error) when (error is not OperationCanceledException)
             {
-                vpkSetupError = error.Message;
+                vpkSetupError = error;
             }
             finally { IasFileTree.Delete(stage); }
         }
@@ -597,7 +597,7 @@ public sealed class IasModuleService(
         {
             var name = conversion.Name ?? DropName(conversion.Path);
             if (conversion.Kind != IasDropItemKind.L4d2Vpk) return await Convert(null).ConfigureAwait(false);
-            if (vpkSetupError is not null) throw new InvalidDataException(vpkSetupError);
+            if (vpkSetupError is not null) throw new InvalidDataException(vpkSetupError.Message, vpkSetupError);
             var occupancy = await service.GetArchiveOccupancyAsync(token).ConfigureAwait(false);
             return await IasVpkAllocation.ConvertAsync(vpkTargets!, vpkCatalog!, occupancy, reserved, name, Convert)
                 .ConfigureAwait(false);
@@ -716,6 +716,7 @@ public sealed class IasModuleService(
         Func<DropConversion, CancellationToken, Task<IReadOnlyList<string>>> convert, CancellationToken ct)
     {
         string? firstFailure = null;
+        var downloadFailed = false;
         foreach (var conversion in conversions)
         {
             ct.ThrowIfCancellationRequested();
@@ -726,6 +727,7 @@ public sealed class IasModuleService(
             }
             catch (Exception error) when (error is not OperationCanceledException)
             {
+                if (IasDownloadFailure.Is(error)) downloadFailed = true;
                 var source = conversion.Kind == IasDropItemKind.L4d2Vpk ? DescribeDropVpk(conversion.Path) : Path.GetFileName(conversion.Path);
                 var failure = $"添加「{source}」失败：{error.Message}";
                 firstFailure ??= failure;
@@ -733,7 +735,7 @@ public sealed class IasModuleService(
             }
         }
         return count == 0
-            ? new(false, firstFailure ?? noModels ?? "没有可安装的 IAS 角色。", warnings)
+            ? new(false, firstFailure ?? noModels ?? "没有可安装的 IAS 角色。", warnings) { DownloadFailed = downloadFailed }
             : new(true, $"已添加 {count} 个 IAS 角色。", warnings);
     }
 
@@ -790,7 +792,7 @@ public sealed class IasModuleService(
     private static string ConversionStage(StoragePaths paths) =>
         IasFileTree.Under(Path.Combine(Path.GetFullPath(paths.AppRootDirectory), "ias"), "temp/convert-" + Guid.NewGuid().ToString("N"));
 
-    private static async Task<IReadOnlyList<string>> ConvertAndAddAsync(IasDeploymentService service, StoragePaths paths,
+    private async Task<IReadOnlyList<string>> ConvertAndAddAsync(IasDeploymentService service, StoragePaths paths,
         string input, IasDropItemKind kind, IProgress<IasPageProgress> progress, CancellationToken ct, string? name = null,
         string? sdk = null, IasVpkTargets? vpkTargets = null,
         Func<LibrarySnapshot, CancellationToken, Task>? verifyOrigin = null, IReadOnlyList<string>? materialVpks = null,
@@ -807,7 +809,7 @@ public sealed class IasModuleService(
             var options = new IasPackagingOptions(output, service.GameData)
             {
                 GeneratorDirectory = generator,
-                AqSdkDirectory = sdk ?? await IasAqSdk.GetAsync(paths, stage, ct).ConfigureAwait(false),
+                AqSdkDirectory = sdk ?? await IasAqSdk.GetAsync(paths, stage, ct, http).ConfigureAwait(false),
                 BodyArchive = vpk ? vpkTargets?.Body : null,
                 HelmetArchive = vpk ? vpkTargets?.Helmet : null,
                 RecordTiming = IasTiming.Record,

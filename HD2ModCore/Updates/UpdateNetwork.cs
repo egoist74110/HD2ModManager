@@ -56,7 +56,9 @@ public sealed class UpdateNetwork
 
 	private static bool DirectHostOk(Uri u, bool loopback) =>
 		loopback ? IsLoopback(u) || DirectHostOk(u, false)
-		: u.Scheme == "https" && string.IsNullOrEmpty(u.UserInfo) && (GithubHosts.Contains(u.Host) || u.Host.EndsWith(".githubusercontent.com", StringComparison.OrdinalIgnoreCase));
+		: u.Scheme == "https" && string.IsNullOrEmpty(u.UserInfo) && (GithubHosts.Contains(u.Host)
+			|| string.Equals(u.Host, "codeload.github.com", StringComparison.OrdinalIgnoreCase)
+			|| u.Host.EndsWith(".githubusercontent.com", StringComparison.OrdinalIgnoreCase));
 
 	public static bool IsLoopback(Uri u) => (u.Scheme is "http" or "https") && (u.IsLoopback || u.Host == "localhost");
 

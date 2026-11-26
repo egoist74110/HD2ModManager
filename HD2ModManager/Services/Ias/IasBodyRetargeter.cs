@@ -1,4 +1,5 @@
 using System.IO;
+using System.Net.Http;
 using System.Text.Json;
 using HD2ModCore.Ias;
 using HD2ModCore.Infrastructure;
@@ -7,7 +8,7 @@ using Microsoft.Data.Sqlite;
 
 namespace HD2ModManager.Services.Ias;
 
-internal sealed class IasBodyRetargeter(StoragePaths storage, string game) : IIasBodyRetargeter
+internal sealed class IasBodyRetargeter(StoragePaths storage, string game, HttpClient? http = null) : IIasBodyRetargeter
 {
     public async Task<IasRetargetAnalysis> AnalyzeAsync(IasInstalled installed, string source, string work, CancellationToken ct)
     {
@@ -79,7 +80,7 @@ internal sealed class IasBodyRetargeter(StoragePaths storage, string game) : IIa
     private async Task<IasBodyRetargetService> OpenAsync(IasInstalled installed, string work, CancellationToken ct)
     {
         var sdk = IasBodyRetargetService.IsSupportedVersion(installed.Version)
-            ? await IasAqSdk.GetAsync(storage, Path.Combine(work, "sdk"), ct).ConfigureAwait(false) : "";
+            ? await IasAqSdk.GetAsync(storage, Path.Combine(work, "sdk"), ct, http).ConfigureAwait(false) : "";
         return new(installed.Version, Path.Combine(installed.ComponentsDirectory, "expanded", "Generator"),
             sdk, Metadata(installed), Path.Combine(game, "data"));
     }
