@@ -147,7 +147,7 @@ public sealed class ModImportPlanner : IModImportPlanner
 		{
 			diagnostics.Add(new ImportPlanDiagnostic(
 				"OptionPathConflict",
-				$"多个 manifest 选项以同等优先级归属实际 Patch 目录“{conflict.SourceRelativePath}”。导入会保留一份共享 payload；仅这些受影响父选项的直属共享内容不会默认启用，其他选项仍按正常规则初始化。",
+				$"多个 manifest 选项以同等优先级归属实际 Patch 目录“{conflict.SourceRelativePath}”。导入会保留一份共享 payload 并挂载到各引用选项下（部署时自动去重），所有选项按通常规则初始化。",
 				presentationSourcePath));
 		}
 		if (!PathsEqual(packageRoot.Directory, presentationSourcePath) && packageRoot.Manifest is not null)
@@ -218,7 +218,7 @@ public sealed class ModImportPlanner : IModImportPlanner
 			{
 				itemDiagnostics.Add(new ImportPlanDiagnostic(
 					"OptionPathConflict",
-					$"该逻辑选项共享实际 Patch 目录“{conflict.SourceRelativePath}”；其直属共享 payload 默认不启用。",
+					$"该逻辑选项共享实际 Patch 目录“{conflict.SourceRelativePath}”；导入会复用同一物理 payload 并在部署时去重。",
 					sourcePath));
 			}
 			foreach (var conflict in planned.OptionPathConflicts.Where(conflict => string.Equals(

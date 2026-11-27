@@ -46,7 +46,7 @@ public sealed class ModImportExecutionServiceTests
 	}
 
 	[Fact]
-	public async Task ImportFolderAsync_WithConflictingManifestIncludes_SuppressesOnlySharedPayloadDefaults()
+	public async Task ImportFolderAsync_WithConflictingManifestIncludes_ActivatesSharedPayloadAndFirstSubOptionOnly()
 	{
 		var root = Path.Combine(Path.GetTempPath(), "hd2coretests", Guid.NewGuid().ToString("N"));
 		try
@@ -56,41 +56,65 @@ public sealed class ModImportExecutionServiceTests
 			await File.WriteAllTextAsync(Path.Combine(source, "manifest.json"), """
 {
   "name": "Conflict Root",
-	  "options": [
-	    { "name": "Choice A", "include": [ "shared" ] },
-	    { "name": "Choice B", "include": [ "shared" ] },
-	    { "name": "Independent", "include": [ "independent" ] }
-	  ]
+  "options": [
+    { "name": "Required", "include": [ "base", "shared" ] },
+    {
+      "name": "Smoke Group",
+      "subOptions": [
+        { "name": "Smoke 50", "include": [ "smoke50", "shared" ] },
+        { "name": "Smoke 25", "include": [ "smoke25", "shared" ] }
+      ]
+    },
+    { "name": "Independent", "include": [ "independent" ] }
+  ]
 }
 """);
-			await WritePatchAsync(Path.Combine(source, "shared", "9ba626afa44a3aa3.patch_4"));
+			await WritePatchAsync(Path.Combine(source, "base", "9ba626afa44a3aa3.patch_0"));
+			await WritePatchAsync(Path.Combine(source, "shared", "9ba626afa44a3aa3.patch_1"));
+			await WritePatchAsync(Path.Combine(source, "smoke50", "9ba626afa44a3aa3.patch_2"));
+			await WritePatchAsync(Path.Combine(source, "smoke25", "9ba626afa44a3aa3.patch_3"));
 			await WritePatchAsync(Path.Combine(source, "independent", "9ba626afa44a3aa4.patch_4"));
 			var paths = new StoragePaths(Path.Combine(root, "manager"), Path.Combine(root, "library"));
 
 			var result = await CoreServices.CreateModImportExecutionService(paths).ImportFolderAsync(source);
 
 			Assert.True(result.HasOptionPathConflicts);
-			Assert.Equal(6, result.InitializedOptionActivationCount);
 			var rootNode = Assert.Single(result.Snapshot.Nodes.Values, node => node.Metadata.Kind == ModNodeKind.Standard);
-			var choiceA = Assert.Single(result.Snapshot.Nodes.Values, node => node.Metadata.Name == "Choice A");
-			var choiceB = Assert.Single(result.Snapshot.Nodes.Values, node => node.Metadata.Name == "Choice B");
+			var required = Assert.Single(result.Snapshot.Nodes.Values, node =>
+				node.Metadata.Name == "Required" && node.Metadata.SourcePackagePath == "option:0");
+			var smokeGroup = Assert.Single(result.Snapshot.Nodes.Values, node =>
+				node.Metadata.Name == "Smoke Group" && node.Metadata.SourcePackagePath == "option:1");
+			var smoke50 = Assert.Single(result.Snapshot.Nodes.Values, node =>
+				node.Metadata.Name == "Smoke 50" && node.Metadata.SourcePackagePath == "option:1/option:0");
+			var smoke25 = Assert.Single(result.Snapshot.Nodes.Values, node =>
+				node.Metadata.Name == "Smoke 25" && node.Metadata.SourcePackagePath == "option:1/option:1");
 			var independent = Assert.Single(result.Snapshot.Nodes.Values, node =>
 				node.Metadata.Name == "Independent" && node.Metadata.SourcePackagePath == "option:2");
-			var physical = Assert.Single(result.Snapshot.Nodes.Values, node =>
+			var basePhysical = Assert.Single(result.Snapshot.Nodes.Values, node =>
+				node.Metadata.SourcePackagePath == "base" && node.PatchGroups.Count > 0);
+			var sharedPhysical = Assert.Single(result.Snapshot.Nodes.Values, node =>
 				node.Metadata.Kind == ModNodeKind.Option
 				&& node.Metadata.SourcePackagePath == "shared"
 				&& node.PatchGroups.Count > 0);
-			Assert.Equal(2, physical.Metadata.HostModGuids!.Count);
-			var optionStates = await OptionActivationStore.TryLoadReadOnlySnapshotAsync(Path.Combine(paths.ModsDirectory, "option-activations.json"));
-			Assert.True(optionStates.IsEnabled(choiceA.Id.Value.ToString("N"), rootNode.Id.Value.ToString("N")));
-			Assert.True(optionStates.IsEnabled(choiceB.Id.Value.ToString("N"), rootNode.Id.Value.ToString("N")));
-			Assert.True(optionStates.IsEnabled(independent.Id.Value.ToString("N"), rootNode.Id.Value.ToString("N")));
-			Assert.False(optionStates.IsEnabled(physical.Id.Value.ToString("N"), choiceA.Id.Value.ToString("N")));
-			Assert.False(optionStates.IsEnabled(physical.Id.Value.ToString("N"), choiceB.Id.Value.ToString("N")));
+			var smoke50Physical = Assert.Single(result.Snapshot.Nodes.Values, node =>
+				node.Metadata.SourcePackagePath == "smoke50" && node.PatchGroups.Count > 0);
 			var independentPhysical = Assert.Single(result.Snapshot.Nodes.Values, node =>
-				node.Metadata.SourcePackagePath == "independent"
-				&& node.PatchGroups.Count > 0);
-			Assert.Equal(independent.Id.Value.ToString("N"), Assert.Single(independentPhysical.Metadata.HostModGuids!));
+				node.Metadata.SourcePackagePath == "independent" && node.PatchGroups.Count > 0);
+
+			Assert.True(smokeGroup.Metadata.IsOptionGroup);
+			Assert.False(required.Metadata.IsOptionGroup);
+			Assert.Equal(3, sharedPhysical.Metadata.HostModGuids!.Count);
+
+			var optionStates = await OptionActivationStore.TryLoadReadOnlySnapshotAsync(Path.Combine(paths.ModsDirectory, "option-activations.json"));
+			Assert.True(optionStates.IsEnabled(required.Id.Value.ToString("N"), rootNode.Id.Value.ToString("N")));
+			Assert.True(optionStates.IsEnabled(basePhysical.Id.Value.ToString("N"), required.Id.Value.ToString("N")));
+			Assert.True(optionStates.IsEnabled(sharedPhysical.Id.Value.ToString("N"), required.Id.Value.ToString("N")));
+			Assert.True(optionStates.IsEnabled(smokeGroup.Id.Value.ToString("N"), rootNode.Id.Value.ToString("N")));
+			Assert.True(optionStates.IsEnabled(smoke50.Id.Value.ToString("N"), smokeGroup.Id.Value.ToString("N")));
+			Assert.False(optionStates.IsEnabled(smoke25.Id.Value.ToString("N"), smokeGroup.Id.Value.ToString("N")));
+			Assert.True(optionStates.IsEnabled(smoke50Physical.Id.Value.ToString("N"), smoke50.Id.Value.ToString("N")));
+			Assert.True(optionStates.IsEnabled(sharedPhysical.Id.Value.ToString("N"), smoke50.Id.Value.ToString("N")));
+			Assert.True(optionStates.IsEnabled(independent.Id.Value.ToString("N"), rootNode.Id.Value.ToString("N")));
 			Assert.True(optionStates.IsEnabled(independentPhysical.Id.Value.ToString("N"), independent.Id.Value.ToString("N")));
 		}
 		finally

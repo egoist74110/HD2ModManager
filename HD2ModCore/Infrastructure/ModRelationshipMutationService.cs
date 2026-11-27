@@ -162,6 +162,7 @@ public sealed class ModRelationshipMutationService : IModRelationshipMutationSer
 					IsLogicalContainer = becomesStandard
 						? keepsLogicalContainer
 						: hasNoPayload,
+					IsOptionGroup = becomesStandard ? false : source.Metadata.IsOptionGroup,
 					ModifiedUtc = timestamp,
 				};
 				var updatedSource = source with { Metadata = metadata };

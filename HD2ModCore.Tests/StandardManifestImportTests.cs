@@ -162,8 +162,8 @@ public sealed class StandardManifestImportTests
 			Assert.True(alpha.Metadata.IsLogicalContainer);
 			Assert.True(beta.Metadata.IsLogicalContainer);
 			Assert.True(independent.Metadata.IsLogicalContainer);
-			Assert.True(alpha.Metadata.SuppressDefaultDirectOptionActivation);
-			Assert.True(beta.Metadata.SuppressDefaultDirectOptionActivation);
+			Assert.False(alpha.Metadata.SuppressDefaultDirectOptionActivation);
+			Assert.False(beta.Metadata.SuppressDefaultDirectOptionActivation);
 			Assert.False(independent.Metadata.SuppressDefaultDirectOptionActivation);
 			Assert.True(File.Exists(ModNodeStorageProtocol.LogicalMarkerPath(Path.Combine(paths.ModsDirectory, alpha.RelativePath))));
 			Assert.True(File.Exists(ModNodeStorageProtocol.LogicalMarkerPath(Path.Combine(paths.ModsDirectory, beta.RelativePath))));

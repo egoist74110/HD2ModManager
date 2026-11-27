@@ -56,6 +56,11 @@
 - 提交前跑全量测试：`dotnet test -c Debug`，绿了再提交。
 - 管理器开着会锁 `bin\`：构建前可 `Stop-Process -Name HD2ModManager -Force`（用户允许）。
 
+## 桌面 dev 预览规矩（必守）
+
+- 用户验收一律通过桌面快捷方式 `C:\Users\q1243\Desktop\HD2 Mod Manager (dev).lnk`（`tools\watch-hd2.cmd Release`）查看，不要让用户自己去 `bin\` 找 exe。
+- 每次改完代码、交给用户验证前，必须检查该快捷方式的 `TargetPath` 和 `WorkingDirectory` 是否指向**本次实际修改的仓库 / worktree 目录**；如果不一致，直接把它改指向本次修改的目录，并在回复里提醒用户关掉旧 watcher 窗口后重新双击桌面 `HD2 Mod Manager (dev)`。
+
 ## 别碰
 
 - `docs/` 下**未跟踪**的文件和目录属于用户本人（`参考项目/`、`_backup/`、`temp/`、各种 `*.zip`），

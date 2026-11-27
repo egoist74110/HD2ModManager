@@ -8825,7 +8825,7 @@ public static class CliApplication
 		CliImportProfileAddition? profileAddition)
 		=> $"已导入：{result.SourceDisplayName}{Environment.NewLine}目标 Mod 库：{libraryRoot}{Environment.NewLine}新增 Mod：{result.AddedNodeIds.Count}；更新 Mod：{result.ChangedNodeIds.Count}；初始化选项状态：{result.InitializedOptionActivationCount}。"
 			+ (result.HasOptionPathConflicts
-				? $"{Environment.NewLine}检测到选项目录冲突：仅共享 Patch 内容未默认选择；其余选项已按通常规则初始化。"
+				? $"{Environment.NewLine}检测到共享选项目录：已保留单份共享 Patch payload（部署时自动去重），所有选项已按通常规则初始化。"
 				: string.Empty)
 			+ (result.CacheInvalidationStatus == ImportCacheInvalidationStatus.Completed
 				? string.Empty

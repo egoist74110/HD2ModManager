@@ -150,6 +150,48 @@ public sealed class OptionActivationDefaultInitializerTests
 		}
 	}
 
+	[Fact]
+	public async Task InitializeMissingStatesAsync_EnablesOnlyFirstChildOfLogicalOptionGroup()
+	{
+		var rootDirectory = Path.Combine(Path.GetTempPath(), "hd2coretests", Guid.NewGuid().ToString("N"));
+		try
+		{
+			var root = Node(ModNodeKind.Standard, "Root");
+			var group = new ModNode(
+				ModNodeId.New(),
+				"Group",
+				new ModNodeMetadata("Group", null, DateTimeOffset.UtcNow, null, ModNodeKind.Option,
+					[root.Id.Value.ToString("N")], IsLogicalContainer: true, IsOptionGroup: true),
+				Array.Empty<PatchGroupKey>(),
+				Array.Empty<ModNodeId>());
+			var first = Node(ModNodeKind.Option, "First", [group.Id.Value.ToString("N")], optionOrder: 0);
+			var second = Node(ModNodeKind.Option, "Second", [group.Id.Value.ToString("N")], optionOrder: 1);
+			var snapshot = new LibrarySnapshot(
+				1,
+				DateTimeOffset.UtcNow,
+				new Dictionary<ModNodeId, ModNode>
+				{
+					[root.Id] = root,
+					[group.Id] = group,
+					[first.Id] = first,
+					[second.Id] = second,
+				},
+				Array.Empty<Profile>());
+			var states = new OptionActivationStore(Path.Combine(rootDirectory, "option-activations.json"));
+
+			await new OptionActivationDefaultInitializer().InitializeMissingStatesAsync(snapshot, states, [root.Id]);
+
+			var state = states.CreateSnapshot();
+			Assert.True(state.IsEnabled(group.Id.Value.ToString("N"), root.Id.Value.ToString("N")));
+			Assert.True(state.IsEnabled(first.Id.Value.ToString("N"), group.Id.Value.ToString("N")));
+			Assert.False(state.IsEnabled(second.Id.Value.ToString("N"), group.Id.Value.ToString("N")));
+		}
+		finally
+		{
+			try { if (Directory.Exists(rootDirectory)) Directory.Delete(rootDirectory, recursive: true); } catch { }
+		}
+	}
+
 	private static ModNode Node(ModNodeKind kind, string name, IReadOnlyList<string>? hostIds = null, int? optionOrder = null)
 		=> new(
 			ModNodeId.New(),

@@ -24,3 +24,5 @@ hd2mod option parent remove <option-id> [...] --host <host-id> --manager-root "<
 `option parent add` converts a normal Mod to an Option when needed and removes it from every Profile. `mod convert-to-option <mod-id> --host <host-id>` is a convenient alias. `option parent remove` only removes the requested parent relation; a shared Option remains attached to its other parents. Removing its last parent restores Standard kind but never restores old Profile placement.
 
 `option insert` is an exact alias of `option move`; it does not attach an Option to a new host. Position 1 precedes the first direct Option; the end position is direct-option count plus one. No command deploys automatically.
+
+Note on `option enable-all` / `disable-all`: they operate on **one multi-parent Option across all of its declared hosts** (such as a shared Patch directory reported by `OptionPathConflict`), not on all sibling choices inside a `SubOptions` group. For a `SubOptions` choice group, enable or disable the specific child option with `--host <group-id>`.

@@ -97,6 +97,7 @@ public static class ModNodeStorageProtocol
 				SourcePath = metadata.SourcePackagePath,
 				OptionOrder = metadata.OptionOrder,
 				SuppressDefaultDirectOptionActivation = metadata.SuppressDefaultDirectOptionActivation,
+				IsOptionGroup = metadata.IsOptionGroup,
 			},
 			cancellationToken);
 	}

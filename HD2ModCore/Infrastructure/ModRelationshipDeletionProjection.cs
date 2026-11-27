@@ -55,6 +55,9 @@ public static class ModRelationshipDeletionProjection
 				IsLogicalContainer = becomesStandard
 					? retainsLogicalContainer
 					: node.Metadata.IsLogicalContainer,
+				IsOptionGroup = becomesStandard
+					? false
+					: node.Metadata.IsOptionGroup,
 				ModifiedUtc = timestamp,
 			};
 			result[node.Id] = node with { Metadata = metadata };
@@ -76,6 +79,7 @@ public static class ModRelationshipDeletionProjection
 			|| before.Metadata.IsLogicalContainer != after.Metadata.IsLogicalContainer
 			|| before.Metadata.OptionOrder != after.Metadata.OptionOrder
 			|| before.Metadata.SuppressDefaultDirectOptionActivation != after.Metadata.SuppressDefaultDirectOptionActivation
+			|| before.Metadata.IsOptionGroup != after.Metadata.IsOptionGroup
 			|| !SequenceEqual(before.Metadata.HostModGuids, after.Metadata.HostModGuids);
 	}
 

@@ -746,10 +746,10 @@ public sealed class ModLibraryImporter : IModLibraryImporter
 			.Any(group => group.Count() > 1));
 		var compatibilityMode = conflictingPayloadNodes.Count > 0 || overlappingPayloadLogicalOptions;
 
-		var conflictParentIds = conflictingPayloadNodes
-			.SelectMany(conflict => conflict.Owners)
-			.Select(entry => entryIds[entry.Key])
-			.ToHashSet();
+		var parentKeysWithSubOptions = optionEntries
+			.Where(entry => !string.IsNullOrEmpty(entry.ParentKey))
+			.Select(entry => entry.ParentKey!)
+			.ToHashSet(StringComparer.OrdinalIgnoreCase);
 		foreach (var entry in optionEntries)
 		{
 			var optionId = entryIds[entry.Key];
@@ -779,13 +779,17 @@ public sealed class ModLibraryImporter : IModLibraryImporter
 					manifest.Guid,
 					entry.Key,
 					entry.OptionOrder,
-					SuppressDefaultDirectOptionActivation: conflictParentIds.Contains(optionId),
+					// Shared Include payloads are deduplicated at deployment time; do not
+					// suppress default activation on their parent options, which would also
+					// turn off sibling required payloads (such as Base alongside Shared).
+					SuppressDefaultDirectOptionActivation: false,
 					// Compatibility mode intentionally moves every real Patch directory
 					// into an independent physical node. The manifest Option remains a
 					// durable relationship-only container even when it originally
 					// matched payload paths, so it needs the same marker as any other
 					// empty logical node.
-					IsLogicalContainer: compatibilityMode || matchedNodes.Length == 0),
+					IsLogicalContainer: compatibilityMode || matchedNodes.Length == 0,
+					IsOptionGroup: parentKeysWithSubOptions.Contains(entry.Key)),
 				compatibilityMode
 					? Array.Empty<PatchGroupKey>()
 					: matchedNodes

@@ -83,7 +83,8 @@ public sealed class ObjectTreeImporter : IObjectTreeImporter
 				SourcePackagePath: option?.SourcePath,
 				OptionOrder: option?.OptionOrder,
 				SuppressDefaultDirectOptionActivation: option?.SuppressDefaultDirectOptionActivation ?? false,
-				IsLogicalContainer: isLogicalContainer || option is not null && patchGroups.Count == 0);
+				IsLogicalContainer: isLogicalContainer || option is not null && patchGroups.Count == 0,
+				IsOptionGroup: option?.IsOptionGroup ?? false);
 
 			nodes[id] = new ModNode(
 				Id: id,

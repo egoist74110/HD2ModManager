@@ -151,7 +151,8 @@ internal sealed class IasModTransaction : IDisposable
 					CreatedUtc = existingNode?.Metadata.CreatedUtc ?? node.Metadata.CreatedUtc,
 					HostModGuids = node.Metadata.HostModGuids?.Select(MapId).ToArray(),
 					SuppressDefaultDirectOptionActivation = existingNode?.Metadata.SuppressDefaultDirectOptionActivation ??
-						node.Metadata.SuppressDefaultDirectOptionActivation
+						node.Metadata.SuppressDefaultDirectOptionActivation,
+					IsOptionGroup = existingNode?.Metadata.IsOptionGroup ?? node.Metadata.IsOptionGroup
 				}
 			};
 			while (existingPath is null && (Path.Exists(ModPath(installed.RelativePath)) || _writes.ContainsKey(ModPath(installed.RelativePath))))

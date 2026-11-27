@@ -17,3 +17,5 @@ hd2mod import apply --plan import-plan.json --manager-root "<manager>" --confirm
 ```
 
 Read the complete validation JSON and stop unless `ok` is `true`. `--add-to-profile` is default-off; it freezes Profile ID and revision in the plan, then apply adds only newly imported deployable Standard/ReShade entries if the Profile is unchanged. Apply never deploys GameData, edits Patch bytes, or retries a partial post-commit result automatically.
+
+`OptionPathConflict` (non-blocking warning) appears when multiple manifest Options include the same physical Patch directory (for example a shared `Shared` dependency referenced by several options). Import keeps one physical Option payload attached to each referencing logical Option, deduplicates it during deployment, and initializes activation with standard rules (`SubOptions` groups enable only their first sibling; Include wrapper containers enable their required physical children).

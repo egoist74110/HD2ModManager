@@ -48,11 +48,11 @@ public sealed class OptionActivationDefaultInitializer
 			var children = graph.GetDirectOptions(parentId);
 			var suppressDirectDefaults = parent.Metadata.SuppressDefaultDirectOptionActivation;
 			// Virtual-reference Manifest imports use an empty logical Option as a
-			// relationship hub. Every physical Include child is required for that
-			// logical choice, unlike ordinary Option siblings where only the first
-			// choice is enabled by default.
+			// relationship hub for its physical Include children, which are all
+			// required for that choice. A SubOptions choice group (IsOptionGroup)
+			// still follows the single-first-sibling default rule.
 			var enableAllChildren = parent.Metadata.Kind == ModNodeKind.Standard
-				|| parent.Metadata.IsLogicalContainer;
+				|| (parent.Metadata.IsLogicalContainer && !parent.Metadata.IsOptionGroup);
 			for (var index = 0; index < children.Count; index++)
 			{
 				var child = children[index];

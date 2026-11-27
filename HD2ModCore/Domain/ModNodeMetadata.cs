@@ -16,4 +16,8 @@ public sealed record ModNodeMetadata(
 	bool SuppressDefaultDirectOptionActivation = false,
 	// A logical container has a durable library directory but no deployable Patch
 	// payload of its own. It is allowed to act as a structural host for Options.
-	bool IsLogicalContainer = false);
+	bool IsLogicalContainer = false,
+	// True when a manifest Option acts as a SubOptions choice group whose direct
+	// children are alternatives (only the first sibling should activate by default),
+	// rather than an Include wrapper whose physical children are all required.
+	bool IsOptionGroup = false);

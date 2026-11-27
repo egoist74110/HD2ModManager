@@ -64,4 +64,5 @@ internal sealed class OptionRelationDocument
 	public string? SourcePath { get; init; }
 	public int? OptionOrder { get; init; }
 	public bool SuppressDefaultDirectOptionActivation { get; init; }
+	public bool IsOptionGroup { get; init; }
 }
